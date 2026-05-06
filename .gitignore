@@ -1,0 +1,27 @@
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+dist/
+package-lock.json
+
+# OS
+.DS_Store
+*.swp
+*~
+
+# Editor
+.vscode/
+.idea/
+*.iml
+
+# Local artifacts
+*.log
+.env
+.env.local
+
+# Bundled binary output (rebuild from source)
+*.dmg
+*.zip

@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the studio: dialogs, fs reads, drag-drop on window.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "fs:default",
+    "core:webview:allow-set-webview-zoom",
+    "core:window:allow-start-dragging"
+  ]
+}

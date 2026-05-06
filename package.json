@@ -1,0 +1,10 @@
+{
+  "name": "glyph-grid-studio",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "echo 'static — nothing to dev'",
+    "build": "echo 'static — nothing to build'",
+    "tauri": "tauri"
+  }
+}
