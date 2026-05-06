@@ -1965,6 +1965,41 @@
     next();
   };
 
+  /* Run an arbitrary list of phases against an arbitrary base directory.
+     For testing the same phase configs on a different source image without
+     overwriting prior runs.
+       runStudioPhasesAt([2,3,4,5,6,7,8,9],
+                         '/Users/.../Glyph Grid Studio Test/thor/');
+     The batch driver creates parent dirs on save (Rust mkdir -p), so the
+     phase sub-folders (02-selection-glyphset/, etc.) appear automatically. */
+  window.runStudioPhasesAt = function (phaseNumbers, baseDir) {
+    if (!baseDir.endsWith('/')) baseDir += '/';
+    let i = 0;
+    function next() {
+      if (i >= phaseNumbers.length) {
+        console.log('PHASES DONE for', baseDir);
+        return;
+      }
+      const n = phaseNumbers[i++];
+      const phase = PHASES[n];
+      if (!phase) { console.warn('unknown phase', n); setTimeout(next, 50); return; }
+      const jobs = phase.jobs.map(j => ({
+        ...j, path: baseDir + phase.dir + j.name + '.gif',
+      }));
+      console.log('STARTING Phase', n, 'at', baseDir + phase.dir, '—', jobs.length, 'jobs');
+      window.__glyphGridTest.runBatchExport(jobs, {
+        onProgress: (k, total, name) => {
+          if (k % 10 === 0) console.log('  ', k + '/' + total, name);
+        },
+        onComplete: (r) => {
+          console.log('Phase', n, 'done. ok=' + r.ok + ', errors=' + r.errors.length);
+          setTimeout(next, 200);
+        },
+      });
+    }
+    next();
+  };
+
   /* Studio UI — Tweakpane-based live tuning. Opt-in via CONFIG.studio.enabled. */
   window.SCENES = SCENES;
   window.GlyphStudio && window.GlyphStudio.init({
