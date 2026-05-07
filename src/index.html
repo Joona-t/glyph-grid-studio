@@ -213,6 +213,11 @@
        are read by the EMA hook in drawGlyphGridV2. */
     studio: {
       enabled: true,
+      /* Auto-resize canvas to match the source image's aspect ratio when
+         a new image loads. Caps long edge at MAX_CANVAS_LONG (1024) to
+         keep render cost predictable. Set false to keep canvas at the
+         CONFIG.canvas dimensions regardless of source aspect. */
+      fitCanvasToImage: true,
       breathing: {
         emaAlpha:  0.35,
         gainSwing: 0.30,
@@ -893,6 +898,84 @@
         console.error('[glyph-grid runtime init] ' + (e.message || e));
       }
     }
+  }
+
+  /* =========================================================================
+     Auto-fit canvas to source image aspect ratio.
+
+     Default canvas dims (CONFIG.canvas = 1024×504) are 2:1, which crops any
+     image that isn't exactly 2:1 — Sparky 612×408 (3:2) loses ear-tips +
+     bunny slipper feet because the studio scene's COVER fit clips overflow.
+
+     This helper resizes the canvas + all canvas-pixel-sized buffers (src
+     graphics, lumBuf, crtState) to match the loaded image's aspect ratio.
+     Long-edge capped at MAX_CANVAS_LONG so render cost stays bounded;
+     short-edge floored at MIN_CANVAS_SHORT to avoid pathologically thin
+     canvases for ultra-wide panoramas. Both rounded to even numbers so
+     cell math + dither tiles align cleanly.
+
+     Cell-grid-sized buffers (cellSignal, cellCpGrid, cellDepth,
+     cellSignalEma) are independent of canvas pixels — they auto-realloc
+     on grid change via the existing safety check in drawGlyphGridV2,
+     and the EMA-preservation logic from BUG-001's fix means breathing
+     extends/contracts gracefully across a resize without flat-resetting.
+
+     Disable via CONFIG.studio.fitCanvasToImage = false. */
+  const MAX_CANVAS_LONG = 1024;
+  const MIN_CANVAS_SHORT = 256;
+
+  function fitCanvasToImage(img) {
+    if (!img || !img.width || !img.height) return;
+    if (CONFIG.studio && CONFIG.studio.fitCanvasToImage === false) return;
+
+    const aspect = img.width / img.height;
+    let cw, ch;
+    if (aspect >= 1) {
+      cw = MAX_CANVAS_LONG;
+      ch = Math.max(MIN_CANVAS_SHORT, Math.round(MAX_CANVAS_LONG / aspect));
+    } else {
+      ch = MAX_CANVAS_LONG;
+      cw = Math.max(MIN_CANVAS_SHORT, Math.round(MAX_CANVAS_LONG * aspect));
+    }
+    cw -= cw % 2;
+    ch -= ch % 2;
+
+    if (cw === CONFIG.canvas.w && ch === CONFIG.canvas.h) return; // no-op
+
+    CONFIG.canvas.w = cw;
+    CONFIG.canvas.h = ch;
+    try { resizeCanvas(cw, ch); } catch (e) {
+      console.warn('fitCanvasToImage: resizeCanvas failed', e);
+      return;
+    }
+
+    /* Recreate canvas-pixel-sized buffers. */
+    src = createGraphics(cw, ch);
+    src.pixelDensity(1);
+    lumBuf = new Float32Array(cw * ch);
+
+    /* Reset crtState — it captures persistent per-pixel buffers at the
+       OLD size, so we drop it and let the v2 advanced pipeline lazy-init
+       it at the new size on next frame. One-frame visual blip on resize
+       (phosphorDecay state lost) is an acceptable tradeoff. */
+    if (window.GlyphGrid && GlyphGrid.crt && GlyphGrid.compat
+        && GlyphGrid.compat.isV2(CONFIG)
+        && GlyphGrid.compat.gatePostprocess(CONFIG)) {
+      crtState = GlyphGrid.crt.makeState(cw, ch);
+    } else {
+      crtState = null;
+    }
+
+    /* Clear scene cache so preprocess re-runs at the new dims. */
+    if (window.SCENES) {
+      for (const name in window.SCENES) {
+        delete window.SCENES[name].__sourceProcessed;
+        delete window.SCENES[name].__sourceDepth;
+      }
+    }
+
+    console.log('canvas resized to ' + cw + '×' + ch
+      + ' (image aspect ' + aspect.toFixed(3) + ')');
   }
 
   function draw() {
@@ -2169,6 +2252,10 @@
       name: 'sourceImg',
       set: function (img) {
         sourceImg = img;
+        /* Auto-fit canvas to the new image's aspect ratio so portrait /
+           square / 4:3 / etc. inputs don't get cropped by the 2:1 default.
+           Disabled via CONFIG.studio.fitCanvasToImage = false. */
+        try { fitCanvasToImage(img); } catch (e) { console.warn(e); }
         /* Image just landed — make sure the draw loop is alive even if a
            previous setting (or the empty-state placeholder branch) had it
            paused.  No-op if already looping. */
@@ -2218,11 +2305,13 @@
     }
 
     // Decode + assign the source image. Wrap in promise so the next steps
-    // wait for the actual image bytes to be ready.
+    // wait for the actual image bytes to be ready. Auto-fit the canvas
+    // to the source aspect ratio (same behavior as the GUI imageRef.set).
     try {
       await new Promise(function (resolve, reject) {
         window.loadImage(dataUrl, function (img) {
           sourceImg = img;
+          try { fitCanvasToImage(img); } catch (e) { console.warn(e); }
           try { loop(); } catch (e) {}
           resolve();
         }, function (err) {

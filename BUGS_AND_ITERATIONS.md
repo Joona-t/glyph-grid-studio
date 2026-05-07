@@ -30,6 +30,22 @@ Driver innovation that landed in this pass:
 
 ---
 
+## BUG-003 — Canvas hardcoded 2:1; non-2:1 source images get cropped
+
+- **Found:** 2026-05-07 by user reporting "uploaded images are cut off depending on dimensions" — Sparky's bunny slippers + ear tips disappeared because Sparky is 3:2 but canvas was forced 2:1.
+- **Root cause:** `CONFIG.canvas` was hardcoded `{ w: 1024, h: 504 }` and the studio scene's render path used a COVER fit (image scales to fully cover the canvas, off-axis cropped). Any image that wasn't exactly 2:1 lost the overflow.
+- **Fix:** New `fitCanvasToImage(img)` helper that resizes the canvas + all canvas-pixel-sized buffers (`src`, `lumBuf`, `crtState`) to match the loaded image's aspect ratio. Long edge capped at 1024 (preserves render budget), short edge floored at 256 (avoids vanishingly thin canvases). Hooked into `imageRef.set` (GUI drag-drop / Pick image) and `tryHeadlessRender` (CLI). Toggleable via `CONFIG.studio.fitCanvasToImage` (default true).
+- **Verification:** end-to-end CLI tests on 5 aspect ratios:
+    - 612×408 (3:2 sparky) → 1024×682 ✓
+    - 500×500 (square) → 1024×1024 ✓
+    - 300×600 (portrait) → 512×1024 ✓
+    - 1200×400 (wide) → 1024×340 ✓
+    - 1500×300 (panorama) → 1024×256 (clamped by floor) ✓
+  Plus GUI verification: Sparky's full body (bunny slippers + ears) now visible.
+- **Status:** ✅ FIXED
+
+---
+
 ## BUG-002 — `app.exit(code)` discards the exit code; CLI always exits 0
 
 - **Found:** 2026-05-07, comprehensive v0.1 test (Phase B7, bad-input case)
