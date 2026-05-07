@@ -660,35 +660,42 @@
     fExp.addButton({ title: 'Snapshot PNG' }).on('click', function () {
       snapshotPNG(document.querySelector('canvas'));
     });
-    /* Live readout of the export length so users see what the next
-       Export GIF click will produce.  Drives off Animation › duration ×
-       Animation › fps — the same animation timeline the on-screen
-       preview uses.  Updated on every pane refresh tick. */
+    /* Compute the frame count + per-frame delay we'll actually pass to
+       the GIF encoder.  The GIF format stores delays in centiseconds
+       (10 ms units), so e.g. 30 fps wants 33.33 ms but the encoder
+       rounds to 30 ms.  Effective fps = 1000 / delayMs, NOT nominal
+       fps — for total output duration to match the user's chosen
+       duration we must derive frame count from effective fps. */
+    function exportPlan() {
+      var fps = (config.animation && config.animation.fps) || 30;
+      var dur = (config.animation && config.animation.duration) || 6;
+      var delayMs = Math.max(20, Math.round(1000 / fps / 10) * 10);
+      var effFps = 1000 / delayMs;
+      var n = Math.max(2, Math.round(dur * effFps));
+      return { frames: n, delayMs: delayMs, dur: n * delayMs / 1000, fps: fps, effFps: effFps };
+    }
+
+    /* Live readout: shows the count and EXACT output duration the next
+       Export GIF will produce, accounting for GIF centisecond precision. */
     var expState = { frames: 0, length: '—' };
     fExp.addMonitor(expState, 'frames', { label: 'frames', interval: 200 });
     fExp.addMonitor(expState, 'length', { label: 'length', interval: 200 });
     setInterval(function () {
-      var fps = (config.animation && config.animation.fps) || 30;
-      var dur = (config.animation && config.animation.duration) || 6;
-      var n = Math.max(2, Math.round(dur * fps));
-      expState.frames = n;
-      expState.length = dur.toFixed(2) + 's @ ' + fps + 'fps';
+      var p = exportPlan();
+      expState.frames = p.frames;
+      expState.length = p.dur.toFixed(2) + 's (' + p.delayMs + 'ms/frame)';
     }, 200);
     var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
-    /* Export GIF — derives frame count from Animation › duration × fps so
-       the time slider IS the export-length slider.  Previously the
-       Export folder had its own `frames` input capped at 8–120 (= 0.27 s
-       to 4 s at 30 fps) which silently overrode the Animation duration.
-       Result: animated GIF uploads played back at 1–4 s no matter where
-       the user moved the time slider. */
+    /* Export GIF — derives frame count from effective fps so the output
+       duration matches the user's Animation › duration setting (within
+       the GIF format's 10 ms quantization). */
     fExp.addButton({ title: inTauri ? 'Export GIF' : 'Export GIF (ZIP fallback)' }).on('click', function () {
-      var fps = (config.animation && config.animation.fps) || 30;
-      var dur = (config.animation && config.animation.duration) || 6;
-      var frames = Math.max(2, Math.round(dur * fps));
-      console.log('glyph-studio: recording', frames, 'frames (' + dur.toFixed(2) + 's @ ' + fps + 'fps)');
-      recordGIF(opts.testHook, frames,
+      var p = exportPlan();
+      console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's');
+      recordGIF(opts.testHook, p.frames,
         function (i, total) { console.log('  ', i, '/', total); },
-        function () { console.log('glyph-studio: recording finished'); });
+        function () { console.log('glyph-studio: recording finished'); },
+        p.delayMs);
     });
 
     var urlPre = presetFromURL();
