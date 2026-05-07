@@ -520,6 +520,17 @@
                   the chosen grid density. Face zone (upper half) gets
                   an extra contrast boost on top. ----- */
       if (sourceImg && sourceImg.width > 0) {
+        /* Animated-source cache invalidation. window.__sourceFrameIdx is
+           updated each frame by draw() (see ANIMATED-SOURCE PLAYBACK
+           block above).  -1 means "static image, never changes"; any
+           non-negative value is the current GIF frame.  When the value
+           changes between renders, the cached preprocessed image is
+           stale — drop it so the unsharp mask runs against the new
+           source frame. */
+        const _curFrame = (typeof window.__sourceFrameIdx === 'number') ? window.__sourceFrameIdx : -1;
+        if (this.__sourceProcessed && this.__sourceProcessedFrame !== _curFrame) {
+          this.__sourceProcessed = null;
+        }
         if (!this.__sourceProcessed) {
           const W0 = sourceImg.width, H0 = sourceImg.height;
           const buf = createGraphics(W0, H0);
@@ -696,6 +707,7 @@
           }
           buf.updatePixels();
           this.__sourceProcessed = buf;
+          this.__sourceProcessedFrame = _curFrame;
         }
         const srcImg = this.__sourceProcessed;
         const imgAspect = srcImg.width / srcImg.height;
@@ -1028,6 +1040,45 @@
       return;
     }
 
+    /* ANIMATED-SOURCE PLAYBACK
+       ---------------------------------------------------------------
+       When the user uploads an animated GIF / APNG / animated WebP,
+       p5's loadImage decodes all frames into `sourceImg.gifProperties`.
+       Without our intervention, p5 either auto-plays the GIF at its
+       own framerate (drift between source and output) or it gets
+       frozen after the first frame is sampled into the scene's
+       __sourceProcessed cache.
+
+       Drive frame selection from our own animation time `t`:
+         loopMs    — sum of the source's per-frame delays
+         frameIdx  — the source frame whose delay window contains
+                     `(t * 1000) mod loopMs`
+
+       The scene's __sourceProcessed cache is busted via the global
+       `__sourceFrameIdx` watcher (scenes that compare against this
+       reset their cache when the source frame changes). */
+    if (sourceImg && sourceImg.gifProperties && sourceImg.numFrames && sourceImg.numFrames() > 1) {
+      const props = sourceImg.gifProperties;
+      const totalMs = props.__totalMs || (function () {
+        let s = 0;
+        for (let i = 0; i < props.numFrames; i++) s += (props.frames[i].delay || 100);
+        props.__totalMs = s;
+        return s;
+      })();
+      const loopT = (t * 1000) % totalMs;
+      let acc = 0, target = props.numFrames - 1;
+      for (let i = 0; i < props.numFrames; i++) {
+        acc += (props.frames[i].delay || 100);
+        if (loopT < acc) { target = i; break; }
+      }
+      if (target !== props.displayIndex) {
+        sourceImg.setFrame(target);
+      }
+      window.__sourceFrameIdx = target;
+    } else {
+      window.__sourceFrameIdx = -1;
+    }
+
     /* Wave 1 opt-in path: a piece may declare `window.PIPELINE = pipeline()...`
        to run through the new runtime. When present, it fully replaces the
        legacy draw path. Absent → legacy v1/v2-advanced path runs unchanged. */
@@ -1094,9 +1145,18 @@
       const atlasTag = (sel === 'shape' || sel === 'shape-edge-aware')
         ? ` | ${sel}/atlas=${(glyphAtlas && glyphAtlas.name) || (CONFIG.glyphSet || 'none')}`
         : '';
+      /* Animated-source frame indicator: shows current_frame/total_frames
+         when the source GIF is animated, lets the user see motion is
+         actually advancing.  Hidden for static images. */
+      let animTag = '';
+      if (sourceImg && sourceImg.gifProperties && sourceImg.numFrames && sourceImg.numFrames() > 1) {
+        const idx = (typeof window.__sourceFrameIdx === 'number' && window.__sourceFrameIdx >= 0)
+          ? window.__sourceFrameIdx : sourceImg.gifProperties.displayIndex;
+        animTag = ` | gif=${idx + 1}/${sourceImg.numFrames()}`;
+      }
       statusEl().textContent =
         `${CONFIG.scene} | ${CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
-        `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag} | ` +
+        `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag}${animTag} | ` +
         `t=${t.toFixed(2)}s | compat=${CONFIG.compat}`;
     }
 
@@ -3330,6 +3390,21 @@
            square / 4:3 / etc. inputs don't get cropped by the 2:1 default.
            Disabled via CONFIG.studio.fitCanvasToImage = false. */
         try { fitCanvasToImage(img); } catch (e) { console.warn(e); }
+        /* Animated source — auto-tune animation params so recording
+           captures exactly one source loop (instead of N loops or partial
+           loops driven by the default 6 s duration). */
+        try {
+          if (img && img.gifProperties && img.numFrames && img.numFrames() > 1) {
+            const props = img.gifProperties;
+            let totalMs = 0;
+            for (let i = 0; i < props.numFrames; i++) totalMs += (props.frames[i].delay || 100);
+            if (totalMs > 0) {
+              CONFIG.animation.duration = totalMs / 1000;
+              CONFIG.animation.loop = true;
+              console.log('animated source: ' + props.numFrames + ' frames, ' + (totalMs / 1000).toFixed(2) + 's loop — duration auto-set');
+            }
+          }
+        } catch (e) { console.warn('animated-source auto-tune failed:', e); }
         /* Image just landed — make sure the draw loop is alive even if a
            previous setting (or the empty-state placeholder branch) had it
            paused.  No-op if already looping. */
