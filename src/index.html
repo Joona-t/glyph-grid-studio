@@ -1088,9 +1088,15 @@
 
     if (!recState) {
       const lat = __pfLatencyTag();
+      /* Surface the active selection mode + atlas so we can verify
+         atlas swap actually fires when CONFIG.glyphSet changes. */
+      const sel = GlyphGrid.compat.resolveSelectionMode(CONFIG);
+      const atlasTag = (sel === 'shape' || sel === 'shape-edge-aware')
+        ? ` | ${sel}/atlas=${(glyphAtlas && glyphAtlas.name) || (CONFIG.glyphSet || 'none')}`
+        : '';
       statusEl().textContent =
         `${CONFIG.scene} | ${CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
-        `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat} | ` +
+        `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag} | ` +
         `t=${t.toFixed(2)}s | compat=${CONFIG.compat}`;
     }
 

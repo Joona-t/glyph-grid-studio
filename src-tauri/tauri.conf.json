@@ -4,8 +4,7 @@
   "version": "0.1.0",
   "identifier": "art.lovespark.glyph-grid-studio",
   "build": {
-    "frontendDist": "../src",
-    "devUrl": "http://localhost:8943"
+    "frontendDist": "../src"
   },
   "app": {
     "withGlobalTauri": true,
