@@ -1,10 +1,10 @@
 [package]
 name = "glyph-grid-studio"
 version = "0.1.0"
-description = "Interactive ASCII / glyph-grid art studio"
-authors = ["LoveSpark"]
+description = "Real-time character-grid image renderer (GUI + CLI + MCP)"
+authors = ["Joona Tyrninoksa"]
 license = "MIT"
-repository = ""
+repository = "https://github.com/Joona-t/glyph-grid-studio"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -25,5 +25,6 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 base64 = "0.22"
 gif = "0.13"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
 color_quant = "1.1"
+clap = { version = "4", features = ["derive"] }

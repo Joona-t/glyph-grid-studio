@@ -41,6 +41,38 @@ The selected glyph is typeset into the cell, in a chosen palette and color mode.
 - **OKLCH palette interpolation**: cylindrical OKLab interpolation along the shorter hue arc, so palette transitions across distant hues stay saturated instead of dipping through gray.
 - **Native GIF muxing**: frames go straight from the JS canvas → Rust `gif` crate via base64 IPC. NeuQuant 256-color quantization at speed 10.
 
+## Two ways to use it
+
+### As a human — visual studio (GUI mode)
+
+Drop image into the window, slide sliders, watch the canvas update live, click Export GIF when you have a look you like. Default behavior when launched with no arguments.
+
+### As an agent / script — headless CLI
+
+Same rendering pipeline, no GUI. Runs in a hidden Tauri window, exits when the GIF is written.
+
+```bash
+# Single render with explicit flags
+glyph-grid-studio render \
+  --in ~/Downloads/portrait.jpg \
+  --out ~/portrait-warm-bone.gif \
+  --palette cream-paper \
+  --color-mode monochrome \
+  --ramp gradient \
+  --dither stbn \
+  --selection-mode shape-edge-aware \
+  --glyph-set octant \
+  --frames 24
+
+# List every available palette / ramp / dither / glyph set
+glyph-grid-studio catalog | jq
+
+# Help
+glyph-grid-studio render --help
+```
+
+The CLI is composable with any AI agent that has shell access. Future v0.3 will ship an MCP server so the studio shows up as a native tool in Claude Desktop / Cursor (see `AGENT-INTEGRATION-PLAN.md`).
+
 ## Build
 
 ```bash
@@ -57,6 +89,8 @@ ditto "src-tauri/target/release/bundle/macos/Glyph Grid Studio.app" \
 xattr -cr "$HOME/Applications/Glyph Grid Studio.app"
 open "$HOME/Applications/Glyph Grid Studio.app"
 ```
+
+The headless binary is at `Glyph Grid Studio.app/Contents/MacOS/glyph-grid-studio`. After v0.2's Homebrew cask, it will be on `$PATH` as `glyph-grid-studio`.
 
 ## Project layout
 

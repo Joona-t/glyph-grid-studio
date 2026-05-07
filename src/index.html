@@ -2020,6 +2020,95 @@
       },
     },
   });
+
+  /* ===========================================================================
+     CLI / headless render auto-hook.
+
+     When this binary was launched as `glyph-grid-studio render --in foo --out
+     bar`, the Rust side stored a HeadlessRenderJob in managed state.  We poll
+     for it on startup; if present, auto-load the image, apply the config, run
+     a single-job batch, and signal exit.  In GUI mode the call returns null
+     and we do nothing.
+     =========================================================================== */
+  async function tryHeadlessRender() {
+    if (!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)) {
+      // Not running in Tauri at all (browser preview): nothing to do.
+      return;
+    }
+    let job;
+    try {
+      job = await window.__TAURI__.core.invoke('get_cli_render_job');
+    } catch (e) {
+      // Command not registered → not running in Tauri-with-CLI.  Silent.
+      return;
+    }
+    if (!job) {
+      console.log('CLI: GUI mode (no headless job)');
+      return;
+    }
+    console.log('CLI: render job received', job);
+
+    // Read the source image via the existing Rust file-reader command.
+    let dataUrl;
+    try {
+      dataUrl = await window.__TAURI__.core.invoke('read_image_file', { path: job.inPath });
+    } catch (e) {
+      console.error('CLI: read_image_file failed:', e);
+      window.__TAURI__.core.invoke('exit_with_status', { ok: false });
+      return;
+    }
+
+    // Decode + assign the source image. Wrap in promise so the next steps
+    // wait for the actual image bytes to be ready.
+    await new Promise(function (resolve, reject) {
+      window.loadImage(dataUrl, function (img) {
+        console.log('CLI: image decoded', img.width + 'x' + img.height);
+        eronImg = img;
+        try { loop(); } catch (e) {}
+        resolve();
+      }, function (err) {
+        console.error('CLI: loadImage failed:', err);
+        window.__TAURI__.core.invoke('exit_with_status', { ok: false });
+        reject(err);
+      });
+    });
+
+    // Settle one or two frames so the canvas reflects the loaded image
+    // before we apply config + start recording.
+    await new Promise(function (r) { setTimeout(r, 300); });
+
+    // Apply the CLI-supplied config (camelCase, JS-shape — built by Rust).
+    if (job.config && typeof job.config === 'object') {
+      try {
+        __glyphGridTest.setConfig(job.config);
+      } catch (e) {
+        console.error('CLI: setConfig failed:', e);
+      }
+    }
+
+    // Settle once more so the new config takes effect on the next frame.
+    await new Promise(function (r) { setTimeout(r, 200); });
+
+    // Run a single-job batch export to the requested output path.
+    __glyphGridTest.runBatchExport([{
+      name: 'cli',
+      path: job.outPath,
+      frames: job.frames || 24,
+      config: {},  // already applied above
+    }], {
+      onComplete: function (result) {
+        var ok = result && result.errors && result.errors.length === 0 && result.ok === 1;
+        console.log('CLI: render complete; exiting with ok=' + ok);
+        window.__TAURI__.core.invoke('exit_with_status', { ok: !!ok });
+      },
+    });
+  }
+
+  // Wait for the p5 setup() + studio init + font load before polling.
+  // 1500ms is generous; the actual setup is usually done by ~300ms.
+  window.addEventListener('DOMContentLoaded', function () {
+    setTimeout(tryHeadlessRender, 1500);
+  });
   </script>
 </body>
 </html>
