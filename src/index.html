@@ -192,10 +192,17 @@
        around the bright silver chip pixels.  depthFog tints the far
        cells (face area) toward a cool dim charcoal so the face reads
        as further away from the camera than the hand+chip. */
+    /* Postprocess defaults — vignette stays on (it's cheap, ~5ms, and
+       reads as a "frame" around the canvas).  bloom + halation OFF by
+       default — they cost ~80–180ms each (full-canvas box-blur) and
+       were carry-overs from the original eron-chip-inspection piece's
+       config, not appropriate for a generic studio default.  Users who
+       want them can toggle in the Postprocess folder.  See PERF-BASELINE.md
+       for the data behind this choice. */
     postprocess: {
-      vignette: { enabled: true, strength: 0.55 },
-      bloom:    { enabled: true, radius: 2.5, strength: 0.95 },
-      halation: { enabled: true, strength: 0.70 },
+      vignette: { enabled: true,  strength: 0.55 },
+      bloom:    { enabled: false, radius: 2.5, strength: 0.95 },
+      halation: { enabled: false, strength: 0.70 },
       depthFog: { enabled: false },
     },
 
@@ -1028,14 +1035,22 @@
       return;
     }
 
+    /* Phase 0 instrumentation: per-stage timing.  Each __pf(name) records
+       the elapsed-since-last-mark and stages it in the rolling buffer.
+       Visible via __perfReport() in dev console + the 'Perf' studio
+       folder (live rolling averages). */
+    __pfStart();
+
     /* 1. Render the source layer (scene). */
     sceneResult = SCENES[CONFIG.scene](src, t, CONFIG) || null;
     depthImg = (sceneResult && sceneResult.depth && sceneResult.depth.width > 0)
       ? sceneResult.depth : null;
+    __pf('scene');
 
     const t0 = performance.now();
     src.loadPixels();
     background(bgColor(CONFIG));
+    __pf('loadPixels');
 
     /* 2. Pipeline dispatch. */
     const isV2 = window.GlyphGrid && GlyphGrid.compat.isV2(CONFIG);
@@ -1046,18 +1061,22 @@
     } else {
       drawGlyphGrid(src); /* byte-identical v1 path */
     }
+    __pf('grid');
 
     /* 3. CRT post-process chain (v2 only, only if at least one stage on). */
     if (isV2 && GlyphGrid.compat.gatePostprocess(CONFIG)) {
       applyPostprocess();
     }
+    __pf('postprocess');
 
     const t1 = performance.now();
+    __pfCommit(t1 - t0);
 
     if (!recState) {
+      const lat = __pfLatencyTag();
       statusEl().textContent =
         `${CONFIG.scene} | ${CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
-        `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms | ` +
+        `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat} | ` +
         `t=${t.toFixed(2)}s | compat=${CONFIG.compat}`;
     }
 
@@ -1066,6 +1085,73 @@
       handleRecordFrame();
     }
   }
+
+  /* =========================================================================
+     PHASE 0 PERF INSTRUMENTATION
+
+     Records per-stage elapsed time per frame into a rolling ring buffer,
+     plus tracks "switch latency" (config change → first frame painted with
+     new value).  Surfaces via dev console (__perfReport, __perfClear,
+     __markChange) and via the studio's optional Perf folder.
+
+     Lightweight: one `performance.now()` call per stage marker, no DOM,
+     no allocations on hot path (object reused).
+     ========================================================================= */
+  let __pfRing = [];               // ring buffer of last N frames' breakdowns
+  const __pfMaxRing = 30;
+  let __pfFrame = null;            // the in-progress frame's stages
+  let __pfLastT = 0;
+  let __pfLastChange = null;       // {key, t} — last config change that hasn't been observed yet
+  let __pfLastLatency = null;      // last measured switch latency (for status bar)
+
+  function __pfStart() {
+    __pfFrame = { stages: {}, total: 0 };
+    __pfLastT = performance.now();
+  }
+  function __pf(name) {
+    const now = performance.now();
+    __pfFrame.stages[name] = now - __pfLastT;
+    __pfLastT = now;
+  }
+  function __pfCommit(total) {
+    __pfFrame.total = total;
+    __pfRing.push(__pfFrame);
+    if (__pfRing.length > __pfMaxRing) __pfRing.shift();
+    /* Switch-latency: if a change is pending, this frame is the first one
+       that reflects it (config was already mutated when draw started). */
+    if (__pfLastChange) {
+      __pfLastLatency = {
+        key: __pfLastChange.key,
+        ms: performance.now() - __pfLastChange.t,
+      };
+      __pfLastChange = null;
+    }
+  }
+  function __pfLatencyTag() {
+    if (!__pfLastLatency) return '';
+    return ` | switch ${__pfLastLatency.key}=${__pfLastLatency.ms.toFixed(0)}ms`;
+  }
+
+  /* Public API: log every config change so we can compute switch latency.
+     Studio-side wraps this in addInput onChange handlers. */
+  window.__markChange = function (key) {
+    __pfLastChange = { key, t: performance.now() };
+  };
+  window.__perfReport = function () {
+    if (!__pfRing.length) { console.log('no frames recorded'); return; }
+    const stages = {};
+    for (const f of __pfRing) {
+      for (const k in f.stages) stages[k] = (stages[k] || 0) + f.stages[k];
+      stages.__total = (stages.__total || 0) + f.total;
+    }
+    const n = __pfRing.length;
+    const avg = {};
+    for (const k in stages) avg[k] = stages[k] / n;
+    console.log('avg over ' + n + ' frames:', avg);
+    return avg;
+  };
+  window.__perfClear = function () { __pfRing = []; __pfLastChange = null; __pfLastLatency = null; };
+  window.__perfRing = () => __pfRing;
 
   /* Detect whether v2 advanced pipeline is needed. Returns false when every
      new gate is inert, in which case we take the legacy path (byte-identical). */
@@ -1334,20 +1420,26 @@
     }
 
     /* Step 1+2: linearize source to per-pixel luminance (Rec.709 on linear sRGB, CR-1). */
+    const _t_lum0 = performance.now();
     linearizeToLuminance(pixels, lumBuf, srcW, srcH);
+    if (__pfFrame) __pfFrame.stages._lum = performance.now() - _t_lum0;
 
     /* Optional prefilter (XDoG) — writes over lumBuf in place. */
     if (GlyphGrid.compat.gatePrefilter(CONFIG) && GlyphGrid.xdog) {
       const pre = CONFIG.prefilter;
       const mode = pre.mode || pre;
       if (typeof mode === 'string' && mode.indexOf('xdog') === 0) {
+        const _t_xdog0 = performance.now();
         const xd = GlyphGrid.xdog.xdog(lumBuf, srcW, srcH, pre);
         lumBuf.set(xd);
+        if (__pfFrame) __pfFrame.stages._xdog = performance.now() - _t_xdog0;
       }
     }
 
     /* Step 3: per-cell brightness via mean-in-cell. */
+    const _t_ds0 = performance.now();
     downsampleToCells(lumBuf, srcW, srcH, cellSignal, cols, rows, cellPxW, cellPxH);
+    if (__pfFrame) __pfFrame.stages._downsample = performance.now() - _t_ds0;
 
     /* Step 3b: temporal coherence — per-cell EMA so each cell's glyph
        drifts toward its target rather than snapping. Stack of skill
@@ -1361,6 +1453,7 @@
     /* EMA + breathing — constants live in CONFIG.studio.breathing
        so the studio panel can mutate them live. Defaults preserve
        previously hardcoded values. */
+    const _t_ema0 = performance.now();
     const _br = (CONFIG.studio && CONFIG.studio.breathing) || {};
     const _emaA = (typeof _br.emaAlpha === 'number') ? _br.emaAlpha : 0.35;
     const _gainSwing = (typeof _br.gainSwing === 'number') ? _br.gainSwing : 0.30;
@@ -1377,6 +1470,7 @@
       const jitter = ((h & 0xff) - 128) * _jScale;
       cellSignal[i] = Math.max(0, Math.min(1, cellSignalEma[i] * _breatheGain + jitter));
     }
+    if (__pfFrame) __pfFrame.stages._ema = performance.now() - _t_ema0;
 
     /* v2.1 — optional depth downsample.  Respects CONFIG.depth.invert /
        range so scenes can author depth maps with arbitrary polarity. */
@@ -1394,12 +1488,14 @@
 
     let cellIndex = null;
     if (GlyphGrid.compat.gateDither(CONFIG) && mode === 'brightness') {
+      const _t_dith0 = performance.now();
       const ditherOpts = Object.assign({}, CONFIG.dither, {
         levels: levels,
         seed: CONFIG.seed,
         frameIdx: frameIdx,
       });
       cellIndex = GlyphGrid.dither.apply(cellSignal, cols, rows, ditherOpts);
+      if (__pfFrame) __pfFrame.stages._dither = performance.now() - _t_dith0;
     }
 
     /* Step 5: glyph selection. */

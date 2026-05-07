@@ -361,6 +361,18 @@
     var config = opts.config;
     var pane = new Pane({ title: opts.title || 'glyph-studio', container: opts.container });
 
+    /* Phase 0 perf instrumentation — attach a single pane-level change
+       listener that records every binding mutation for switch-latency
+       tracking.  Tweakpane fires this for every addInput in any folder. */
+    if (window.__markChange) {
+      try {
+        pane.on('change', function (ev) {
+          var key = (ev && ev.target && ev.target.key) || 'unknown';
+          window.__markChange(key);
+        });
+      } catch (e) { /* old Tweakpane build may not expose pane.on */ }
+    }
+
     var fImg = pane.addFolder({ title: 'Image' });
     fImg.addButton({ title: 'drag & drop an image anywhere' });
     /* Native picker — Tauri only. Falls back to a hidden <input type=file>
@@ -529,6 +541,52 @@
     fAnim.addInput(config.animation, 'duration', { min: 1, max: 20, step: 0.5 });
     fAnim.addInput(config.animation, 'fps', { min: 12, max: 60, step: 6 });
     fAnim.addInput(config.animation, 'loop');
+
+    /* Perf — Phase 0 instrumentation. Live rolling averages of per-stage
+       frame time + last switch latency. Click "Report (console)" to
+       dump full averages to dev console. Click "Clear" to reset the
+       ring buffer. */
+    if (window.__perfReport) {
+      var fPerf = pane.addFolder({ title: 'Perf', expanded: false });
+      var perfState = { total: 0, scene: 0, lum: 0, downsample: 0, ema: 0, dither: 0, grid: 0, postproc: 0, lastSwitch: '—' };
+      fPerf.addMonitor(perfState, 'total', { label: 'total ms' });
+      fPerf.addMonitor(perfState, 'scene', { label: 'scene ms' });
+      fPerf.addMonitor(perfState, 'lum', { label: 'lum ms' });
+      fPerf.addMonitor(perfState, 'downsample', { label: 'downsample ms' });
+      fPerf.addMonitor(perfState, 'ema', { label: 'ema ms' });
+      fPerf.addMonitor(perfState, 'dither', { label: 'dither ms' });
+      fPerf.addMonitor(perfState, 'grid', { label: 'grid ms' });
+      fPerf.addMonitor(perfState, 'postproc', { label: 'postproc ms' });
+      fPerf.addMonitor(perfState, 'lastSwitch', { label: 'last switch' });
+      fPerf.addButton({ title: 'Report (console)' }).on('click', function () { window.__perfReport(); });
+      fPerf.addButton({ title: 'Clear' }).on('click', function () { window.__perfClear(); });
+
+      // Update perf state every 500ms with rolling-30-frame averages
+      setInterval(function () {
+        var ring = window.__perfRing && window.__perfRing();
+        if (!ring || !ring.length) return;
+        var sum = { total: 0, scene: 0, _lum: 0, _downsample: 0, _ema: 0, _dither: 0, grid: 0, postprocess: 0 };
+        for (var i = 0; i < ring.length; i++) {
+          sum.total += ring[i].total;
+          sum.scene += ring[i].stages.scene || 0;
+          sum._lum += ring[i].stages._lum || 0;
+          sum._downsample += ring[i].stages._downsample || 0;
+          sum._ema += ring[i].stages._ema || 0;
+          sum._dither += ring[i].stages._dither || 0;
+          sum.grid += ring[i].stages.grid || 0;
+          sum.postprocess += ring[i].stages.postprocess || 0;
+        }
+        var n = ring.length;
+        perfState.total = +(sum.total / n).toFixed(1);
+        perfState.scene = +(sum.scene / n).toFixed(1);
+        perfState.lum = +(sum._lum / n).toFixed(1);
+        perfState.downsample = +(sum._downsample / n).toFixed(1);
+        perfState.ema = +(sum._ema / n).toFixed(1);
+        perfState.dither = +(sum._dither / n).toFixed(1);
+        perfState.grid = +(sum.grid / n).toFixed(1);
+        perfState.postproc = +(sum.postprocess / n).toFixed(1);
+      }, 500);
+    }
 
     /* Presets */
     var fPre = pane.addFolder({ title: 'Presets' });
