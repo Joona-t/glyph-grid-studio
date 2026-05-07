@@ -121,7 +121,12 @@ fn main() {
                     rows: args.rows,
                 },
             };
-            std::process::exit(app_lib::run_headless_render(job));
+            let code = app_lib::run_headless_render(job);
+            // Tauri's `app.exit(code)` triggers `tauri::run()` to return without
+            // process-exiting (despite docs implying otherwise). Always exit
+            // explicitly with the captured code so shell-level CI can detect
+            // failures.
+            std::process::exit(code);
         }
         Some(Command::Catalog) => {
             println!("{}", app_lib::catalog_json());

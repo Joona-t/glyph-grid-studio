@@ -25,3 +25,4 @@ package-lock.json
 # Bundled binary output (rebuild from source)
 *.dmg
 *.zip
+tests/scratch/

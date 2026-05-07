@@ -151,11 +151,19 @@ fn get_cli_render_job(state: tauri::State<CliJobState>) -> Option<serde_json::Va
     state.job.lock().ok().and_then(|g| g.clone())
 }
 
-/// JS calls this when the headless render is finished. Sets the exit code
-/// then triggers the Tauri runtime to shut down.
+/// JS calls this when the headless render is finished. Logs to stderr so
+/// CLI users can see why a headless render reported failure, then exits
+/// the process directly.
+///
+/// Why `std::process::exit` instead of `app.exit(code)`: in Tauri 2.10,
+/// `AppHandle::exit(code)` accepts the code but the actual process always
+/// terminates with status 0, which breaks shell-level error handling
+/// (CI, MCP subprocess error reporting, scripts that check `$?`).
+/// `std::process::exit` bypasses Tauri's cleanup but for a CLI render
+/// that's about to terminate anyway, that's acceptable.
 #[tauri::command]
 fn exit_with_status(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<CliJobState>,
     ok: bool,
 ) {
@@ -163,7 +171,10 @@ fn exit_with_status(
     if let Ok(mut guard) = state.exit_code.lock() {
         *guard = code;
     }
-    app.exit(code);
+    if !ok {
+        eprintln!("glyph-grid-studio: render reported failure (exit code {})", code);
+    }
+    std::process::exit(code);
 }
 
 /// Public entry point invoked by main.rs for `render` subcommand.  Returns
@@ -183,6 +194,9 @@ pub fn run_headless_render(job: HeadlessRenderJob) -> i32 {
         exit_code: exit_code.clone(),
     };
     run_tauri(state, !job.show_window);
+    // In practice we should never reach here — exit_with_status calls
+    // std::process::exit() directly. This is a fallback for the "Tauri
+    // shut down without JS firing exit_with_status" case.
     let code = *exit_code.lock().unwrap();
     code
 }

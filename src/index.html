@@ -2078,29 +2078,35 @@
     console.log('CLI: render job received', job);
 
     // Read the source image via the existing Rust file-reader command.
+    // Errors here are common (path typo, file moved, permission denied).
+    // Critically: AWAIT the exit_with_status call so the process actually
+    // shuts down with the right exit code instead of returning to no-op.
     let dataUrl;
     try {
       dataUrl = await window.__TAURI__.core.invoke('read_image_file', { path: job.inPath });
     } catch (e) {
       console.error('CLI: read_image_file failed:', e);
-      window.__TAURI__.core.invoke('exit_with_status', { ok: false });
+      try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
     }
 
     // Decode + assign the source image. Wrap in promise so the next steps
     // wait for the actual image bytes to be ready.
-    await new Promise(function (resolve, reject) {
-      window.loadImage(dataUrl, function (img) {
-        console.log('CLI: image decoded', img.width + 'x' + img.height);
-        sourceImg = img;
-        try { loop(); } catch (e) {}
-        resolve();
-      }, function (err) {
-        console.error('CLI: loadImage failed:', err);
-        window.__TAURI__.core.invoke('exit_with_status', { ok: false });
-        reject(err);
+    try {
+      await new Promise(function (resolve, reject) {
+        window.loadImage(dataUrl, function (img) {
+          sourceImg = img;
+          try { loop(); } catch (e) {}
+          resolve();
+        }, function (err) {
+          reject(err);
+        });
       });
-    });
+    } catch (e) {
+      console.error('CLI: loadImage failed:', e);
+      try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
+      return;
+    }
 
     // Settle one or two frames so the canvas reflects the loaded image
     // before we apply config + start recording.

@@ -30,6 +30,17 @@ Driver innovation that landed in this pass:
 
 ---
 
+## BUG-002 — `app.exit(code)` discards the exit code; CLI always exits 0
+
+- **Found:** 2026-05-07, comprehensive v0.1 test (Phase B7, bad-input case)
+- **Symptom:** `glyph-grid-studio render --in /nonexistent` printed "render reported failure (exit code 1)" to stderr but the shell still saw exit code 0. Made shell-level error handling (CI, MCP subprocess error reporting) unreliable.
+- **Diagnosis:** `tauri::AppHandle::exit(code)` in Tauri 2.10 accepts the code parameter but the actual process termination always uses status 0. The argument is silently discarded somewhere in Tauri's runtime shutdown path.
+- **Fix:** Bypass Tauri's exit handling — `exit_with_status` now calls `std::process::exit(code)` directly. Skips Tauri's cleanup but acceptable for a CLI render about to terminate. Documented inline why.
+- **Verification:** `glyph-grid-studio render --in /nonexistent ... ; echo $?` now prints 1.
+- **Status:** ✅ FIXED
+
+---
+
 ## BUG-001 — Batch GIF export stalls after first job
 
 **Found:** 2026-05-06, Phase 1 of comprehensive test
