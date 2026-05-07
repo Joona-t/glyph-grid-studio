@@ -1698,6 +1698,34 @@
     _gammaLutGamma = gamma;
   }
 
+  /* Gradient color LUT — 256 RGB triples precomputed once per palette/mode/
+     curve change. Replaces 28,800 × interpAtU(stops, u) calls per frame
+     (each one allocating ~5 objects via _blendOne) with a Uint8Array lookup.
+     Rebuilt only when the palette stops, blend mode, or curve exponent
+     changes — all cheap state to hash. */
+  const _gradColorLut = new Uint8Array(256 * 3);
+  let _gradColorLutKey = null;
+  function _ensureGradColorLut(stops, mode, curveExp) {
+    let stopKey = '';
+    for (let i = 0; i < stops.length; i++) {
+      const s = stops[i].srgb;
+      stopKey += s[0] + ',' + s[1] + ',' + s[2] + ';';
+    }
+    const key = stopKey + '|' + mode + '|' + curveExp;
+    if (_gradColorLutKey === key) return;
+    const flat = curveExp === 1.0;
+    for (let i = 0; i < 256; i++) {
+      const v = i / 255;
+      const u = flat ? v : Math.pow(v, curveExp);
+      const rgb = GlyphGrid.paletteMorph.interpAtU(stops, u, mode);
+      const o = i * 3;
+      _gradColorLut[o]     = rgb[0];
+      _gradColorLut[o + 1] = rgb[1];
+      _gradColorLut[o + 2] = rgb[2];
+    }
+    _gradColorLutKey = key;
+  }
+
   function drawBrightnessGrid(cellIndex, signal, cols, rows, cellW, cellH) {
     const palette = PALETTES[CONFIG.palette];
     const bgC = color(palette.bg);
@@ -1731,6 +1759,33 @@
     if (colorMode === 'monochrome' && palette.inks && palette.inks[0]) {
       const ic = color(palette.inks[0]);
       monoR = red(ic); monoG = green(ic); monoB = blue(ic);
+    }
+
+    /* Hoist duotone inks once per frame.  Pre-this-fix: applyCellFill
+       allocated 3 p5.Color objects per cell (color(inks[0]), color(inks[1]),
+       lerpColor) → ~86,400 allocs/frame at 240×120.  Now: 6 numbers parsed
+       once, inline RGB lerp in the per-cell loop below. */
+    let dueR0 = 0, dueG0 = 0, dueB0 = 0, dueR1 = 0, dueG1 = 0, dueB1 = 0;
+    if (colorMode === 'duotone' && palette.inks && palette.inks.length > 0) {
+      const c0 = color(palette.inks[0]);
+      const c1 = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
+      dueR0 = red(c0); dueG0 = green(c0); dueB0 = blue(c0);
+      dueR1 = red(c1); dueG1 = green(c1); dueB1 = blue(c1);
+    }
+
+    /* Build gradient color LUT once per palette/mode/curve change.  Replaces
+       28,800 × interpAtU calls per frame (each allocating ~5 objects via
+       _blendOne) with a 256-entry Uint8Array lookup. */
+    let useGradLut = false;
+    if (colorMode === 'gradient') {
+      const gStops = resolveGradientStops(palette);
+      if (gStops && gStops.length > 0) {
+        const gmap = CONFIG.gradientColorMap || {};
+        const curveExp = typeof gmap.curve === 'number' ? gmap.curve : 1.0;
+        const blendMode = gmap.mode || 'oklab';
+        _ensureGradColorLut(gStops, blendMode, curveExp);
+        useGradLut = true;
+      }
     }
 
     /* Half-cell offsets pre-computed (used 28,800 times per frame) */
@@ -1768,9 +1823,76 @@
       return;
     }
 
-    /* Slow path: preserve / duotone / gradient / depthFog — go through
-       applyCellFill which handles each mode's branch. Sample only when
-       the chosen mode actually uses it. */
+    /* Fast path: duotone + no depthFog.  Inline lerp between two pre-parsed
+       inks — replaces ~86,400 p5.Color allocations/frame at 240×120. */
+    if (colorMode === 'duotone' && !depthFogActive) {
+      for (let r = 0; r < rows; r++) {
+        const yBase = (r * cellH) | 0;
+        const cy = yBase + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const sigI = signal[i];
+          const sigQ = sigI < 0 ? 0 : (sigI > 1 ? 1 : sigI);
+          const curved = _gammaLut[(sigQ * 255) | 0];
+          let ch;
+          if (cellIndex) {
+            ch = ramp.charAt(cellIndex[i]);
+          } else {
+            const idx = (curved * rampLast + 0.0001) | 0;
+            ch = ramp.charAt(idx > rampLast ? rampLast : (idx < 0 ? 0 : idx));
+          }
+          if (ch === ' ') continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          /* Branchless clamp + inline RGB lerp — replaces lerpColor. */
+          const t = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
+          const fr = dueR0 + (dueR1 - dueR0) * t;
+          const fg = dueG0 + (dueG1 - dueG0) * t;
+          const fb = dueB0 + (dueB1 - dueB0) * t;
+          fill(fr, fg, fb);
+          text(ch, cx, cy);
+        }
+      }
+      currentCellDepth = -1;
+      return;
+    }
+
+    /* Fast path: gradient + no depthFog.  Lookup precomputed RGB triple from
+       _gradColorLut — replaces 28,800 × interpAtU calls per frame and the
+       per-cell Math.pow for the curve.  LUT was rebuilt above only if any
+       of (stops, mode, curveExp) changed. */
+    if (colorMode === 'gradient' && !depthFogActive && useGradLut) {
+      for (let r = 0; r < rows; r++) {
+        const yBase = (r * cellH) | 0;
+        const cy = yBase + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const sigI = signal[i];
+          const sigQ = sigI < 0 ? 0 : (sigI > 1 ? 1 : sigI);
+          const curved = _gammaLut[(sigQ * 255) | 0];
+          let ch;
+          if (cellIndex) {
+            ch = ramp.charAt(cellIndex[i]);
+          } else {
+            const idx = (curved * rampLast + 0.0001) | 0;
+            ch = ramp.charAt(idx > rampLast ? rampLast : (idx < 0 ? 0 : idx));
+          }
+          if (ch === ' ') continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          const cClamped = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
+          const lo = ((cClamped * 255) | 0) * 3;
+          fill(_gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2]);
+          text(ch, cx, cy);
+        }
+      }
+      currentCellDepth = -1;
+      return;
+    }
+
+    /* Slow path: preserve / depthFog (and any colorMode without an inline
+       fast path) — go through applyCellFill which handles per-cell sampling
+       and depth fog colour blending. */
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const i = r * cols + c;
