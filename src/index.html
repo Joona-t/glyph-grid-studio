@@ -1983,24 +1983,134 @@
     textFont(fontFamilyForActive());
     const pixels = g.pixels;
     const srcW = g.width;
+    const srcH = g.height;
     const stride = srcW * 4;
+    const glyphs = glyphAtlas.glyphs;
     const indices = GlyphGrid.shapeIndex.selectGrid(
-      glyphAtlas, lumBuf, srcW, g.height, cols, rows, cellPxW, cellPxH,
+      glyphAtlas, lumBuf, srcW, srcH, cols, rows, cellPxW, cellPxH,
       { reach: edgeAware ? Math.floor(Math.min(cellPxW, cellPxH) / 2) : Math.floor(Math.min(cellPxW, cellPxH) / 4) }
     );
+
+    /* Mirror the drawBrightnessGrid optimization: hoist all per-frame palette
+       parsing OUT of the per-cell loop, then dispatch into one of three inline
+       fast paths (monochrome / duotone / gradient).  Pre-fix: every cell did
+       a `sampleCell` (object alloc) + applyCellFill (per-cell color() alloc)
+       even when the colorMode never actually used the sample.  At 240×120 in
+       shape-edge-aware that's 28,800 sampleCell allocs + 28,800 applyCellFill
+       calls = ~95 ms of grid-stage overhead all on its own. */
+    const colorMode = CONFIG.colorMode;
+    const depthFogActive = GlyphGrid.compat.gateDepthFog(CONFIG);
+    const needsSample = (colorMode === 'preserve') || depthFogActive;
+
+    let monoR = 0, monoG = 0, monoB = 0;
+    if (colorMode === 'monochrome' && palette.inks && palette.inks[0]) {
+      const ic = color(palette.inks[0]);
+      monoR = red(ic); monoG = green(ic); monoB = blue(ic);
+    }
+    let dueR0 = 0, dueG0 = 0, dueB0 = 0, dueR1 = 0, dueG1 = 0, dueB1 = 0;
+    if (colorMode === 'duotone' && palette.inks && palette.inks.length > 0) {
+      const c0 = color(palette.inks[0]);
+      const c1 = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
+      dueR0 = red(c0); dueG0 = green(c0); dueB0 = blue(c0);
+      dueR1 = red(c1); dueG1 = green(c1); dueB1 = blue(c1);
+    }
+    let useGradLut = false;
+    if (colorMode === 'gradient') {
+      const gStops = resolveGradientStops(palette);
+      if (gStops && gStops.length > 0) {
+        const gmap = CONFIG.gradientColorMap || {};
+        const curveExp = typeof gmap.curve === 'number' ? gmap.curve : 1.0;
+        const blendMode = gmap.mode || 'oklab';
+        _ensureGradColorLut(gStops, blendMode, curveExp);
+        useGradLut = true;
+      }
+    }
+
+    const halfCellW = cellW * 0.5;
+    const halfCellH = cellH * 0.5;
+
+    /* Fast path: monochrome + no depthFog. */
+    if (colorMode === 'monochrome' && !depthFogActive) {
+      for (let r = 0; r < rows; r++) {
+        const cy = ((r * cellH) | 0) + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const glyph = glyphs[indices[i]];
+          if (!glyph) continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          const sig = cellSignal[i];
+          const sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          const a = sigQ * 280.5;
+          fill(monoR, monoG, monoB, a > 255 ? 255 : a);
+          text(glyph.s, cx, cy);
+        }
+      }
+      currentCellDepth = -1;
+      return;
+    }
+
+    /* Fast path: duotone + no depthFog. */
+    if (colorMode === 'duotone' && !depthFogActive) {
+      for (let r = 0; r < rows; r++) {
+        const cy = ((r * cellH) | 0) + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const glyph = glyphs[indices[i]];
+          if (!glyph) continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          const sig = cellSignal[i];
+          const t = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          const fr = dueR0 + (dueR1 - dueR0) * t;
+          const fg = dueG0 + (dueG1 - dueG0) * t;
+          const fb = dueB0 + (dueB1 - dueB0) * t;
+          fill(fr, fg, fb);
+          text(glyph.s, cx, cy);
+        }
+      }
+      currentCellDepth = -1;
+      return;
+    }
+
+    /* Fast path: gradient + no depthFog. */
+    if (colorMode === 'gradient' && !depthFogActive && useGradLut) {
+      for (let r = 0; r < rows; r++) {
+        const cy = ((r * cellH) | 0) + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const glyph = glyphs[indices[i]];
+          if (!glyph) continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          const sig = cellSignal[i];
+          const sigC = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          const lo = ((sigC * 255) | 0) * 3;
+          fill(_gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2]);
+          text(glyph.s, cx, cy);
+        }
+      }
+      currentCellDepth = -1;
+      return;
+    }
+
+    /* Slow path: preserve / depthFog — go through applyCellFill so per-cell
+       sampling and fog colour blending stay correct.  sampleCellInto reuses
+       _sampleObj so no per-cell allocation. */
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const i = r * cols + c;
-        const gi = indices[i];
-        const glyph = glyphAtlas.glyphs[gi];
+        const glyph = glyphs[indices[i]];
         if (!glyph) continue;
-        const x0 = Math.floor(c * cellW);
-        const y0 = Math.floor(r * cellH);
-        const cx = x0 + cellW / 2;
-        const cy = y0 + cellH / 2;
-        const sample = sampleCell(pixels, stride, x0, y0, cellPxW, cellPxH, srcW, g.height);
+        const x0 = (c * cellW) | 0;
+        const y0 = (r * cellH) | 0;
+        const cx = x0 + halfCellW;
+        const cy = y0 + halfCellH;
+        if (needsSample) {
+          sampleCellInto(_sampleObj, pixels, stride, x0, y0, cellPxW, cellPxH, srcW, srcH);
+        }
         currentCellDepth = cellDepth[i];
-        applyCellFill(sample, palette, cellSignal[i], bgR, bgG, bgB);
+        applyCellFill(_sampleObj, palette, cellSignal[i], bgR, bgG, bgB);
         text(glyph.s, cx, cy);
       }
     }
@@ -2018,6 +2128,7 @@
     textFont(fontFamilyForActive());
     const pixels = src.pixels;
     const srcW = src.width;
+    const srcH = src.height;
     const stride = srcW * 4;
     const cellPxW = Math.max(1, Math.floor(cellW));
     const cellPxH = Math.max(1, Math.floor(cellH));
@@ -2025,18 +2136,116 @@
       threshold: 0.15,
       fallbackCp: 0x20,
     });
+
+    /* Same hoist + fast-path pattern as drawShapeGrid. */
+    const colorMode = CONFIG.colorMode;
+    const depthFogActive = GlyphGrid.compat.gateDepthFog(CONFIG);
+    const needsSample = (colorMode === 'preserve') || depthFogActive;
+
+    let monoR = 0, monoG = 0, monoB = 0;
+    if (colorMode === 'monochrome' && palette.inks && palette.inks[0]) {
+      const ic = color(palette.inks[0]);
+      monoR = red(ic); monoG = green(ic); monoB = blue(ic);
+    }
+    let dueR0 = 0, dueG0 = 0, dueB0 = 0, dueR1 = 0, dueG1 = 0, dueB1 = 0;
+    if (colorMode === 'duotone' && palette.inks && palette.inks.length > 0) {
+      const c0 = color(palette.inks[0]);
+      const c1 = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
+      dueR0 = red(c0); dueG0 = green(c0); dueB0 = blue(c0);
+      dueR1 = red(c1); dueG1 = green(c1); dueB1 = blue(c1);
+    }
+    let useGradLut = false;
+    if (colorMode === 'gradient') {
+      const gStops = resolveGradientStops(palette);
+      if (gStops && gStops.length > 0) {
+        const gmap = CONFIG.gradientColorMap || {};
+        const curveExp = typeof gmap.curve === 'number' ? gmap.curve : 1.0;
+        const blendMode = gmap.mode || 'oklab';
+        _ensureGradColorLut(gStops, blendMode, curveExp);
+        useGradLut = true;
+      }
+    }
+
+    const halfCellW = cellW * 0.5;
+    const halfCellH = cellH * 0.5;
+
+    if (colorMode === 'monochrome' && !depthFogActive) {
+      for (let r = 0; r < rows; r++) {
+        const cy = ((r * cellH) | 0) + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const cp = cps[i];
+          if (cp === 0x20) continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          const sig = cellSignal[i];
+          const sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          const a = sigQ * 280.5;
+          fill(monoR, monoG, monoB, a > 255 ? 255 : a);
+          text(String.fromCodePoint(cp), cx, cy);
+        }
+      }
+      currentCellDepth = -1;
+      return;
+    }
+
+    if (colorMode === 'duotone' && !depthFogActive) {
+      for (let r = 0; r < rows; r++) {
+        const cy = ((r * cellH) | 0) + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const cp = cps[i];
+          if (cp === 0x20) continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          const sig = cellSignal[i];
+          const t = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          const fr = dueR0 + (dueR1 - dueR0) * t;
+          const fg = dueG0 + (dueG1 - dueG0) * t;
+          const fb = dueB0 + (dueB1 - dueB0) * t;
+          fill(fr, fg, fb);
+          text(String.fromCodePoint(cp), cx, cy);
+        }
+      }
+      currentCellDepth = -1;
+      return;
+    }
+
+    if (colorMode === 'gradient' && !depthFogActive && useGradLut) {
+      for (let r = 0; r < rows; r++) {
+        const cy = ((r * cellH) | 0) + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const cp = cps[i];
+          if (cp === 0x20) continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          const sig = cellSignal[i];
+          const sigC = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          const lo = ((sigC * 255) | 0) * 3;
+          fill(_gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2]);
+          text(String.fromCodePoint(cp), cx, cy);
+        }
+      }
+      currentCellDepth = -1;
+      return;
+    }
+
+    /* Slow path: preserve / depthFog. */
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         const i = r * cols + c;
         const cp = cps[i];
         if (cp === 0x20) continue;
-        const x0 = Math.floor(c * cellW);
-        const y0 = Math.floor(r * cellH);
-        const cx = x0 + cellW / 2;
-        const cy = y0 + cellH / 2;
-        const sample = sampleCell(pixels, stride, x0, y0, cellPxW, cellPxH, srcW, src.height);
+        const x0 = (c * cellW) | 0;
+        const y0 = (r * cellH) | 0;
+        const cx = x0 + halfCellW;
+        const cy = y0 + halfCellH;
+        if (needsSample) {
+          sampleCellInto(_sampleObj, pixels, stride, x0, y0, cellPxW, cellPxH, srcW, srcH);
+        }
         currentCellDepth = cellDepth[i];
-        applyCellFill(sample, palette, cellSignal[i], bgR, bgG, bgB);
+        applyCellFill(_sampleObj, palette, cellSignal[i], bgR, bgG, bgB);
         text(String.fromCodePoint(cp), cx, cy);
       }
     }
