@@ -85,10 +85,25 @@
   const BLUE_NOISE_SIZE = 128;
   const BLUE_NOISE = makeBlueNoiseTile(BLUE_NOISE_SIZE);
 
+  /* F3+F5 — zero-alloc hot path.  Persistent output buffer reused across
+     all dither modes; replaced only when grid size changes (~once per
+     resize event, not per frame).  Eliminates 28-960 KB of per-frame
+     allocation that previously caused GC stutter. */
+  let _ditherOut = null;
+  let _ditherErrorBuf = null;
+  function _getOutBuf(n) {
+    if (!_ditherOut || _ditherOut.length !== n) _ditherOut = new Uint8Array(n);
+    return _ditherOut;
+  }
+  function _getErrorBuf(n) {
+    if (!_ditherErrorBuf || _ditherErrorBuf.length !== n) _ditherErrorBuf = new Float32Array(n);
+    return _ditherErrorBuf;
+  }
+
   /* --- Ordered dither kernels. --- */
 
   function applyBayer(signal, cols, rows, levels, mat, size) {
-    const out = new Uint8Array(signal.length);
+    const out = _getOutBuf(signal.length);
     const step = 1 / (levels - 1 || 1);
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < cols; x++) {
@@ -102,7 +117,7 @@
   }
 
   function applyBlueNoise(signal, cols, rows, levels, seed, frameIdx) {
-    const out = new Uint8Array(signal.length);
+    const out = _getOutBuf(signal.length);
     const step = 1 / (levels - 1 || 1);
     /* Jittered tile origin per frame so periodic artefacts vanish. */
     const jx = hash32(seed, frameIdx, 0xC0DE, 0x1234) % BLUE_NOISE_SIZE;
@@ -123,7 +138,7 @@
   function applyTemporal(signal, cols, rows, levels, seed, frameIdx) {
     /* Temporal dither = Bayer8 whose matrix is rotated/offset per frame.
        Reproducible given the same (seed, frameIdx). */
-    const out = new Uint8Array(signal.length);
+    const out = _getOutBuf(signal.length);
     const step = 1 / (levels - 1 || 1);
     const ox = hash32(seed, frameIdx, 0x5AA5, 0x1111) % 8;
     const oy = hash32(seed, frameIdx, 0x1111, 0xA5A5) % 8;
@@ -162,7 +177,7 @@
     return r;
   }
   function applySTBN(signal, cols, rows, levels, seed, frameIdx) {
-    const out = new Uint8Array(signal.length);
+    const out = _getOutBuf(signal.length);
     const step = 1 / (levels - 1 || 1);
     /* Halton-driven offsets — smooth temporal motion of the spatial pattern. */
     const hx = halton(frameIdx + (seed & 0xFF), 2);
@@ -225,8 +240,8 @@
   };
 
   function applyErrorDiffusion(signal, cols, rows, levels, spec) {
-    const out = new Uint8Array(signal.length);
-    const buf = new Float32Array(signal.length);
+    const out = _getOutBuf(signal.length);
+    const buf = _getErrorBuf(signal.length);
     buf.set(signal);
     const denom = spec.denom;
     const kernel = spec.kernel;
@@ -269,7 +284,7 @@
     }
 
     if (mode === 'none') {
-      const out = new Uint8Array(signal.length);
+      const out = _getOutBuf(signal.length);
       for (let i = 0; i < signal.length; i++) {
         const v = Math.round(signal[i] * (levels - 1));
         out[i] = v < 0 ? 0 : (v > levels - 1 ? levels - 1 : v);

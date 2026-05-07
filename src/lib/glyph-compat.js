@@ -61,20 +61,37 @@
     return true;
   }
 
+  /* F4 — tighter postprocess gate.  A stage is "active" only if its
+     params would actually change pixels.  enabled:true with strength:0
+     (or zero radius/intensity) is a no-op that should NOT trigger the
+     full get/putImageData round-trip (~5ms/frame each). */
+  function _stageActive(stage, requiredKeys) {
+    if (!stage || !stage.enabled) return false;
+    /* If any "would change pixels" key is non-zero, stage is active. */
+    if (!requiredKeys || !requiredKeys.length) return true;
+    for (var i = 0; i < requiredKeys.length; i++) {
+      var v = stage[requiredKeys[i]];
+      if (typeof v === 'number' && v > 0.001) return true;
+    }
+    return false;
+  }
   function gatePostprocess(config) {
     if (isV1(config)) return false;
     const p = config.postprocess;
     if (!p) return false;
-    if (p.crt && p.crt.enabled) return true;
-    if (p.bloom && p.bloom.enabled) return true;
-    if (p.scanlines && p.scanlines.enabled) return true;
-    if (p.chromaticAberration && p.chromaticAberration.enabled) return true;
-    if (p.phosphorDecay && p.phosphorDecay.enabled) return true;
-    if (p.halation && p.halation.enabled) return true;
-    if (p.vignette && p.vignette.enabled) return true;
-    if (p.barrel && p.barrel.enabled) return true;
-    if (p.godRays && p.godRays.enabled) return true;
-    if (p.letterbox && p.letterbox.enabled) return true;
+    if (_stageActive(p.crt))                                  return true;
+    if (_stageActive(p.bloom, ['intensity', 'strength']))     return true;
+    if (_stageActive(p.scanlines, ['intensity', 'strength'])) return true;
+    if (_stageActive(p.chromaticAberration, ['amount']))      return true;
+    if (_stageActive(p.phosphorDecay, ['decay']))             return true;
+    if (_stageActive(p.halation, ['intensity', 'strength']))  return true;
+    if (_stageActive(p.vignette, ['strength']))               return true;
+    if (_stageActive(p.barrel, ['amount']))                   return true;
+    if (_stageActive(p.godRays, ['strength', 'intensity']))   return true;
+    if (_stageActive(p.depthFog, ['strength', 'intensity']))  return true;
+    if (_stageActive(p.letterbox))                            return true;
+    if (_stageActive(p.crtBeam, ['intensity']))               return true;
+    if (_stageActive(p.kawaii, ['intensity']))                return true;
     return false;
   }
 
