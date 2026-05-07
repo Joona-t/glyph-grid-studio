@@ -1762,6 +1762,165 @@
     return _spriteAtlas;
   }
 
+  /* Multi-tint sprite atlas — generalised version of _ensureSpriteAtlas /
+     _ensureRampSprite for colorModes where the COLOR (not just alpha)
+     varies per cell.  Pre-renders the same glyph set at `steps` discrete
+     tints and stacks them as rows of one big canvas:
+
+       canvas:
+         row 0   = glyphs at tint(0/(steps-1))   y=0..tileH
+         row 1   = glyphs at tint(1/(steps-1))   y=tileH..2*tileH
+         ...
+         row k-1 = glyphs at tint(1.0)           y=(k-1)*tileH..k*tileH
+
+     Per-cell rendering picks a tint row by `(t * (steps-1)) | 0` and
+     blits one tile via drawImage.  Same per-cell cost as the monochrome
+     atlas; ~60-180 KB extra memory per atlas (16 steps × ascii 96 glyphs
+     at 8pt) — well below any limit.
+
+     Used for duotone and gradient color modes in both drawShapeGrid and
+     drawBrightnessGrid.  Cache key includes everything that affects the
+     pre-rendered colours so palette / mode / stop / ink changes
+     trigger a rebuild. */
+
+  const MULTITINT_STEPS = 16;        // 16 tint stops — visually indistinguishable from continuous
+
+  function _buildMultiTintAtlas(items, fontFamily, fontSizePx, colorAtT, steps) {
+    const N = items.length;
+    const tileW = Math.max(2, Math.ceil(fontSizePx * 1.1));
+    const tileH = Math.max(2, Math.ceil(fontSizePx * 1.4));
+    const canvas = document.createElement('canvas');
+    canvas.width = tileW * N;
+    canvas.height = tileH * steps;
+    const ctx = canvas.getContext('2d');
+    ctx.font = fontSizePx + 'px ' + fontFamily;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const halfW = tileW * 0.5;
+    const halfH = tileH * 0.5;
+    for (let s = 0; s < steps; s++) {
+      const t = steps > 1 ? s / (steps - 1) : 0;
+      ctx.fillStyle = colorAtT(t);
+      const yBase = s * tileH + halfH;
+      for (let i = 0; i < N; i++) {
+        const ch = items[i];
+        if (!ch || ch === ' ') continue;
+        ctx.fillText(ch, i * tileW + halfW, yBase);
+      }
+    }
+    return { canvas: canvas, tileW: tileW, tileH: tileH, halfW: halfW, halfH: halfH, steps: steps };
+  }
+
+  /* Convert hex string '#rrggbb' or '#rgb' to [r, g, b]. */
+  function _hexToRgb(hex) {
+    const s = hex.replace(/^#/, '');
+    const full = s.length === 3 ? s[0]+s[0]+s[1]+s[1]+s[2]+s[2] : s;
+    return [
+      parseInt(full.slice(0, 2), 16),
+      parseInt(full.slice(2, 4), 16),
+      parseInt(full.slice(4, 6), 16),
+    ];
+  }
+
+  /* --- Duotone atlases (ramp + glyph variants) --- */
+
+  let _rampDuotoneSprite = null, _rampDuotoneKey = null, _rampDuotoneSpaceMask = null;
+  function _ensureRampDuotoneSprite(rampStr, fontFamily, fontSizePx, ink0Hex, ink1Hex) {
+    if (!rampStr || rampStr.length === 0) return null;
+    const key = 'rampduo:' + rampStr + '|' + fontFamily + '|' + fontSizePx + '|' + ink0Hex + '|' + ink1Hex;
+    if (_rampDuotoneKey === key && _rampDuotoneSprite) return _rampDuotoneSprite;
+    const c0 = _hexToRgb(ink0Hex), c1 = _hexToRgb(ink1Hex);
+    const N = rampStr.length;
+    const items = new Array(N);
+    for (let i = 0; i < N; i++) items[i] = rampStr.charAt(i);
+    const mask = new Uint8Array(N);
+    for (let i = 0; i < N; i++) if (items[i] === ' ') mask[i] = 1;
+    const sprite = _buildMultiTintAtlas(items, fontFamily, fontSizePx, function (t) {
+      const r = (c0[0] + (c1[0] - c0[0]) * t) | 0;
+      const g = (c0[1] + (c1[1] - c0[1]) * t) | 0;
+      const b = (c0[2] + (c1[2] - c0[2]) * t) | 0;
+      return 'rgb(' + r + ',' + g + ',' + b + ')';
+    }, MULTITINT_STEPS);
+    _rampDuotoneSprite = sprite;
+    _rampDuotoneKey = key;
+    _rampDuotoneSpaceMask = mask;
+    return sprite;
+  }
+
+  let _glyphDuotoneSprite = null, _glyphDuotoneKey = null;
+  function _ensureGlyphDuotoneSprite(glyphAtlasArg, fontFamily, fontSizePx, ink0Hex, ink1Hex) {
+    if (!glyphAtlasArg) return null;
+    const key = 'glyphduo:' + (glyphAtlasArg.name || '?') + '|' + fontFamily + '|' + fontSizePx + '|' + ink0Hex + '|' + ink1Hex + '|' + glyphAtlasArg.size;
+    if (_glyphDuotoneKey === key && _glyphDuotoneSprite) return _glyphDuotoneSprite;
+    const c0 = _hexToRgb(ink0Hex), c1 = _hexToRgb(ink1Hex);
+    const N = glyphAtlasArg.size;
+    const items = new Array(N);
+    for (let i = 0; i < N; i++) items[i] = (glyphAtlasArg.glyphs[i] && glyphAtlasArg.glyphs[i].s) || '';
+    const sprite = _buildMultiTintAtlas(items, fontFamily, fontSizePx, function (t) {
+      const r = (c0[0] + (c1[0] - c0[0]) * t) | 0;
+      const g = (c0[1] + (c1[1] - c0[1]) * t) | 0;
+      const b = (c0[2] + (c1[2] - c0[2]) * t) | 0;
+      return 'rgb(' + r + ',' + g + ',' + b + ')';
+    }, MULTITINT_STEPS);
+    _glyphDuotoneSprite = sprite;
+    _glyphDuotoneKey = key;
+    return sprite;
+  }
+
+  /* --- Gradient atlases (ramp + glyph variants) --- */
+
+  let _rampGradientSprite = null, _rampGradientKey = null, _rampGradientSpaceMask = null;
+  function _ensureRampGradientSprite(rampStr, fontFamily, fontSizePx, stops, mode, curveExp) {
+    if (!rampStr || rampStr.length === 0 || !stops || stops.length === 0) return null;
+    /* Stop key from srgb of each stop — the parsed stops already cache OKLab. */
+    let stopKey = '';
+    for (let i = 0; i < stops.length; i++) {
+      const s = stops[i].srgb;
+      stopKey += s[0] + ',' + s[1] + ',' + s[2] + ';';
+    }
+    const key = 'rampgrad:' + rampStr + '|' + fontFamily + '|' + fontSizePx + '|' + stopKey + '|' + mode + '|' + curveExp;
+    if (_rampGradientKey === key && _rampGradientSprite) return _rampGradientSprite;
+    const N = rampStr.length;
+    const items = new Array(N);
+    for (let i = 0; i < N; i++) items[i] = rampStr.charAt(i);
+    const mask = new Uint8Array(N);
+    for (let i = 0; i < N; i++) if (items[i] === ' ') mask[i] = 1;
+    const flat = curveExp === 1.0;
+    const sprite = _buildMultiTintAtlas(items, fontFamily, fontSizePx, function (t) {
+      const u = flat ? t : Math.pow(t, curveExp);
+      const rgb = GlyphGrid.paletteMorph.interpAtU(stops, u, mode);
+      return 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
+    }, MULTITINT_STEPS);
+    _rampGradientSprite = sprite;
+    _rampGradientKey = key;
+    _rampGradientSpaceMask = mask;
+    return sprite;
+  }
+
+  let _glyphGradientSprite = null, _glyphGradientKey = null;
+  function _ensureGlyphGradientSprite(glyphAtlasArg, fontFamily, fontSizePx, stops, mode, curveExp) {
+    if (!glyphAtlasArg || !stops || stops.length === 0) return null;
+    let stopKey = '';
+    for (let i = 0; i < stops.length; i++) {
+      const s = stops[i].srgb;
+      stopKey += s[0] + ',' + s[1] + ',' + s[2] + ';';
+    }
+    const key = 'glyphgrad:' + (glyphAtlasArg.name || '?') + '|' + fontFamily + '|' + fontSizePx + '|' + stopKey + '|' + mode + '|' + curveExp + '|' + glyphAtlasArg.size;
+    if (_glyphGradientKey === key && _glyphGradientSprite) return _glyphGradientSprite;
+    const N = glyphAtlasArg.size;
+    const items = new Array(N);
+    for (let i = 0; i < N; i++) items[i] = (glyphAtlasArg.glyphs[i] && glyphAtlasArg.glyphs[i].s) || '';
+    const flat = curveExp === 1.0;
+    const sprite = _buildMultiTintAtlas(items, fontFamily, fontSizePx, function (t) {
+      const u = flat ? t : Math.pow(t, curveExp);
+      const rgb = GlyphGrid.paletteMorph.interpAtU(stops, u, mode);
+      return 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
+    }, MULTITINT_STEPS);
+    _glyphGradientSprite = sprite;
+    _glyphGradientKey = key;
+    return sprite;
+  }
+
   /* Ramp sprite atlas — sibling of _ensureSpriteAtlas but keyed on a
      plain RAMPS string rather than a glyphAtlas object.  Used by the
      drawBrightnessGrid monochrome fast path: pre-rasterise each ramp
@@ -1942,9 +2101,17 @@
       return;
     }
 
-    /* Fast path: duotone + no depthFog.  Inline lerp between two pre-parsed
-       inks — replaces ~86,400 p5.Color allocations/frame at 240×120. */
-    if (colorMode === 'duotone' && !depthFogActive) {
+    /* Fast path: duotone + no depthFog (sprite-atlas accelerated). */
+    if (colorMode === 'duotone' && !depthFogActive && palette.inks && palette.inks.length > 0) {
+      const ink0 = palette.inks[0];
+      const ink1 = palette.inks[Math.min(1, palette.inks.length - 1)];
+      const sprite = _ensureRampDuotoneSprite(ramp, fontFamilyForActive(), CONFIG.font.size, ink0, ink1);
+      const ctx = drawingContext;
+      const tileW = sprite.tileW, tileH = sprite.tileH;
+      const halfTW = sprite.halfW, halfTH = sprite.halfH;
+      const spriteCanvas = sprite.canvas;
+      const spaceMask = _rampDuotoneSpaceMask;
+      const stepsLast = sprite.steps - 1;
       for (let r = 0; r < rows; r++) {
         const yBase = (r * cellH) | 0;
         const cy = yBase + halfCellH;
@@ -1954,33 +2121,41 @@
           const sigI = signal[i];
           const sigQ = sigI < 0 ? 0 : (sigI > 1 ? 1 : sigI);
           const curved = _gammaLut[(sigQ * 255) | 0];
-          let ch;
+          let idx;
           if (cellIndex) {
-            ch = ramp.charAt(cellIndex[i]);
+            idx = cellIndex[i];
           } else {
-            const idx = (curved * rampLast + 0.0001) | 0;
-            ch = ramp.charAt(idx > rampLast ? rampLast : (idx < 0 ? 0 : idx));
+            idx = (curved * rampLast + 0.0001) | 0;
+            if (idx > rampLast) idx = rampLast;
+            else if (idx < 0) idx = 0;
           }
-          if (ch === ' ') continue;
+          if (spaceMask[idx]) continue;
           const cx = ((c * cellW) | 0) + halfCellW;
-          /* Branchless clamp + inline RGB lerp — replaces lerpColor. */
           const t = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
-          const fr = dueR0 + (dueR1 - dueR0) * t;
-          const fg = dueG0 + (dueG1 - dueG0) * t;
-          const fb = dueB0 + (dueB1 - dueB0) * t;
-          fill(fr, fg, fb);
-          text(ch, cx, cy);
+          const stepIdx = (t * stepsLast + 0.5) | 0;
+          ctx.drawImage(
+            spriteCanvas, idx * tileW, stepIdx * tileH, tileW, tileH,
+            (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
+          );
         }
       }
       currentCellDepth = -1;
       return;
     }
 
-    /* Fast path: gradient + no depthFog.  Lookup precomputed RGB triple from
-       _gradColorLut — replaces 28,800 × interpAtU calls per frame and the
-       per-cell Math.pow for the curve.  LUT was rebuilt above only if any
-       of (stops, mode, curveExp) changed. */
+    /* Fast path: gradient + no depthFog (sprite-atlas accelerated). */
     if (colorMode === 'gradient' && !depthFogActive && useGradLut) {
+      const gStops = resolveGradientStops(palette);
+      const gmap = CONFIG.gradientColorMap || {};
+      const curveExp = typeof gmap.curve === 'number' ? gmap.curve : 1.0;
+      const blendMode = gmap.mode || 'oklab';
+      const sprite = _ensureRampGradientSprite(ramp, fontFamilyForActive(), CONFIG.font.size, gStops, blendMode, curveExp);
+      const ctx = drawingContext;
+      const tileW = sprite.tileW, tileH = sprite.tileH;
+      const halfTW = sprite.halfW, halfTH = sprite.halfH;
+      const spriteCanvas = sprite.canvas;
+      const spaceMask = _rampGradientSpaceMask;
+      const stepsLast = sprite.steps - 1;
       for (let r = 0; r < rows; r++) {
         const yBase = (r * cellH) | 0;
         const cy = yBase + halfCellH;
@@ -1990,19 +2165,22 @@
           const sigI = signal[i];
           const sigQ = sigI < 0 ? 0 : (sigI > 1 ? 1 : sigI);
           const curved = _gammaLut[(sigQ * 255) | 0];
-          let ch;
+          let idx;
           if (cellIndex) {
-            ch = ramp.charAt(cellIndex[i]);
+            idx = cellIndex[i];
           } else {
-            const idx = (curved * rampLast + 0.0001) | 0;
-            ch = ramp.charAt(idx > rampLast ? rampLast : (idx < 0 ? 0 : idx));
+            idx = (curved * rampLast + 0.0001) | 0;
+            if (idx > rampLast) idx = rampLast;
+            else if (idx < 0) idx = 0;
           }
-          if (ch === ' ') continue;
+          if (spaceMask[idx]) continue;
           const cx = ((c * cellW) | 0) + halfCellW;
           const cClamped = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
-          const lo = ((cClamped * 255) | 0) * 3;
-          fill(_gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2]);
-          text(ch, cx, cy);
+          const stepIdx = (cClamped * stepsLast + 0.5) | 0;
+          ctx.drawImage(
+            spriteCanvas, idx * tileW, stepIdx * tileH, tileW, tileH,
+            (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
+          );
         }
       }
       currentCellDepth = -1;
@@ -2189,23 +2367,33 @@
       return;
     }
 
-    /* Fast path: duotone + no depthFog. */
-    if (colorMode === 'duotone' && !depthFogActive) {
+    /* Fast path: duotone + no depthFog (sprite-atlas accelerated).
+       16-step pre-tinted atlas; per cell picks the closest tint row. */
+    if (colorMode === 'duotone' && !depthFogActive && palette.inks && palette.inks.length > 0) {
+      const ink0 = palette.inks[0];
+      const ink1 = palette.inks[Math.min(1, palette.inks.length - 1)];
+      const sprite = _ensureGlyphDuotoneSprite(glyphAtlas, fontFamilyForActive(), CONFIG.font.size, ink0, ink1);
+      const ctx = drawingContext;
+      const tileW = sprite.tileW, tileH = sprite.tileH;
+      const halfTW = sprite.halfW, halfTH = sprite.halfH;
+      const spriteCanvas = sprite.canvas;
+      const stepsLast = sprite.steps - 1;
       for (let r = 0; r < rows; r++) {
         const cy = ((r * cellH) | 0) + halfCellH;
         const rowI = r * cols;
         for (let c = 0; c < cols; c++) {
           const i = rowI + c;
-          const glyph = glyphs[indices[i]];
+          const gi = indices[i];
+          const glyph = glyphs[gi];
           if (!glyph) continue;
           const cx = ((c * cellW) | 0) + halfCellW;
           const sig = cellSignal[i];
           const t = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
-          const fr = dueR0 + (dueR1 - dueR0) * t;
-          const fg = dueG0 + (dueG1 - dueG0) * t;
-          const fb = dueB0 + (dueB1 - dueB0) * t;
-          fill(fr, fg, fb);
-          text(glyph.s, cx, cy);
+          const stepIdx = (t * stepsLast + 0.5) | 0;
+          ctx.drawImage(
+            spriteCanvas, gi * tileW, stepIdx * tileH, tileW, tileH,
+            (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
+          );
         }
       }
       currentCellDepth = -1;
@@ -2213,21 +2401,34 @@
       return;
     }
 
-    /* Fast path: gradient + no depthFog. */
+    /* Fast path: gradient + no depthFog (sprite-atlas accelerated). */
     if (colorMode === 'gradient' && !depthFogActive && useGradLut) {
+      const gStops = resolveGradientStops(palette);
+      const gmap = CONFIG.gradientColorMap || {};
+      const curveExp = typeof gmap.curve === 'number' ? gmap.curve : 1.0;
+      const blendMode = gmap.mode || 'oklab';
+      const sprite = _ensureGlyphGradientSprite(glyphAtlas, fontFamilyForActive(), CONFIG.font.size, gStops, blendMode, curveExp);
+      const ctx = drawingContext;
+      const tileW = sprite.tileW, tileH = sprite.tileH;
+      const halfTW = sprite.halfW, halfTH = sprite.halfH;
+      const spriteCanvas = sprite.canvas;
+      const stepsLast = sprite.steps - 1;
       for (let r = 0; r < rows; r++) {
         const cy = ((r * cellH) | 0) + halfCellH;
         const rowI = r * cols;
         for (let c = 0; c < cols; c++) {
           const i = rowI + c;
-          const glyph = glyphs[indices[i]];
+          const gi = indices[i];
+          const glyph = glyphs[gi];
           if (!glyph) continue;
           const cx = ((c * cellW) | 0) + halfCellW;
           const sig = cellSignal[i];
           const sigC = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
-          const lo = ((sigC * 255) | 0) * 3;
-          fill(_gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2]);
-          text(glyph.s, cx, cy);
+          const stepIdx = (sigC * stepsLast + 0.5) | 0;
+          ctx.drawImage(
+            spriteCanvas, gi * tileW, stepIdx * tileH, tileW, tileH,
+            (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
+          );
         }
       }
       currentCellDepth = -1;
