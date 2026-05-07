@@ -50,14 +50,21 @@
       for (let j = 0; j < 6; j++) vecs[base + j] = g.vec[j];
       meta[i] = { cp: g.cp, s: g.s, ink: g.ink };
     }
-    return {
+    const atlas = {
       name: setJson.name,
       size: N,
       cellW: setJson.cellW,
       cellH: setJson.cellH,
       vecs: vecs,
       glyphs: meta,
+      tree: null,
     };
+    /* Build the k-d tree once at atlas-load time so selectGrid can do
+       log-N descent instead of brute force on every cell every frame.
+       For octant (~230 glyphs) at 240×120 cells this drops the per-frame
+       NN cost from 6.6M comparisons to ~230K (~28× fewer). */
+    atlas.tree = buildKDTree(atlas);
+    return atlas;
   }
 
   /* Compute the 6D shape vector for one cell of a source luminance image.
@@ -162,6 +169,103 @@
     return [tlf, trf, blf, brf, Math.max(0, Math.min(1, h_sym)), Math.max(0, Math.min(1, v_sym))];
   }
 
+  /* Zero-alloc variant of cellVector: writes the 6 components into
+     `out[outOff..outOff+5]` instead of returning a fresh array.
+     Used by selectGrid's hot loop to eliminate ~28,800 array
+     allocations per frame at 240×120 (one per cell). */
+  function cellVectorInto(out, outOff, luminance, srcW, srcH, cellX, cellY, cellW, cellH, opts) {
+    opts = opts || {};
+    const reach = opts.reach == null ? Math.floor(Math.min(cellW, cellH) / 4) : opts.reach;
+    const reachWeight = opts.reachWeight == null ? 0.5 : opts.reachWeight;
+    const scale = opts.luminanceScale || (luminance instanceof Uint8Array || luminance instanceof Uint8ClampedArray ? 1 / 255 : 1);
+
+    const x0 = cellX * cellW;
+    const y0 = cellY * cellH;
+    const hw = cellW / 2;
+    const hh = cellH / 2;
+
+    let tl = 0, tr = 0, bl = 0, br = 0;
+    let tlN = 0, trN = 0, blN = 0, brN = 0;
+
+    for (let dy = 0; dy < cellH; dy++) {
+      const py = y0 + dy;
+      if (py < 0 || py >= srcH) continue;
+      const row = py * srcW;
+      for (let dx = 0; dx < cellW; dx++) {
+        const px = x0 + dx;
+        if (px < 0 || px >= srcW) continue;
+        const v = luminance[row + px] * scale;
+        if (dy < hh) {
+          if (dx < hw) { tl += v; tlN++; }
+          else         { tr += v; trN++; }
+        } else {
+          if (dx < hw) { bl += v; blN++; }
+          else         { br += v; brN++; }
+        }
+      }
+    }
+
+    if (reach > 0 && reachWeight > 0) {
+      for (let dy = -reach; dy < cellH + reach; dy++) {
+        const py = y0 + dy;
+        if (py < 0 || py >= srcH) continue;
+        const row = py * srcW;
+        const inMainY = (dy >= 0 && dy < cellH);
+        for (let dx = -reach; dx < 0; dx++) {
+          const px = x0 + dx;
+          if (px < 0 || px >= srcW) continue;
+          const v = luminance[row + px] * scale * reachWeight;
+          const inTop = dy < hh;
+          if (inTop) { tl += v; tlN += reachWeight; }
+          else       { bl += v; blN += reachWeight; }
+        }
+        for (let dx = cellW; dx < cellW + reach; dx++) {
+          const px = x0 + dx;
+          if (px < 0 || px >= srcW) continue;
+          const v = luminance[row + px] * scale * reachWeight;
+          const inTop = dy < hh;
+          if (inTop) { tr += v; trN += reachWeight; }
+          else       { br += v; brN += reachWeight; }
+        }
+        if (inMainY) continue;
+        for (let dx = 0; dx < cellW; dx++) {
+          const px = x0 + dx;
+          if (px < 0 || px >= srcW) continue;
+          const v = luminance[row + px] * scale * reachWeight;
+          if (dy < 0) {
+            if (dx < hw) { tl += v; tlN += reachWeight; }
+            else         { tr += v; trN += reachWeight; }
+          } else {
+            if (dx < hw) { bl += v; blN += reachWeight; }
+            else         { br += v; brN += reachWeight; }
+          }
+        }
+      }
+    }
+
+    const tlf = tlN > 0 ? tl / tlN : 0;
+    const trf = trN > 0 ? tr / trN : 0;
+    const blf = blN > 0 ? bl / blN : 0;
+    const brf = brN > 0 ? br / brN : 0;
+
+    const top = tlf + trf;
+    const bot = blf + brf;
+    const left = tlf + blf;
+    const right = trf + brf;
+    const eps = 1e-6;
+    let h_sym = 1 - Math.abs(top - bot) / Math.max(top, bot, eps);
+    let v_sym = 1 - Math.abs(left - right) / Math.max(left, right, eps);
+    h_sym = h_sym < 0 ? 0 : (h_sym > 1 ? 1 : h_sym);
+    v_sym = v_sym < 0 ? 0 : (v_sym > 1 ? 1 : v_sym);
+
+    out[outOff]     = tlf;
+    out[outOff + 1] = trf;
+    out[outOff + 2] = blf;
+    out[outOff + 3] = brf;
+    out[outOff + 4] = h_sym;
+    out[outOff + 5] = v_sym;
+  }
+
   /* Select the glyph in the atlas closest to `vec` (6-element array or typed
      array). Returns the glyph index. Brute-force squared-distance. */
   function select(atlas, vec) {
@@ -213,20 +317,41 @@
     return outIndices;
   }
 
+  /* Persistent buffers reused across frames (sized to match the current
+     grid; resized only when cols*rows changes).  Pre-this-fix selectGrid
+     allocated `new Float32Array(count*6)` (~691 KB at 240×120) and
+     `new Uint16Array(count)` (~57 KB) every single frame, plus a
+     6-element array per cell from cellVector (28,800 allocs/frame). */
+  let _selectGridVecs = null;
+  let _selectGridIdx = null;
+  function _ensureBuffers(count) {
+    if (!_selectGridVecs || _selectGridVecs.length < count * 6) {
+      _selectGridVecs = new Float32Array(count * 6);
+    }
+    if (!_selectGridIdx || _selectGridIdx.length < count) {
+      _selectGridIdx = new Uint16Array(count);
+    }
+  }
+
   /* Convenience: compute 6D vectors for every cell in the source and
-     run selectAll. */
+     run NN search.  Uses the atlas's pre-built k-d tree when available
+     (every atlas built via buildAtlas has one), falling back to brute
+     force for unusual atlas shapes. */
   function selectGrid(atlas, luminance, srcW, srcH, cols, rows, cellW, cellH, opts) {
     const count = cols * rows;
-    const vectors = new Float32Array(count * 6);
+    _ensureBuffers(count);
+    const vectors = _selectGridVecs;
+    const indices = _selectGridIdx;
     for (let y = 0; y < rows; y++) {
+      const rowOff = y * cols * 6;
       for (let x = 0; x < cols; x++) {
-        const vec = cellVector(luminance, srcW, srcH, x, y, cellW, cellH, opts);
-        const b = (y * cols + x) * 6;
-        vectors[b] = vec[0]; vectors[b+1] = vec[1]; vectors[b+2] = vec[2];
-        vectors[b+3] = vec[3]; vectors[b+4] = vec[4]; vectors[b+5] = vec[5];
+        cellVectorInto(vectors, rowOff + x * 6, luminance, srcW, srcH, x, y, cellW, cellH, opts);
       }
     }
-    return selectAll(atlas, vectors, new Uint16Array(count));
+    if (atlas.tree) {
+      return selectAllKDTree(atlas.tree, vectors, indices);
+    }
+    return selectAll(atlas, vectors, indices);
   }
 
   /* Stage 2D — k-d tree NN search over the 6-D shape-vector atlas
