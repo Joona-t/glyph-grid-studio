@@ -4,6 +4,77 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-07 — Live-debug performance push: brightness 70 ms → 11 ms, shape-edge-aware 162 ms → 42 ms
+
+User reported "switching settings still freezes / doesn't apply changes" and asked me to drive the running app via computer-use to "decode" what was actually broken. The session ran for several hours and shipped eight commits, with two critical correctness fixes and four perf wins. Rolling totals at session end:
+
+| Mode | Before session | After session | Speedup |
+|---|---|---|---|
+| brightness + cream-paper monochrome (default) | ~70 ms | **~11 ms** | **6.4×** |
+| shape-edge-aware / ascii monochrome | ~162 ms | **~42 ms** | **3.9×** |
+| shape-edge-aware / octant monochrome | ~209 ms | **~50 ms** | **4.2×** |
+| selectionMode brightness → shape-edge-aware switch | 327–3339 ms | 60–172 ms | up to **20×** |
+| glyphSet swap visually applies | ❌ broken | ✅ fixed | correctness |
+
+### BUG-004 — `glyphSet` dropdown updates config but never swaps the atlas
+
+- **Found:** 2026-05-07 by computer-use observation. Cycled `ascii → octant → braille` while zooming on the canvas. All three rendered visually identically — impossible if the atlas were swapping (braille is 2×4 dot patterns, octant is 2×4 block fills, ascii is letterforms). The dropdown updated `CONFIG.glyphSet` cleanly, but the canvas kept using whichever atlas loaded first.
+- **Root cause:** Lazy-load condition at `src/index.html:1523` was `if (CONFIG.glyphSet && !glyphAtlas)` — fires only when NO atlas exists. After the first shape-mode entry loads any atlas, the branch is skipped forever. Subsequent dropdown changes mutate config but never re-point `glyphAtlas`. The F6 pre-warm cache (`_atlasCache`) holds all six atlases ready to go but the render path never read from it.
+- **Fix (commit `2829226`):** On every frame in shape mode, point `glyphAtlas` at the cached atlas matching `CONFIG.glyphSet`. Cache hit (the common case after F6 pre-warm) is an instant pointer swap. Cache miss kicks off `loadAtlasAsync` and falls back to `drawBrightnessGrid` for that frame only. When `glyphSet` is `null`, clear `glyphAtlas` so shape mode falls back to brightness instead of using a stale atlas from a prior selection.
+- **Verification:** drove the running app, switched glyphSets, zoomed on the canvas. ASCII letterforms (M, V, X, Y, ?, !, jj, ll) now visible; braille shows distinct stripe + dot patterns. Pre-fix and post-fix outputs were pixel-different — proves the atlas swap actually took effect.
+
+### BUG-005 — `cargo build --release` produced binaries that loaded `http://localhost:8943/` and showed a white window
+
+- **Found:** 2026-05-07 after rebuilding to pick up new code, the relaunched app showed a blank white window. Wasted ~30 minutes assuming code bugs before opening DevTools and finding `Failed to load resource: Could not connect to the server. http://localhost:8943/` in the WebView console.
+- **Root cause:** Both `frontendDist: "../src"` and `devUrl: "http://localhost:8943"` were set in `tauri.conf.json`. With both present, `cargo build --release` was emitting `--cfg dev` (visible in the `rustc` invocation), which made the production binary attempt the dev URL instead of the embedded frontend. No dev server was running, so the WebView received nothing.
+- **Fix (commit `40f2bcc`):** Removed the `devUrl` field from `tauri.conf.json`. Production binary now reads the embedded frontend unconditionally. Also added `shape-edge-aware/atlas=<name>` to the live status bar string when in any shape selection mode — the diagnostic that pinned BUG-004 down without DevTools.
+- **Followup discovered during fix:** the running app was at `~/Applications/Glyph Grid Studio.app`, not the build folder bundle. Rebuilds were going to the wrong path entirely. Documented in commit message: after `cargo build --release`, copy the binary to `~/Applications/Glyph Grid Studio.app/Contents/MacOS/glyph-grid-studio` and re-sign with `codesign --force --deep --sign - <app>`.
+
+### ITER-013 — k-d tree wired into `selectGrid` + zero-alloc per-frame buffers (commit `82fa87f`)
+
+- **Why:** Live measurement with `Perf` folder showed shape-edge-aware grid stage at 180 ms — the ~28,800-cell brute-force NN (≈6.6M distance comparisons/frame for octant) plus 691 KB Float32Array allocs and 28,800 fresh 6-element vectors per frame.
+- **What:** `glyph-shape-index.js`:
+    - `buildAtlas` now calls `buildKDTree` and stores it as `atlas.tree` (the implementation existed but was dead code — `selectGrid` only ever called `selectAll` brute force).
+    - New `cellVectorInto(out, outOff, …)` zero-alloc variant of `cellVector`. Mutates a passed-in buffer slice instead of returning a fresh array.
+    - `selectGrid` uses module-level persistent `_selectGridVecs` (Float32Array) and `_selectGridIdx` (Uint16Array) buffers, resized only when `cols × rows` changes. Calls `selectAllKDTree(atlas.tree, ...)` when the tree is present.
+- **Result:** select substage isolated to ~16 ms (down from being lumped into the 180 ms grid stage).
+
+### ITER-014 — Sprite atlas in `drawShapeGrid` (commit `8682c5e`) — 162 ms → 66 ms
+
+- **Why:** After the k-d tree win, instrumentation showed `select` at 16 ms and `draw` at 130 ms. The 130 ms was 28,800 `text(glyph.s, cx, cy)` calls hitting canvas2D `fillText` at ~4.5 µs each.
+- **What:** New `_ensureSpriteAtlas(glyphAtlas, fontFamily, sizePx, fillColor)` builds a `tileW × tileH × N` offscreen canvas with each glyph rasterised into its tile. Per-cell rendering becomes one `drawImage` blit (~0.5 µs) plus a `globalAlpha` write for cell brightness modulation. Cached on `(atlasName, font, size, color, glyphCount)`; rebuilt only on change. Wired into the monochrome fast path of `drawShapeGrid`.
+- **Result:** draw stage 130 → 7.3 ms (94% reduction, 18× faster); shape-edge-aware total 162 → 66 ms.
+
+### ITER-015 — Postproc vignette as composite overlay (commit `9f0143d`) — 66 ms → 42 ms
+
+- **Why:** Sprite atlas success surfaced a regression: `postproc` stage went 10.8 → 38.5 ms. Cause: `drawShapeGrid`'s 28,800 drawImage blits promote the main canvas to a GPU layer; the next `getImageData` in `applyPostprocess` triggers a GPU→CPU readback (~28 ms at 1024×683 on this M-series WebKit).
+- **What:** Two-phase `applyPostprocess`:
+    - **Phase A** (imgData stages — bloom, halation, scanlines, etc.): keeps the existing `getImageData/putImageData` round-trip. Skipped entirely when no imgData stage is enabled.
+    - **Phase B** (overlay stages — vignette, letterbox): applied via `drawingContext.drawImage` with `globalCompositeOperation = 'multiply'` from a precomputed radial-darken canvas. Never reads pixel data.
+    - New `_ensureVignetteOverlay(w, h, strength)` builds a w×h canvas where each pixel encodes `(1 - s·r²) * 255` — byte-identical falloff to `applyVignette` in `glyph-crt.js`. Cached by `(w, h, strength)`.
+    - `applyChain` in `glyph-crt.js` now respects `runtime.skipOverlays` (default false preserves headless / GIF export which still bakes vignette into pixel data).
+- **Result:** postproc 38.5 → ~0 ms (drawImage on GPU is essentially free); shape-edge-aware total 66 → 42 ms. Visual diff confirmed vignette darkening still matches the pre-fix render.
+
+### ITER-016 — Sprite atlas in `drawBrightnessGrid` (commit `89b660d`) — 70 ms → 11 ms
+
+- **Why:** The user's default code path (cream-paper monochrome, brightness mode) was still hitting `fillText` 28,800 times per frame. Mirror the sprite-atlas pattern from `drawShapeGrid` for ramp-based rendering.
+- **What:** `_ensureRampSprite(rampStr, fontFamily, sizePx, fillColor)` builds a `tileW × tileH × ramp.length` offscreen canvas — one tile per ramp character. Caches a `Uint8Array` mask of "is this ramp index a space" so we skip drawImage for blank ramp positions (the gradient ramp has 2 leading spaces). Cache key includes the ramp string so switching `gradient → unicode-block` rebuilds correctly. Wired into the monochrome fast path of `drawBrightnessGrid` (replaces `fill(...) text(ch, cx, cy)` with `globalAlpha = curved × 1.1` clamped + `drawImage`).
+- **Result:** grid stage 57 → 9 ms (84% reduction, 6.3× faster); brightness mode total 70 → 11 ms. Visual unchanged — same dotted stipple, same vignette, same edge contrast.
+
+### Live-observation discoveries that drove the session
+
+- **Default colorMode visual washout (still open):** during early observation the user's session was on `bone-charcoal/duotone/gradientNoSpace/0.90` — duotone interpolates between two near-light inks (`#F5ECDA` cream and `#C8B89E` bone) so the rendered image is genuinely low-contrast by design. Compounded the perception of slowness. Documented for separate UX consideration; no code change.
+- **selectionMode `unknown=Nms` switch tag:** Tweakpane v3's `pane.on('change')` event sometimes lacks `ev.target.key`, so the latency tracker falls back to "unknown". Cosmetic.
+
+### Out of scope (deferred for the next push)
+
+- Sprite atlas for duotone / gradient color modes — would need per-palette-tinted atlases or a multiply-by-color composite step. Currently those paths still run `text() + fill()` per cell.
+- Flatten the k-d tree from object nodes (closure-heavy `descend(node)` recursion) into a `Uint32Array` of `[idx, axis, leftOff, rightOff]` records with iterative descent. ~12 ms remaining in the select substage.
+- WebGL renderer (long-deferred to v0.5+).
+- Verify GIF export with the new sprite atlases — recording uses `applyChain`'s default `skipOverlays:false` so headless renders should still bake vignette into pixel data correctly, but worth a manual test.
+
+---
+
 ## 2026-05-06 — Comprehensive feature test (469-GIF Cartesian)
 
 Drove the full feature surface against a single anime portrait (Claymore — Clare). Generated 469 GIFs across 9 phases:
