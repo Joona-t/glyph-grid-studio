@@ -2991,6 +2991,7 @@
                 frames: frames.map(b => ({ b64: b })),
                 delayMs: delay,
                 path: job.path,
+                capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
               })
               .then(p => {
                 console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);

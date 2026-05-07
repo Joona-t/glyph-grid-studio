@@ -41,6 +41,9 @@ schemars = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+gifski = "1.34.0"
+imgref = "1.12.1"
+rgb = "0.8.53"
 
 [features]
 # When enabled, Cmd+Opt+I opens the WebKit inspector. Default OFF for

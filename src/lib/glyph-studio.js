@@ -244,7 +244,7 @@
      loop, then hand them to the Rust gif muxer.  Browser path: keep the old
      ZIP behaviour as a fallback so the studio works outside Tauri.
      `delayMs` defaults to the per-frame duration implied by CONFIG.animation. */
-  function recordGIF(testHook, total, onProgress, onDone, delayMs) {
+  function recordGIF(testHook, total, onProgress, onDone, delayMs, capWidth) {
     if (!testHook) return;
     var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
 
@@ -270,6 +270,7 @@
           window.__TAURI__.core.invoke('save_gif_real', {
             frames: payloadFrames,
             delayMs: dly,
+            capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
           })
             .then(function (p) {
               if (p) console.log('glyph-studio: saved GIF to', p);
@@ -685,17 +686,36 @@
       expState.frames = p.frames;
       expState.length = p.dur.toFixed(2) + 's (' + p.delayMs + 'ms/frame)';
     }, 200);
+
+    /* Output size dropdown — caps width before encoding for smaller files.
+       Twitter's GIF post limit is 15 MB on web/iOS (5 MB on Android); a
+       1024×683 glyph render of an animated source can exceed 30 MB at
+       full size.  720 px wide ≈ 50% of the pixel count → ≈ 50% smaller
+       file with no perceptible difference at typical Twitter mobile
+       display widths.  480 px is for very long loops or smaller targets.
+       0 = no cap (full quality, original render dimensions). */
+    var sizeOpts = { capWidth: 0 };
+    fExp.addInput(sizeOpts, 'capWidth', {
+      label: 'output size',
+      options: { 'full (no cap)': 0, '720px (Twitter)': 720, '480px (small)': 480 },
+    });
+
     var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
     /* Export GIF — derives frame count from effective fps so the output
        duration matches the user's Animation › duration setting (within
-       the GIF format's 10 ms quantization). */
+       the GIF format's 10 ms quantization).  Encoder is gifski (shared
+       palette across frames + error-diffusion dithering at quality 100,
+       lossless for our limited-palette glyph art).  Optional cap-width
+       resize is applied by gifski itself before quantisation. */
     fExp.addButton({ title: inTauri ? 'Export GIF' : 'Export GIF (ZIP fallback)' }).on('click', function () {
       var p = exportPlan();
-      console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's');
+      var capW = sizeOpts.capWidth || 0;
+      console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : ''));
       recordGIF(opts.testHook, p.frames,
         function (i, total) { console.log('  ', i, '/', total); },
         function () { console.log('glyph-studio: recording finished'); },
-        p.delayMs);
+        p.delayMs,
+        capW > 0 ? capW : null);
     });
 
     var urlPre = presetFromURL();
