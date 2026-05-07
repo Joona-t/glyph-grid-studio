@@ -1519,12 +1519,35 @@
     if (mode === 'brightness') {
       drawBrightnessGrid(cellIndex, cellSignal, cols, rows, cellW, cellH);
     } else if (mode === 'shape' || mode === 'shape-edge-aware') {
-      /* Lazy atlas load (if glyphSet given). */
-      if (CONFIG.glyphSet && !glyphAtlas) {
-        loadAtlasAsync(CONFIG.glyphSet);
-        /* fallback while waiting */
-        drawBrightnessGrid(cellIndex, cellSignal, cols, rows, cellW, cellH);
-        return;
+      /* Atlas swap.  PREVIOUS BUG: the lazy-load condition was
+         `if (CONFIG.glyphSet && !glyphAtlas)` which only fires when NO
+         atlas is loaded.  After the first atlas load, that branch is
+         skipped forever — and `glyphAtlas` stays pointed at whichever
+         set was loaded first, regardless of `CONFIG.glyphSet` changes.
+         Symptom: dropdown updates the config value but the canvas keeps
+         rendering with the old atlas (visually confirmed: ascii, octant,
+         and braille all rendered identically when they should be wildly
+         different).  The pre-warm cache holds all six atlases ready
+         (F6) — we just have to actually point `glyphAtlas` at the right
+         one on every frame.
+
+         The fix: read the cached atlas for the current glyphSet on each
+         frame.  Cache hit → instant pointer swap.  Cache miss → kick off
+         async load + fall back to brightness for this frame only.  When
+         glyphSet is null, clear glyphAtlas so shape mode falls back to
+         brightness instead of using a stale atlas. */
+      if (CONFIG.glyphSet) {
+        const cached = _atlasCache[CONFIG.glyphSet];
+        if (cached) {
+          glyphAtlas = cached;  /* pointer swap, ~0 cost */
+        } else {
+          loadAtlasAsync(CONFIG.glyphSet);
+          /* fallback while waiting for the fetch */
+          drawBrightnessGrid(cellIndex, cellSignal, cols, rows, cellW, cellH);
+          return;
+        }
+      } else {
+        glyphAtlas = null;
       }
       if (glyphAtlas) {
         drawShapeGrid(g, cols, rows, cellW, cellH, cellPxW, cellPxH, mode === 'shape-edge-aware');
