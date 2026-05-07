@@ -387,6 +387,9 @@
             }
           }
         }
+        /* Refresh slider displays after imageRef.set's auto-tune of
+           CONFIG.animation.duration (animated-source uploads). */
+        if (opts.__refreshPane) opts.__refreshPane();
       };
       if (pickImageNative(swap)) return;
       var inp = document.createElement('input');
@@ -546,7 +549,14 @@
 
     var fAnim = pane.addFolder({ title: 'Animation', expanded: false });
     if (!config.animation) config.animation = { fps: 30, duration: 6, loop: true };
-    fAnim.addInput(config.animation, 'duration', { min: 1, max: 20, step: 0.5 });
+    /* Slider cap raised from 20 → 60 s so animated-source uploads with
+       longer loops (10+ s anime GIFs) don't get visually clamped.
+       Programmatic duration values beyond the slider max still work.
+       Step lowered from 0.5 → 0.1 so animated-GIF auto-tune can preserve
+       sub-half-second loops without rounding (e.g. kaneki.gif 2.70 s
+       was getting snapped to 2.50 s by Tweakpane's step constraint
+       during pane.refresh, costing 6 frames of source motion). */
+    fAnim.addInput(config.animation, 'duration', { min: 0.5, max: 60, step: 0.1 });
     fAnim.addInput(config.animation, 'fps', { min: 12, max: 60, step: 6 });
     fAnim.addInput(config.animation, 'loop');
 
@@ -650,12 +660,33 @@
     fExp.addButton({ title: 'Snapshot PNG' }).on('click', function () {
       snapshotPNG(document.querySelector('canvas'));
     });
-    var rec = { frames: 24 };
-    fExp.addInput(rec, 'frames', { min: 8, max: 120, step: 1 });
+    /* Live readout of the export length so users see what the next
+       Export GIF click will produce.  Drives off Animation › duration ×
+       Animation › fps — the same animation timeline the on-screen
+       preview uses.  Updated on every pane refresh tick. */
+    var expState = { frames: 0, length: '—' };
+    fExp.addMonitor(expState, 'frames', { label: 'frames', interval: 200 });
+    fExp.addMonitor(expState, 'length', { label: 'length', interval: 200 });
+    setInterval(function () {
+      var fps = (config.animation && config.animation.fps) || 30;
+      var dur = (config.animation && config.animation.duration) || 6;
+      var n = Math.max(2, Math.round(dur * fps));
+      expState.frames = n;
+      expState.length = dur.toFixed(2) + 's @ ' + fps + 'fps';
+    }, 200);
     var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
+    /* Export GIF — derives frame count from Animation › duration × fps so
+       the time slider IS the export-length slider.  Previously the
+       Export folder had its own `frames` input capped at 8–120 (= 0.27 s
+       to 4 s at 30 fps) which silently overrode the Animation duration.
+       Result: animated GIF uploads played back at 1–4 s no matter where
+       the user moved the time slider. */
     fExp.addButton({ title: inTauri ? 'Export GIF' : 'Export GIF (ZIP fallback)' }).on('click', function () {
-      console.log('glyph-studio: recording', rec.frames, 'frames');
-      recordGIF(opts.testHook, rec.frames,
+      var fps = (config.animation && config.animation.fps) || 30;
+      var dur = (config.animation && config.animation.duration) || 6;
+      var frames = Math.max(2, Math.round(dur * fps));
+      console.log('glyph-studio: recording', frames, 'frames (' + dur.toFixed(2) + 's @ ' + fps + 'fps)');
+      recordGIF(opts.testHook, frames,
         function (i, total) { console.log('  ', i, '/', total); },
         function () { console.log('glyph-studio: recording finished'); });
     });
@@ -677,9 +708,20 @@
       var pane = buildPane(Pane, opts);
       apiOut.pane = pane;
       apiOut.refresh = function () { pane.refresh(); };
+      /* When a new image lands (drag-drop OR pick-image button OR Tauri
+         file-drop), the imageRef.set callback in index.html may auto-tune
+         CONFIG.animation.duration to match an animated GIF's loop length.
+         Tweakpane v3 does NOT auto-refresh displayed values when bound
+         object properties mutate externally — pane.refresh() is required.
+         Pass a refresh callback to setupImageDrop and the Pick-image
+         button so the slider catches up after every image swap. */
+      var refreshOnSwap = function () { try { pane.refresh(); } catch (e) {} };
       if (opts.imageRef) {
-        setupImageDrop(opts.imageRef, opts.sceneCacheKeys);
+        setupImageDrop(opts.imageRef, opts.sceneCacheKeys, refreshOnSwap);
       }
+      /* Expose to buildPane's pick-image handler via opts so the synchronous
+         path (Pick image button) refreshes too. */
+      opts.__refreshPane = refreshOnSwap;
     });
     return apiOut;
   }
