@@ -367,6 +367,12 @@
     if (postOpts.letterbox && postOpts.letterbox.enabled) {
       applyLetterbox(d, w, h, postOpts.letterbox);
     }
+    /* Kawaii overlay — drawn LAST so the hearts + sparkles stay on top
+       of the glyph grid. Frame-aware via runtime.frameIdx so they twinkle
+       smoothly. */
+    if (postOpts.kawaii && postOpts.kawaii.enabled) {
+      applyKawaii(d, w, h, postOpts.kawaii, runtime.frameIdx | 0);
+    }
     return imgData;
   }
 
@@ -418,6 +424,139 @@
     return state;
   }
   function d_at(rgba, i) { return rgba[i]; }
+
+  /* =========================================================================
+     KAWAII OVERLAY
+     A postprocess stage that scatters soft pink hearts ♥ and sparkles ✦ on
+     top of the rendered glyph grid. Particles are deterministic per-cell
+     (hashed by position + frameIdx) so they don't strobe between frames;
+     a per-particle phase makes them twinkle smoothly. Heart count, sparkle
+     count, hue, and twinkle speed are all tunable.
+
+     Implementation: each particle is a tiny pre-baked bitmap pattern blitted
+     directly into the canvas RGBA buffer. No font dependency; works with
+     any source image and any palette. Drawn LAST in the postprocess chain
+     so vignette + crtBeam don't darken the kawaii overlay.
+     ========================================================================= */
+  // 8x8 heart pattern (1 = filled)
+  const KAWAII_HEART = new Uint8Array([
+    0,1,1,0,0,1,1,0,
+    1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,
+    1,1,1,1,1,1,1,1,
+    0,1,1,1,1,1,1,0,
+    0,0,1,1,1,1,0,0,
+    0,0,0,1,1,0,0,0,
+    0,0,0,0,1,0,0,0,
+  ]);
+  // 5x5 four-point sparkle (cross with center bright spot)
+  const KAWAII_SPARKLE = new Uint8Array([
+    0,0,1,0,0,
+    0,0,2,0,0,
+    1,2,3,2,1,
+    0,0,2,0,0,
+    0,0,1,0,0,
+  ]);
+  // 3x3 small twinkle (just a plus)
+  const KAWAII_TWINKLE = new Uint8Array([
+    0,1,0,
+    1,2,1,
+    0,1,0,
+  ]);
+
+  /* Lightweight integer hash used for deterministic particle placement. */
+  function _kawaiiHash(a, b) {
+    let h = (a | 0) ^ Math.imul(b | 0, 0x9e3779b1);
+    h ^= h >>> 16;
+    h = Math.imul(h, 0x7feb352d);
+    h ^= h >>> 15;
+    h = Math.imul(h, 0x846ca68b);
+    h ^= h >>> 16;
+    return h >>> 0;
+  }
+
+  /* Blit a kawaii pattern into rgba at (px, py) with given color + alpha.
+     The pattern's nonzero cells get blended on top of the existing pixel. */
+  function _kawaiiBlit(rgba, w, h, pattern, pw, ph, px, py, r, g, b, alpha) {
+    const ox = (px - (pw >> 1)) | 0;
+    const oy = (py - (ph >> 1)) | 0;
+    for (let dy = 0; dy < ph; dy++) {
+      const yy = oy + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (let dx = 0; dx < pw; dx++) {
+        const v = pattern[dy * pw + dx];
+        if (v === 0) continue;
+        const xx = ox + dx;
+        if (xx < 0 || xx >= w) continue;
+        // intensity 1..3 → opacity boost
+        const a = alpha * (v / 3);
+        const i = (yy * w + xx) * 4;
+        rgba[i]     = Math.min(255, rgba[i]     * (1 - a) + r * a);
+        rgba[i + 1] = Math.min(255, rgba[i + 1] * (1 - a) + g * a);
+        rgba[i + 2] = Math.min(255, rgba[i + 2] * (1 - a) + b * a);
+      }
+    }
+  }
+
+  function applyKawaii(rgba, w, h, opts, frameIdx) {
+    const intensity   = opts.intensity   != null ? opts.intensity   : 0.85;
+    const heartCount  = opts.heartCount  != null ? opts.heartCount  : 12;
+    const sparkleCount= opts.sparkleCount!= null ? opts.sparkleCount: 28;
+    const twinkleCount= opts.twinkleCount!= null ? opts.twinkleCount: 60;
+    const speed       = opts.speed       != null ? opts.speed       : 1.0;
+    const hueR = opts.hueR != null ? opts.hueR : 255;
+    const hueG = opts.hueG != null ? opts.hueG : 105;
+    const hueB = opts.hueB != null ? opts.hueB : 180;
+
+    /* Hearts — slow phase, big amplitude. Position drifts linearly so they
+       glide gently across the canvas instead of jittering. */
+    for (let i = 0; i < heartCount; i++) {
+      const seedX = _kawaiiHash(i, 0xBEEF);
+      const seedY = _kawaiiHash(i, 0xCAFE);
+      // Drift slowly: position = seed + frameIdx * driftSpeed
+      const dvx = ((_kawaiiHash(i, 0x1A1A) % 1000) / 1000 - 0.5) * 0.6;
+      const dvy = ((_kawaiiHash(i, 0x2B2B) % 1000) / 1000 - 0.5) * 0.4;
+      const px = ((seedX % w) + frameIdx * dvx + w * 1000) % w;
+      const py = ((seedY % h) + frameIdx * dvy + h * 1000) % h;
+      // Slow twinkle cycle, never fully off
+      const phase = (frameIdx * speed * 0.06 + i * 0.5);
+      const tw = Math.sin(phase) * 0.5 + 0.65;
+      const a = Math.max(0, Math.min(1, intensity * tw));
+      _kawaiiBlit(rgba, w, h, KAWAII_HEART, 8, 8, px | 0, py | 0, hueR, hueG, hueB, a);
+    }
+
+    /* Sparkles — medium count, faster twinkle. Use the brighter "4-point"
+       pattern; lighter pink hue. */
+    const spR = Math.min(255, hueR + 25);
+    const spG = Math.min(255, hueG + 60);
+    const spB = Math.min(255, hueB + 40);
+    for (let i = 0; i < sparkleCount; i++) {
+      const seedX = _kawaiiHash(i, 0xDEAD);
+      const seedY = _kawaiiHash(i, 0xFACE);
+      const px = seedX % w;
+      const py = seedY % h;
+      const phase = (frameIdx * speed * 0.18 + i * 0.7);
+      const tw = Math.sin(phase) * 0.5 + 0.5;
+      const a = Math.max(0, Math.min(1, intensity * tw * 0.9));
+      _kawaiiBlit(rgba, w, h, KAWAII_SPARKLE, 5, 5, px | 0, py | 0, spR, spG, spB, a);
+    }
+
+    /* Tiny twinkles — many, fastest. White-ish, brief flashes. */
+    const twR = 255, twG = 240, twB = 250;
+    for (let i = 0; i < twinkleCount; i++) {
+      const seedX = _kawaiiHash(i, 0xC0DE);
+      const seedY = _kawaiiHash(i, 0xBABE);
+      const px = seedX % w;
+      const py = seedY % h;
+      const phase = (frameIdx * speed * 0.32 + i * 1.1);
+      const tw = Math.sin(phase) * 0.5 + 0.5;
+      // Make them flicker — clamp at 0.4 floor for visibility
+      const a = Math.max(0, Math.min(1, intensity * Math.pow(tw, 2.5)));
+      if (a > 0.05) {
+        _kawaiiBlit(rgba, w, h, KAWAII_TWINKLE, 3, 3, px | 0, py | 0, twR, twG, twB, a);
+      }
+    }
+  }
 
   /* Pre-roll: advance stateful stages N frames before recording (CR-8). */
   function prerollFrames(n, capture, state, postOpts, runtime) {

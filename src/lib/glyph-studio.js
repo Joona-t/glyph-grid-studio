@@ -488,8 +488,18 @@
           speed: 1.0, slotMask: true, slotStrength: 0.20,
         };
       }
+      /* Kawaii overlay — soft pink hearts + sparkles. Default off so the
+         studio doesn't surprise users; enable per-piece via slider. */
+      if (!config.postprocess.kawaii) {
+        config.postprocess.kawaii = {
+          enabled: false, intensity: 0.85,
+          heartCount: 12, sparkleCount: 28, twinkleCount: 60,
+          speed: 1.0,
+          hueR: 255, hueG: 105, hueB: 180,
+        };
+      }
       var fPP = pane.addFolder({ title: 'Postprocess', expanded: false });
-      ['vignette', 'bloom', 'halation', 'scanlines', 'chromaticAberration', 'phosphorDecay', 'depthFog', 'crtBeam'].forEach(function (key) {
+      ['vignette', 'bloom', 'halation', 'scanlines', 'chromaticAberration', 'phosphorDecay', 'depthFog', 'crtBeam', 'kawaii'].forEach(function (key) {
         if (!config.postprocess[key]) return;
         var sub = fPP.addFolder({ title: key, expanded: false });
         var P = config.postprocess[key];
@@ -504,6 +514,13 @@
         if ('speed' in P) sub.addInput(P, 'speed', { min: 0.1, max: 4, step: 0.05 });
         if ('slotMask' in P) sub.addInput(P, 'slotMask');
         if ('slotStrength' in P) sub.addInput(P, 'slotStrength', { min: 0, max: 0.6, step: 0.01 });
+        // Kawaii-specific sliders
+        if ('heartCount' in P) sub.addInput(P, 'heartCount', { min: 0, max: 60, step: 1 });
+        if ('sparkleCount' in P) sub.addInput(P, 'sparkleCount', { min: 0, max: 120, step: 1 });
+        if ('twinkleCount' in P) sub.addInput(P, 'twinkleCount', { min: 0, max: 200, step: 1 });
+        if ('hueR' in P) sub.addInput(P, 'hueR', { min: 0, max: 255, step: 1, label: 'hue R' });
+        if ('hueG' in P) sub.addInput(P, 'hueG', { min: 0, max: 255, step: 1, label: 'hue G' });
+        if ('hueB' in P) sub.addInput(P, 'hueB', { min: 0, max: 255, step: 1, label: 'hue B' });
       });
     }
 

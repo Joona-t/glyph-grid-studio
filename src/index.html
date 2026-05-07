@@ -285,6 +285,12 @@
        piece.  inks[0] amber + inks[1] rust drive duotone lerp; inks[2]
        pale-gold + inks[3] deep-ember are used by atmospheric layers. */
     'spice':         { bg: '#0A0302', inks: ['#FFB347', '#E85D1A', '#FFE4A8', '#9C4A16'] },
+    /* Kawaii-pink — soft cream→blush→hot-pink→magenta gradient. Pairs
+       with the kawaii postprocess overlay (hearts + sparkles). All inks
+       are perceptually-uniform-ish in OKLab so gradient colorMode reads
+       as a smooth pink wash. inks[0] is the pale highlight, inks[3] the
+       deepest plum. */
+    'kawaii-pink':   { bg: '#FFF0F5', inks: ['#FFE4F0', '#FFB7DC', '#FF6FB8', '#C73E8E', '#7A1F4D'] },
   };
 
   function inkColor(config, i) {
@@ -1617,8 +1623,15 @@
     const ctx = drawingContext;
     const w = width, h = height;
     const imgData = ctx.getImageData(0, 0, w, h);
+    /* Pass frameIdx so frame-aware stages (kawaii overlay, crtBeam) can
+       drive their per-frame phase. recState.frameIdx during recording,
+       p5's frameCount otherwise. */
+    const frameIdx = (recState && typeof recState.frameIdx === 'number')
+      ? recState.frameIdx
+      : (frameCount - 1);
     GlyphGrid.crt.applyChain(imgData, crtState, CONFIG.postprocess, {
       prefersReducedMotion: window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+      frameIdx: frameIdx,
     });
     ctx.putImageData(imgData, 0, 0);
   }
@@ -2027,6 +2040,120 @@
       });
     }
     next();
+  };
+
+  /* =========================================================================
+     KAWAII VARIANTS — 10 curated looks using the new kawaii postprocess
+     overlay + kawaii-pink palette. Call as:
+       runKawaiiVariants('/abs/path/to/kawaii-output/')
+     Writes 10 GIFs into the supplied directory.
+     ========================================================================= */
+  window.runKawaiiVariants = function (baseDir) {
+    if (!baseDir) {
+      console.warn('runKawaiiVariants requires an absolute output directory.');
+      return;
+    }
+    if (!baseDir.endsWith('/')) baseDir += '/';
+
+    const PP_OFF = ['vignette','bloom','halation','scanlines',
+                    'chromaticAberration','phosphorDecay','depthFog','crtBeam','kawaii']
+      .reduce((o, k) => (o[k] = { enabled: false }, o), {});
+    const ppWith = (overrides) => Object.assign({}, PP_OFF, overrides);
+
+    const variants = [
+      // 1. Classic — soft cream + hot-pink gradient + steady kawaii overlay
+      { name: '01_classic', config: {
+          palette: 'kawaii-pink', colorMode: 'gradient', ramp: 'gradient',
+          dither: { mode: 'stbn', asSourcePrefilter: true, levels: 16 },
+          selectionMode: 'brightness',
+          postprocess: ppWith({ kawaii: { enabled: true, intensity: 0.85 } }),
+      }},
+      // 2. Dense hearts — more particles, bigger kawaii presence
+      { name: '02_dense-hearts', config: {
+          palette: 'kawaii-pink', colorMode: 'gradient', ramp: 'gradient',
+          dither: { mode: 'stbn' }, selectionMode: 'brightness',
+          postprocess: ppWith({ kawaii: { enabled: true, intensity: 0.95,
+                       heartCount: 36, sparkleCount: 70, twinkleCount: 120 } }),
+      }},
+      // 3. Pastel duotone — softer color split + kawaii
+      { name: '03_pastel-duotone', config: {
+          palette: 'kawaii-pink', colorMode: 'duotone', ramp: 'gradient',
+          dither: { mode: 'stbn' }, selectionMode: 'brightness',
+          postprocess: ppWith({ kawaii: { enabled: true, intensity: 0.75 } }),
+      }},
+      // 4. Dreamy bloom — heavy bloom + kawaii (glowing fuzz)
+      { name: '04_dreamy-bloom', config: {
+          palette: 'kawaii-pink', colorMode: 'gradient', ramp: 'gradient',
+          dither: { mode: 'temporal' }, selectionMode: 'brightness',
+          postprocess: ppWith({
+            bloom: { enabled: true, threshold: 0.55, intensity: 0.6, radius: 6 },
+            kawaii: { enabled: true, intensity: 0.85, heartCount: 14 },
+          }),
+      }},
+      // 5. Y2K pop — scanlines + kawaii (CD-ROM cute era)
+      { name: '05_y2k-pop', config: {
+          palette: 'kawaii-pink', colorMode: 'gradient', ramp: 'blockAscend',
+          dither: { mode: 'bayer8' }, selectionMode: 'brightness',
+          postprocess: ppWith({
+            scanlines: { enabled: true, period: 2 },
+            kawaii: { enabled: true, intensity: 0.9, heartCount: 20 },
+          }),
+      }},
+      // 6. Charcoal cute — cream-paper pencil-sketch with kawaii sparkles
+      { name: '06_charcoal-cute', config: {
+          palette: 'cream-paper', colorMode: 'monochrome', ramp: 'gradient',
+          dither: { mode: 'stbn' },
+          selectionMode: 'shape-edge-aware', glyphSet: 'octant',
+          postprocess: ppWith({ kawaii: { enabled: true, intensity: 0.75,
+                       hueR: 230, hueG: 100, hueB: 160, heartCount: 10, sparkleCount: 25 } }),
+      }},
+      // 7. Pink CRT — full CRT-beam + kawaii overlay (kawaii on a TV)
+      { name: '07_pink-CRT', config: {
+          palette: 'kawaii-pink', colorMode: 'gradient', ramp: 'gradient',
+          dither: { mode: 'temporal' }, selectionMode: 'brightness',
+          postprocess: ppWith({
+            crtBeam: { enabled: true, intensity: 0.4, slotMask: true, slotStrength: 0.18 },
+            kawaii: { enabled: true, intensity: 0.85 },
+          }),
+      }},
+      // 8. Minimalist — sparse glyphs + sparing kawaii
+      { name: '08_minimalist', config: {
+          palette: 'kawaii-pink', colorMode: 'monochrome', ramp: 'sparse',
+          dither: { mode: 'none' }, selectionMode: 'brightness',
+          postprocess: ppWith({ kawaii: { enabled: true, intensity: 0.6,
+                       heartCount: 6, sparkleCount: 14, twinkleCount: 28 } }),
+      }},
+      // 9. Max cute — everything turned up
+      { name: '09_max-cute', config: {
+          palette: 'kawaii-pink', colorMode: 'gradient', ramp: 'gradient',
+          dither: { mode: 'stbn' }, selectionMode: 'brightness',
+          postprocess: ppWith({
+            halation: { enabled: true, threshold: 0.5, intensity: 0.4, radius: 5 },
+            bloom: { enabled: true, threshold: 0.6, intensity: 0.4, radius: 4 },
+            kawaii: { enabled: true, intensity: 1.0, heartCount: 32,
+                      sparkleCount: 60, twinkleCount: 100 },
+          }),
+      }},
+      // 10. Holographic — chromatic aberration + kawaii (iridescent shift)
+      { name: '10_holographic', config: {
+          palette: 'kawaii-pink', colorMode: 'gradient', ramp: 'gradient',
+          dither: { mode: 'stbn' }, selectionMode: 'brightness',
+          postprocess: ppWith({
+            chromaticAberration: { enabled: true, amount: 1.5 },
+            kawaii: { enabled: true, intensity: 0.85, heartCount: 16 },
+          }),
+      }},
+    ];
+
+    const jobs = variants.map(v => ({
+      ...v, frames: 32,
+      path: baseDir + 'kawaii_' + v.name + '.gif',
+    }));
+    console.log('runKawaiiVariants:', jobs.length, 'jobs →', baseDir);
+    window.__glyphGridTest.runBatchExport(jobs, {
+      onProgress: (i, n, name) => console.log('  ', i + '/' + n, name),
+      onComplete: (r) => console.log('KAWAII DONE — ok=' + r.ok + ', errors=' + r.errors.length),
+    });
   };
 
   /* Studio UI — Tweakpane-based live tuning. Opt-in via CONFIG.studio.enabled. */
