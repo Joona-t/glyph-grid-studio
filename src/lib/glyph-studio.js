@@ -706,14 +706,33 @@
        the GIF format's 10 ms quantization).  Encoder is gifski (shared
        palette across frames + error-diffusion dithering at quality 100,
        lossless for our limited-palette glyph art).  Optional cap-width
-       resize is applied by gifski itself before quantisation. */
+       resize is applied by gifski itself before quantisation.
+
+       Loop-clean fix: override CONFIG.animation.fps to the effective
+       fps (1000 / delayMs) for the duration of the recording.  Without
+       this override, the studio's animation timeline advances at the
+       slider fps (e.g. 30) but the output GIF plays at the cs-quantised
+       rate (e.g. 33.33 if delay rounds to 30 ms).  The mismatch makes
+       the last few captured frames overshoot the source loop, then the
+       output GIF wraps and replays the same source frames it just
+       showed — that's the stutter.  Forcing the studio to render at
+       the same effective rate the GIF will play at means each captured
+       frame represents exactly one delayMs of animation time, and the
+       last captured frame lands precisely at duration - delayMs. */
     fExp.addButton({ title: inTauri ? 'Export GIF' : 'Export GIF (ZIP fallback)' }).on('click', function () {
       var p = exportPlan();
       var capW = sizeOpts.capWidth || 0;
-      console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : ''));
+      var savedFps = config.animation.fps;
+      config.animation.fps = p.effFps;
+      console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps overridden ' + savedFps + ' → ' + p.effFps.toFixed(2) + ' for clean loop');
       recordGIF(opts.testHook, p.frames,
         function (i, total) { console.log('  ', i, '/', total); },
-        function () { console.log('glyph-studio: recording finished'); },
+        function () {
+          /* Always restore — finally-style — even if encoding errored. */
+          config.animation.fps = savedFps;
+          try { pane.refresh(); } catch (e) {}
+          console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
+        },
         p.delayMs,
         capW > 0 ? capW : null);
     });

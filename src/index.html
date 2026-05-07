@@ -2971,6 +2971,20 @@
         // Force loop on so draw() advances
         try { loop(); } catch (e) {}
 
+        /* Loop-clean fix: when delay_ms doesn't divide 1000 evenly (e.g.
+           30 fps wants 33.33 ms but rounds to 30 ms = 3 cs), the GIF
+           output plays back at effFps = 1000/delayMs, not at the slider's
+           nominal fps.  If we don't sync the studio's animation timeline
+           to the same effFps, the captured frames overshoot the source
+           loop and the output GIF stutters at the wrap point.  Override
+           CONFIG.animation.fps for the duration of this job, restore
+           after the encoder finishes. */
+        const userFps = (CONFIG.animation && CONFIG.animation.fps) || 24;
+        const delayMs = Math.max(20, Math.round(1000 / userFps / 10) * 10);
+        const effFps = 1000 / delayMs;
+        const savedFps = CONFIG.animation.fps;
+        CONFIG.animation.fps = effFps;
+
         setTimeout(() => {
           self.beginRecord({
             total: job.frames || 24,
@@ -2981,26 +2995,27 @@
               if (!frames.length) {
                 console.warn('batch: empty frames for', job.name);
                 errors.push({ name: job.name, err: 'no-frames' });
+                CONFIG.animation.fps = savedFps;       // restore even on no-frames error
                 idx++;
                 setTimeout(next, 50);
                 return;
               }
-              const fps = (CONFIG.animation && CONFIG.animation.fps) || 24;
-              const delay = Math.round(1000 / fps);
               tauri('save_gif_to_path', {
                 frames: frames.map(b => ({ b64: b })),
-                delayMs: delay,
+                delayMs: delayMs,
                 path: job.path,
                 capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
               })
               .then(p => {
                 console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);
+                CONFIG.animation.fps = savedFps;     // restore on success
                 idx++;
                 setTimeout(next, 50);
               })
               .catch(e => {
                 console.warn('batch: save failed', job.name, e);
                 errors.push({ name: job.name, err: String(e) });
+                CONFIG.animation.fps = savedFps;     // restore on encoder failure
                 idx++;
                 setTimeout(next, 50);
               });
