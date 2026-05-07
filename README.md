@@ -49,7 +49,7 @@ Drop image into the window, slide sliders, watch the canvas update live, click E
 
 ### As an agent / script — headless CLI
 
-Same rendering pipeline, no GUI. Runs in a hidden Tauri window, exits when the GIF is written.
+Same rendering pipeline, no GUI. Runs in an off-screen Tauri window, exits when the GIF is written.
 
 ```bash
 # Single render with explicit flags
@@ -71,7 +71,26 @@ glyph-grid-studio catalog | jq
 glyph-grid-studio render --help
 ```
 
-The CLI is composable with any AI agent that has shell access. Future v0.3 will ship an MCP server so the studio shows up as a native tool in Claude Desktop / Cursor (see `AGENT-INTEGRATION-PLAN.md`).
+### As a Claude / Cursor tool — MCP server
+
+Wire it into any MCP-aware AI client and the renderer becomes a native tool. Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "glyph-grid-studio": {
+      "command": "/Applications/Glyph Grid Studio.app/Contents/MacOS/glyph-grid-studio",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop. Then in any chat:
+
+> *"Render the image at ~/Pictures/sunset.jpg as a cream-paper monochrome glyph drawing using shape-edge-aware octant selection. Save it next to the original."*
+
+Tools exposed: `glyph_grid_render`, `glyph_grid_catalog`. Full setup + agentic-exploration examples in [docs/mcp.md](docs/mcp.md).
 
 ## Build
 

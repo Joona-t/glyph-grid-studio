@@ -159,7 +159,7 @@
        tone tan washes. */
     colorMode: 'monochrome',
     palette: 'cream-paper',
-    scene: 'eronChip',
+    scene: 'studio',
     animation: { fps: 30, duration: 6.0, loop: true },
     seed: 1337,
     record: false,
@@ -296,17 +296,12 @@
   /* =================================================================
      ASSETS
      ================================================================= */
-  let sparkyImg = null;
-  let eronImg = null;       /* generic source-image slot — fed by drag-drop / Pick image */
+  let sourceImg = null;       /* source image — fed by drag-drop / Pick image */
+  let sparkyImg = null;       /* optional mascot used by the sparkyPortrait scene */
   function preload() {
-    /* No source image at startup — the studio launches blank.
-       The user supplies one via drag-drop or the Pick image… button.
-       sparkyImg is kept for legacy scenes that compose with the mascot. */
-    sparkyImg = loadImage(
-      'assets/sparky.png',
-      () => { /* ok */ },
-      () => { sparkyImg = null; }
-    );
+    /* No bundled source image — the studio launches blank with a
+       "Drop an image to start" placeholder. The user supplies one via
+       drag-drop or the Pick image… button in the panel. */
   }
 
   /* =================================================================
@@ -481,7 +476,7 @@
        just the photograph + atmospheric drifting motes + soft warm
        haze + faint starfield.  No HUD, no reticle, no scan bands —
        the image carries the composition. */
-    eronChip(g, t, config) {
+    studio(g, t, config) {
       const W = g.width, H = g.height;
       const loopPhase = (t / config.animation.duration) * Math.PI * 2;
       const u = ((t / config.animation.duration) % 1 + 1) % 1;
@@ -506,12 +501,12 @@
                   enough that they survive the per-cell averaging at
                   the chosen grid density. Face zone (upper half) gets
                   an extra contrast boost on top. ----- */
-      if (eronImg && eronImg.width > 0) {
-        if (!this.__eronProcessed) {
-          const W0 = eronImg.width, H0 = eronImg.height;
+      if (sourceImg && sourceImg.width > 0) {
+        if (!this.__sourceProcessed) {
+          const W0 = sourceImg.width, H0 = sourceImg.height;
           const buf = createGraphics(W0, H0);
           buf.pixelDensity(1);
-          buf.image(eronImg, 0, 0);
+          buf.image(sourceImg, 0, 0);
           buf.loadPixels();
           const px = buf.pixels;
           /* Step A — copy luminance into a flat array for a 3×3 box blur,
@@ -682,9 +677,9 @@
             }
           }
           buf.updatePixels();
-          this.__eronProcessed = buf;
+          this.__sourceProcessed = buf;
         }
-        const srcImg = this.__eronProcessed;
+        const srcImg = this.__sourceProcessed;
         const imgAspect = srcImg.width / srcImg.height;
         const canvasAspect = W / H;
         let dw, dh, dx, dy;
@@ -722,9 +717,9 @@
                   stage tints far cells toward the cool fog colour,
                   pushing the face into atmospheric haze.  Cached. ----- */
       if (config.depth && config.depth.enabled) {
-        if (!this.__eronDepth) {
-          this.__eronDepth = createGraphics(W, H);
-          const d = this.__eronDepth;
+        if (!this.__sourceDepth) {
+          this.__sourceDepth = createGraphics(W, H);
+          const d = this.__sourceDepth;
           d.background(0);
           d.noStroke();
           /* face / upper background — push to 0.10 (very far) so depth
@@ -754,7 +749,7 @@
           d.rect(0, 0, W, H * 0.06);
           d.rect(0, H * 0.94, W, H * 0.06);
         }
-        return { depth: this.__eronDepth };
+        return { depth: this.__sourceDepth };
       }
     },
 
@@ -904,7 +899,7 @@
 
     /* Empty-state placeholder — no source image loaded yet.  Show a clear
        "drop or pick" message instead of running the scene against null. */
-    if (!eronImg || !eronImg.width) {
+    if (!sourceImg || !sourceImg.width) {
       background(bgColor(CONFIG));
       noStroke();
       const fg = (CONFIG.palette === 'cream-paper') ? color(60, 50, 40) : color(220, 215, 205);
@@ -1227,12 +1222,27 @@
     const cellPxH = Math.max(1, Math.floor(cellH));
 
     /* Studio-mode safety: if grid dimensions changed via slider since
-       setup(), our per-cell buffers are sized wrong.  Re-allocate. */
+       setup(), our per-cell buffers are sized wrong.  Re-allocate.
+
+       Bug fix B1 — when the EMA buffer needs resizing (cols/rows slider
+       scrub), preserve as much of the previous breathing state as
+       possible so the canvas doesn't visibly "freeze and reset."
+       Strategy: fill the new buffer with a neutral 0.5 mid-tone, then
+       copy the overlap region from the old buffer.  Breathing extends
+       or contracts gracefully instead of resetting to flat. */
     const want = cols * rows;
     if (!cellSignal || cellSignal.length !== want) cellSignal = new Float32Array(want);
     if (!cellCpGrid || cellCpGrid.length !== want) cellCpGrid = new Uint16Array(want);
     if (!cellDepth || cellDepth.length !== want) cellDepth = new Float32Array(want);
-    if (cellSignalEma && cellSignalEma.length !== want) cellSignalEma = null;
+    if (cellSignalEma && cellSignalEma.length !== want) {
+      const oldEma = cellSignalEma;
+      cellSignalEma = new Float32Array(want).fill(0.5);
+      // Copy overlap (linear copy is fine — breathing is a per-cell signal,
+      // and adjacent cells' values are similar enough that a 1D copy reads
+      // as continuous even when the grid reshapes).
+      const n = Math.min(oldEma.length, cellSignalEma.length);
+      for (let i = 0; i < n; i++) cellSignalEma[i] = oldEma[i];
+    }
 
     /* Step 1+2: linearize source to per-pixel luminance (Rec.709 on linear sRGB, CR-1). */
     linearizeToLuminance(pixels, lumBuf, srcW, srcH);
@@ -1774,8 +1784,17 @@
   /* =========================================================================
      Test batch driver — bake all test phases into the build so the dev
      console only needs `runStudioPhase(N)` to kick off the run.
+
+     The output base directory defaults to the user's Documents folder via
+     a window global that callers can override before invoking the driver:
+       window.GLYPH_TEST_BASE = '/some/other/path/';
+       runStudioPhase(1);
+     If unset, `runStudioPhasesAt([1,...], '/abs/dir/')` is the cleaner
+     entry point for non-default locations.
      ========================================================================= */
-  const TEST_BASE = '/Users/darkfire/Documents/Glyph Grid Studio Test/';
+  const TEST_BASE = (typeof window !== 'undefined' && window.GLYPH_TEST_BASE)
+    ? window.GLYPH_TEST_BASE
+    : null;
   const PHASES = {
     1: {
       dir: '01-palette-colormode-dither/',
@@ -1923,6 +1942,11 @@
   };
 
   window.runStudioPhase = function (n) {
+    if (!TEST_BASE) {
+      console.warn('runStudioPhase requires window.GLYPH_TEST_BASE to be set ' +
+        'to an absolute output directory, OR call runStudioPhasesAt([n], baseDir) instead.');
+      return;
+    }
     const phase = PHASES[n];
     if (!phase) { console.warn('unknown phase', n); return; }
     const jobs = phase.jobs.map(j => ({
@@ -1942,6 +1966,11 @@
     });
   };
   window.runAllStudioPhases = function () {
+    if (!TEST_BASE) {
+      console.warn('runAllStudioPhases requires window.GLYPH_TEST_BASE to be set ' +
+        'to an absolute output directory, OR call runStudioPhasesAt([1,...,9], baseDir).');
+      return;
+    }
     const order = [1, 2, 3, 4, 5, 6, 7, 8, 9];
     let i = 0;
     function next() {
@@ -2008,11 +2037,11 @@
     palettes: PALETTES,
     ramps: RAMPS,
     testHook: window.__glyphGridTest,
-    sceneCacheKeys: ['__eronProcessed'],
+    sceneCacheKeys: ['__sourceProcessed'],
     imageRef: {
-      name: 'eronImg',
+      name: 'sourceImg',
       set: function (img) {
-        eronImg = img;
+        sourceImg = img;
         /* Image just landed — make sure the draw loop is alive even if a
            previous setting (or the empty-state placeholder branch) had it
            paused.  No-op if already looping. */
@@ -2063,7 +2092,7 @@
     await new Promise(function (resolve, reject) {
       window.loadImage(dataUrl, function (img) {
         console.log('CLI: image decoded', img.width + 'x' + img.height);
-        eronImg = img;
+        sourceImg = img;
         try { loop(); } catch (e) {}
         resolve();
       }, function (err) {

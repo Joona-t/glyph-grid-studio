@@ -18,7 +18,7 @@
          testHook: window.__glyphGridTest                  — required for record
          palettes: PALETTES                                — for the palette dropdown
          ramps:    RAMPS                                   — for the ramp dropdown
-         sceneCacheKeys: ['__cloudProcessed', '__eronProcessed', …]
+         sceneCacheKeys: ['__sourceProcessed', '__sourceDepth', …]
                    keys inside the SCENES[name] container that hold
                    cached p5.Graphics buffers. Cleared on image swap.
        }
@@ -184,38 +184,32 @@
           for (var name in window.SCENES) {
             if (window.SCENES[name][sceneCacheKeys[i]]) {
               delete window.SCENES[name][sceneCacheKeys[i]];
-              console.log('glyph-studio: cleared scene cache', name, sceneCacheKeys[i]);
             }
           }
         }
       }
     }
     function loadFromFilePath(absPath) {
-      console.log('glyph-studio: loadFromFilePath', absPath);
       if (!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)) {
         console.warn('glyph-studio: Tauri core unavailable, cannot read file');
         return;
       }
       window.__TAURI__.core.invoke('read_image_file', { path: absPath })
         .then(function (dataUrl) {
-          console.log('glyph-studio: read_image_file ok, decoding…');
           window.loadImage(dataUrl, function (img) {
-            console.log('glyph-studio: image decoded', img.width, 'x', img.height);
             imageRef.set(img);
             clearSceneCaches();
             if (onSwap) onSwap(img);
-          }, function (err) { console.warn('glyph-studio: tauri-drop decode failed', err); });
+          }, function (err) { console.warn('glyph-studio: image decode failed', err); });
         })
         .catch(function (e) { console.warn('glyph-studio: read_image_file failed:', e); });
     }
     if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen) {
-      console.log('glyph-studio: registering Tauri drag-drop listeners');
       var enterEvents = ['tauri://drag-enter', 'tauri://file-drop-hover', 'tauri://drag-over'];
       var leaveEvents = ['tauri://drag-leave', 'tauri://file-drop-cancelled', 'tauri://drag-cancelled'];
       var dropEvents  = ['tauri://drag-drop',  'tauri://file-drop'];
       enterEvents.forEach(function (name) {
-        window.__TAURI__.event.listen(name, function (evt) {
-          console.log('glyph-studio: enter event', name, evt && evt.payload);
+        window.__TAURI__.event.listen(name, function () {
           overlay.style.borderColor = 'rgba(255,180,80,0.85)';
           overlay.style.pointerEvents = 'auto';
         });
@@ -236,13 +230,10 @@
           if (p && Array.isArray(p)) paths = p;
           else if (p && Array.isArray(p.paths)) paths = p.paths;
           else if (typeof p === 'string') paths = [p];
-          console.log('glyph-studio: drop event', name, 'paths:', paths);
           if (paths.length) loadFromFilePath(paths[0]);
           else console.warn('glyph-studio: drop event with no paths in payload', p);
         });
       });
-    } else {
-      console.log('glyph-studio: Tauri event API not available — DOM drag-drop only');
     }
   }
 

@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
+pub mod mcp;
+
 /* ============================================================================
  *  CLI / headless-render plumbing.
  *

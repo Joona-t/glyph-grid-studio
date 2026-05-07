@@ -25,6 +25,11 @@ enum Command {
 
     /// Print the catalog of available palettes / ramps / dithers / glyph sets / postprocess stages.
     Catalog,
+
+    /// Run the MCP server (Model Context Protocol over stdio JSON-RPC).
+    /// Wire this into Claude Desktop / Cursor via their MCP config; tools then
+    /// appear as `glyph_grid_render` and `glyph_grid_catalog`.
+    Mcp,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -120,6 +125,15 @@ fn main() {
         }
         Some(Command::Catalog) => {
             println!("{}", app_lib::catalog_json());
+        }
+        Some(Command::Mcp) => {
+            // MCP server is async; spin up a tokio runtime ad-hoc for it.
+            // GUI / Render modes don't need tokio so we don't pay for it there.
+            let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
+            if let Err(e) = rt.block_on(app_lib::mcp::run()) {
+                eprintln!("MCP server error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }
