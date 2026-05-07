@@ -556,7 +556,7 @@
        ring buffer. */
     if (window.__perfReport) {
       var fPerf = pane.addFolder({ title: 'Perf', expanded: false });
-      var perfState = { total: 0, scene: 0, lum: 0, downsample: 0, ema: 0, dither: 0, grid: 0, postproc: 0, lastSwitch: '—' };
+      var perfState = { total: 0, scene: 0, lum: 0, downsample: 0, ema: 0, dither: 0, grid: 0, select: 0, draw: 0, postproc: 0, lastSwitch: '—' };
       fPerf.addMonitor(perfState, 'total', { label: 'total ms' });
       fPerf.addMonitor(perfState, 'scene', { label: 'scene ms' });
       fPerf.addMonitor(perfState, 'lum', { label: 'lum ms' });
@@ -564,6 +564,8 @@
       fPerf.addMonitor(perfState, 'ema', { label: 'ema ms' });
       fPerf.addMonitor(perfState, 'dither', { label: 'dither ms' });
       fPerf.addMonitor(perfState, 'grid', { label: 'grid ms' });
+      fPerf.addMonitor(perfState, 'select', { label: '  select ms' });
+      fPerf.addMonitor(perfState, 'draw', { label: '  draw ms' });
       fPerf.addMonitor(perfState, 'postproc', { label: 'postproc ms' });
       fPerf.addMonitor(perfState, 'lastSwitch', { label: 'last switch' });
       fPerf.addButton({ title: 'Report (console)' }).on('click', function () { window.__perfReport(); });
@@ -573,7 +575,7 @@
       setInterval(function () {
         var ring = window.__perfRing && window.__perfRing();
         if (!ring || !ring.length) return;
-        var sum = { total: 0, scene: 0, _lum: 0, _downsample: 0, _ema: 0, _dither: 0, grid: 0, postprocess: 0 };
+        var sum = { total: 0, scene: 0, _lum: 0, _downsample: 0, _ema: 0, _dither: 0, grid: 0, _select: 0, _draw: 0, postprocess: 0 };
         for (var i = 0; i < ring.length; i++) {
           sum.total += ring[i].total;
           sum.scene += ring[i].stages.scene || 0;
@@ -582,6 +584,8 @@
           sum._ema += ring[i].stages._ema || 0;
           sum._dither += ring[i].stages._dither || 0;
           sum.grid += ring[i].stages.grid || 0;
+          sum._select += ring[i].stages._select || 0;
+          sum._draw += ring[i].stages._draw || 0;
           sum.postprocess += ring[i].stages.postprocess || 0;
         }
         var n = ring.length;
@@ -592,6 +596,8 @@
         perfState.ema = +(sum._ema / n).toFixed(1);
         perfState.dither = +(sum._dither / n).toFixed(1);
         perfState.grid = +(sum.grid / n).toFixed(1);
+        perfState.select = +(sum._select / n).toFixed(1);
+        perfState.draw = +(sum._draw / n).toFixed(1);
         perfState.postproc = +(sum.postprocess / n).toFixed(1);
       }, 500);
     }
