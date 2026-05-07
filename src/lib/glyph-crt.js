@@ -361,11 +361,17 @@
     if (postOpts.barrel && postOpts.barrel.enabled) {
       applyBarrel(d, w, h, postOpts.barrel);
     }
-    if (postOpts.vignette && postOpts.vignette.enabled) {
-      applyVignette(d, w, h, postOpts.vignette);
-    }
-    if (postOpts.letterbox && postOpts.letterbox.enabled) {
-      applyLetterbox(d, w, h, postOpts.letterbox);
+    /* Vignette + letterbox are pure mask multiplies; the host can apply
+       them as canvas2D composite overlays after putImageData (avoids the
+       per-pixel JS multiply when those are the only enabled stages).
+       Set runtime.skipOverlays = true to skip them here. */
+    if (!runtime.skipOverlays) {
+      if (postOpts.vignette && postOpts.vignette.enabled) {
+        applyVignette(d, w, h, postOpts.vignette);
+      }
+      if (postOpts.letterbox && postOpts.letterbox.enabled) {
+        applyLetterbox(d, w, h, postOpts.letterbox);
+      }
     }
     /* Kawaii overlay — drawn LAST so the hearts + sparkles stay on top
        of the glyph grid. Frame-aware via runtime.frameIdx so they twinkle

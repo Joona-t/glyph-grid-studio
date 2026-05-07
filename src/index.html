@@ -2394,22 +2394,112 @@
     });
   }
 
-  /* ---- post-process (v2 only). ---- */
+  /* ---- post-process (v2 only). ----
+
+     Two-phase pipeline:
+
+     Phase A — imgData stages (bloom, halation, scanlines, chromatic aberration,
+       barrel, godRays, phosphorDecay, crtBeam, kawaii). These genuinely need
+       per-pixel JS work over the rgba buffer, so we still pay one
+       getImageData/putImageData round-trip when any of them is enabled.
+
+     Phase B — overlay stages (vignette, letterbox). These are pure mask
+       multiplies / black bars; we apply them via canvas2D composite operations
+       AFTER putImageData, so we never read pixel data back to JS for them.
+
+     For the user's default config (vignette only) Phase A is skipped entirely.
+     The 38ms postproc-stage regression we saw in shape-edge-aware mode came
+     from the readback, not from the per-pixel work — so skipping the readback
+     is the actual fix. */
+
+  /* Vignette as a canvas2D 'multiply' overlay.  Pre-builds a w×h canvas where
+     each pixel encodes the `1 - s·r²` darken factor (radial falloff matching
+     applyVignette in glyph-crt.js byte-for-byte).  Cached by (w, h, strength);
+     rebuilt only when any of those changes — i.e. on canvas resize or
+     strength slider adjustment. */
+  let _vignetteOverlay = null;       // { canvas, key }
+  function _ensureVignetteOverlay(w, h, strength) {
+    const key = w + 'x' + h + ':' + strength;
+    if (_vignetteOverlay && _vignetteOverlay.key === key) return _vignetteOverlay;
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const imgData = ctx.createImageData(w, h);
+    const d = imgData.data;
+    const cx = w * 0.5, cy = h * 0.5;
+    const maxR = Math.hypot(cx, cy);
+    for (let y = 0; y < h; y++) {
+      const dy = y - cy;
+      const dy2 = dy * dy;
+      for (let x = 0; x < w; x++) {
+        const dx = x - cx;
+        const r = Math.sqrt(dx * dx + dy2) / maxR;
+        const darken = 1 - strength * r * r;
+        const v = (darken * 255) | 0;
+        const i = (y * w + x) * 4;
+        d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255;
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+    _vignetteOverlay = { canvas: canvas, key: key };
+    return _vignetteOverlay;
+  }
+
+  function _hasImgDataStages(p) {
+    if (!p) return false;
+    return !!(
+      (p.phosphorDecay && p.phosphorDecay.enabled) ||
+      (p.crtBeam && p.crtBeam.enabled) ||
+      (p.halation && p.halation.enabled) ||
+      (p.bloom && p.bloom.enabled) ||
+      (p.godRays && p.godRays.enabled) ||
+      (p.scanlines && p.scanlines.enabled) ||
+      (p.chromaticAberration && p.chromaticAberration.enabled) ||
+      (p.barrel && p.barrel.enabled) ||
+      (p.kawaii && p.kawaii.enabled)
+    );
+  }
+
   function applyPostprocess() {
     const ctx = drawingContext;
     const w = width, h = height;
-    const imgData = ctx.getImageData(0, 0, w, h);
-    /* Pass frameIdx so frame-aware stages (kawaii overlay, crtBeam) can
-       drive their per-frame phase. recState.frameIdx during recording,
-       p5's frameCount otherwise. */
+    const post = CONFIG.postprocess || {};
     const frameIdx = (recState && typeof recState.frameIdx === 'number')
       ? recState.frameIdx
       : (frameCount - 1);
-    GlyphGrid.crt.applyChain(imgData, crtState, CONFIG.postprocess, {
-      prefersReducedMotion: window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
-      frameIdx: frameIdx,
-    });
-    ctx.putImageData(imgData, 0, 0);
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    /* Phase A — only when any imgData stage is active. */
+    if (_hasImgDataStages(post)) {
+      const imgData = ctx.getImageData(0, 0, w, h);
+      GlyphGrid.crt.applyChain(imgData, crtState, post, {
+        prefersReducedMotion: reduced,
+        frameIdx: frameIdx,
+        skipOverlays: true,            /* vignette + letterbox handled below */
+      });
+      ctx.putImageData(imgData, 0, 0);
+    }
+
+    /* Phase B — overlays. drawImage with composite op; no readback. */
+    if (post.vignette && post.vignette.enabled) {
+      const strength = typeof post.vignette.strength === 'number' ? post.vignette.strength : 0.5;
+      if (strength > 0.001) {
+        const overlay = _ensureVignetteOverlay(w, h, strength);
+        const prevOp = ctx.globalCompositeOperation;
+        ctx.globalCompositeOperation = 'multiply';
+        ctx.drawImage(overlay.canvas, 0, 0);
+        ctx.globalCompositeOperation = prevOp;
+      }
+    }
+    if (post.letterbox && post.letterbox.enabled) {
+      const ratio = typeof post.letterbox.ratio === 'number' ? post.letterbox.ratio : 0;
+      if (ratio > 0.001) {
+        const barH = (h * ratio) | 0;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, w, barH);
+        ctx.fillRect(0, h - barH, w, barH);
+      }
+    }
   }
 
   /* =================================================================
