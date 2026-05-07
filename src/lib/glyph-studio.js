@@ -471,10 +471,18 @@
       },
     }).on('change', function (e) {
       config.glyphSet = e.value === 'null' ? null : e.value;
-      /* Re-trigger the font loader so the cascade picks up the new set
-         (Stage 2A — trust the explicit choice). */
+      /* Stage 2A trustRequested: the renderer reads config.glyphSet
+         live + uses the bundled fonts via the always-loaded cssStack;
+         no async font reload needed on switch. The previous version
+         called clearCache + load() which awaited 3 waitForFace promises
+         (3s + 1.5s + 1.5s timeouts) and made the UI freeze for 1–6s
+         on every glyphSet switch. That was the wrong path — the fonts
+         are physically the same WOFF2 files for every glyphSet; only
+         the requestedSet metadata changes. Re-issue load() WITHOUT
+         clearing the cache so subsequent calls hit the descriptor cache
+         (or do a fast availability re-probe + return). The renderer's
+         next frame picks up config.glyphSet automatically. */
       if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
-        window.GlyphGrid.fonts.clearCache && window.GlyphGrid.fonts.clearCache();
         window.GlyphGrid.fonts.load({
           sizePx: config.font.size,
           glyphSet: config.glyphSet || 'ascii',
