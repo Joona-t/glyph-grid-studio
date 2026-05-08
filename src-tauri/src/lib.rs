@@ -269,6 +269,70 @@ struct GifFrame {
     b64: String,
 }
 
+/// Bordered-export config passed from JS.  When `enabled` is true and
+/// `width > 0`, frames get a palette-bg matte band of `width` px on all
+/// four sides before encoding.  v0.1.1 supports `style: "solid"` only;
+/// v0.1.2 will add `inner-line`, `passepartout`, and `deckle`.
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
+struct BorderConfig {
+    enabled: bool,
+    width: u32,
+    style: String,
+    #[serde(rename = "bgColor")]
+    bg_color: String,
+    #[serde(rename = "inkColor")]
+    ink_color: String,
+}
+
+fn parse_hex_rgb(s: &str) -> (u8, u8, u8) {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() == 6 {
+        if let (Ok(r), Ok(g), Ok(b)) = (
+            u8::from_str_radix(&s[0..2], 16),
+            u8::from_str_radix(&s[2..4], 16),
+            u8::from_str_radix(&s[4..6], 16),
+        ) {
+            return (r, g, b);
+        }
+    }
+    // Default: cream-paper bg.
+    (232, 221, 200)
+}
+
+/// Wrap an RGBA frame in a palette-bg matte band of `border.width` px on
+/// all four sides.  Output dims are even (yuv420p compatibility).
+/// Returns the input image unmodified if the border is disabled or
+/// width is 0.  Currently only the `solid` style is implemented;
+/// unknown styles fall back to solid.
+fn apply_border(img: image::RgbaImage, border: &BorderConfig) -> image::RgbaImage {
+    if !border.enabled || border.width == 0 {
+        return img;
+    }
+    let bw = (border.width / 2) * 2; // even
+    let (src_w, src_h) = (img.width(), img.height());
+    let new_w_raw = src_w + 2 * bw;
+    let new_h_raw = src_h + 2 * bw;
+    let new_w = (new_w_raw / 2) * 2;
+    let new_h = (new_h_raw / 2) * 2;
+
+    let (r, g, b) = parse_hex_rgb(&border.bg_color);
+    let mut out = image::RgbaImage::from_pixel(new_w, new_h, image::Rgba([r, g, b, 255]));
+
+    let dst_x = (new_w - src_w) / 2;
+    let dst_y = (new_h - src_h) / 2;
+
+    // Copy source into the centred region.
+    for y in 0..src_h {
+        for x in 0..src_w {
+            let p = img.get_pixel(x, y);
+            out.put_pixel(dst_x + x, dst_y + y, *p);
+        }
+    }
+
+    out
+}
+
 /// Save a single PNG snapshot to disk, prompting the user via a native
 /// save dialog. `data_url` is the canvas.toDataURL('image/png') string.
 #[tauri::command]
@@ -314,6 +378,7 @@ fn encode_gif_gifski(
     frames: &[GifFrame],
     delay_ms: u32,
     cap_width: Option<u32>,
+    border: Option<&BorderConfig>,
 ) -> Result<Vec<u8>, String> {
     if frames.is_empty() {
         return Err("no frames provided".into());
@@ -330,15 +395,20 @@ fn encode_gif_gifski(
 
     // Decode all frames up-front. PNG decode is fast; doing it before
     // launching the collector thread lets us surface decode errors
-    // synchronously.
+    // synchronously.  Border (if enabled) is applied after decode so the
+    // matte expands the source dims; gifski then resizes the bordered
+    // frame to cap_width preserving the new aspect.
     let mut decoded: Vec<(imgref::ImgVec<rgb::RGBA8>, f64)> = Vec::with_capacity(frames.len());
     for (idx, f) in frames.iter().enumerate() {
         let bytes = general_purpose::STANDARD
             .decode(&f.b64)
             .map_err(|e| format!("frame {} b64: {}", idx, e))?;
-        let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        let mut img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
             .map_err(|e| format!("frame {} decode: {}", idx, e))?
             .to_rgba8();
+        if let Some(b) = border {
+            img = apply_border(img, b);
+        }
         let (w, h) = (img.width() as usize, img.height() as usize);
         let pixels: Vec<rgb::RGBA8> = img
             .pixels()
@@ -391,8 +461,9 @@ async fn save_gif_real(
     frames: Vec<GifFrame>,
     delay_ms: u32,
     cap_width: Option<u32>,
+    border: Option<BorderConfig>,
 ) -> Result<String, String> {
-    let gif_buf = encode_gif_gifski(&frames, delay_ms, cap_width)?;
+    let gif_buf = encode_gif_gifski(&frames, delay_ms, cap_width, border.as_ref())?;
 
     let path: Option<PathBuf> = app
         .dialog()
@@ -420,8 +491,9 @@ async fn save_gif_to_path(
     delay_ms: u32,
     path: String,
     cap_width: Option<u32>,
+    border: Option<BorderConfig>,
 ) -> Result<String, String> {
-    let gif_buf = encode_gif_gifski(&frames, delay_ms, cap_width)?;
+    let gif_buf = encode_gif_gifski(&frames, delay_ms, cap_width, border.as_ref())?;
     let p = PathBuf::from(&path);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;
@@ -443,6 +515,7 @@ fn encode_mp4_h264(
     frames: &[GifFrame],
     fps: u32,
     cap_width: Option<u32>,
+    border: Option<&BorderConfig>,
 ) -> Result<Vec<u8>, String> {
     use mp4::{AvcConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
     use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode};
@@ -456,14 +529,20 @@ fn encode_mp4_h264(
         return Err("fps must be > 0".into());
     }
 
-    // Decode the first frame to learn source dimensions.
+    // Decode the first frame to learn source dimensions.  When border is
+    // enabled, dims grow by 2*border.width on each axis (rounded to even),
+    // so we apply border to the first frame too before reading dims.
     let first_bytes = general_purpose::STANDARD
         .decode(&frames[0].b64)
         .map_err(|e| format!("frame 0 b64: {}", e))?;
-    let first_img = image::load_from_memory_with_format(&first_bytes, image::ImageFormat::Png)
+    let first_dyn = image::load_from_memory_with_format(&first_bytes, image::ImageFormat::Png)
         .map_err(|e| format!("frame 0 decode: {}", e))?;
-    let src_w = first_img.width();
-    let src_h = first_img.height();
+    let mut first_rgba = first_dyn.to_rgba8();
+    if let Some(b) = border {
+        first_rgba = apply_border(first_rgba, b);
+    }
+    let src_w = first_rgba.width();
+    let src_h = first_rgba.height();
 
     // yuv420p requires even W and H.  When cap_width is set and smaller than
     // the source, scale H proportionally and round both to even.
@@ -504,14 +583,20 @@ fn encode_mp4_h264(
         let bytes = general_purpose::STANDARD
             .decode(&f.b64)
             .map_err(|e| format!("frame {} b64: {}", idx, e))?;
-        let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        let dyn_img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
             .map_err(|e| format!("frame {} decode: {}", idx, e))?;
-        let img = if img.width() != target_w || img.height() != target_h {
-            img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3)
+        let mut rgba_img = dyn_img.to_rgba8();
+        if let Some(b) = border {
+            rgba_img = apply_border(rgba_img, b);
+        }
+        // Wrap as DynamicImage so we can use resize_exact + to_rgb8.
+        let img_dyn = image::DynamicImage::ImageRgba8(rgba_img);
+        let img_dyn = if img_dyn.width() != target_w || img_dyn.height() != target_h {
+            img_dyn.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3)
         } else {
-            img
+            img_dyn
         };
-        let rgb = img.to_rgb8();
+        let rgb = img_dyn.to_rgb8();
         let rgb_data: Vec<u8> = rgb.into_raw();
 
         let rgb_source = RgbSliceU8::new(&rgb_data, (target_w as usize, target_h as usize));
@@ -645,8 +730,9 @@ async fn save_mp4_real(
     frames: Vec<GifFrame>,
     fps: u32,
     cap_width: Option<u32>,
+    border: Option<BorderConfig>,
 ) -> Result<String, String> {
-    let mp4_buf = encode_mp4_h264(&frames, fps, cap_width)?;
+    let mp4_buf = encode_mp4_h264(&frames, fps, cap_width, border.as_ref())?;
 
     let path: Option<PathBuf> = app
         .dialog()
@@ -674,8 +760,9 @@ async fn save_mp4_to_path(
     fps: u32,
     path: String,
     cap_width: Option<u32>,
+    border: Option<BorderConfig>,
 ) -> Result<String, String> {
-    let mp4_buf = encode_mp4_h264(&frames, fps, cap_width)?;
+    let mp4_buf = encode_mp4_h264(&frames, fps, cap_width, border.as_ref())?;
     let p = PathBuf::from(&path);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;
@@ -728,6 +815,32 @@ async fn pick_image(app: tauri::AppHandle) -> Result<String, String> {
 
     match path {
         Some(p) => read_path_as_data_url(&p),
+        None => Err("cancelled".into()),
+    }
+}
+
+/// Same as `pick_image` but returns both the absolute path and the data URL,
+/// so the JS side can persist a "recent sources" list keyed on path.
+#[tauri::command]
+async fn pick_image_with_path(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let path = app
+        .dialog()
+        .file()
+        .add_filter(
+            "Image",
+            &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "avif"],
+        )
+        .blocking_pick_file()
+        .and_then(|fp| fp.into_path().ok());
+
+    match path {
+        Some(p) => {
+            let data_url = read_path_as_data_url(&p)?;
+            Ok(serde_json::json!({
+                "path": p.to_string_lossy().to_string(),
+                "dataUrl": data_url
+            }))
+        }
         None => Err("cancelled".into()),
     }
 }
@@ -872,6 +985,7 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             save_blob,
             cli_log,
             pick_image,
+            pick_image_with_path,
             read_image_file,
             save_preset_json,
             load_preset_json,

@@ -124,7 +124,7 @@
   /* ----------------------------------------------------------------
    * 3.  Drag-drop image upload zone
    * ---------------------------------------------------------------- */
-  function setupImageDrop(imageRef, sceneCacheKeys, onSwap) {
+  function setupImageDrop(imageRef, sceneCacheKeys, onSwap, config) {
     if (!imageRef) return;
     var overlay = document.createElement('div');
     overlay.style.cssText =
@@ -200,6 +200,14 @@
             imageRef.set(img);
             clearSceneCaches();
             if (onSwap) onSwap(img);
+            try {
+              if (typeof window.__glyphAddRecentSource === 'function') {
+                window.__glyphAddRecentSource(absPath);
+              }
+              if (typeof window.__glyphMaybeSuggestInvert === 'function' && config) {
+                window.__glyphMaybeSuggestInvert(img, config);
+              }
+            } catch (e) {}
           }, function (err) { console.warn('glyph-studio: image decode failed', err); });
         })
         .catch(function (e) { console.warn('glyph-studio: read_image_file failed:', e); });
@@ -244,7 +252,7 @@
      loop, then hand them to the Rust gif muxer.  Browser path: keep the old
      ZIP behaviour as a fallback so the studio works outside Tauri.
      `delayMs` defaults to the per-frame duration implied by CONFIG.animation. */
-  function recordGIF(testHook, total, onProgress, onDone, delayMs, capWidth) {
+  function recordGIF(testHook, total, onProgress, onDone, delayMs, capWidth, border) {
     if (!testHook) return;
     var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
 
@@ -271,6 +279,7 @@
             frames: payloadFrames,
             delayMs: dly,
             capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
+            border: (border && border.enabled) ? border : null,
           })
             .then(function (p) {
               if (p) console.log('glyph-studio: saved GIF to', p);
@@ -301,7 +310,7 @@
      strips uploaded GIFs.  Mirrors recordGIF: collect frames during
      playback, hand them to the Rust openh264 + mp4 muxer.  Outside Tauri
      this falls back to a ZIP of frames, same as the GIF path. */
-  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth) {
+  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border) {
     if (!testHook) return;
     var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
 
@@ -329,6 +338,7 @@
             frames: payloadFrames,
             fps: resolvedFps,
             capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
+            border: (border && border.enabled) ? border : null,
           })
             .then(function (p) {
               if (p) console.log('glyph-studio: saved MP4 to', p);
@@ -403,15 +413,122 @@
   }
   function pickImageNative(loadIntoP5) {
     if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
-      window.__TAURI__.core.invoke('pick_image')
-        .then(function (dataUrl) {
-          if (window.loadImage) window.loadImage(dataUrl, loadIntoP5);
+      /* Use the path-aware variant so we can record the load in
+         localStorage's recent-sources list.  Fall back to plain
+         `pick_image` if the new command isn't registered (older builds). */
+      window.__TAURI__.core.invoke('pick_image_with_path')
+        .then(function (result) {
+          if (result && result.dataUrl && window.loadImage) {
+            window.loadImage(result.dataUrl, loadIntoP5);
+            try { addRecentSource(result.path); } catch (e) {}
+          }
         })
-        .catch(function (e) { if (e !== 'cancelled') console.warn('pick_image:', e); });
+        .catch(function (e) {
+          if (e === 'cancelled') return;
+          /* Older build — try the legacy pick_image.  No path tracking. */
+          window.__TAURI__.core.invoke('pick_image')
+            .then(function (dataUrl) {
+              if (window.loadImage) window.loadImage(dataUrl, loadIntoP5);
+            })
+            .catch(function (e2) { if (e2 !== 'cancelled') console.warn('pick_image:', e2); });
+        });
       return true;
     }
     return false;
   }
+
+  /* Recent-sources persistence: last 5 image paths the user opened.
+     Stored in localStorage as JSON `[{path, name, ts}, ...]`.  Updated
+     by both the file picker and the drag-drop hook (see loadFromFilePath
+     in setupImageDrop).  Display name = basename(path). */
+  var RECENT_KEY = 'glyphgrid:recentSources';
+  function basename(p) {
+    if (!p) return '';
+    var s = String(p).split(/[/\\]/);
+    return s[s.length - 1] || s[s.length - 2] || p;
+  }
+  function getRecentSources() {
+    try {
+      var raw = localStorage.getItem(RECENT_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) { return []; }
+  }
+  function addRecentSource(path) {
+    if (!path) return;
+    var list = getRecentSources();
+    list = list.filter(function (r) { return r.path !== path; });
+    list.unshift({ path: path, name: basename(path), ts: Date.now() });
+    list = list.slice(0, 5);
+    try { localStorage.setItem(RECENT_KEY, JSON.stringify(list)); } catch (e) {}
+  }
+  /* Expose to setupImageDrop so the drag-drop path also tracks recents. */
+  window.__glyphAddRecentSource = addRecentSource;
+
+  /* Toast notification — small banner near the top of the window for
+     non-blocking suggestions (e.g. "try invertSignal").  Click to
+     dismiss; auto-fades after `ttlMs`.  Cream-on-charcoal palette to
+     match the app aesthetic. */
+  function showToast(msg, ttlMs) {
+    var existing = document.getElementById('glyph-toast');
+    if (existing) existing.parentNode.removeChild(existing);
+    var t = document.createElement('div');
+    t.id = 'glyph-toast';
+    t.textContent = msg;
+    t.style.cssText =
+      'position:fixed; top:14px; left:50%; transform:translateX(-50%); ' +
+      'background:rgba(20,18,16,0.93); color:#E8DDC8; ' +
+      'padding:10px 18px; border-radius:6px; ' +
+      'font:12px ui-monospace, "SF Mono", Menlo, monospace; ' +
+      'z-index:9999; box-shadow:0 2px 10px rgba(0,0,0,0.35); ' +
+      'cursor:pointer; opacity:0; transition:opacity 0.3s ease; ' +
+      'max-width:520px; line-height:1.5;';
+    t.title = 'click to dismiss';
+    t.onclick = function () {
+      if (t.parentNode) t.parentNode.removeChild(t);
+    };
+    document.body.appendChild(t);
+    requestAnimationFrame(function () { t.style.opacity = '1'; });
+    setTimeout(function () {
+      t.style.opacity = '0';
+      setTimeout(function () {
+        if (t.parentNode) t.parentNode.removeChild(t);
+      }, 300);
+    }, ttlMs || 9000);
+  }
+  window.__glyphToast = showToast;
+
+  /* Auto-suggest helper — when a freshly-loaded image is mostly bright
+     (mean luminance > 60%) AND invertSignal is currently OFF, surface a
+     toast suggesting the sketch-mode setting.  No auto-apply — the user
+     might want the "filter" look intentionally.  Sampled every 16th pixel
+     for speed (~1 ms on a 1024×574 frame). */
+  function maybeSuggestInvert(img, configRef) {
+    if (!img || !img.loadPixels) return;
+    if (!configRef || configRef.invertSignal) return;
+    try {
+      img.loadPixels();
+      var pixels = img.pixels;
+      if (!pixels || pixels.length < 64) return;
+      var sum = 0, n = 0;
+      for (var i = 0; i < pixels.length; i += 64) {
+        sum += 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
+        n++;
+      }
+      if (n === 0) return;
+      var meanPct = Math.round(sum / n / 255 * 100);
+      if (meanPct > 60) {
+        showToast(
+          '💡 Bright source detected (' + meanPct + '% mean luminance). ' +
+          'Try toggling `invert signal` in Mapping for the sketch / ink-on-paper look.',
+          10000
+        );
+      }
+    } catch (e) {
+      /* loadPixels may fail mid-load; harmless. */
+    }
+  }
+  window.__glyphMaybeSuggestInvert = maybeSuggestInvert;
 
   /* ----------------------------------------------------------------
    * 5.  Build Tweakpane panel
@@ -419,6 +536,18 @@
   function buildPane(Pane, opts) {
     var config = opts.config;
     var pane = new Pane({ title: opts.title || 'glyph-studio', container: opts.container });
+
+    /* Tooltip helper — sets a native-browser `title` on the binding's
+       row element so hover-text appears for confusing settings.  Tweakpane
+       3.1 doesn't expose a `description` option; the row element is
+       reachable via the BindingApi's `.element` accessor.  No-op if the
+       binding API shape differs. */
+    function tip(binding, text) {
+      try {
+        if (binding && text && binding.element) binding.element.setAttribute('title', text);
+      } catch (e) {}
+      return binding;
+    }
 
     /* Phase 0 perf instrumentation — attach a single pane-level change
        listener that records every binding mutation for switch-latency
@@ -460,6 +589,11 @@
         /* Refresh slider displays after imageRef.set's auto-tune of
            CONFIG.animation.duration (animated-source uploads). */
         if (opts.__refreshPane) opts.__refreshPane();
+        try {
+          if (typeof window.__glyphMaybeSuggestInvert === 'function') {
+            window.__glyphMaybeSuggestInvert(img, config);
+          }
+        } catch (e) {}
       };
       if (pickImageNative(swap)) return;
       var inp = document.createElement('input');
@@ -490,41 +624,90 @@
       }
     });
 
+    /* Recent sources dropdown — last 5 image paths persisted in
+       localStorage (key `glyphgrid:recentSources`).  Selecting a recent
+       re-loads via the read_image_file Tauri command (Tauri only).
+       Rebuilt every time the dropdown opens so freshly-loaded images
+       appear without a panel reload.  Browser preview: shows nothing. */
+    var inTauriForRecent = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
+    if (inTauriForRecent) {
+      var recentBox = { sel: '' };
+      function rebuildRecentOptions() {
+        var list = getRecentSources();
+        var opt = { '(none)': '' };
+        for (var i = 0; i < list.length; i++) opt[list[i].name] = list[i].path;
+        return opt;
+      }
+      var _recentBinding = fImg.addInput(recentBox, 'sel', {
+        label: 'Recent', options: rebuildRecentOptions(),
+      });
+      tip(_recentBinding, 'Last 5 images you opened. Pick one to re-load. Cleared by clearing browser localStorage.');
+      _recentBinding.on('change', function (e) {
+        if (!e.value) return;
+        window.__TAURI__.core.invoke('read_image_file', { path: e.value })
+          .then(function (dataUrl) {
+            if (!window.loadImage) return;
+            window.loadImage(dataUrl, function (img) {
+              if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(img);
+              if (opts.sceneCacheKeys && window.SCENES) {
+                for (var i = 0; i < opts.sceneCacheKeys.length; i++) {
+                  for (var name in window.SCENES) {
+                    if (window.SCENES[name][opts.sceneCacheKeys[i]]) delete window.SCENES[name][opts.sceneCacheKeys[i]];
+                  }
+                }
+              }
+              try { addRecentSource(e.value); } catch (_) {}
+              try {
+                if (typeof window.__glyphMaybeSuggestInvert === 'function') {
+                  window.__glyphMaybeSuggestInvert(img, config);
+                }
+              } catch (_) {}
+              if (opts.__refreshPane) opts.__refreshPane();
+            });
+          })
+          .catch(function (err) {
+            console.warn('Recent sources: load failed for', e.value, err);
+          });
+        recentBox.sel = '';
+      });
+    }
+
     var fGrid = pane.addFolder({ title: 'Grid' });
     if (!config.grid) config.grid = { cols: 240, rows: 120 };
-    fGrid.addInput(config.grid, 'cols', { min: 60, max: 400, step: 5 });
-    fGrid.addInput(config.grid, 'rows', { min: 40, max: 300, step: 5 });
+    tip(fGrid.addInput(config.grid, 'cols', { min: 60, max: 400, step: 5 }),
+        'Glyph columns. More = finer detail, smaller cells, slower render. cols × rows = total cell count.');
+    tip(fGrid.addInput(config.grid, 'rows', { min: 40, max: 300, step: 5 }),
+        'Glyph rows. Pair with cols. Default 240×120 ≈ 28,800 cells.');
     if (!config.font) config.font = { family: 'monospace', size: 8 };
-    fGrid.addInput(config.font, 'size', { min: 3, max: 14, step: 1 });
+    tip(fGrid.addInput(config.font, 'size', { min: 3, max: 14, step: 1 }),
+        'Glyph pixel size. Tune until characters bleed into neighbours and the grid pattern dissolves.');
 
     var fMap = pane.addFolder({ title: 'Mapping' });
     if (opts.ramps) {
       var rampOpts = {};
       Object.keys(opts.ramps).forEach(function (k) { rampOpts[k] = k; });
-      fMap.addInput(config, 'ramp', { options: rampOpts });
+      tip(fMap.addInput(config, 'ramp', { options: rampOpts }),
+          'Character set ordered by visual density. `gradient` is default. Try `blockShaded` for solid texture.');
     }
-    fMap.addInput(config, 'brightnessGamma', { min: 0.2, max: 2.5, step: 0.05 });
-    /* invertSignal — flips bright↔dark.  Use for sources with bright bg
-       + dark subject (white-bg portraits) where the dark details should
-       be the drawn ink. */
+    tip(fMap.addInput(config, 'brightnessGamma', { min: 0.2, max: 2.5, step: 0.05 }),
+        'Curve applied to source brightness. <0.5 = high-contrast stipple. >1.0 = lifts mid-tones, more cream.');
     if (config.invertSignal === undefined) config.invertSignal = false;
-    fMap.addInput(config, 'invertSignal', { label: 'invert signal' });
+    tip(fMap.addInput(config, 'invertSignal', { label: 'invert signal' }),
+        'Flip bright↔dark. ON = dark source becomes drawn ink, bright becomes cream paper. Use for white-bg sources.');
 
-    /* bgThreshold — forces signal above X to render as palette bg (cream).
-       Apply on top of invertSignal to carve more negative space.  Try
-       0.65–0.85.  0 disables (default). */
     if (config.bgThreshold === undefined) config.bgThreshold = 0;
-    fMap.addInput(config, 'bgThreshold', { min: 0, max: 1, step: 0.05, label: 'bg threshold' });
-    fMap.addInput(config, 'samplingStrategy', {
+    tip(fMap.addInput(config, 'bgThreshold', { min: 0, max: 1, step: 0.05, label: 'bg threshold' }),
+        'Source pixels brighter than this are forced to palette bg (cream). Carves negative space. 0 = off.');
+    tip(fMap.addInput(config, 'samplingStrategy', {
       options: { average: 'average', nearest: 'nearest', 'edge-weighted': 'edge-weighted' },
-    });
+    }), 'How each cell reads source pixels. `average` for photos, `nearest` for sprite art, `edge-weighted` preserves thin lines.');
 
     /* Dither folder — Stage 2B exposes the new STBN mode alongside the
        existing modes. STBN gives smoother substrate breathing than the
        hash-based `temporal` mode without flicker. */
     if (config.dither) {
       var fDth = pane.addFolder({ title: 'Dither', expanded: false });
-      fDth.addInput(config.dither, 'mode', {
+      tip(fDth.addInput(config.dither, 'mode', {
         options: {
           none: 'none',
           bayer4: 'bayer4',
@@ -536,12 +719,14 @@
           atkinson: 'atkinson',
           jarvisJudiceNinke: 'jarvisJudiceNinke',
         },
-      });
+      }), 'Quantization noise pattern. `temporal` (default) animates the grid each frame. Only applies in brightness selection mode.');
       if (typeof config.dither.levels === 'number') {
-        fDth.addInput(config.dither, 'levels', { min: 2, max: 32, step: 1 });
+        tip(fDth.addInput(config.dither, 'levels', { min: 2, max: 32, step: 1 }),
+            'Number of brightness bands. Lower = chunkier, higher = more glyph variety.');
       }
       if (typeof config.dither.asSourcePrefilter === 'boolean') {
-        fDth.addInput(config.dither, 'asSourcePrefilter');
+        tip(fDth.addInput(config.dither, 'asSourcePrefilter'),
+            'Run dither over the source image before cell signal computation. Only applies for `temporal` mode.');
       }
     }
 
@@ -549,28 +734,31 @@
     if (opts.palettes) {
       var palOpts = {};
       Object.keys(opts.palettes).forEach(function (k) { palOpts[k] = k; });
-      fCol.addInput(config, 'palette', { options: palOpts });
+      tip(fCol.addInput(config, 'palette', { options: palOpts }),
+          'Background colour + ink stops. `cream-paper` is the signature look. Pairs with `monochrome` colorMode.');
     }
-    fCol.addInput(config, 'colorMode', {
+    tip(fCol.addInput(config, 'colorMode', {
       options: { preserve: 'preserve', monochrome: 'monochrome', duotone: 'duotone', gradient: 'gradient' },
-    });
+    }), 'How palette maps to cells. `monochrome` = single ink with alpha. `gradient` = OKLab interp across all stops.');
 
     var fSel = pane.addFolder({ title: 'Selection (advanced)', expanded: false });
-    fSel.addInput(config, 'selectionMode', {
+    tip(fSel.addInput(config, 'selectionMode', {
       options: {
         brightness: 'brightness', shape: 'shape',
         'shape-edge-aware': 'shape-edge-aware', 'edge-directional': 'edge-directional',
       },
-    });
+    }), 'How glyphs are picked per cell. `brightness` = fast ramp lookup. `shape-edge-aware` = best aesthetic, ~4× slower.');
     var glyphSetVal = { v: config.glyphSet || 'null' };
-    fSel.addInput(glyphSetVal, 'v', {
+    var _gsBinding = fSel.addInput(glyphSetVal, 'v', {
       label: 'glyphSet',
       options: {
         none: 'null', ascii: 'ascii', asciiDense: 'asciiDense',
         blockElements: 'blockElements', braille: 'braille',
         sextant: 'sextant', octant: 'octant',
       },
-    }).on('change', function (e) {
+    });
+    tip(_gsBinding, 'Atlas used by shape modes. `octant` (Unicode 16) gives the densest texture; `ascii` is widely compatible.');
+    _gsBinding.on('change', function (e) {
       config.glyphSet = e.value === 'null' ? null : e.value;
       /* Stage 2A trustRequested: the renderer reads config.glyphSet
          live + uses the bundled fonts via the always-loaded cssStack;
@@ -594,10 +782,14 @@
 
     if (config.studio && config.studio.breathing) {
       var fBr = pane.addFolder({ title: 'Breathing' });
-      fBr.addInput(config.studio.breathing, 'emaAlpha', { min: 0, max: 1, step: 0.01 });
-      fBr.addInput(config.studio.breathing, 'gainSwing', { min: 0, max: 0.6, step: 0.01, label: 'gain swing' });
-      fBr.addInput(config.studio.breathing, 'jitter', { min: 0, max: 0.2, step: 0.005 });
-      fBr.addInput(config.studio.breathing, 'pulseHz', { min: 0.1, max: 3, step: 0.05 });
+      tip(fBr.addInput(config.studio.breathing, 'emaAlpha', { min: 0, max: 1, step: 0.01 }),
+          'EMA smoothing factor. 0 = flicker, 1 = frozen. 0.35 = relaxed breathing.');
+      tip(fBr.addInput(config.studio.breathing, 'gainSwing', { min: 0, max: 0.6, step: 0.01, label: 'gain swing' }),
+          'Per-frame brightness pulse magnitude. 0 = no pulse, 0.5 = strong heartbeat.');
+      tip(fBr.addInput(config.studio.breathing, 'jitter', { min: 0, max: 0.2, step: 0.005 }),
+          'Per-cell random offset each frame. Higher = more "live" texture.');
+      tip(fBr.addInput(config.studio.breathing, 'pulseHz', { min: 0.1, max: 3, step: 0.05 }),
+          'Gain swing rate in Hz. 0.7 = once per 1.4s. Slow = meditative, fast = nervous.');
     }
 
     if (config.postprocess) {
@@ -824,10 +1016,24 @@
        display widths.  480 px is for very long loops or smaller targets.
        0 = no cap (full quality, original render dimensions). */
     var sizeOpts = { capWidth: 0 };
-    fExp.addInput(sizeOpts, 'capWidth', {
+    tip(fExp.addInput(sizeOpts, 'capWidth', {
       label: 'output size',
       options: { 'full (no cap)': 0, '720px (Twitter)': 720, '480px (small)': 480 },
-    });
+    }), 'Cap output width before encoding. Smaller = smaller file, no quality loss for mobile viewing.');
+
+    /* Bordered export — palette-aware matte added to the encoded frame.
+       Frames out at (w + 2*borderWidth) × (h + 2*borderWidth), rounded to
+       even for yuv420p compatibility.  v0.1.1 ships `solid` only; deckle /
+       passepartout / inner-line styles are queued for v0.1.2 (TODO.md). */
+    var borderOpts = { enabled: false, width: 32, color: 'auto' };
+    var fBorder = fExp.addFolder({ title: 'Border', expanded: false });
+    tip(fBorder.addInput(borderOpts, 'enabled'),
+        'Add a palette-aware matte band around the encoded frame (passepartout look).');
+    tip(fBorder.addInput(borderOpts, 'width', { min: 0, max: 128, step: 4 }),
+        'Border thickness in pixels. Same on all 4 sides. Rounded to even for video compatibility.');
+    tip(fBorder.addInput(borderOpts, 'color', {
+      options: { 'palette bg (auto)': 'auto', 'cream': '#E8DDC8', 'charcoal': '#0E0805', 'white': '#FFFFFF', 'black': '#000000' },
+    }), 'Matte colour. `auto` picks the current palette\'s bg colour for a seamless print-on-paper feel.');
 
     var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
     /* Export GIF — derives frame count from effective fps so the output
@@ -848,6 +1054,30 @@
        the same effective rate the GIF will play at means each captured
        frame represents exactly one delayMs of animation time, and the
        last captured frame lands precisely at duration - delayMs. */
+    /* Resolve border colour: 'auto' uses the current palette bg.  Returns
+       a fully-resolved BorderConfig or null when disabled. */
+    function resolveBorder() {
+      if (!borderOpts.enabled || !borderOpts.width) return null;
+      var color = borderOpts.color;
+      if (color === 'auto' && opts.palettes && config.palette) {
+        var pal = opts.palettes[config.palette];
+        if (pal && pal.bg) color = pal.bg;
+      }
+      if (!color || color === 'auto') color = '#E8DDC8';
+      var ink = '#0E0805';
+      if (opts.palettes && config.palette) {
+        var p2 = opts.palettes[config.palette];
+        if (p2 && p2.inks && p2.inks[0]) ink = p2.inks[0];
+      }
+      return {
+        enabled: true,
+        width: Math.round(borderOpts.width),
+        style: 'solid',
+        bgColor: color,
+        inkColor: ink,
+      };
+    }
+
     fExp.addButton({ title: inTauri ? 'Export GIF' : 'Export GIF (ZIP fallback)' }).on('click', function () {
       var p = exportPlan();
       var capW = sizeOpts.capWidth || 0;
@@ -863,7 +1093,8 @@
           console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
         },
         p.delayMs,
-        capW > 0 ? capW : null);
+        capW > 0 ? capW : null,
+        resolveBorder());
     });
 
     /* Export MP4 — for Instagram (Reels / Stories / feed posts strip
@@ -885,7 +1116,8 @@
           console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
         },
         encFps,
-        capW > 0 ? capW : null);
+        capW > 0 ? capW : null,
+        resolveBorder());
     });
 
     var urlPre = presetFromURL();
@@ -914,7 +1146,7 @@
          button so the slider catches up after every image swap. */
       var refreshOnSwap = function () { try { pane.refresh(); } catch (e) {} };
       if (opts.imageRef) {
-        setupImageDrop(opts.imageRef, opts.sceneCacheKeys, refreshOnSwap);
+        setupImageDrop(opts.imageRef, opts.sceneCacheKeys, refreshOnSwap, opts.config);
       }
       /* Expose to buildPane's pick-image handler via opts so the synchronous
          path (Pick image button) refreshes too. */
