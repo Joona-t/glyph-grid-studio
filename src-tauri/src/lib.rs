@@ -931,12 +931,16 @@ async fn open_user_guide(app: tauri::AppHandle) -> Result<(), String> {
 
     // 1) Try the bundled resource path (production .app — see tauri.conf.json
     //    bundle.resources entry).  resource_dir is the .app/Contents/Resources
-    //    directory on macOS.
+    //    directory on macOS.  Tauri 2 places parent-relative resources
+    //    (`../USER-GUIDE.md`) under the `_up_/` subfolder, so check both.
     let mut candidate: Option<PathBuf> = None;
     if let Ok(resource_dir) = app.path().resource_dir() {
-        let p = resource_dir.join("USER-GUIDE.md");
-        if p.exists() {
-            candidate = Some(p);
+        for sub in &["USER-GUIDE.md", "_up_/USER-GUIDE.md"] {
+            let p = resource_dir.join(sub);
+            if p.exists() {
+                candidate = Some(p);
+                break;
+            }
         }
     }
     // 2) Fall back to the project-root path for dev / cargo tauri dev runs.
