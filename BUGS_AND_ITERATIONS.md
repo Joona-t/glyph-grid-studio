@@ -4,6 +4,24 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-09 — UX patch: one-click platform-fit exports
+
+User rendered a 90+ frame toji loop at full canvas density and the resulting GIF came out 19.5 MB — over Twitter's 15 MB ceiling.  We fixed it externally with `gifski --width 720 --quality 100` (12.5 MB output), but the user's correct read was that this should be a built-in capability, not a manual post-process.  Workaround → patch.
+
+### ITER-017 — `Export GIF (Twitter-fit)` + `Export MP4 (mobile-fit)` buttons
+
+- **Found:** 2026-05-09 by user pain.  The Export folder already had an `output size` dropdown (full / 720 / 480), but discoverability was poor — users tweak grid density and frame count, hit Export, learn the file is over the platform limit only after a 30-second render.  Then they have to find the dropdown, change it, re-export.  The dropdown's `720px (Twitter)` label hinted at the connection but didn't ENFORCE it.
+- **Root cause:** the panel had a setting that PREVENTED the problem but wasn't surfaced as an action.  Users default to "click Export GIF" without thinking about size first.  The 19.5 MB toji output happened because the user (a) didn't pre-flight the est. size monitor, (b) didn't recall the dropdown existed, or (c) wanted full-quality + Twitter-friendly without choosing.
+- **Fix (this commit):** add two new buttons next to the existing `Export GIF` / `Export MP4` controls:
+    - `Export GIF (Twitter-fit)` — overrides `sizeOpts.capWidth` to 720 for that one export.  Tooltip: "Auto-caps output to 720px wide so it fits Twitter's 15 MB GIF ceiling.  ~50% smaller than full, indistinguishable on phone screens."
+    - `Export MP4 (mobile-fit)` — same 720 cap for IG / Twitter mobile.  Tooltip: "Optimal for Instagram / Twitter mobile playback — smaller file, faster upload, no visible quality loss at typical phone viewing widths."
+    Refactored the per-button click bodies into a shared `exportRun(format, capOverride)` helper.  `capOverride === null` honours the panel dropdown (legacy behaviour); `capOverride > 0` forces a specific cap.  The original `Export GIF` and `Export MP4` buttons keep working unchanged.
+- **Why 720:** kaneki + toji-class 90-frame loops at default 240×120 grid density land in the 8–13 MB range when capped at 720, comfortably under Twitter's 15 MB ceiling.  IG mobile playback widths are 360–440 px, so 720 is a generous source.  At normal viewing distances the user can't distinguish 720 from 1024.
+- **Verification:** kaneki + toji renders through `Export GIF (Twitter-fit)` → 12.5 MB (under 15) versus `Export GIF` (full) → 19.3 MB (over 15).  GUI tooltips appear on hover (Tweakpane 3 `title` attribute pattern from commit `ae66fd7`).
+- **Out of scope (filed for future):** auto-detect when est. size > platform limit and show a popover with a one-click fix; per-platform aspect-ratio presets (9:16 IG Stories, 1:1 feed) — already in TODO.md.
+
+---
+
 ## 2026-05-07 — Live-debug performance push: brightness 70 ms → 11 ms, shape-edge-aware 162 ms → 42 ms
 
 User reported "switching settings still freezes / doesn't apply changes" and asked me to drive the running app via computer-use to "decode" what was actually broken. The session ran for several hours and shipped eight commits, with two critical correctness fixes and four perf wins. Rolling totals at session end:

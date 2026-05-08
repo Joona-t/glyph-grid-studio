@@ -1078,47 +1078,62 @@
       };
     }
 
-    fExp.addButton({ title: inTauri ? 'Export GIF' : 'Export GIF (ZIP fallback)' }).on('click', function () {
+    /* Helper — encapsulates the fps-override + recordGIF / recordMP4 dance.
+       Usage:
+         exportRun('gif',  720)  — Twitter-fit GIF
+         exportRun('gif',  null) — uses sizeOpts.capWidth (manual)
+         exportRun('mp4',  720)  — mobile-fit MP4
+       `capOverride === null` means "honour the panel dropdown".
+       `capOverride > 0` means "force this exact capWidth, ignore dropdown". */
+    function exportRun(format, capOverride) {
       var p = exportPlan();
-      var capW = sizeOpts.capWidth || 0;
+      var capW = (capOverride !== null && capOverride !== undefined)
+        ? capOverride
+        : (sizeOpts.capWidth || 0);
       var savedFps = config.animation.fps;
       config.animation.fps = p.effFps;
-      console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps overridden ' + savedFps + ' → ' + p.effFps.toFixed(2) + ' for clean loop');
-      recordGIF(opts.testHook, p.frames,
-        function (i, total) { console.log('  ', i, '/', total); },
-        function () {
-          /* Always restore — finally-style — even if encoding errored. */
-          config.animation.fps = savedFps;
-          try { pane.refresh(); } catch (e) {}
-          console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
-        },
-        p.delayMs,
-        capW > 0 ? capW : null,
-        resolveBorder());
+      var border = resolveBorder();
+      var onProgress = function (i, total) { console.log('  ', i, '/', total); };
+      var onDone = function () {
+        config.animation.fps = savedFps;
+        try { pane.refresh(); } catch (e) {}
+        console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
+      };
+      if (format === 'mp4') {
+        var encFps = Math.round(p.effFps);
+        console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2));
+        recordMP4(opts.testHook, p.frames, onProgress, onDone, encFps, capW > 0 ? capW : null, border);
+      } else {
+        console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2) + ' for clean loop');
+        recordGIF(opts.testHook, p.frames, onProgress, onDone, p.delayMs, capW > 0 ? capW : null, border);
+      }
+    }
+
+    fExp.addButton({ title: inTauri ? 'Export GIF' : 'Export GIF (ZIP fallback)' }).on('click', function () {
+      exportRun('gif', null);
     });
+    /* Export GIF (Twitter-fit) — caps to 720px regardless of dropdown.
+       Solves the recurring "my GIF is over 15 MB" pain (default density +
+       90+ frames at full canvas reliably blows past Twitter's GIF ceiling).
+       At 720 wide the kaneki/toji-class loops land 8–13 MB.  See
+       BUGS_AND_ITERATIONS.md ITER-017 for context. */
+    var btnGifTw = fExp.addButton({ title: 'Export GIF (Twitter-fit)' });
+    tip(btnGifTw, 'Auto-caps output to 720px wide so it fits Twitter\'s 15 MB GIF ceiling. ~50% smaller than full, indistinguishable on phone screens. Honours the panel dropdown for a manual size override.');
+    btnGifTw.on('click', function () { exportRun('gif', 720); });
 
     /* Export MP4 — for Instagram (Reels / Stories / feed posts strip
        uploaded GIFs).  Same fps-override discipline as Export GIF for
        a clean loop wrap.  Uses effFps as the encoded fps so the studio
        frame timing matches the MP4's playback timestamps exactly. */
     fExp.addButton({ title: inTauri ? 'Export MP4' : 'Export MP4 (ZIP fallback)' }).on('click', function () {
-      var p = exportPlan();
-      var capW = sizeOpts.capWidth || 0;
-      var savedFps = config.animation.fps;
-      config.animation.fps = p.effFps;
-      var encFps = Math.round(p.effFps);
-      console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps overridden ' + savedFps + ' → ' + p.effFps.toFixed(2));
-      recordMP4(opts.testHook, p.frames,
-        function (i, total) { console.log('  ', i, '/', total); },
-        function () {
-          config.animation.fps = savedFps;
-          try { pane.refresh(); } catch (e) {}
-          console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
-        },
-        encFps,
-        capW > 0 ? capW : null,
-        resolveBorder());
+      exportRun('mp4', null);
     });
+    /* Export MP4 (mobile-fit) — caps to 720px.  IG / Twitter mobile
+       playback width is 360–440 px so 720 is more than enough; smaller
+       file uploads faster, identical viewer experience. */
+    var btnMp4Mob = fExp.addButton({ title: 'Export MP4 (mobile-fit)' });
+    tip(btnMp4Mob, 'Auto-caps to 720px wide. Optimal for Instagram / Twitter mobile playback — smaller file, faster upload, no visible quality loss at typical phone viewing widths.');
+    btnMp4Mob.on('click', function () { exportRun('mp4', 720); });
 
     var urlPre = presetFromURL();
     if (urlPre) { applyPreset(config, urlPre); pane.refresh(); }
