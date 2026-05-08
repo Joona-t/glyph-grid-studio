@@ -151,6 +151,23 @@
        The cream-paper-bg cleanliness is handled by the hard signal
        threshold (_bgFloor) in the EMA hook, not by gamma. */
     brightnessGamma: 0.55,
+    /* bgThreshold (0..1, default 0 = disabled).  When > 0, any cell whose
+       source luminance is above this value is forced to signal=0 (rendered
+       as palette bg / cream paper).  Lets the cream-paper sketch aesthetic
+       work on bright-bg sources (white anime panels, photos with white
+       backgrounds) by punching out the bright bg before it gets rendered
+       as dense ink.  Set to ~0.65–0.85 for white-bg sources; leave at 0
+       for the original kaneki workflow where the source is mostly dark. */
+    bgThreshold: 0,
+    /* invertSignal — flips bright↔dark for the brightness signal.  Default
+       is bright source → ink, dark source → cream (works when source is
+       mostly dark with bright accents, like the original kaneki).  When
+       the source is mostly bright with dark details (white-bg portraits,
+       anime panels with light hair on light bg), invertSignal: true makes
+       the DARK details become the drawn ink and the bright areas become
+       cream paper — giving the same selective-sketch aesthetic on
+       inverted-luminance sources. */
+    invertSignal: false,
     samplingStrategy: 'average',
     /* monochrome — single dark ink with alpha driven by cell signal.
        Bright cells = opaque dark char (stipple), dim cells = low
@@ -1520,6 +1537,27 @@
     const _t_ds0 = performance.now();
     downsampleToCells(lumBuf, srcW, srcH, cellSignal, cols, rows, cellPxW, cellPxH);
     if (__pfFrame) __pfFrame.stages._downsample = performance.now() - _t_ds0;
+
+    /* Step 3a: bgThreshold + invertSignal — both operate on raw source
+       luminance.  Single fused pass:
+       - If the cell's source brightness > bgThreshold → signal = 0
+         (forced to cream paper, intuitive "anything brighter than X is bg")
+       - Else if invertSignal → signal = 1 - lum
+         (dark source becomes ink, bright source fades to cream — for
+         white-bg / dark-subject sources)
+       - Else signal = lum (default behavior, bright source = ink) */
+    const _bgThr = (typeof CONFIG.bgThreshold === 'number') ? CONFIG.bgThreshold : 0;
+    const _invSig = !!CONFIG.invertSignal;
+    if (_bgThr > 0 || _invSig) {
+      for (let i = 0; i < cellSignal.length; i++) {
+        const lum = cellSignal[i];
+        if (_bgThr > 0 && lum > _bgThr) {
+          cellSignal[i] = 0;
+        } else if (_invSig) {
+          cellSignal[i] = 1 - lum;
+        }
+      }
+    }
 
     /* Step 3b: temporal coherence — per-cell EMA so each cell's glyph
        drifts toward its target rather than snapping. Stack of skill

@@ -476,6 +476,17 @@
       fMap.addInput(config, 'ramp', { options: rampOpts });
     }
     fMap.addInput(config, 'brightnessGamma', { min: 0.2, max: 2.5, step: 0.05 });
+    /* invertSignal — flips bright↔dark.  Use for sources with bright bg
+       + dark subject (white-bg portraits) where the dark details should
+       be the drawn ink. */
+    if (config.invertSignal === undefined) config.invertSignal = false;
+    fMap.addInput(config, 'invertSignal', { label: 'invert signal' });
+
+    /* bgThreshold — forces signal above X to render as palette bg (cream).
+       Apply on top of invertSignal to carve more negative space.  Try
+       0.65–0.85.  0 disables (default). */
+    if (config.bgThreshold === undefined) config.bgThreshold = 0;
+    fMap.addInput(config, 'bgThreshold', { min: 0, max: 1, step: 0.05, label: 'bg threshold' });
     fMap.addInput(config, 'samplingStrategy', {
       options: { average: 'average', nearest: 'nearest', 'edge-weighted': 'edge-weighted' },
     });
