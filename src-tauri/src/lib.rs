@@ -806,6 +806,49 @@ pub fn run() {
     run_tauri(empty_cli_state, false);
 }
 
+/// Open USER-GUIDE.md in the user's default markdown / text app.  Tries
+/// the bundled resource path first (production .app), then falls back to
+/// the project root for `cargo tauri dev` runs.  Uses tauri-plugin-shell
+/// `open` which on macOS invokes Launch Services (`open` command), on
+/// Linux `xdg-open`, on Windows `ShellExecute`.
+#[tauri::command]
+async fn open_user_guide(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    use tauri_plugin_shell::ShellExt;
+
+    // 1) Try the bundled resource path (production .app — see tauri.conf.json
+    //    bundle.resources entry).  resource_dir is the .app/Contents/Resources
+    //    directory on macOS.
+    let mut candidate: Option<PathBuf> = None;
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let p = resource_dir.join("USER-GUIDE.md");
+        if p.exists() {
+            candidate = Some(p);
+        }
+    }
+    // 2) Fall back to the project-root path for dev / cargo tauri dev runs.
+    if candidate.is_none() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let p = cwd.join("USER-GUIDE.md");
+            if p.exists() {
+                candidate = Some(p);
+            }
+            // Also try parent (in case current dir is src-tauri/)
+            if candidate.is_none() {
+                let parent_p = cwd.parent().map(|d| d.join("USER-GUIDE.md"));
+                if let Some(pp) = parent_p {
+                    if pp.exists() { candidate = Some(pp); }
+                }
+            }
+        }
+    }
+
+    let path = candidate.ok_or_else(|| "USER-GUIDE.md not found in resources or project root".to_string())?;
+    app.shell()
+        .open(path.to_string_lossy().into_owned(), None)
+        .map_err(|e| format!("shell.open failed: {}", e))
+}
+
 /// Shared Tauri builder used by both `run()` (GUI) and `run_headless_render()`
 /// (CLI). Tauri's `generate_context!` macro can only be invoked once per crate
 /// because it embeds the Info.plist binary blob — so this function is the
@@ -818,6 +861,7 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             save_png,
@@ -833,6 +877,7 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             load_preset_json,
             get_cli_render_job,
             exit_with_status,
+            open_user_guide,
         ])
         .setup(move |app| {
             if cfg!(debug_assertions) {

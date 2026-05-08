@@ -432,6 +432,17 @@
       } catch (e) { /* old Tweakpane build may not expose pane.on */ }
     }
 
+    /* Help — opens USER-GUIDE.md in the user's default markdown / text app
+       via tauri-plugin-shell.  Sits at the top of the panel for
+       discoverability.  No-op outside Tauri (browser preview). */
+    if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+      pane.addButton({ title: '? User Guide' }).on('click', function () {
+        window.__TAURI__.core.invoke('open_user_guide').catch(function (e) {
+          console.warn('open_user_guide failed:', e);
+        });
+      });
+    }
+
     var fImg = pane.addFolder({ title: 'Image' });
     fImg.addButton({ title: 'drag & drop an image anywhere' });
     /* Native picker — Tauri only. Falls back to a hidden <input type=file>
@@ -460,6 +471,23 @@
         }
       };
       inp.click();
+    });
+    /* Clear image — wipe sourceImg + scene caches and revert to the
+       "Drop an image to start" placeholder.  draw() at index.html:1041
+       early-returns when sourceImg is null and re-renders the placeholder.
+       Disabled while a recording is in progress so we don't kill an
+       in-flight export. */
+    fImg.addButton({ title: 'Clear image' }).on('click', function () {
+      var rs = opts.testHook && opts.testHook.getRecState && opts.testHook.getRecState();
+      if (rs && !rs.done) return;
+      if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(null);
+      if (opts.sceneCacheKeys && window.SCENES) {
+        for (var i = 0; i < opts.sceneCacheKeys.length; i++) {
+          for (var name in window.SCENES) {
+            if (window.SCENES[name][opts.sceneCacheKeys[i]]) delete window.SCENES[name][opts.sceneCacheKeys[i]];
+          }
+        }
+      }
     });
 
     var fGrid = pane.addFolder({ title: 'Grid' });
@@ -636,8 +664,9 @@
        ring buffer. */
     if (window.__perfReport) {
       var fPerf = pane.addFolder({ title: 'Perf', expanded: false });
-      var perfState = { total: 0, scene: 0, lum: 0, downsample: 0, ema: 0, dither: 0, grid: 0, select: 0, draw: 0, postproc: 0, lastSwitch: '—' };
+      var perfState = { total: 0, fps: 0, scene: 0, lum: 0, downsample: 0, ema: 0, dither: 0, grid: 0, select: 0, draw: 0, postproc: 0, lastSwitch: '—' };
       fPerf.addMonitor(perfState, 'total', { label: 'total ms' });
+      fPerf.addMonitor(perfState, 'fps', { label: 'fps' });
       fPerf.addMonitor(perfState, 'scene', { label: 'scene ms' });
       fPerf.addMonitor(perfState, 'lum', { label: 'lum ms' });
       fPerf.addMonitor(perfState, 'downsample', { label: 'downsample ms' });
@@ -670,6 +699,7 @@
         }
         var n = ring.length;
         perfState.total = +(sum.total / n).toFixed(1);
+        perfState.fps = perfState.total > 0 ? +(1000 / perfState.total).toFixed(1) : 0;
         perfState.scene = +(sum.scene / n).toFixed(1);
         perfState.lum = +(sum._lum / n).toFixed(1);
         perfState.downsample = +(sum._downsample / n).toFixed(1);
@@ -745,15 +775,45 @@
       return { frames: n, delayMs: delayMs, dur: n * delayMs / 1000, fps: fps, effFps: effFps };
     }
 
-    /* Live readout: shows the count and EXACT output duration the next
-       Export GIF will produce, accounting for GIF centisecond precision. */
-    var expState = { frames: 0, length: '—' };
+    /* Live readout: frames + EXACT output duration + estimated file size
+       (GIF and MP4) before clicking Export.  Size estimate uses bytes-per-
+       pixel heuristic seeded from kaneki measurements:
+         GIF: 0.18 B/px (cream-paper monochrome) / 0.30 (multi-colour)
+         MP4: 0.075 B/px (mono) / 0.10 (multi-colour)
+       Heavy postproc (bloom + halation) adds ~30% entropy.
+       Twitter limits: GIF 15 MB, MP4 ~512 MB.  The ✗ tag flags GIF > 15. */
+    var expState = { frames: 0, length: '—', estGif: '—', estMp4: '—' };
     fExp.addMonitor(expState, 'frames', { label: 'frames', interval: 200 });
     fExp.addMonitor(expState, 'length', { label: 'length', interval: 200 });
+    fExp.addMonitor(expState, 'estGif', { label: 'est. gif', interval: 200 });
+    fExp.addMonitor(expState, 'estMp4', { label: 'est. mp4', interval: 200 });
+    function _estimateBytes(p, capW, gif) {
+      var canv = document.querySelector('canvas');
+      var srcW = (canv && canv.width)  || 1024;
+      var srcH = (canv && canv.height) || 504;
+      var w = (capW > 0 && capW < srcW) ? capW : srcW;
+      var h = (capW > 0 && capW < srcW) ? Math.round(capW * srcH / srcW) : srcH;
+      var px = p.frames * w * h;
+      var isMono = (config.colorMode === 'monochrome');
+      var pp = config.postprocess || {};
+      var heavyPP = !!((pp.bloom && pp.bloom.enabled) || (pp.halation && pp.halation.enabled));
+      var bpp = gif ? (isMono ? 0.18 : 0.30) : (isMono ? 0.075 : 0.10);
+      if (heavyPP) bpp *= 1.3;
+      return px * bpp;
+    }
+    function _formatMB(bytes) {
+      var mb = bytes / 1024 / 1024;
+      return (mb < 1) ? (Math.round(bytes / 1024) + ' KB') : (mb.toFixed(1) + ' MB');
+    }
     setInterval(function () {
       var p = exportPlan();
+      var capW = (sizeOpts && sizeOpts.capWidth) || 0;
       expState.frames = p.frames;
       expState.length = p.dur.toFixed(2) + 's (' + p.delayMs + 'ms/frame)';
+      var gifB = _estimateBytes(p, capW, true);
+      var mp4B = _estimateBytes(p, capW, false);
+      expState.estGif = _formatMB(gifB) + (gifB > 15 * 1024 * 1024 ? ' ✗ Twitter' : '');
+      expState.estMp4 = _formatMB(mp4B);
     }, 200);
 
     /* Output size dropdown — caps width before encoding for smaller files.

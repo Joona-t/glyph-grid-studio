@@ -1171,9 +1171,19 @@
           ? window.__sourceFrameIdx : sourceImg.gifProperties.displayIndex;
         animTag = ` | gif=${idx + 1}/${sourceImg.numFrames()}`;
       }
+      /* Rolling-average fps from the perf ring (last 30 frames, ~1s).
+         "is the build keeping up?" answer in one glance.  total can be 0
+         on the first frame before __pfCommit fires; show '—' then. */
+      let fpsTag = '';
+      if (__pfRing.length > 0) {
+        let sumTotal = 0;
+        for (let _i = 0; _i < __pfRing.length; _i++) sumTotal += __pfRing[_i].total;
+        const avgMs = sumTotal / __pfRing.length;
+        if (avgMs > 0) fpsTag = ` | ${(1000 / avgMs).toFixed(0)} fps`;
+      }
       statusEl().textContent =
         `${CONFIG.scene} | ${CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
-        `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag}${animTag} | ` +
+        `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag}${animTag}${fpsTag} | ` +
         `t=${t.toFixed(2)}s | compat=${CONFIG.compat}`;
     }
 

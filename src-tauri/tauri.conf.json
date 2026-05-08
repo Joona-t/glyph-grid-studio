@@ -43,6 +43,7 @@
     ],
     "category": "GraphicsAndDesign",
     "shortDescription": "Interactive ASCII / glyph-grid art studio",
-    "longDescription": "Tunable ASCII / character-grid art renderer. Drag-drop any image, dial in palettes / breathing / dithering / postprocess via sliders, save presets, export PNG and animated GIF."
+    "longDescription": "Tunable ASCII / character-grid art renderer. Drag-drop any image, dial in palettes / breathing / dithering / postprocess via sliders, save presets, export PNG and animated GIF.",
+    "resources": ["../USER-GUIDE.md"]
   }
 }
