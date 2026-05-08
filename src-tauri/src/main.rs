@@ -93,6 +93,11 @@ struct RenderArgs {
     /// Show the rendering window during the headless render (debug aid).
     #[arg(long)]
     show_window: bool,
+
+    /// Output format: `gif` (default) or `mp4`.  When omitted, the format
+    /// is inferred from the output path extension (`.mp4` → mp4).
+    #[arg(long, value_name = "FORMAT")]
+    format: Option<String>,
 }
 
 fn main() {
@@ -120,6 +125,7 @@ fn main() {
                     cols: args.cols,
                     rows: args.rows,
                 },
+                format: args.format,
             };
             let code = app_lib::run_headless_render(job);
             // Tauri's `app.exit(code)` triggers `tauri::run()` to return without

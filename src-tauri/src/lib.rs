@@ -43,6 +43,29 @@ pub struct HeadlessRenderJob {
     pub show_window: bool,
     pub preset_path: Option<PathBuf>,
     pub config_overrides: ConfigOverrides,
+    /// Output format. `"gif"` (default) → gifski; `"mp4"` → openh264 + mp4.
+    /// When None, derived from `out_path`'s extension.
+    pub format: Option<String>,
+}
+
+impl HeadlessRenderJob {
+    /// Resolve the output format: explicit `format` wins, otherwise infer
+    /// from the output extension.  Defaults to `"gif"` for unknown extensions.
+    pub fn resolved_format(&self) -> String {
+        if let Some(f) = &self.format {
+            return f.to_lowercase();
+        }
+        match self
+            .out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .as_deref()
+        {
+            Some("mp4") => "mp4".into(),
+            _ => "gif".into(),
+        }
+    }
 }
 
 impl HeadlessRenderJob {
@@ -151,6 +174,13 @@ fn get_cli_render_job(state: tauri::State<CliJobState>) -> Option<serde_json::Va
     state.job.lock().ok().and_then(|g| g.clone())
 }
 
+/// JS-side log forwarding for headless / production builds where
+/// `console.log` doesn't reach stderr.  Useful for surfacing batch errors.
+#[tauri::command]
+fn cli_log(msg: String) {
+    eprintln!("glyph-grid-studio[js]: {}", msg);
+}
+
 /// JS calls this when the headless render is finished. Logs to stderr so
 /// CLI users can see why a headless render reported failure, then exits
 /// the process directly.
@@ -182,10 +212,12 @@ fn exit_with_status(
 /// before this function returns, so the return value here is a fallback for
 /// the "tauri runtime closed without a render" case.
 pub fn run_headless_render(job: HeadlessRenderJob) -> i32 {
+    let format = job.resolved_format();
     let job_json = serde_json::json!({
         "inPath": job.in_path.to_string_lossy().to_string(),
         "outPath": job.out_path.to_string_lossy().to_string(),
         "frames": job.frames,
+        "format": format,
         "config": job.build_js_config(),
     });
     let exit_code = Arc::new(Mutex::new(2)); // 2 = "didn't complete"
@@ -398,6 +430,260 @@ async fn save_gif_to_path(
     Ok(p.display().to_string())
 }
 
+/// Encode a recorded sequence of PNG frames as an MP4/H.264 video using the
+/// `openh264` (Cisco's BSD-licensed encoder) + `mp4` (ISO-MP4 muxer) crates.
+/// This path exists because Instagram (Reels / Stories / feed posts) strips
+/// uploaded GIFs — only MP4 plays back inline.  For a 90-frame loop the
+/// output is typically ~1-3 MB, well under any platform limit.
+///
+/// `cap_width` resizes frames to that width (preserving aspect, rounded to
+/// even because yuv420p requires even dimensions).  `None` keeps the source
+/// size (still rounded to even).
+fn encode_mp4_h264(
+    frames: &[GifFrame],
+    fps: u32,
+    cap_width: Option<u32>,
+) -> Result<Vec<u8>, String> {
+    use mp4::{AvcConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
+    use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode};
+    use openh264::formats::{RgbSliceU8, YUVBuffer};
+    use openh264::OpenH264API;
+
+    if frames.is_empty() {
+        return Err("no frames provided".into());
+    }
+    if fps == 0 {
+        return Err("fps must be > 0".into());
+    }
+
+    // Decode the first frame to learn source dimensions.
+    let first_bytes = general_purpose::STANDARD
+        .decode(&frames[0].b64)
+        .map_err(|e| format!("frame 0 b64: {}", e))?;
+    let first_img = image::load_from_memory_with_format(&first_bytes, image::ImageFormat::Png)
+        .map_err(|e| format!("frame 0 decode: {}", e))?;
+    let src_w = first_img.width();
+    let src_h = first_img.height();
+
+    // yuv420p requires even W and H.  When cap_width is set and smaller than
+    // the source, scale H proportionally and round both to even.
+    fn even(v: u32) -> u32 { v & !1 }
+    let (target_w, target_h) = match cap_width {
+        Some(cap) if cap > 0 && cap < src_w => {
+            let scale = cap as f64 / src_w as f64;
+            (even(cap), even((src_h as f64 * scale).round() as u32))
+        }
+        _ => (even(src_w), even(src_h)),
+    };
+    if target_w == 0 || target_h == 0 {
+        return Err(format!("invalid output dims: {}x{}", target_w, target_h));
+    }
+
+    // Configure the encoder explicitly:
+    //   - Rate control = Off — never skip frames.  Glyph art has very low
+    //     inter-frame motion in static backgrounds; under default bitrate-
+    //     based RC openh264 was emitting zero NAL units for some frames,
+    //     producing a broken stream.  RC Off makes every encode() yield a
+    //     real slice NAL.
+    //   - Bitrate = 5 Mbps cap (still small for our content; usually
+    //     produces 1-2 MB output for a 90-frame loop).
+    //   - Max frame rate 30 — tells the encoder the playback target.
+    let cfg = EncoderConfig::new()
+        .max_frame_rate(FrameRate::from_hz(fps as f32))
+        .bitrate(BitRate::from_bps(5_000_000))
+        .rate_control_mode(RateControlMode::Off);
+    let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), cfg)
+        .map_err(|e| format!("openh264 init: {}", e))?;
+
+    // Walk frames, encode, capture SPS/PPS once and slice NALs per frame.
+    let mut sps: Option<Vec<u8>> = None;
+    let mut pps: Option<Vec<u8>> = None;
+    let mut samples: Vec<(Vec<u8>, bool)> = Vec::with_capacity(frames.len());
+
+    for (idx, f) in frames.iter().enumerate() {
+        let bytes = general_purpose::STANDARD
+            .decode(&f.b64)
+            .map_err(|e| format!("frame {} b64: {}", idx, e))?;
+        let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+            .map_err(|e| format!("frame {} decode: {}", idx, e))?;
+        let img = if img.width() != target_w || img.height() != target_h {
+            img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3)
+        } else {
+            img
+        };
+        let rgb = img.to_rgb8();
+        let rgb_data: Vec<u8> = rgb.into_raw();
+
+        let rgb_source = RgbSliceU8::new(&rgb_data, (target_w as usize, target_h as usize));
+        let yuv = YUVBuffer::from_rgb_source(rgb_source);
+
+        let bitstream = encoder
+            .encode(&yuv)
+            .map_err(|e| format!("frame {} encode: {}", idx, e))?;
+
+        // openh264 emits each NAL with a 4-byte Annex-B start code 00 00 00 01.
+        // For MP4/AVCC we need: SPS (NAL type 7) and PPS (NAL type 8) extracted
+        // and stored in AvcConfig once; slice NALs (type 5 = IDR, type 1 =
+        // non-IDR) length-prefixed (4-byte big-endian) and concatenated as the
+        // sample payload.
+        let mut sample_bytes: Vec<u8> = Vec::new();
+        let mut is_idr = false;
+        let mut nal_types_seen: Vec<u8> = Vec::new();
+
+        for li in 0..bitstream.num_layers() {
+            let layer = bitstream
+                .layer(li)
+                .ok_or_else(|| format!("frame {} layer {} missing", idx, li))?;
+            for ni in 0..layer.nal_count() {
+                let nal = layer
+                    .nal_unit(ni)
+                    .ok_or_else(|| format!("frame {} layer {} nal {} missing", idx, li, ni))?;
+                let payload: &[u8] = if nal.starts_with(&[0, 0, 0, 1]) {
+                    &nal[4..]
+                } else if nal.starts_with(&[0, 0, 1]) {
+                    &nal[3..]
+                } else {
+                    return Err(format!(
+                        "frame {} unexpected NAL prefix: {:?}",
+                        idx,
+                        &nal[..nal.len().min(5)]
+                    ));
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+                let nal_type = payload[0] & 0x1F;
+                nal_types_seen.push(nal_type);
+                match nal_type {
+                    7 => { if sps.is_none() { sps = Some(payload.to_vec()); } }
+                    8 => { if pps.is_none() { pps = Some(payload.to_vec()); } }
+                    5 => {
+                        // IDR slice — keyframe.
+                        is_idr = true;
+                        sample_bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                        sample_bytes.extend_from_slice(payload);
+                    }
+                    1 | 2 | 3 | 4 => {
+                        // Non-IDR slice variants: 1=non-IDR, 2-4=DPA/B/C
+                        // (data-partitioned slice types).  All count as slice
+                        // payload for MP4 sample bytes.
+                        sample_bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                        sample_bytes.extend_from_slice(payload);
+                    }
+                    // Skip SEI (6) / AUD (9) / filler (12) / other NALs —
+                    // the AVC1 file format doesn't require them, and including
+                    // them in samples can confuse strict players.
+                    _ => {}
+                }
+            }
+        }
+
+        if sample_bytes.is_empty() {
+            return Err(format!(
+                "frame {} produced no slice NALs (saw NAL types {:?})",
+                idx, nal_types_seen
+            ));
+        }
+        samples.push((sample_bytes, is_idr));
+    }
+
+    let sps = sps.ok_or("no SPS NAL emitted by encoder")?;
+    let pps = pps.ok_or("no PPS NAL emitted by encoder")?;
+
+    // Mux to MP4 in memory.
+    let mp4_config = Mp4Config {
+        major_brand: "isom".parse().map_err(|_| "isom brand parse")?,
+        minor_version: 512,
+        compatible_brands: vec![
+            "isom".parse().map_err(|_| "isom brand parse")?,
+            "iso2".parse().map_err(|_| "iso2 brand parse")?,
+            "avc1".parse().map_err(|_| "avc1 brand parse")?,
+            "mp41".parse().map_err(|_| "mp41 brand parse")?,
+        ],
+        timescale: 1000,
+    };
+    let buf = std::io::Cursor::new(Vec::<u8>::new());
+    let mut writer = Mp4Writer::write_start(buf, &mp4_config)
+        .map_err(|e| format!("mp4 write_start: {}", e))?;
+
+    let track_config = TrackConfig::from(AvcConfig {
+        width: target_w as u16,
+        height: target_h as u16,
+        seq_param_set: sps,
+        pic_param_set: pps,
+    });
+    writer
+        .add_track(&track_config)
+        .map_err(|e| format!("mp4 add_track: {}", e))?;
+
+    // Frame duration in timescale ticks (timescale = 1000).  Use exact
+    // 1000 / fps so total duration ≈ frames / fps.
+    let frame_dur_ticks: u32 = (1000.0 / fps as f64).round().max(1.0) as u32;
+
+    for (idx, (bytes, is_idr)) in samples.into_iter().enumerate() {
+        let sample = Mp4Sample {
+            start_time: (idx as u64) * (frame_dur_ticks as u64),
+            duration: frame_dur_ticks,
+            rendering_offset: 0,
+            is_sync: is_idr,
+            bytes: bytes.into(),
+        };
+        writer
+            .write_sample(1, &sample)
+            .map_err(|e| format!("write_sample {}: {}", idx, e))?;
+    }
+
+    writer.write_end().map_err(|e| format!("mp4 write_end: {}", e))?;
+    Ok(writer.into_writer().into_inner())
+}
+
+/// Save a recorded sequence of PNG frames as a single MP4/H.264 video.
+/// Pops the native save dialog and writes the encoded bytes there.
+#[tauri::command]
+async fn save_mp4_real(
+    app: tauri::AppHandle,
+    frames: Vec<GifFrame>,
+    fps: u32,
+    cap_width: Option<u32>,
+) -> Result<String, String> {
+    let mp4_buf = encode_mp4_h264(&frames, fps, cap_width)?;
+
+    let path: Option<PathBuf> = app
+        .dialog()
+        .file()
+        .add_filter("MP4 video", &["mp4"])
+        .set_file_name("glyph-loop.mp4")
+        .blocking_save_file()
+        .map(|fp| fp.into_path().ok())
+        .flatten();
+
+    if let Some(p) = path {
+        fs::write(&p, &mp4_buf).map_err(|e| e.to_string())?;
+        Ok(p.display().to_string())
+    } else {
+        Err("cancelled".into())
+    }
+}
+
+/// Batch-mode MP4 write: encode frames and write to an absolute path with
+/// no save dialog.  Used by `runBatchExport` and the headless `--format mp4`
+/// CLI path.
+#[tauri::command]
+async fn save_mp4_to_path(
+    frames: Vec<GifFrame>,
+    fps: u32,
+    path: String,
+    cap_width: Option<u32>,
+) -> Result<String, String> {
+    let mp4_buf = encode_mp4_h264(&frames, fps, cap_width)?;
+    let p = PathBuf::from(&path);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;
+    }
+    fs::write(&p, &mp4_buf).map_err(|e| e.to_string())?;
+    Ok(p.display().to_string())
+}
+
 /// Save an arbitrary blob (e.g. an already-assembled GIF or ZIP) to a path
 /// chosen via native save dialog.  Kept for back-compat with the ZIP path.
 #[tauri::command]
@@ -537,7 +823,10 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             save_png,
             save_gif_real,
             save_gif_to_path,
+            save_mp4_real,
+            save_mp4_to_path,
             save_blob,
+            cli_log,
             pick_image,
             read_image_file,
             save_preset_json,

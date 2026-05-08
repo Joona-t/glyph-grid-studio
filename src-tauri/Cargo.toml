@@ -44,6 +44,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 gifski = "1.34.0"
 imgref = "1.12.1"
 rgb = "0.8.53"
+# MP4 export (Instagram Reels/Stories/feed posts strip uploaded GIFs).
+# openh264 default features include `source` which builds Cisco's BSD-licensed
+# H.264 encoder from C source — needs `nasm` at build time. Cisco licenses
+# redistribution of the encoder so the binary stays MIT.  `mp4` muxes the
+# raw H.264 NAL stream into an MP4 container with an avc1 video track.
+openh264 = "0.9.3"
+mp4 = "0.14.0"
 
 [features]
 # When enabled, Cmd+Opt+I opens the WebKit inspector. Default OFF for

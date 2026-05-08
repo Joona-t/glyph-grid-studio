@@ -3000,20 +3000,37 @@
                 setTimeout(next, 50);
                 return;
               }
-              tauri('save_gif_to_path', {
-                frames: frames.map(b => ({ b64: b })),
-                delayMs: delayMs,
-                path: job.path,
-                capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
-              })
+              /* Format dispatch: GIF (default) → save_gif_to_path with
+                 delayMs; MP4 → save_mp4_to_path with fps.  Both honour the
+                 capWidth resize.  Format is also auto-derived from the
+                 output path extension if `job.format` isn't set. */
+              const inferred = (job.path || '').toLowerCase().endsWith('.mp4') ? 'mp4' : 'gif';
+              const fmt = (job.format || inferred).toLowerCase();
+              const cmd = fmt === 'mp4' ? 'save_mp4_to_path' : 'save_gif_to_path';
+              const args = fmt === 'mp4'
+                ? {
+                    frames: frames.map(b => ({ b64: b })),
+                    fps: Math.round(effFps),
+                    path: job.path,
+                    capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+                  }
+                : {
+                    frames: frames.map(b => ({ b64: b })),
+                    delayMs: delayMs,
+                    path: job.path,
+                    capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+                  };
+              tauri(cmd, args)
               .then(p => {
                 console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);
+                tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p }).catch(()=>{});
                 CONFIG.animation.fps = savedFps;     // restore on success
                 idx++;
                 setTimeout(next, 50);
               })
               .catch(e => {
                 console.warn('batch: save failed', job.name, e);
+                tauri('cli_log', { msg: 'batch: save failed ' + job.name + ' fmt=' + fmt + ' err=' + String(e) }).catch(()=>{});
                 errors.push({ name: job.name, err: String(e) });
                 CONFIG.animation.fps = savedFps;     // restore on encoder failure
                 idx++;
@@ -3510,6 +3527,7 @@
       name: 'cli',
       path: job.outPath,
       frames: job.frames || 24,
+      format: job.format,  // 'gif' (default) | 'mp4' — Rust pre-resolves
       config: {},  // already applied above
     }], {
       onComplete: function (result) {

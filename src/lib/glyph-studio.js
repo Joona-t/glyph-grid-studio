@@ -296,6 +296,64 @@
       }, 200);
     }
   }
+
+  /* MP4/H.264 path — for Instagram (Reels / Stories / feed posts) which
+     strips uploaded GIFs.  Mirrors recordGIF: collect frames during
+     playback, hand them to the Rust openh264 + mp4 muxer.  Outside Tauri
+     this falls back to a ZIP of frames, same as the GIF path. */
+  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth) {
+    if (!testHook) return;
+    var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
+
+    testHook.beginRecord({
+      total: total || 24,
+      collectFrames: inTauri,
+      onFinish: function (blob) {
+        if (onDone) onDone(blob);
+        if (inTauri) {
+          var rs = testHook.getRecState();
+          var frames = rs && rs.framesB64 ? rs.framesB64 : [];
+          if (!frames.length) {
+            console.warn('glyph-studio: no frames collected, falling back to ZIP');
+            saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
+            return;
+          }
+          var resolvedFps = (typeof fps === 'number' && fps > 0)
+            ? Math.round(fps)
+            : ((window.__glyphGridTest &&
+                window.__glyphGridTest.getConfig &&
+                window.__glyphGridTest.getConfig().animation &&
+                window.__glyphGridTest.getConfig().animation.fps) || 30);
+          var payloadFrames = frames.map(function (b64) { return { b64: b64 }; });
+          window.__TAURI__.core.invoke('save_mp4_real', {
+            frames: payloadFrames,
+            fps: resolvedFps,
+            capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
+          })
+            .then(function (p) {
+              if (p) console.log('glyph-studio: saved MP4 to', p);
+            })
+            .catch(function (e) {
+              if (e !== 'cancelled') {
+                console.warn('save_mp4_real failed:', e, '— falling back to ZIP');
+                saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
+              }
+            });
+        } else {
+          saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
+        }
+      },
+    });
+    if (onProgress) {
+      var lastIdx = 0;
+      var t = setInterval(function () {
+        var rs = testHook.getRecState();
+        if (!rs) { clearInterval(t); return; }
+        if (rs.frameIdx !== lastIdx) { lastIdx = rs.frameIdx; onProgress(lastIdx, total || 24); }
+        if (rs.done) clearInterval(t);
+      }, 200);
+    }
+  }
   function stamp() { return new Date().toISOString().replace(/[:.]/g, '-'); }
   function saveBlobBrowser(blob, filename) {
     var url = URL.createObjectURL(blob);
@@ -734,6 +792,28 @@
           console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
         },
         p.delayMs,
+        capW > 0 ? capW : null);
+    });
+
+    /* Export MP4 — for Instagram (Reels / Stories / feed posts strip
+       uploaded GIFs).  Same fps-override discipline as Export GIF for
+       a clean loop wrap.  Uses effFps as the encoded fps so the studio
+       frame timing matches the MP4's playback timestamps exactly. */
+    fExp.addButton({ title: inTauri ? 'Export MP4' : 'Export MP4 (ZIP fallback)' }).on('click', function () {
+      var p = exportPlan();
+      var capW = sizeOpts.capWidth || 0;
+      var savedFps = config.animation.fps;
+      config.animation.fps = p.effFps;
+      var encFps = Math.round(p.effFps);
+      console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps overridden ' + savedFps + ' → ' + p.effFps.toFixed(2));
+      recordMP4(opts.testHook, p.frames,
+        function (i, total) { console.log('  ', i, '/', total); },
+        function () {
+          config.animation.fps = savedFps;
+          try { pane.refresh(); } catch (e) {}
+          console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
+        },
+        encFps,
         capW > 0 ? capW : null);
     });
 

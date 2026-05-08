@@ -58,6 +58,10 @@ pub struct RenderParams {
     /// Grid rows.
     #[serde(default)]
     pub rows: Option<u32>,
+    /// Output format: `gif` (default) or `mp4`.  When omitted, inferred
+    /// from `out_path`'s extension.
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 /* ---------- Server handler ---------- */
@@ -118,6 +122,9 @@ impl GlyphGridServer {
         }
         if let Some(v) = p.rows {
             cmd.arg("--rows").arg(v.to_string());
+        }
+        if let Some(v) = &p.format {
+            cmd.arg("--format").arg(v);
         }
 
         match cmd.output() {
