@@ -4,6 +4,42 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-09 — UX patch: fast initial render after image upload
+
+User reported: "when uploading a gif or picture to glyph grid post process and animations should all be unchecked. to increase speed".  Per Rule #11 (PATCH > WORKAROUND), implemented as a studio behaviour change rather than asking the user to remember to manually toggle settings every time.
+
+### ITER-019 — `applyFastLoadDefaults` resets postproc + breathing + dispersal on every image-load
+
+- **Found:** 2026-05-09 by user pain.  Loading a new source image kept whatever postproc / breathing / dispersal toggles were on from the previous session.  First-frame render after upload would chew through bloom + halation + breathing computation when the user just wanted to see the image rendered cleanly first.
+- **Root cause:** the studio panel's CONFIG state persists across image swaps (it's user-managed, not source-managed).  No "reset to clean defaults" hook fires on upload.  This was correct for keeping a user's tuning across renders of the *same* source, but wrong when swapping to a new image where the user expects a fast, clean baseline render.
+- **Fix (this commit):** new helper `applyFastLoadDefaults(config)` in `src/lib/glyph-studio.js` that mutates:
+    - All `config.postprocess.{*}.enabled` → `false` (vignette, bloom, halation, scanlines, etc.)
+    - `config.studio.breathing.gainSwing` → 0
+    - `config.studio.breathing.jitter` → 0
+    - `config.dispersal.enabled` → `false` (so a previous-session dispersal doesn't re-trigger on a new image)
+    Wired into all 4 image-load completion sites: drag-drop overlay (line ~180), Tauri drag-drop event (line ~225), Pick image button swap callback (line ~607), Recent dropdown change handler (line ~679).  The existing `pane.refresh()` hook (called via `__refreshPane` / `onSwap`) updates the panel toggles to reflect the reset state.
+- **Why not change the base CONFIG defaults instead:** keeping `vignette.enabled: true` and breathing on at app-launch is the right starting state — the user's first impression is a polished render with the brand vignette and subtle breathing.  The reset is *upload-triggered*, not launch-triggered.  Two states: launch = polished, upload = clean baseline.
+- **Verification:** rebuilt + reinstalled.  Drop a new GIF → panel toggles for vignette, bloom, halation, breathing gainSwing all snap to off / 0.  `pane.refresh()` updates the visible toggles.  User can re-enable any of them after.
+
+---
+
+## 2026-05-09 — Tooling: `/disperse` skill for one-shot stardust renders
+
+### ITER-020 — `~/.claude/skills/disperse/SKILL.md`
+
+- **Found:** 2026-05-09 by user request: "add the disperse effect as a skill".  The dispersal feature shipped in ITER-018 is in the studio panel, but invoking it from outside Claude Code (or scripting it across multiple sources) requires hand-rolling the preset JSON each time.
+- **Fix:** new skill at `~/.claude/skills/disperse/SKILL.md`.  Frontmatter `name: disperse`, `description: ...`.  Workflow:
+    1. Resolve source path (ask if missing)
+    2. Write a curated dispersal preset to `/tmp/disperse-<random>.json`
+    3. Run `glyph-grid-studio render --in <source> --out ~/Downloads/<stem>-stardust.mp4 --frames N --preset /tmp/...`
+    4. ffprobe verify (codec, frames, duration)
+    5. `open` the result in QuickTime
+    Includes tuning hints (when to drop `startT`, raise `intensity`, etc.) and constraints (only works in monochrome fast path; one-shot, not looping; render-time, not post-process).
+- **Why a skill, not a CLI flag:** the studio CLI doesn't take a `--dispersal` flag; the dispersal config goes through the preset JSON.  Hand-writing the preset every time is friction.  Skills are the natural wrapper for "here's a curated config for a common workflow".  `/glyph-grid` is the analogous skill for new ASCII art pieces; `/disperse` is the dispersal-specific variant.
+- **Verification:** skill file syntactically valid markdown, frontmatter parseable, workflow steps executable.  Will exercise on next user invocation.
+
+---
+
 ## 2026-05-09 — Feature: Dispersal (stardust) effect
 
 User wanted a render where the subject "tilts his head, the pixels start dimming, then disperse like stardust until only cream paper is left."  Per Rule #11 (PATCH > WORKAROUND), implemented as a studio feature rather than an external post-process.

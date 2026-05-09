@@ -124,6 +124,30 @@
   /* ----------------------------------------------------------------
    * 3.  Drag-drop image upload zone
    * ---------------------------------------------------------------- */
+  /* applyFastLoadDefaults — called every time a NEW source image lands.
+     Turns off all postprocess stages + breathing animation + dispersal so
+     the first render after upload is fast and clean.  User can re-enable
+     anything from the panel after the image lands.  Per ITER-019 — Joona
+     wanted upload-then-tweak to feel snappy without first-frame chrome. */
+  function applyFastLoadDefaults(config) {
+    if (!config) return;
+    if (config.postprocess) {
+      Object.keys(config.postprocess).forEach(function (k) {
+        var stage = config.postprocess[k];
+        if (stage && typeof stage === 'object' && 'enabled' in stage) {
+          stage.enabled = false;
+        }
+      });
+    }
+    if (config.studio && config.studio.breathing) {
+      config.studio.breathing.gainSwing = 0;
+      config.studio.breathing.jitter = 0;
+    }
+    if (config.dispersal) {
+      config.dispersal.enabled = false;
+    }
+  }
+
   function setupImageDrop(imageRef, sceneCacheKeys, onSwap, config) {
     if (!imageRef) return;
     var overlay = document.createElement('div');
@@ -154,6 +178,7 @@
       if (!file || !/^image\//.test(file.type)) return;
       var url = URL.createObjectURL(file);
       window.loadImage(url, function (img) {
+        applyFastLoadDefaults(config);
         imageRef.set(img);
         if (sceneCacheKeys && window.SCENES) {
           for (var i = 0; i < sceneCacheKeys.length; i++) {
@@ -197,6 +222,7 @@
       window.__TAURI__.core.invoke('read_image_file', { path: absPath })
         .then(function (dataUrl) {
           window.loadImage(dataUrl, function (img) {
+            applyFastLoadDefaults(config);
             imageRef.set(img);
             clearSceneCaches();
             if (onSwap) onSwap(img);
@@ -578,6 +604,7 @@
        when running in plain browser. */
     fImg.addButton({ title: 'Pick image…' }).on('click', function () {
       var swap = function (img) {
+        applyFastLoadDefaults(config);
         if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(img);
         if (opts.sceneCacheKeys && window.SCENES) {
           for (var i = 0; i < opts.sceneCacheKeys.length; i++) {
@@ -648,6 +675,7 @@
           .then(function (dataUrl) {
             if (!window.loadImage) return;
             window.loadImage(dataUrl, function (img) {
+              applyFastLoadDefaults(config);
               if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(img);
               if (opts.sceneCacheKeys && window.SCENES) {
                 for (var i = 0; i < opts.sceneCacheKeys.length; i++) {
