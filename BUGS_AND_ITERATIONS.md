@@ -4,6 +4,30 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-09 — Refinement: post-process dispersal threshold (selective vs total)
+
+### ITER-022 — Default `--ink-threshold` 200 → 140 (only shaded pixels disperse, mid-tone silhouette stays)
+
+- **Found:** 2026-05-09 by user feedback after watching the v1 outro: "currently everything disperses, but only the shaded pixels should disperse so its intentional."  The v1 default (200) classified all non-cream pixels as "ink", so the entire toji content (including the lighter mid-tone glyph stipple that forms the silhouette structure) drifted away uniformly.  Result read as "everything dissolves" rather than "the ink lifts off the page".
+- **Root cause:** cream-paper-monochrome glyph art has a tri-modal luminance distribution per ITER-021's verification:
+    - Bottom ~13%: actually-shaded pixels (eye sockets, hair shadows, mouth) — luminance < 140
+    - Middle ~77%: mid-tone glyph stipple that forms the figure's structure — 140–210
+    - Top ~10%: cream paper bg — > 210
+  The user's mental model: "shaded" = the bottom band only.  My v1 default conflated the bottom AND middle bands, so the form's whole substance drifted instead of just the ink.
+- **Fix (continuation of ITER-021):** lowered the script's default `--ink-threshold` from 200 → 140 in `disperse_video.py`.  Now only the bottom-luminance pixels (the actually-dark "shading") drift; the mid-tone glyph stipple stays in place, leaving a ghost silhouette of the figure as the outro plays.  Effect: ink evaporates, the pencil tracing remains.
+- **Verification:** re-ran on `Toji-JJK.mp4` with `--ink-threshold 140`:
+    | Frame | dark<140 | mid 140-210 | cream>210 |
+    |---|---|---|---|
+    | 232 (orig last) | 13.0% | 77.3% | 9.7% |
+    | 250 (outro 0.20) | 3.8% | 79.5% | 16.7% |
+    | 280 (outro 0.57) | 0.2% | 79.7% | 20.1% |
+    | 310 (outro 0.94) | 0.3% | 70.7% | 29.1% |
+    The dark band drains (13.0 → 0.3%) while the mid-tone band stays roughly intact (77 → 71%).  The remaining mid-tone forms a ghost silhouette through the entire outro.  Output `~/Downloads/Toji-JJK-stardust-outro.mp4` (10.9 MB, 9.48s, replaced earlier 17.2 MB version).
+- **Tuning hints documented in `SKILL.md`:** raise `--ink-threshold` to 180+ if the user wants the silhouette to dissolve too; lower to 100 to disperse only the very darkest features.
+- **Lesson logged:** when adding "what counts as ink" thresholds for the cream-paper aesthetic, the default should match the user's *aesthetic* mental model (shaded = bottom luminance band only), not the *technical* one (anything not pure cream).
+
+---
+
 ## 2026-05-09 — Tooling: post-process dispersal outro (Mode B)
 
 User wanted the stardust effect applied to an EXISTING glyph render (`Toji-JJK.mp4`) without re-rendering through the studio.  ITER-018 gave us render-time dispersal (Mode A), but the user's mental model was different: "Keep the original gif. The disperse effect only happens at the end then extend it."  Per Rule #11, built the post-process tool rather than telling them re-rendering was the only path.
