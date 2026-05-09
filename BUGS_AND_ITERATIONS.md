@@ -4,6 +4,28 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-09 — Refinement: in-video vs outro mode (settling the placement)
+
+### ITER-023 — Restored `--mode in-video` as default; `--mode outro` kept as opt-in
+
+- **Found:** 2026-05-09 by user feedback after watching the outro version: "nah still not getting it.  The postdip version was almost it.  Tojis pixels disperse at the end when he tilts his head."  The user's settled mental model: original duration preserved, dispersal happens IN-VIDEO during the original frames (specifically during the head-tilt moment ≈ second half of the loop) — NOT as an appended outro.
+- **Why I drifted to outro mode:** earlier in the same session the user had said "Keep the original gif. The disperse effect only happens at the end then extend it" → I built outro mode (ITER-021).  Then `... at the end when he tilts his head` clarified that "the end" meant *the latter portion of the original*, not *after the original ends*.  The "tilts his head" was the giveaway — that moment lives WITHIN the source, not after it.
+- **Fix (continuation of ITER-021/022):** `disperse_video.py` now takes `--mode {in-video,outro}` with `in-video` as the default.  In-video mode: each input frame at fractional time `t` gets dispersal phase `clamp((t/dur - startT) / (endT - startT), 0, 1)`.  Frames before startT pass through unchanged; frames after endT are fully dispersed.  Outro mode (the previous default) is still available as opt-in.
+- **Verification on `Toji-JJK.mp4`** (in-video mode, startT=0.5, endT=0.95, ink-threshold=140):
+    | Frame | Time | Phase | dark<140 | mid 140-210 | cream>210 |
+    |---|---|---|---|---|---|
+    | 0 | 0.0s | 0 (before) | 16.5% | 75.2% | 8.3% |
+    | 60 | 1.8s | 0 | 23.3% | 68.3% | 8.4% |
+    | 116 | 3.5s | 0 (=startT) | 22.3% | 68.4% | 9.3% |
+    | 150 | 4.5s | 0.31 | 7.7% | 70.8% | 21.5% |
+    | 180 | 5.4s | 0.60 | 0.6% | 75.6% | 23.8% |
+    | 210 | 6.3s | 0.88 | 0.3% | 68.0% | 31.7% |
+    | 232 | 7.0s | 1.00 | 0.1% | 70.5% | 29.4% |
+    Original duration preserved (6.99s).  Toji animates fully through the first half; dark band (the shaded ink) drains 22% → 0% during the second half; mid-tone band (the silhouette structure) stays roughly intact 68–75% throughout.  Effect: toji's ink lifts off during his head tilt, ghost silhouette remains.
+- **Lesson logged:** when the user says "X happens at the end of the gif", parse "the end" as "the latter portion within the duration" by default, not "after the duration".  "Extends/extend" is the keyword that signals the appended-outro intent.
+
+---
+
 ## 2026-05-09 — Refinement: post-process dispersal threshold (selective vs total)
 
 ### ITER-022 — Default `--ink-threshold` 200 → 140 (only shaded pixels disperse, mid-tone silhouette stays)
