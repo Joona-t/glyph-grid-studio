@@ -792,6 +792,33 @@
           'Gain swing rate in Hz. 0.7 = once per 1.4s. Slow = meditative, fast = nervous.');
     }
 
+    /* Dispersal — stardust effect.  Each inked cell drifts off in a seeded
+       random direction (upward-biased) and fades out across a tunable
+       startT → endT window.  Cream-paper bg is naturally exempt (cells
+       with space-glyphs render nothing anyway).  Read at draw-time per
+       index.html ITER-018. */
+    if (!config.dispersal) {
+      config.dispersal = {
+        enabled: false, startT: 0.5, endT: 0.95,
+        intensity: 0.4, upwardBias: 0.7, swayAmount: 0.5, rippleAmt: 0.2,
+      };
+    }
+    var fDis = pane.addFolder({ title: 'Dispersal', expanded: false });
+    tip(fDis.addInput(config.dispersal, 'enabled'),
+        'Stardust drift effect. Inked cells fly off and fade between startT and endT (fractions of animation duration). End state: blank cream paper.');
+    tip(fDis.addInput(config.dispersal, 'startT', { min: 0, max: 1, step: 0.01, label: 'start T' }),
+        'When the drift begins, as a fraction of animation.duration. 0 = from frame 0, 0.5 = halfway through.');
+    tip(fDis.addInput(config.dispersal, 'endT', { min: 0, max: 1, step: 0.01, label: 'end T' }),
+        'When fully dispersed (alpha = 0). Set ≤ 1.0 so the last frames are blank cream.');
+    tip(fDis.addInput(config.dispersal, 'intensity', { min: 0, max: 2, step: 0.05 }),
+        'Max drift distance as a fraction of canvas height. 0.4 ≈ 40% of canvas. Higher = particles fly further off-screen.');
+    tip(fDis.addInput(config.dispersal, 'upwardBias', { min: 0, max: 1, step: 0.05, label: 'upward bias' }),
+        '0 = random direction, 1 = straight up. 0.7 reads as "lifting away".');
+    tip(fDis.addInput(config.dispersal, 'swayAmount', { min: 0, max: 2, step: 0.05, label: 'sway' }),
+        'Horizontal sine wobble during drift. Subtle organic feel; 0 disables.');
+    tip(fDis.addInput(config.dispersal, 'rippleAmt', { min: 0, max: 0.5, step: 0.01, label: 'ripple' }),
+        'Per-cell start-time jitter. 0 = all cells start dispersing at startT. 0.3 = 30% of cells start later, creating a ripple.');
+
     if (config.postprocess) {
       /* Stage 3A: ensure crtBeam config block exists so the slider appears
          even if the scene didn't pre-declare it. */

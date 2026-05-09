@@ -232,6 +232,23 @@
     paletteMorph: null,
     recording: { mode: 'legacy' },
 
+    /* Dispersal — stardust effect.  Each inked cell drifts in a seeded
+       random direction (upward-biased) and fades out as time crosses
+       startT → endT (fractions of animation.duration).  Cream-paper bg
+       is naturally exempt since space-glyph cells already render nothing.
+       Designed for one-shot end-of-animation effects ("dimming →
+       stardust → blank paper"); for looping renders the effect resets
+       at frame 0 of each loop, which can read as breathing-out. */
+    dispersal: {
+      enabled:     false,
+      startT:      0.5,    // 0..1 fraction of duration when drift begins
+      endT:        0.95,   // 0..1 fraction of duration when fully dispersed
+      intensity:   0.4,    // max drift distance as fraction of canvas height
+      upwardBias:  0.7,    // 0 = random direction, 1 = pure upward
+      swayAmount:  0.5,    // horizontal sine wobble for organic feel (px scale)
+      rippleAmt:   0.2,    // per-cell start-time jitter; 0 = all-at-once, 0.3 = 30% ripple
+    },
+
     /* Studio UI (Tweakpane). Setting enabled:true builds a control
        panel that live-tunes everything in CONFIG. Breathing constants
        are read by the EMA hook in drawGlyphGridV2. */
@@ -2162,6 +2179,38 @@
     const halfCellW = cellW * 0.5;
     const halfCellH = cellH * 0.5;
 
+    /* Dispersal — stardust effect.  Per-cell drift + alpha fade across
+       a startT → endT window.  Cell positions resolved deterministically
+       from (col, row, seed) so frames are coherent.  Cream-paper bg
+       cells with space glyphs are exempt via the existing spaceMask
+       continue (no extra cost when dispersal is off — basePhase=0
+       short-circuits the per-cell branch). */
+    const _dispCfg = CONFIG.dispersal || {};
+    const _dispOn = !!(_dispCfg.enabled && _dispCfg.endT > _dispCfg.startT);
+    let _dispBasePhase = 0;
+    let _dispSwayPhase = 0;
+    if (_dispOn) {
+      const _dispDur = (CONFIG.animation && CONFIG.animation.duration) || 6;
+      const _dispT = recState
+        ? (recState.frameIdx / CONFIG.animation.fps)
+        : ((frameCount - 1) / CONFIG.animation.fps);
+      const _dispNorm = (_dispT % _dispDur) / _dispDur;
+      if (_dispNorm >= _dispCfg.startT) {
+        const _dispRange = _dispCfg.endT - _dispCfg.startT;
+        _dispBasePhase = (_dispNorm - _dispCfg.startT) / _dispRange;
+        if (_dispBasePhase > 1) _dispBasePhase = 1;
+      }
+      _dispSwayPhase = _dispT * 2;
+    }
+    const _dispActive = _dispBasePhase > 0;
+    const _dispUpBias = (_dispCfg.upwardBias != null) ? _dispCfg.upwardBias : 0.7;
+    const _dispHorizFactor = 1 - _dispUpBias;
+    const _dispDriftScale = (typeof height !== 'undefined' ? height : 600) * (_dispCfg.intensity || 0);
+    const _dispSwayScale = (_dispCfg.swayAmount || 0) * 8;
+    const _dispRippleAmt = _dispCfg.rippleAmt || 0;
+    const _dispRippleSpan = Math.max(0.01, 1 - _dispRippleAmt);
+    const _dispSeedBase = (CONFIG.seed | 0) >>> 0;
+
     /* Fast path: monochrome + no depthFog. ~85% of users hit this.
        Sprite-atlas accelerated — pre-rasterised ramp tiles get blitted
        via drawImage instead of one fillText per cell.  At 240×120 the
@@ -2178,7 +2227,7 @@
       const prevAlpha = ctx.globalAlpha;
       for (let r = 0; r < rows; r++) {
         const yBase = (r * cellH) | 0;
-        const cy = yBase + halfCellH;
+        const cy_base = yBase + halfCellH;
         const rowI = r * cols;
         for (let c = 0; c < cols; c++) {
           const i = rowI + c;
@@ -2194,9 +2243,34 @@
             else if (idx < 0) idx = 0;
           }
           if (spaceMask[idx]) continue;
-          const cx = ((c * cellW) | 0) + halfCellW;
+          let cx = ((c * cellW) | 0) + halfCellW;
+          let cy = cy_base;
           /* curved * 1.1 clamped to [0,1], used as globalAlpha. */
-          const a = curved * 1.1;
+          let a = curved * 1.1;
+
+          /* ── Dispersal: per-cell drift + alpha fade ──
+             Skipped entirely when basePhase == 0 (frames before startT)
+             so the hot path stays fast.  Math: cellRipple delays some
+             cells via per-cell hash; angle/speed both seeded from same
+             hash for coherence; horizontal sway is a sine wobble for
+             organic "drift up like ash" feel. */
+          if (_dispActive) {
+            const _seed = (_dispSeedBase ^ (c * 73856093) ^ (r * 19349663)) >>> 0;
+            const _ripple = ((_seed >>> 20) & 0xff) * (_dispRippleAmt / 255);
+            let _cellPhase = (_dispBasePhase - _ripple) / _dispRippleSpan;
+            if (_cellPhase > 0) {
+              if (_cellPhase > 1) _cellPhase = 1;
+              const _angle = ((_seed & 0xfff) / 4096) * Math.PI * 2;
+              const _speedRand = (((_seed >>> 12) & 0xff) / 255) * 0.7 + 0.3;
+              const _driftMag = _cellPhase * _dispDriftScale * _speedRand;
+              cx += Math.cos(_angle) * _driftMag * _dispHorizFactor
+                  + Math.sin(_dispSwayPhase + _seed * 0.0001) * _dispSwayScale * _cellPhase;
+              cy += Math.sin(_angle) * _driftMag * _dispHorizFactor
+                  - _driftMag * _dispUpBias;
+              a *= (1 - _cellPhase);
+            }
+          }
+
           ctx.globalAlpha = a > 1 ? 1 : a;
           ctx.drawImage(
             spriteCanvas, idx * tileW, 0, tileW, tileH,

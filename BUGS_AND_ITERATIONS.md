@@ -4,6 +4,29 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-09 — Feature: Dispersal (stardust) effect
+
+User wanted a render where the subject "tilts his head, the pixels start dimming, then disperse like stardust until only cream paper is left."  Per Rule #11 (PATCH > WORKAROUND), implemented as a studio feature rather than an external post-process.
+
+### ITER-018 — Per-cell stardust dispersal effect with upward drift + alpha fade
+
+- **Found:** 2026-05-09 by user request (toji loop, end-of-animation effect).
+- **Design:** time-based per-cell drift.  Each inked cell gets a deterministic random direction (seeded from `(col, row, CONFIG.seed)`) with configurable upward bias.  As the animation crosses `startT → endT` (fractions of duration), every cell drifts in its direction and fades alpha to zero.  Cream-paper bg is naturally exempt because cells with space-glyphs already render nothing (the existing `spaceMask[idx] continue` short-circuits before the dispersal math).  End state: blank cream paper.
+- **Implementation:** new `CONFIG.dispersal` block at `src/index.html:233+` with knobs `enabled / startT / endT / intensity / upwardBias / swayAmount / rippleAmt`.  Per-frame base phase computed once; per-cell phase derived from base + a hash-driven ripple delay so cells start drifting at slightly different times (organic ripple instead of all-at-once).  Inner loop additions in `drawBrightnessGrid` monochrome fast path: cell hash → angle + speed → `dx, dy` offset, `alpha *= (1 - cellPhase)`.  ~10 multiplies per cell when active; sub-millisecond at 28,800 cells.  Hot path stays clean when `basePhase = 0` (frames before startT) — single early-exit branch.
+- **Panel:** new `Dispersal` folder in `src/lib/glyph-studio.js` between Breathing and Postprocess.  All knobs tooltipped per the project's existing Tweakpane v3 `title` pattern.
+- **Verification:** rendered toji iii.gif at 6s duration, dispersal startT=0.5, endT=0.95, intensity=0.5, upwardBias=0.7, swayAmount=0.6, rippleAmt=0.25.  Pixel-stats progression across the dispersal window:
+    | Frame | t (s) | Status | inked % | cream % |
+    |---|---|---|---|---|
+    | 0 | 0.0 | before startT | 4.2 | 20.6 |
+    | 90 | 2.7 | startT (boundary) | 5.1 | 20.3 |
+    | 150 | 4.5 | mid-drift | 0.0 | 24.8 |
+    | 178 | 5.3 | end | 0.0 | 25.2 |
+    Cells drifted off-canvas + faded to transparent in the second half of the animation, leaving blank cream paper.  Visual confirmed via QuickTime.
+- **Output:** `~/Downloads/toji-stardust.mp4` (14 MB, 5.4s, 180 frames).
+- **Out of scope (filed for v0.1.2 if requested):** dispersal in `drawShapeGrid` (shape-edge-aware, octant, etc.), and in the duotone/gradient fast paths of `drawBrightnessGrid`.  Currently only the monochrome fast path supports dispersal — which is what the user's cream-paper-monochrome workflow uses.  Adding to other paths is mechanical (same math, repeated in each path's inner loop).
+
+---
+
 ## 2026-05-09 — UX patch: one-click platform-fit exports
 
 User rendered a 90+ frame toji loop at full canvas density and the resulting GIF came out 19.5 MB — over Twitter's 15 MB ceiling.  We fixed it externally with `gifski --width 720 --quality 100` (12.5 MB output), but the user's correct read was that this should be a built-in capability, not a manual post-process.  Workaround → patch.
