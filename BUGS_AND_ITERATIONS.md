@@ -4,6 +4,35 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-09 — Tooling: post-process dispersal outro (Mode B)
+
+User wanted the stardust effect applied to an EXISTING glyph render (`Toji-JJK.mp4`) without re-rendering through the studio.  ITER-018 gave us render-time dispersal (Mode A), but the user's mental model was different: "Keep the original gif. The disperse effect only happens at the end then extend it."  Per Rule #11, built the post-process tool rather than telling them re-rendering was the only path.
+
+### ITER-021 — `disperse_video.py` post-process: append a stardust outro to any rendered video
+
+- **Found:** 2026-05-09 by user pain.  My initial mistake: applied dispersal in-place across the second half of `Toji-JJK.mp4` (replacing toji's content with cream paper progressively).  User's correction was sharp: "no no no.  Keep the original gif.  The disperse effect only happens at the end then extend it."  Original mental model = original video plays through 100%, then a stardust outro is APPENDED.
+- **Root cause of the v1 mistake:** I conflated Mode A (render-time, ITER-018) with Mode B (post-process outro).  Mode A operates on the cell grid during render and replaces inked cells progressively.  Mode B operates on already-rendered frames and should APPEND, not overlay.  The user's word "extend" was the giveaway.
+- **Fix:** new script `~/.claude/skills/disperse/disperse_video.py` (lives outside the project repo since it's part of the user's `/disperse` skill, not the studio).  Algorithm:
+    1. Extract all input frames via `ffmpeg`.
+    2. Copy them into the output sequence UNTOUCHED.
+    3. Take the LAST input frame as the source for the outro.
+    4. Generate `extend × fps` outro frames with dispersal phase ramping `0 → 1`.  Per-pixel deterministic angle/speed seeded from `(x, y, seed)` mirroring the studio's `(c × 73856093) ^ (r × 19349663) ^ seed` hash from ITER-018.
+    5. Reassemble with `ffmpeg -c:v libx264 -pix_fmt yuv420p -movflags +faststart`.
+- **Subtle bug found and fixed mid-iteration:** v1 algorithm started the outro with cream paper as the baseline, then painted only "ink" pixels onto it.  Result: anything not classified as ink (cream bg, mid-tone glyphs at 100–200 luminance) got replaced with cream — toji's actual content disappeared instantly.  Fix: start with the ORIGINAL last frame as the baseline, then for ACTIVE ink pixels (cell_phase > 0): erase original position to cream, paint at offset with `alpha = (1 - cell_phase)`.  Non-ink pixels and not-yet-drifting ink pixels pass through.  Also raised `--ink-threshold` default from 150 to 200 — cream-paper bg is ~218 luminance, so 200 captures mid-tone glyphs (the `~,+,>,*,o` characters in the gradient ramp's middle range).
+- **Verification on `Toji-JJK.mp4` (1024×644, 233 frames, 6.99s):**
+    | Frame | Time | Phase | content<200 |
+    |---|---|---|---|
+    | 0 | 0.0s | original start | 79.2% (toji intact) |
+    | 116 | 3.5s | original mid | 78.8% |
+    | 232 | 7.0s | original last | 76.9% |
+    | 250 | 7.5s | outro phase ~0.20 | 45.1% (drifting) |
+    | 280 | 8.4s | outro phase ~0.57 | 18.0% |
+    | 310 | 9.3s | outro phase ~0.94 | 0.0% (cream paper) |
+    Output `~/Downloads/Toji-JJK-stardust-outro.mp4` (17.2 MB, 9.48s = 6.99s original + 2.49s outro).
+- **Skill update:** `~/.claude/skills/disperse/SKILL.md` now has TWO modes — Mode A (render-time, source-image input) calls the studio CLI; Mode B (post-process outro, video input) calls `disperse_video.py`.  Decision rule: source content → A; existing glyph render → B; ambiguous → ask once.
+
+---
+
 ## 2026-05-09 — UX patch: fast initial render after image upload
 
 User reported: "when uploading a gif or picture to glyph grid post process and animations should all be unchecked. to increase speed".  Per Rule #11 (PATCH > WORKAROUND), implemented as a studio behaviour change rather than asking the user to remember to manually toggle settings every time.
