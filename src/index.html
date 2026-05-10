@@ -212,10 +212,10 @@
     /* Postprocess defaults — vignette stays on (it's cheap, ~5ms, and
        reads as a "frame" around the canvas).  bloom + halation OFF by
        default — they cost ~80–180ms each (full-canvas box-blur) and
-       were carry-overs from the original eron-chip-inspection piece's
-       config, not appropriate for a generic studio default.  Users who
-       want them can toggle in the Postprocess folder.  See PERF-BASELINE.md
-       for the data behind this choice. */
+       were carry-overs from the original showcase config, not appropriate
+       for a generic studio default.  Users who want them can toggle in
+       the Postprocess folder.  See PERF-BASELINE.md for the data behind
+       this choice. */
     postprocess: {
       vignette: { enabled: true,  strength: 0.55 },
       bloom:    { enabled: false, radius: 2.5, strength: 0.95 },
