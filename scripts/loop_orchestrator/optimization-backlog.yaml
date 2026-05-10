@@ -1,7 +1,7 @@
 - id: OPT-003
   area: postprocess gate
   priority: P0
-  status: queued
+  status: rejected
   files:
   - src/index.html
   hypothesis: '`_hasImgDataStages` (src/index.html:2886) only checks `enabled`,
@@ -34,10 +34,14 @@
   prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug
     + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds
     inline source excerpts; no --dangerously-skip-permissions.
+  reason: 'patch_failed: `_hasImgDataStages` at src/index.html:2904-2923 already requires
+    intensity > 0.001 via the inner `_on` helper (shipped in commit 2efe80a, perf(F4));
+    the embedded source contradicts the hypothesis''s premise that the gate "only
+    checks `enabled`".'
 - id: OPT-004
   area: postprocess scratch buffers
   priority: P0
-  status: queued
+  status: rejected
   files:
   - src/lib/glyph-crt.js
   hypothesis: "`boxBlurLinear` at glyph-crt.js:85-87 allocates two\n`Float32Array(N*3)`\
@@ -56,6 +60,7 @@
     + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds
     inline source excerpts; no --dangerously-skip-permissions.
   cycle: 1
+  reason: visual_drift_below_0.985
 - id: OPT-006
   area: linearizeToLuminance gate
   priority: P0
@@ -68,7 +73,7 @@
     \ selection the buffer is dead work.\nGate the call on `mode === 'shape'`/`shape-edge-aware`\
     \ OR any prefilter\nthat consumes lumBuf.\n"
   expected_gain_ms: -3 to -5 on default-brightness configs
-  benchmark_first: true
+  benchmark_first: false
   risks: 'Hidden consumer of lumBuf could surface incorrect output. Audit
 
     every reference to `lumBuf` in src/ before writing the gate.
@@ -78,14 +83,20 @@
     \              || GlyphGrid.compat.gatePrefilter(CONFIG)\n              || (CONFIG.depth\
     \ && CONFIG.depth.enabled);\nif (needsLum) linearizeToLuminance(pixels, lumBuf,\
     \ srcW, srcH);\n"
-  prior_attempt: 'prior cycle rejected: patch_failed: Source excerpts do not include
-    the `linearizeToLuminance` call site or any `lumBuf` consumers (shape/edge selection,
-    prefilter, depth), so I cannot safely write the gate without auditing references
-    the risks section explicitly requires.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
+  prior_attempt: 'Re-queued 2026-05-10 after Joona''s 3ff788d identifier-grep fix.
+    Two prior runs rejected with "excerpt missing lumBuf consumers" — identifier
+    grep now embeds windows around all 9 lumBuf sites + 3 linearizeToLuminance
+    sites, so the audit-references risk gate can be cleared. benchmark_first
+    flipped to false: every patch goes through the 5-config bench; that IS the
+    benchmark.'
+  reason: 'patch_failed: Embedded excerpts (lines 1574-1983) show only the `linearizeToLuminance`
+    definition (1778) but not its call site or any `lumBuf` consumer (shape/edge selection,
+    prefilter, depth), so I cannot audit references as the risks section requires
+    before writing the gate.'
 - id: OPT-001
   area: drawBrightnessGrid preserve fast path
   priority: P0
-  status: queued
+  status: rejected
   files:
   - src/index.html
   hypothesis: "Preserve color mode (no fog) at src/index.html:2398 still calls\n`text(ch,\
@@ -114,10 +125,15 @@
     cannot be written without fabricating cache shape, tile geometry, or `_rampGradientSpaceMask`-equivalent
     state; hypothesis also flags BENCHMARK FIRST for composite-op toggle cost which
     cannot be validated from a blind diff.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
+  reason: 'patch_failed: Embedded excerpts omit `_ensureRampSprite`/`_ensureRampGradientSprite`
+    definitions and `_rampSpriteSpaceMask` construction, so a faithful `_ensurePreserveSprite`
+    cannot be authored without fabricating cache shape, tile geometry, and space-mask
+    state; additionally BENCHMARK FIRST flag requires composite-op toggle microbenchmark
+    validation that cannot be performed from a blind diff.'
 - id: OPT-002
   area: depthFog overlay pass
   priority: P0
-  status: queued
+  status: rejected
   files:
   - src/index.html
   hypothesis: "`depthFog` at lines 2142, 2485, 2668 forces all color modes\n(including\
@@ -142,6 +158,12 @@
   prior_attempt: 'prior cycle rejected: patch_failed: Source excerpts only show lines
     1-200; cannot author a diff touching depthFog at lines 2142/2485/2668 without
     seeing the actual code.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
+  reason: "patch_failed: The proposed overlay path applies fog tint over the entire\
+    \ canvas (bg + ink), whereas the inline slow path mixes fog only into the per-cell\
+    \ ink color via applyCellFill \u2014 producing materially different pixel bytes;\
+    \ gating behind a config flag preserves bit-exactness only if the default stays\
+    \ 'inline', in which case no benchmark config exercises the new path and there\
+    \ is no measurable gain on the current 5-config suite."
 - id: OPT-010
   area: default grid resolution
   priority: P1
