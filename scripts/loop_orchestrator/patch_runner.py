@@ -169,14 +169,38 @@ def _normalize_hunk_headers(diff_body: str) -> str:
     return "\n".join(out)
 
 
-# Maximum lines of source to embed per cited file. Glyph Grid's `index.html`
-# is ~3000 lines; embedding all of it in every prompt is wasteful. We grab a
-# window around any explicit `path:line` references in the hypothesis text;
-# if no line numbers are cited, we embed the head of the file as a fallback.
-_EXCERPT_BEFORE = 60
-_EXCERPT_AFTER = 60
-_FALLBACK_HEAD_LINES = 200
-_LINE_REF_RE = re.compile(r"([A-Za-z0-9_./\\-]+\.(?:html|js|ts|css|rs)):(\d+)")
+# Source-embedding strategy. The previous version under-shipped excerpts
+# (200-line head fallback when sites were at lines 1800-2700) and ignored
+# the "lines N, M, P" / "path:N-M" forms used in 6+ of the YAML hypotheses.
+# Five consecutive cycles failed with "source excerpts only show lines 1-200"
+# before this rewrite — see runs/cycle-000 through cycle-004 (2026-05-10).
+#
+# New strategy:
+#   * Files at or below FULL_FILE_LINES_MAX ship as full content (most cited
+#     glyph-grid modules are ≤ 600 lines).
+#   * Larger files (index.html is ~3800) ship windows around every detected
+#     line reference, with the windows widened from ±60 to ±200.
+#   * If still no line refs after expanded extraction, embed a wider fallback
+#     of FALLBACK_HEAD_LINES so even uncited files include their public API.
+_FULL_FILE_LINES_MAX = 1500
+_EXCERPT_BEFORE = 200
+_EXCERPT_AFTER = 200
+_FALLBACK_HEAD_LINES = 600
+
+# Path-qualified ref: "src/index.html:1774" or "glyph-crt.js:85". Captures a
+# range endpoint too so `:1774-1783` produces both 1774 and 1783 windows.
+_LINE_REF_RE = re.compile(
+    r"(?P<path>[A-Za-z0-9_./\\-]+\.(?:html|js|ts|css|rs)):"
+    r"(?P<lo>\d+)(?:[-–](?P<hi>\d+))?"
+)
+# Standalone "lines 2142, 2485, 2668" or "line 1774" — no path prefix. The
+# numbers attribute to whatever file(s) the hypothesis lists. Used when the
+# hypothesis says e.g. "depthFog at lines 2142, 2485, 2668" without quoting
+# the file path each time.
+_STANDALONE_LINES_RE = re.compile(
+    r"\blines?\s+(\d+(?:\s*[-,–]\s*\d+)*)",
+    re.IGNORECASE,
+)
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -186,25 +210,57 @@ def _read_lines(path: Path) -> list[str]:
         return []
 
 
+def _extract_line_refs(text: str, listed_files: list[str]) -> dict[str, list[int]]:
+    """Return {file: [line_numbers]} from both qualified and standalone refs.
+
+    Qualified refs (`path:N` or `path:N-M`) attribute to that exact path. A
+    range adds both endpoints so the merger covers the full span via two
+    windows. Standalone refs (`lines 2142, 2485, 2668`) attribute to every
+    file in `listed_files` — the hypothesis is talking about those files.
+    """
+    refs: dict[str, list[int]] = {}
+
+    # Qualified path:line[-line]
+    for m in _LINE_REF_RE.finditer(text):
+        path = m.group("path")
+        lo = int(m.group("lo"))
+        # Heuristic: match by suffix so "glyph-crt.js" matches "src/lib/glyph-crt.js"
+        target = next(
+            (f for f in listed_files if f.endswith(path) or path.endswith(f)),
+            path,
+        )
+        refs.setdefault(target, []).append(lo)
+        if m.group("hi"):
+            refs[target].append(int(m.group("hi")))
+
+    # Standalone "lines N, M, P" / "line N"
+    standalone_lines: list[int] = []
+    for m in _STANDALONE_LINES_RE.finditer(text):
+        for token in re.split(r"[,\s]+", m.group(1)):
+            for span in token.split("-"):
+                span = span.replace("–", "").strip()
+                if span.isdigit():
+                    standalone_lines.append(int(span))
+    if standalone_lines:
+        for f in listed_files:
+            refs.setdefault(f, []).extend(standalone_lines)
+
+    return refs
+
+
 def _file_excerpts(hyp: dict[str, Any]) -> str:
     """Build inline source excerpts for every file the hypothesis cites.
 
-    Strategy:
-      1. Parse `<file>:<line>` references from `hypothesis` and `code_shape`.
-      2. For each cited line, take a ±60-line window.
-      3. Merge overlapping windows per file.
-      4. If a `files:` entry has no explicit line reference, embed the first
-         200 lines of the file (better than nothing for short modules).
-    Each excerpt is rendered with absolute line numbers so Claude can match
-    them to hunk headers without guessing.
+    Small files ship in full. Large files ship merged ±200-line windows
+    around every detected line reference (qualified and standalone). Each
+    excerpt is rendered with absolute line numbers so Claude can match them
+    to hunk headers without guessing.
     """
     text = " ".join(str(hyp.get(k, "")) for k in
                     ("hypothesis", "code_shape", "area", "risks"))
-    refs: dict[str, list[int]] = {}
-    for m in _LINE_REF_RE.finditer(text):
-        refs.setdefault(m.group(1), []).append(int(m.group(2)))
-
     listed_files: list[str] = list(hyp.get("files", []))
+    refs = _extract_line_refs(text, listed_files)
+
     out_blocks: list[str] = []
     for f in listed_files:
         path = REPO_ROOT / f
@@ -213,6 +269,16 @@ def _file_excerpts(hyp: dict[str, Any]) -> str:
             continue
         lines = _read_lines(path)
         n = len(lines)
+
+        # Small file: ship the whole thing.
+        if n <= _FULL_FILE_LINES_MAX:
+            body_lines: list[str] = [f"  ### {f}  ({n} lines total — full file)"]
+            for i in range(1, n + 1):
+                body_lines.append(f"  {i:5d}  {lines[i - 1]}")
+            out_blocks.append("\n".join(body_lines))
+            continue
+
+        # Large file: window around references.
         windows: list[tuple[int, int]] = []
         for ln in refs.get(f, []):
             lo = max(1, ln - _EXCERPT_BEFORE)
@@ -220,7 +286,6 @@ def _file_excerpts(hyp: dict[str, Any]) -> str:
             windows.append((lo, hi))
         if not windows:
             windows.append((1, min(n, _FALLBACK_HEAD_LINES)))
-        # Merge overlaps
         windows.sort()
         merged: list[tuple[int, int]] = []
         for lo, hi in windows:
@@ -228,7 +293,7 @@ def _file_excerpts(hyp: dict[str, Any]) -> str:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
             else:
                 merged.append((lo, hi))
-        body_lines: list[str] = [f"  ### {f}  ({n} lines total)"]
+        body_lines = [f"  ### {f}  ({n} lines total — {sum(hi-lo+1 for lo,hi in merged)} lines embedded)"]
         for lo, hi in merged:
             body_lines.append(f"  --- lines {lo}-{hi} ---")
             for i in range(lo, hi + 1):
@@ -380,25 +445,60 @@ def request_patch(hyp: dict[str, Any], baseline_ms: dict[str, float],
 
 def apply_patch(diff_text: str, *, branch: str) -> dict:
     """Create branch, write diff, `git apply --check` then `git apply`.
-    Returns {ok, error}."""
+    Returns {ok, error, mode}.
+
+    Two-stage tolerance ladder:
+      1. Strict apply (no flags) — preferred.  Catches every drift.
+      2. If strict fails, retry with `--ignore-whitespace`.  This catches
+         the common LLM mistake of emitting context lines with subtly
+         wrong leading whitespace (e.g. cycle-3 OPT-010 had 11-space
+         indent where the source has 9-space).  JS / HTML are
+         whitespace-insensitive at runtime, so semantically the patch
+         still produces a bit-identical build of the affected functions.
+    The `mode` field on success says which path applied — `"strict"` or
+    `"ws-relaxed"` — so the orchestrator can flag ws-relaxed diffs as
+    "manual review recommended" before they hit a KEEP commit.
+    """
     diff_path = REPO_ROOT / ".git" / "auto-patches" / f"{branch}.diff"
     diff_path.parent.mkdir(parents=True, exist_ok=True)
     diff_path.write_text(diff_text)
 
-    # Validate
-    chk = subprocess.run(["git", "apply", "--check", str(diff_path)],
-                         capture_output=True, text=True, cwd=str(REPO_ROOT))
-    if chk.returncode != 0:
-        return {"ok": False, "error": f"check failed: {chk.stderr.strip()}"}
+    def _run(extra: list[str]) -> tuple[int, str]:
+        proc = subprocess.run(
+            ["git", "apply", *extra, str(diff_path)],
+            capture_output=True, text=True, cwd=str(REPO_ROOT),
+        )
+        return proc.returncode, proc.stderr.strip()
 
-    # Branch + apply
+    def _check(extra: list[str]) -> tuple[int, str]:
+        proc = subprocess.run(
+            ["git", "apply", "--check", *extra, str(diff_path)],
+            capture_output=True, text=True, cwd=str(REPO_ROOT),
+        )
+        return proc.returncode, proc.stderr.strip()
+
+    # Stage 1: strict
+    rc, err = _check([])
+    mode = "strict"
+    if rc != 0:
+        # Stage 2: try whitespace-tolerant.  We pass --recount as
+        # belt-and-braces in case anything slipped past _normalize_hunk_headers.
+        rc2, err2 = _check(["--ignore-whitespace", "--recount"])
+        if rc2 != 0:
+            # Original error is more useful than the relaxed error —
+            # they often match anyway.
+            return {"ok": False, "error": f"check failed: {err}",
+                    "mode": None}
+        mode = "ws-relaxed"
+
+    # Branch + apply with the same flags that passed --check
     subprocess.run(["git", "checkout", "-B", branch], capture_output=True,
                    text=True, cwd=str(REPO_ROOT))
-    ap = subprocess.run(["git", "apply", str(diff_path)],
-                        capture_output=True, text=True, cwd=str(REPO_ROOT))
-    if ap.returncode != 0:
-        return {"ok": False, "error": f"apply failed: {ap.stderr.strip()}"}
-    return {"ok": True, "error": None}
+    apply_flags = ["--ignore-whitespace", "--recount"] if mode == "ws-relaxed" else []
+    rc, err = _run(apply_flags)
+    if rc != 0:
+        return {"ok": False, "error": f"apply failed: {err}", "mode": None}
+    return {"ok": True, "error": None, "mode": mode}
 
 
 def revert_to_main() -> None:

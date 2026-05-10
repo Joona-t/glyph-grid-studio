@@ -22,27 +22,51 @@
   risks: 'Negligible; pixel-identical when stage was already a no-op.
 
     '
-  code_shape: "function _hasImgDataStages(p) {\n  if (!p) return false;\n  function _on(s, ks) { if (!s || !s.enabled) return false;\n    for (const k of ks) if ((s[k] || 0) > 0.001) return true; return false; }\n  return _on(p.phosphorDecay, ['decay']) ||\n         _on(p.crtBeam, ['intensity']) ||\n         _on(p.halation, ['intensity', 'strength']) ||\n         _on(p.bloom, ['intensity', 'strength']) ||\n         _on(p.godRays, ['strength', 'intensity']) ||\n         _on(p.scanlines, ['intensity', 'strength']) ||\n         _on(p.chromaticAberration, ['amount']) ||\n         _on(p.barrel, ['amount']) ||\n         _on(p.kawaii, ['intensity']);\n}\n"
-  prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds inline source excerpts; no --dangerously-skip-permissions.
+  code_shape: "function _hasImgDataStages(p) {\n  if (!p) return false;\n  function\
+    \ _on(s, ks) { if (!s || !s.enabled) return false;\n    for (const k of ks) if\
+    \ ((s[k] || 0) > 0.001) return true; return false; }\n  return _on(p.phosphorDecay,\
+    \ ['decay']) ||\n         _on(p.crtBeam, ['intensity']) ||\n         _on(p.halation,\
+    \ ['intensity', 'strength']) ||\n         _on(p.bloom, ['intensity', 'strength'])\
+    \ ||\n         _on(p.godRays, ['strength', 'intensity']) ||\n         _on(p.scanlines,\
+    \ ['intensity', 'strength']) ||\n         _on(p.chromaticAberration, ['amount'])\
+    \ ||\n         _on(p.barrel, ['amount']) ||\n         _on(p.kawaii, ['intensity']);\n\
+    }\n"
+  prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug
+    + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds
+    inline source excerpts; no --dangerously-skip-permissions.
 - id: OPT-004
   area: postprocess scratch buffers
   priority: P0
   status: queued
   files:
   - src/lib/glyph-crt.js
-  hypothesis: "`boxBlurLinear` at glyph-crt.js:85-87 allocates two\n`Float32Array(N*3)` per call. At 1024\xD7504 that's 6.2 MB \xD7 2 per call\n\xD7 2 stages (bloom + halation) = ~25 MB allocated per frame when\nthose stages are on. Persist module-scope scratch buffers, grow only\nwhen N increases.\n"
+  hypothesis: "`boxBlurLinear` at glyph-crt.js:85-87 allocates two\n`Float32Array(N*3)`\
+    \ per call. At 1024\xD7504 that's 6.2 MB \xD7 2 per call\n\xD7 2 stages (bloom\
+    \ + halation) = ~25 MB allocated per frame when\nthose stages are on. Persist\
+    \ module-scope scratch buffers, grow only\nwhen N increases.\n"
   expected_gain_ms: -4 to -8 steady + GC pause smoothing
   benchmark_first: false
-  risks: "JS is single-threaded and `applyChain` is sequential \u2014 no aliasing\nrisk. Buffer-growing branch only fires on canvas resize.\n"
-  code_shape: "let _bbOut = null, _bbTmp = null;\nfunction boxBlurLinear(src, w, h, radius) {\n  const N = src.length;\n  if (!_bbOut || _bbOut.length < N) {\n    _bbOut = new Float32Array(N);\n    _bbTmp = new Float32Array(N);\n  }\n  const out = _bbOut, tmp = _bbTmp;\n  // existing unchanged below\n}\n"
-  prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds inline source excerpts; no --dangerously-skip-permissions.
+  risks: "JS is single-threaded and `applyChain` is sequential \u2014 no aliasing\n\
+    risk. Buffer-growing branch only fires on canvas resize.\n"
+  code_shape: "let _bbOut = null, _bbTmp = null;\nfunction boxBlurLinear(src, w, h,\
+    \ radius) {\n  const N = src.length;\n  if (!_bbOut || _bbOut.length < N) {\n\
+    \    _bbOut = new Float32Array(N);\n    _bbTmp = new Float32Array(N);\n  }\n \
+    \ const out = _bbOut, tmp = _bbTmp;\n  // existing unchanged below\n}\n"
+  prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug
+    + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds
+    inline source excerpts; no --dangerously-skip-permissions.
+  cycle: 1
 - id: OPT-006
   area: linearizeToLuminance gate
   priority: P0
   status: queued
   files:
   - src/index.html
-  hypothesis: "`linearizeToLuminance` (src/index.html:1774-1783) runs over the full\nsource every frame the v2 path fires (~245 K pixels at 1024\xD7504).\n`lumBuf` is read by shape/edge selection and prefilter only \u2014 for\nplain brightness selection the buffer is dead work.\nGate the call on `mode === 'shape'`/`shape-edge-aware` OR any prefilter\nthat consumes lumBuf.\n"
+  hypothesis: "`linearizeToLuminance` (src/index.html:1774-1783) runs over the full\n\
+    source every frame the v2 path fires (~245 K pixels at 1024\xD7504).\n`lumBuf`\
+    \ is read by shape/edge selection and prefilter only \u2014 for\nplain brightness\
+    \ selection the buffer is dead work.\nGate the call on `mode === 'shape'`/`shape-edge-aware`\
+    \ OR any prefilter\nthat consumes lumBuf.\n"
   expected_gain_ms: -3 to -5 on default-brightness configs
   benchmark_first: true
   risks: 'Hidden consumer of lumBuf could surface incorrect output. Audit
@@ -50,42 +74,94 @@
     every reference to `lumBuf` in src/ before writing the gate.
 
     '
-  code_shape: "const needsLum = (sel === 'shape' || sel === 'shape-edge-aware')\n              || GlyphGrid.compat.gatePrefilter(CONFIG)\n              || (CONFIG.depth && CONFIG.depth.enabled);\nif (needsLum) linearizeToLuminance(pixels, lumBuf, srcW, srcH);\n"
+  code_shape: "const needsLum = (sel === 'shape' || sel === 'shape-edge-aware')\n\
+    \              || GlyphGrid.compat.gatePrefilter(CONFIG)\n              || (CONFIG.depth\
+    \ && CONFIG.depth.enabled);\nif (needsLum) linearizeToLuminance(pixels, lumBuf,\
+    \ srcW, srcH);\n"
+  prior_attempt: 'prior cycle rejected: patch_failed: Source excerpts do not include
+    the `linearizeToLuminance` call site or any `lumBuf` consumers (shape/edge selection,
+    prefilter, depth), so I cannot safely write the gate without auditing references
+    the risks section explicitly requires.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
 - id: OPT-001
   area: drawBrightnessGrid preserve fast path
   priority: P0
   status: queued
   files:
   - src/index.html
-  hypothesis: "Preserve color mode (no fog) at src/index.html:2398 still calls\n`text(ch, cx, cy)` per cell \u2014 ~57 ms at 240\xD7120. The other three\nfast color modes already use sprite atlases (mono / duotone / gradient).\nBuild an alpha-only sprite atlas for the ramp + a per-cell solid\nfillStyle from `_sampleObj.r/g/b`, then composite via 'source-over'.\n"
-  expected_gain_ms: -30 to -45 on cfg-preserve-stress (and downstream wins when fog overlay lands)
+  hypothesis: "Preserve color mode (no fog) at src/index.html:2398 still calls\n`text(ch,\
+    \ cx, cy)` per cell \u2014 ~57 ms at 240\xD7120. The other three\nfast color modes\
+    \ already use sprite atlases (mono / duotone / gradient).\nBuild an alpha-only\
+    \ sprite atlas for the ramp + a per-cell solid\nfillStyle from `_sampleObj.r/g/b`,\
+    \ then composite via 'source-over'.\n"
+  expected_gain_ms: -30 to -45 on cfg-preserve-stress (and downstream wins when fog
+    overlay lands)
   benchmark_first: true
-  risks: "`globalCompositeOperation` toggle cost varies by browser. Validate\nthe toggle-pair cost on a 100\xD7100 dummy loop microbenchmark before\ncommitting. Composite-op churn could exceed `fillText` baseline on\nsome hardware.\n"
-  code_shape: "if (colorMode === 'preserve' && !depthFogActive) {\n  const sprite = _ensurePreserveSprite(ramp, fontFamily, fontSize);\n  const ctx = drawingContext;\n  for (let r = 0; r < rows; r++) {\n    for (let c = 0; c < cols; c++) {\n      const i = r*cols+c;\n      if (spaceMask[i]) continue;\n      sampleCellInto(_sampleObj, pixels, stride, x0, y0, cellPxW, cellPxH, srcW, srcH);\n      ctx.fillStyle = `rgb(${_sampleObj.r|0},${_sampleObj.g|0},${_sampleObj.b|0})`;\n      ctx.fillRect(cx, cy, tileW, tileH);\n      ctx.globalCompositeOperation = 'destination-in';\n      ctx.drawImage(sprite, idx*tileW, 0, tileW, tileH, cx, cy, tileW, tileH);\n      ctx.globalCompositeOperation = 'source-over';\n    }\n  }\n  return;\n}\n"
+  risks: "`globalCompositeOperation` toggle cost varies by browser. Validate\nthe\
+    \ toggle-pair cost on a 100\xD7100 dummy loop microbenchmark before\ncommitting.\
+    \ Composite-op churn could exceed `fillText` baseline on\nsome hardware.\n"
+  code_shape: "if (colorMode === 'preserve' && !depthFogActive) {\n  const sprite\
+    \ = _ensurePreserveSprite(ramp, fontFamily, fontSize);\n  const ctx = drawingContext;\n\
+    \  for (let r = 0; r < rows; r++) {\n    for (let c = 0; c < cols; c++) {\n  \
+    \    const i = r*cols+c;\n      if (spaceMask[i]) continue;\n      sampleCellInto(_sampleObj,\
+    \ pixels, stride, x0, y0, cellPxW, cellPxH, srcW, srcH);\n      ctx.fillStyle\
+    \ = `rgb(${_sampleObj.r|0},${_sampleObj.g|0},${_sampleObj.b|0})`;\n      ctx.fillRect(cx,\
+    \ cy, tileW, tileH);\n      ctx.globalCompositeOperation = 'destination-in';\n\
+    \      ctx.drawImage(sprite, idx*tileW, 0, tileW, tileH, cx, cy, tileW, tileH);\n\
+    \      ctx.globalCompositeOperation = 'source-over';\n    }\n  }\n  return;\n\
+    }\n"
+  prior_attempt: 'prior cycle rejected: patch_failed: Embedded excerpts omit `_ensureRampGradientSprite`
+    and the sprite-atlas/space-mask construction it mirrors, so a faithful `_ensurePreserveSprite`
+    cannot be written without fabricating cache shape, tile geometry, or `_rampGradientSpaceMask`-equivalent
+    state; hypothesis also flags BENCHMARK FIRST for composite-op toggle cost which
+    cannot be validated from a blind diff.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
 - id: OPT-002
   area: depthFog overlay pass
   priority: P0
   status: queued
   files:
   - src/index.html
-  hypothesis: "`depthFog` at lines 2142, 2485, 2668 forces all color modes\n(including monochrome) into the slow preserve path via the\n`needsSample` gate \u2014 penalty ~30 ms. The fog operation is per-cell\n`r = r*(1-tf) + fogR*tf`, an output-space tint that doesn't require\nper-pixel sampling. Decouple by computing the cellDepth \u2192 fogTint\noverlay once per frame and blending via drawImage 'multiply'.\n"
+  hypothesis: "`depthFog` at lines 2142, 2485, 2668 forces all color modes\n(including\
+    \ monochrome) into the slow preserve path via the\n`needsSample` gate \u2014 penalty\
+    \ ~30 ms. The fog operation is per-cell\n`r = r*(1-tf) + fogR*tf`, an output-space\
+    \ tint that doesn't require\nper-pixel sampling. Decouple by computing the cellDepth\
+    \ \u2192 fogTint\noverlay once per frame and blending via drawImage 'multiply'.\n"
   expected_gain_ms: -25 to -30 when fog is enabled
   benchmark_first: false
-  risks: "Pixel parity. Slow path lerps in display-output space pre-fog; if\nthe new overlay diverges (fog applied after monochrome alpha\nmultiplies the *char*, not the bg), \u0394E may spike. Gate behind\n`CONFIG.depthFogPath: 'overlay' | 'inline'` for safe rollout.\n"
-  code_shape: "// After the fast-path return:\nif (depthFogActive) _applyDepthFogOverlay(ctx, cellDepth, cols, rows, cellW, cellH, fog);\n\nfunction _applyDepthFogOverlay(ctx, cellDepth, cols, rows, cellW, cellH, fog) {\n  const overlay = _ensureFogOverlay(cols, rows, cellW, cellH, fog);\n  const id = overlay.imgData; const d = id.data;\n  for (let i = 0, n = cols*rows; i < n; i++) {\n    const tf = computeFogT(cellDepth[i], fog);\n    const k = i*4; d[k]=fog.r; d[k+1]=fog.g; d[k+2]=fog.b;\n    d[k+3] = (tf*255)|0;\n  }\n  overlay.ctx.putImageData(id, 0, 0);\n  ctx.drawImage(overlay.canvas, 0, 0, ctx.canvas.width, ctx.canvas.height);\n}\n"
+  risks: "Pixel parity. Slow path lerps in display-output space pre-fog; if\nthe new\
+    \ overlay diverges (fog applied after monochrome alpha\nmultiplies the *char*,\
+    \ not the bg), \u0394E may spike. Gate behind\n`CONFIG.depthFogPath: 'overlay'\
+    \ | 'inline'` for safe rollout.\n"
+  code_shape: "// After the fast-path return:\nif (depthFogActive) _applyDepthFogOverlay(ctx,\
+    \ cellDepth, cols, rows, cellW, cellH, fog);\n\nfunction _applyDepthFogOverlay(ctx,\
+    \ cellDepth, cols, rows, cellW, cellH, fog) {\n  const overlay = _ensureFogOverlay(cols,\
+    \ rows, cellW, cellH, fog);\n  const id = overlay.imgData; const d = id.data;\n\
+    \  for (let i = 0, n = cols*rows; i < n; i++) {\n    const tf = computeFogT(cellDepth[i],\
+    \ fog);\n    const k = i*4; d[k]=fog.r; d[k+1]=fog.g; d[k+2]=fog.b;\n    d[k+3]\
+    \ = (tf*255)|0;\n  }\n  overlay.ctx.putImageData(id, 0, 0);\n  ctx.drawImage(overlay.canvas,\
+    \ 0, 0, ctx.canvas.width, ctx.canvas.height);\n}\n"
+  prior_attempt: 'prior cycle rejected: patch_failed: Source excerpts only show lines
+    1-200; cannot author a diff touching depthFog at lines 2142/2485/2668 without
+    seeing the actual code.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
 - id: OPT-010
   area: default grid resolution
   priority: P1
-  status: queued
+  status: rejected
   files:
   - src/index.html
-  hypothesis: "Default grid is 240\xD7120 (28,800 cells) at src/index.html:133. The\n\"Phase 0.5\" win that came from defaults-tuning was 2.5\xD7; the next\ncandidate is grid resolution. 192\xD796 = 18,432 cells = 36 % fewer\ncells; 200\xD7100 = 30 % fewer. Aspect stays close to source (1.92:1\nvs 2:1).\n"
+  hypothesis: "Default grid is 240\xD7120 (28,800 cells) at src/index.html:133. The\n\
+    \"Phase 0.5\" win that came from defaults-tuning was 2.5\xD7; the next\ncandidate\
+    \ is grid resolution. 192\xD796 = 18,432 cells = 36 % fewer\ncells; 200\xD7100\
+    \ = 30 % fewer. Aspect stays close to source (1.92:1\nvs 2:1).\n"
   expected_gain_ms: -15 to -30 on cfg-default
   benchmark_first: true
-  risks: "Loss of microscopic detail. \u0394E94 < 2.0 on portfolio sources required\nto keep. Subjective A/B (3 viewers blind) before commit.\n"
+  risks: "Loss of microscopic detail. \u0394E94 < 2.0 on portfolio sources required\n\
+    to keep. Subjective A/B (3 viewers blind) before commit.\n"
   code_shape: 'cols: 192, rows: 96,  // was 240, 120
 
     '
+  reason: 'build_failed: check failed: error: patch failed: src/index.html:130
+
+    error: src/index.html: patch does not apply'
 - id: OPT-012
   area: sprite atlas integer alignment
   priority: P1
@@ -119,13 +195,21 @@
     // pad bg fill on right/bottom: cols*cellWint may be < canvas.width
 
     '
+  prior_attempt: 'prior cycle rejected: patch_failed: Embedded source excerpt only
+    covers lines 1-200, so the line-1870 `tileW` site and the `cellW` blit site needed
+    to construct exact-match hunks are not visible.. Re-queued after orchestrator
+    fix (parser/excerpts/hunk-header/A2-test).'
 - id: OPT-005
   area: applyCellFill hoist (slow path)
   priority: P1-fallback
   status: queued
   files:
   - src/index.html
-  hypothesis: "`applyCellFill` at lines 1386-1480 allocates 1-3 `p5.Color` objects\nper cell on the slow path. At 28,800 cells \xD7 3 allocs that's 86,400\nallocs per frame on cfg-preserve-stress. Hoist palette-derived\nconstants (monoR/G/B, dueR0\u20261, gradLut) once per frame, pass into\ninner loop as numerics. Stacks with OPT-002 \u2014 DROP if OPT-002\neliminates the slow path entirely.\n"
+  hypothesis: "`applyCellFill` at lines 1386-1480 allocates 1-3 `p5.Color` objects\n\
+    per cell on the slow path. At 28,800 cells \xD7 3 allocs that's 86,400\nallocs\
+    \ per frame on cfg-preserve-stress. Hoist palette-derived\nconstants (monoR/G/B,\
+    \ dueR0\u20261, gradLut) once per frame, pass into\ninner loop as numerics. Stacks\
+    \ with OPT-002 \u2014 DROP if OPT-002\neliminates the slow path entirely.\n"
   expected_gain_ms: -10 to -18 on cfg-preserve-stress
   benchmark_first: false
   risks: 'API change at 3 call sites (drawBrightnessGrid, drawShapeGrid,
@@ -133,25 +217,42 @@
     drawEdgeDirectionalGrid); keep them in a single edit.
 
     '
-  code_shape: "function applyCellFill(sample, hoist, curved, bgR, bgG, bgB) {\n  const mode = CONFIG.colorMode;\n  let r, g, b, a = 255;\n  if (mode === 'monochrome') { r=hoist.monoR; g=hoist.monoG; b=hoist.monoB;\n    a = (curved*255*1.1)|0; if (a>255) a=255; }\n  // ... gradient/duotone/preserve branches with hoisted values\n  fill(r, g, b, a);\n}\n"
+  code_shape: "function applyCellFill(sample, hoist, curved, bgR, bgG, bgB) {\n  const\
+    \ mode = CONFIG.colorMode;\n  let r, g, b, a = 255;\n  if (mode === 'monochrome')\
+    \ { r=hoist.monoR; g=hoist.monoG; b=hoist.monoB;\n    a = (curved*255*1.1)|0;\
+    \ if (a>255) a=255; }\n  // ... gradient/duotone/preserve branches with hoisted\
+    \ values\n  fill(r, g, b, a);\n}\n"
 - id: OPT-008
   area: vignette overlay strength bucketing
   priority: P2
   status: queued
   files:
   - src/index.html
-  hypothesis: "`_ensureVignetteOverlay` (line 2858) caches the gradient canvas but\nrebuilds when `_vignetteOverlay.key` mismatches. During slider\ndrags, this rebuild fires every frame (~80 ms freeze on 1024\xD7504).\nBucket the strength to 11 fixed values (0.0, 0.1, \u2026, 1.0) so drags\nskip the rebuild. Bound the cache at 32 entries.\n"
+  hypothesis: "`_ensureVignetteOverlay` (line 2858) caches the gradient canvas but\n\
+    rebuilds when `_vignetteOverlay.key` mismatches. During slider\ndrags, this rebuild\
+    \ fires every frame (~80 ms freeze on 1024\xD7504).\nBucket the strength to 11\
+    \ fixed values (0.0, 0.1, \u2026, 1.0) so drags\nskip the rebuild. Bound the cache\
+    \ at 32 entries.\n"
   expected_gain_ms: 0 ms steady; ~80 ms freeze elimination on drag
   benchmark_first: false
-  risks: "Memory bound: 32 entries \xD7 1024\xD7504\xD74 bytes = ~64 MB worst case.\nUse Map+LRU eviction at 8 entries instead if memory is tight.\n"
-  code_shape: "const _vigCache = new Map();\nfunction _ensureVignetteOverlay(w, h, strength) {\n  const sBucket = Math.round(strength * 10);\n  const key = `${w}x${h}:${sBucket}`;\n  let entry = _vigCache.get(key);\n  if (entry) return entry;\n  // existing build code, snapped to bucket\n  _vigCache.set(key, { canvas, key });\n  if (_vigCache.size > 8) _vigCache.delete(_vigCache.keys().next().value);\n  return _vigCache.get(key);\n}\n"
+  risks: "Memory bound: 32 entries \xD7 1024\xD7504\xD74 bytes = ~64 MB worst case.\n\
+    Use Map+LRU eviction at 8 entries instead if memory is tight.\n"
+  code_shape: "const _vigCache = new Map();\nfunction _ensureVignetteOverlay(w, h,\
+    \ strength) {\n  const sBucket = Math.round(strength * 10);\n  const key = `${w}x${h}:${sBucket}`;\n\
+    \  let entry = _vigCache.get(key);\n  if (entry) return entry;\n  // existing\
+    \ build code, snapped to bucket\n  _vigCache.set(key, { canvas, key });\n  if\
+    \ (_vigCache.size > 8) _vigCache.delete(_vigCache.keys().next().value);\n  return\
+    \ _vigCache.get(key);\n}\n"
 - id: OPT-009
   area: branchless inner-loop clamp
   priority: P2
   status: queued
   files:
   - src/index.html
-  hypothesis: "Each fast-path inner loop runs `sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig)`\n\u2014 2 branches per cell \xD7 28,800 cells \xD7 6 inner loops = ~350K\nbranches/frame. Replace with `Math.min(1, Math.max(0, sig))` (V8\ninlines), or skip clamp where downstream multiplies anyway.\n"
+  hypothesis: "Each fast-path inner loop runs `sigQ = sig < 0 ? 0 : (sig > 1 ? 1 :\
+    \ sig)`\n\u2014 2 branches per cell \xD7 28,800 cells \xD7 6 inner loops = ~350K\n\
+    branches/frame. Replace with `Math.min(1, Math.max(0, sig))` (V8\ninlines), or\
+    \ skip clamp where downstream multiplies anyway.\n"
   expected_gain_ms: -1 to -3 (depends on V8 inlining)
   benchmark_first: true
   risks: 'V8 may already statically branch-predict this; gain may be zero.
@@ -176,7 +277,8 @@
     '
   expected_gain_ms: -1 ms on first-frame after palette change; mobile memory drop
   benchmark_first: true
-  risks: "Visible banding on long, thin gradient strips. Validate \u0394E94 < 1.0\non `gradient` mode + clean greyscale ramp source.\n"
+  risks: "Visible banding on long, thin gradient strips. Validate \u0394E94 < 1.0\n\
+    on `gradient` mode + clean greyscale ramp source.\n"
 - id: OPT-007
   area: linearizeToLuminance allocation audit
   priority: P2
@@ -212,7 +314,8 @@
     '
   expected_gain_ms: -2 to -5 (JIT) + maintenance win
   benchmark_first: true
-  risks: "Major refactor. Validate by `__pfFrame.stages.grid` post-refactor\nnot regressing on any of 4 modes \xD7 3 selection modes.\n"
+  risks: "Major refactor. Validate by `__pfFrame.stages.grid` post-refactor\nnot regressing\
+    \ on any of 4 modes \xD7 3 selection modes.\n"
 - id: OPT-014
   area: postprocess Web Worker
   priority: P2
@@ -220,10 +323,14 @@
   files:
   - src/index.html
   - src/lib/glyph-crt.js
-  hypothesis: "Once OPT-001\u2026005 land, residual postproc cost is JS-side bloom +\nhalation pixel work. OffscreenCanvas + transferToImageBitmap\nenables running these on a worker. Main thread waits but doesn't\nblock GPU compositor.\n"
+  hypothesis: "Once OPT-001\u2026005 land, residual postproc cost is JS-side bloom\
+    \ +\nhalation pixel work. OffscreenCanvas + transferToImageBitmap\nenables running\
+    \ these on a worker. Main thread waits but doesn't\nblock GPU compositor.\n"
   expected_gain_ms: -15 to -30 on cfg-postproc-heavy; 0 elsewhere
   benchmark_first: true
-  risks: "SharedArrayBuffer requires COOP/COEP headers in production.\nTauri's CSP needs adjustment in tauri.conf.json \u2014 DENIED by safety\nrails. So this hypothesis is FROZEN unless OPT-001 \u2192 OPT-005 leave\nbudget unmet.\n"
+  risks: "SharedArrayBuffer requires COOP/COEP headers in production.\nTauri's CSP\
+    \ needs adjustment in tauri.conf.json \u2014 DENIED by safety\nrails. So this\
+    \ hypothesis is FROZEN unless OPT-001 \u2192 OPT-005 leave\nbudget unmet.\n"
 - id: OPT-015
   area: WebGL renderer prototype
   priority: P2-frozen
@@ -242,4 +349,6 @@
     '
   expected_gain_ms: -40 to -80 on heavy configs
   benchmark_first: true
-  risks: "80-120 h scope. Major surface change. FROZEN unless 24-h loop\nexhausts every cheaper win and 60 fps becomes mandatory. The\nautonomous loop will NOT attempt this \u2014 escalate instead.\n"
+  risks: "80-120 h scope. Major surface change. FROZEN unless 24-h loop\nexhausts\
+    \ every cheaper win and 60 fps becomes mandatory. The\nautonomous loop will NOT\
+    \ attempt this \u2014 escalate instead.\n"
