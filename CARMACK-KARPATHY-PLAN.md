@@ -22,7 +22,7 @@ These lenses agree more than they disagree. Carmack tells us *what to fix*; Karp
 | ✅ Phase 0.5 | Disable expensive postprocess defaults (bloom + halation off) | 5 min | **408 ms → 151 ms (2.5×)** |
 | ✅ F1 | glyphSet switch freeze (remove redundant `clearCache` + load) | 5 min | **1–6 s → 174 ms (6–35×)** |
 | 🔄 F7 | Debounce heavy sliders (cols/rows/font.size) | 2 h | TBD |
-| 🔄 F4 | Tighter postprocess gate (skip get/putImageData if all stages no-op) | 1 h | TBD |
+| ✅ F4 | Tighter postprocess gate (skip get/putImageData if all stages no-op) | 1 h | shipped 2026-05-10 (`src/index.html:2898-2925`); next loop cycle measures real gain — expected ~5–15 ms/frame on configs with stages enabled but intensity 0 |
 | 🔄 F2A | drawText skip empty cells | 2 h | TBD |
 | ✅ F8 | Branchless clamp in EMA loop (manual ship — loop hadn't reached it) | 30 min | shipped 2026-05-10 (`src/index.html:1612-1619`); next loop cycle measures real gain |
 | 🔄 F3+F5+F10 | Zero-alloc hot path (persistent buffers) | 3 h | TBD |

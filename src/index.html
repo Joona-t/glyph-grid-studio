@@ -2895,19 +2895,31 @@
 
   // HOT-PATH: _hasImgDataStages — gate function for the postprocess
   // pixel-readback round-trip. Optimization loop may inline-rewrite this.
+  //
+  // F4 (audit OPT-003): a stage is only "active" if its intensity-bearing
+  // field is > epsilon. enabled:true with strength:0 is a no-op that should
+  // NOT trigger the full getImageData + putImageData round-trip (~5 ms/frame
+  // combined on default canvas). Mirrors the _stageActive helper in
+  // glyph-compat.js — same source of truth as gatePostprocess.
   function _hasImgDataStages(p) {
     if (!p) return false;
-    return !!(
-      (p.phosphorDecay && p.phosphorDecay.enabled) ||
-      (p.crtBeam && p.crtBeam.enabled) ||
-      (p.halation && p.halation.enabled) ||
-      (p.bloom && p.bloom.enabled) ||
-      (p.godRays && p.godRays.enabled) ||
-      (p.scanlines && p.scanlines.enabled) ||
-      (p.chromaticAberration && p.chromaticAberration.enabled) ||
-      (p.barrel && p.barrel.enabled) ||
-      (p.kawaii && p.kawaii.enabled)
-    );
+    function _on(s, ks) {
+      if (!s || !s.enabled) return false;
+      for (let i = 0; i < ks.length; i++) {
+        const v = s[ks[i]];
+        if (typeof v === 'number' && v > 0.001) return true;
+      }
+      return false;
+    }
+    return _on(p.phosphorDecay, ['decay']) ||
+           _on(p.crtBeam, ['intensity']) ||
+           _on(p.halation, ['intensity', 'strength']) ||
+           _on(p.bloom, ['intensity', 'strength']) ||
+           _on(p.godRays, ['strength', 'intensity']) ||
+           _on(p.scanlines, ['intensity', 'strength']) ||
+           _on(p.chromaticAberration, ['amount']) ||
+           _on(p.barrel, ['amount']) ||
+           _on(p.kawaii, ['intensity']);
   }
 
   // HOT-PATH: applyPostprocess — pixel-stage round-trip. Optimization loop
