@@ -1609,11 +1609,15 @@
     const _breatheGain = 1.0 + _gainSwing * Math.sin(_loopPhase * _pulseHz);
     const _seed = (CONFIG.seed | 0) ^ ((_frameIdx + 1) * 2654435761) >>> 0;
     const _jScale = _jitterAmt / 128;
+    // F8 (audit): branchless clamp replaces Math.max/Math.min function-call
+    // pair per cell. 28,800 iters × 2 fewer calls/iter at default 240×120 grid.
+    // Semantics identical for all finite values (NaN → NaN in both paths).
     for (let i = 0; i < cellSignal.length; i++) {
       cellSignalEma[i] = (1 - _emaA) * cellSignalEma[i] + _emaA * cellSignal[i];
       const h = ((i * 2246822519) ^ _seed) >>> 0;
       const jitter = ((h & 0xff) - 128) * _jScale;
-      cellSignal[i] = Math.max(0, Math.min(1, cellSignalEma[i] * _breatheGain + jitter));
+      const _v = cellSignalEma[i] * _breatheGain + jitter;
+      cellSignal[i] = _v < 0 ? 0 : _v > 1 ? 1 : _v;
     }
     if (__pfFrame) __pfFrame.stages._ema = performance.now() - _t_ema0;
 
