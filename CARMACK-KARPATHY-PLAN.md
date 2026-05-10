@@ -24,7 +24,7 @@ These lenses agree more than they disagree. Carmack tells us *what to fix*; Karp
 | 🔄 F7 | Debounce heavy sliders (cols/rows/font.size) | 2 h | TBD |
 | 🔄 F4 | Tighter postprocess gate (skip get/putImageData if all stages no-op) | 1 h | TBD |
 | 🔄 F2A | drawText skip empty cells | 2 h | TBD |
-| 🔄 F8 | Branchless clamp in EMA loop | 30 min | TBD |
+| ✅ F8 | Branchless clamp in EMA loop (manual ship — loop hadn't reached it) | 30 min | shipped 2026-05-10 (`src/index.html:1612-1619`); next loop cycle measures real gain |
 | 🔄 F3+F5+F10 | Zero-alloc hot path (persistent buffers) | 3 h | TBD |
 | 🔄 F6 | Pre-warm shape atlases at startup | 1 h | TBD |
 | 🔄 Phase 1 | GIF export freeze (toDataURL → toBlob async) | 3 h | TBD |
