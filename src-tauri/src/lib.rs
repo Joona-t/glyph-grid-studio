@@ -207,6 +207,87 @@ fn exit_with_status(
     std::process::exit(code);
 }
 
+/// Public entry point for the `batch` subcommand.  Reads the manifest JSON,
+/// validates the basic shape, then hands a normalised batch JSON to the JS
+/// side via `CliJobState`.  The JS hook (`tryHeadlessRender`) detects the
+/// `batch: true` discriminator and runs `runBatchExport` with all jobs in
+/// a single Tauri session — no per-variant Tauri restarts.  See ITER-024.
+pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
+    let raw = match fs::read_to_string(&manifest_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("batch: cannot read manifest {:?}: {}", manifest_path, e);
+            return 2;
+        }
+    };
+    let manifest: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("batch: manifest is not valid JSON: {}", e);
+            return 2;
+        }
+    };
+
+    // Required: in (source path), frames, jobs (array)
+    let in_path = manifest
+        .get("in")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let frames = manifest.get("frames").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
+    let jobs_arr = manifest.get("jobs").and_then(|v| v.as_array());
+
+    let (in_path, jobs_arr) = match (in_path, jobs_arr) {
+        (Some(p), Some(arr)) => (p, arr.clone()),
+        _ => {
+            eprintln!("batch: manifest must have keys `in` (string) and `jobs` (array). Got: {:?}", manifest);
+            return 2;
+        }
+    };
+
+    // Build the JS-shaped batch JSON.  Each job carries its own out/format/config.
+    let jobs_js: Vec<serde_json::Value> = jobs_arr
+        .into_iter()
+        .map(|j| {
+            let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("job").to_string();
+            let out_path = j.get("out").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let format = j
+                .get("format")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    if out_path.to_lowercase().ends_with(".mp4") { "mp4".into() } else { "gif".into() }
+                });
+            let config = j.get("config").cloned().unwrap_or(serde_json::json!({}));
+            let cap_width = j.get("capWidth").and_then(|v| v.as_u64()).unwrap_or(0);
+            serde_json::json!({
+                "name": name,
+                "outPath": out_path,
+                "format": format,
+                "config": config,
+                "capWidth": cap_width,
+            })
+        })
+        .collect();
+
+    let batch_json = serde_json::json!({
+        "batch": true,
+        "inPath": in_path,
+        "frames": frames,
+        "jobs": jobs_js,
+    });
+
+    eprintln!("batch: queued {} jobs from {:?}", batch_json.get("jobs").and_then(|j| j.as_array()).map(|a| a.len()).unwrap_or(0), manifest_path);
+
+    let exit_code = Arc::new(Mutex::new(2));
+    let state = CliJobState {
+        job: Mutex::new(Some(batch_json)),
+        exit_code: exit_code.clone(),
+    };
+    run_tauri(state, !show_window);
+    let code = *exit_code.lock().unwrap();
+    code
+}
+
 /// Public entry point invoked by main.rs for `render` subcommand.  Returns
 /// the exit code; in practice the process exits via `app.exit()` from JS
 /// before this function returns, so the return value here is a fallback for

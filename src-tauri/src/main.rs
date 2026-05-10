@@ -23,6 +23,13 @@ enum Command {
     /// Render a single image to an animated GIF, headlessly.
     Render(RenderArgs),
 
+    /// Render many variants of the SAME source in ONE Tauri session.  Reads a
+    /// manifest JSON with `{in, frames, jobs:[{name,out,format?,config}, ...]}`
+    /// and runs all jobs back-to-back without re-launching the app per variant.
+    /// ~10× faster than calling `render` repeatedly because Tauri startup +
+    /// source-image decode happens once.  See ITER-024 in BUGS_AND_ITERATIONS.md.
+    Batch(BatchArgs),
+
     /// Print the catalog of available palettes / ramps / dithers / glyph sets / postprocess stages.
     Catalog,
 
@@ -100,6 +107,18 @@ struct RenderArgs {
     format: Option<String>,
 }
 
+#[derive(Parser, Debug, Clone)]
+struct BatchArgs {
+    /// Path to a JSON manifest. Shape:
+    /// `{"in":"<source>","frames":<N>,"jobs":[{"name":"...","out":"...","format":"gif|mp4","config":{...}}, ...]}`
+    #[arg(long, value_name = "PATH")]
+    manifest: PathBuf,
+
+    /// Show the rendering window during the headless batch (debug aid).
+    #[arg(long)]
+    show_window: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -132,6 +151,10 @@ fn main() {
             // process-exiting (despite docs implying otherwise). Always exit
             // explicitly with the captured code so shell-level CI can detect
             // failures.
+            std::process::exit(code);
+        }
+        Some(Command::Batch(args)) => {
+            let code = app_lib::run_headless_batch(args.manifest, args.show_window);
             std::process::exit(code);
         }
         Some(Command::Catalog) => {

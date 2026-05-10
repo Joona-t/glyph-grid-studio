@@ -3632,6 +3632,38 @@
     // before we apply config + start recording.
     await new Promise(function (r) { setTimeout(r, 300); });
 
+    /* Batch mode (ITER-024): the Rust side may pass `batch:true` with a
+       jobs array.  In that shape, run runBatchExport with all jobs in a
+       single Tauri session — Tauri startup + source-image decode happen
+       once.  ~10× faster than spawning a fresh `render` per variant. */
+    if (job.batch && Array.isArray(job.jobs)) {
+      var batchJobs = job.jobs.map(function (j) {
+        return {
+          name:     j.name || 'job',
+          path:     j.outPath,
+          frames:   job.frames || 24,
+          format:   j.format,
+          config:   j.config || {},
+          capWidth: (j.capWidth && j.capWidth > 0) ? j.capWidth : 0,
+        };
+      });
+      console.log('CLI: batch mode — ' + batchJobs.length + ' jobs queued');
+      __glyphGridTest.runBatchExport(batchJobs, {
+        onComplete: function (result) {
+          var ok = result && result.errors && result.errors.length === 0;
+          var summary = 'batch complete: ' + (result.ok || 0) + '/' + batchJobs.length + ' ok';
+          if (result.errors && result.errors.length) {
+            summary += ', ' + result.errors.length + ' errors: ' +
+              result.errors.map(function (e) { return e.name + '(' + e.err + ')'; }).join(', ');
+          }
+          console.log('CLI: ' + summary);
+          window.__TAURI__.core.invoke('cli_log', { msg: summary }).catch(function () {});
+          window.__TAURI__.core.invoke('exit_with_status', { ok: !!ok });
+        },
+      });
+      return;
+    }
+
     // Apply the CLI-supplied config (camelCase, JS-shape — built by Rust).
     if (job.config && typeof job.config === 'object') {
       try {

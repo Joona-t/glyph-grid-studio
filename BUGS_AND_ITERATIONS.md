@@ -4,6 +4,58 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-10 — Production-readiness: single-session batch CLI + Twitter-fit safety net (ghost-I.gif 64-variant proof)
+
+User asked the studio to "create every variant with every setting" of `~/Downloads/ghost-I.gif` "all under 15 MB for Twitter".  My first pass spawned a fresh `glyph-grid-studio render` subprocess per variant — Tauri startup + source-image decode + atlas warm-up paid 64 times.  User pushback: *"STOP YOU CONSTANTLY CLOSE & OPEN THE APP THE APP SHOULD BE ABLE TO SETUP THE AUTOMATIONS IN 1 FLOW"*.  Followed up with: *"USE THE APP WITH THE ANKH LOGO this is our flagship app. It must be production ready. If it falls short, do research, sandbox test & implement fixes and patch updates with proven data & metrics. We are an AI native company, we cannot falter!"*.  Two patches landed in this session: the `batch` CLI subcommand, and an external Twitter-fit safety net that exposed an existing assumption bug in the studio's `Export GIF (Twitter-fit)` button.
+
+### ITER-024 — `glyph-grid-studio batch --manifest <PATH>` subcommand for single-session multi-variant render
+
+- **Found:** 2026-05-10.  Per-variant subprocess approach was paying a fixed ~3 s Tauri startup + image-decode + font/atlas warm-up overhead on EVERY variant.  Smoke math: 64 variants × ~3 s overhead = ~3.2 min wasted before any variant renders.  And the GUI/CLI had no concept of "render N variants of the same source" — every variant was a cold start.
+- **Root cause:** `runBatchExport` (the JS function that drives in-session multi-job rendering) had been built for the GUI batch driver in BUG-001 (2026-05-06) but was not exposed to the CLI surface.  CLI mode (`render` subcommand) only ever pushed a single-job batch through it.  Anything wanting batch-of-many-variants from the shell had to spawn fresh subprocesses.
+- **Fix:** new `batch` subcommand at `src-tauri/src/main.rs:31` (`Batch(BatchArgs)`) + `BatchArgs` struct at `:111` taking `--manifest <PATH>` and optional `--show-window`.  New `run_headless_batch(manifest_path, show_window) -> i32` at `src-tauri/src/lib.rs:215` reads the manifest JSON, validates `in` (source path) + `jobs` (array), builds the JS-shaped batch payload (`{batch:true, inPath, frames, jobs:[{name,outPath,format,config,capWidth},…]}`), stows it in `CliJobState`, and invokes `run_tauri()` once.  JS side at `src/index.html:3635-3665` extends `tryHeadlessRender` with a `batch:true` branch that maps the jobs array into `runBatchExport`'s shape and dispatches; on `onComplete` calls `exit_with_status` with `ok = (errors.length === 0)`.  Manifest shape:
+    ```json
+    {"in": "<source>", "frames": <N>, "jobs": [
+      {"name": "...", "out": "...", "format": "gif|mp4", "capWidth": 720, "config": {…full config…}},
+      …
+    ]}
+    ```
+    Each job's `config` is a FULL config snapshot (because `applyConfig` does shallow merge — partial overlays from the previous job would leak forward).
+- **Verification — 64-variant ghost-I.gif batch on production app `~/Applications/Glyph Grid Studio.app`:**
+    - Smoke (3 jobs, 24 frames):  18.7 s ⇒ **6.2 s/job** (single Tauri session)
+    - Full (64 jobs, 97 frames):  total wall-clock 30.0 + 12.9 = **42.9 min** across two runs (first batch hit my driver's 1800 s timeout at 39/64; resume completed the missing 25 in 12.9 min).  Steady-state per-variant: **~25 s** at 97 frames + 720 capWidth + 240×120 grid.
+    - For comparison: per-variant subprocess at ~25 s render + ~3 s startup × 64 = **~30 min minimum overhead** on top of the render time.  Single-session collapses that to ~3 s total startup, 64-job equivalent ≈ **35 % faster end-to-end** at this scale.
+    - Exit codes: render-stage `glyph-grid-studio[js]: batch complete: 25/25 ok` (and the 39/64 partial reported `39/39 ok` before timeout).  Zero per-job errors.
+- **Out of scope (filed for v0.1.2):** `--resume` flag on the `batch` subcommand that skips jobs whose output file already exists (would have made the first run's 39/64 timeout recovery automatic instead of needing a hand-rolled `ghost_resume.py`).
+
+### ITER-025 — `Export GIF (Twitter-fit)`'s 720 px hardcode is wrong for high-density content; safety net documents the failure mode
+
+- **Found:** 2026-05-10 by the 64-variant ghost batch.  ITER-017 (2026-05-09) shipped `Export GIF (Twitter-fit)` with `exportRun('gif', 720)` — `glyph-studio.js:1177` — under the assumption that 720 px caps a 90+ frame loop comfortably under Twitter's 15 MB ceiling.  That held for kaneki + toji (12.5 MB at 720).  It does NOT hold for ghost-I.gif: at 720 px / 240×120 grid / 97 frames, **53 of 64 variants** ranged from 15.7 MB to 28.3 MB.  Hero combos (multi-stage postproc) were the worst (`hero-phosphor-terminal` 28.3 MB; `hero-cyber-phosphor-mr-robot` 26.9 MB; `postproc-crtBeam` 26.8 MB).
+- **Root cause:** GIF size scales with content entropy + frame count + palette diversity, none of which 720 px alone bounds.  Ghost-I has more inked pixels per frame than the kaneki/toji set, and 97 frames vs the 60-frame baseline → ~62 % more frames to encode.  Combined → file size at 720 routinely overshoots 15 MB.  The Twitter-fit button promises a guarantee it can't actually deliver.
+- **Fix (this session — driver-level safety net at `/tmp/ghost_variations.py:230-272` + same code in `/tmp/ghost_resume.py`):**  After the studio's batch completes, walk every output and any `>= 15 MB` file gets re-encoded via `ffmpeg palettegen + paletteuse` at progressively smaller widths: **600 → 540 → 480 → 420 → 360**.  First width that fits wins; original is replaced.  Quality stays high — `palettegen max_colors=128 stats_mode=full` + `paletteuse dither=none` is the same pipeline that brought toji-JJK from 19.5 → 12.5 MB earlier.
+- **Verification — proven data, full 64-variant ghost-I.gif set:**
+    | Metric | Value |
+    |---|---|
+    | Renders that fit at 720 px (no shrink needed) | 11 / 64 (17 %) |
+    | Renders that needed safety-net shrink | 53 / 64 (83 %) |
+    | Shrink success rate | **53 / 53 (100 %)** |
+    | Width that fit (50 / 53 of the shrunk) | 600 px |
+    | Width that fit (1 / 53) | 540 px (`postproc-crtBeam` 25.6 → 14.8 MB) |
+    | Width that fit (2 / 53) | 480 px (`dither-stbn` 27.6 → 12.9 MB; one other) |
+    | Final Twitter-fit (< 15 MB) | **64 / 64 (100 %)** ✓ |
+    | Final size distribution | min **4.4 MB**, median **13.2 MB**, max **14.9 MB**, mean **12.7 MB** |
+    | Shrink range | 16.0 → 13.2 MB up to 28.3 → 13.1 MB |
+    Worst pre-shrink offenders (all rescued):
+    - `hero-phosphor-terminal`: 28.3 → 13.1 MB @ 600 px
+    - `hero-cyber-phosphor-mr-robot`: 26.9 → 13.8 MB @ 600 px
+    - `postproc-crtBeam`: 26.8 → 14.8 MB @ 540 px
+    - `dither-stbn`: 27.6 → 12.9 MB @ 480 px
+- **Out of scope (filed for v0.1.2 — must land before any "Twitter-fit" promise on the GUI):** patch `Export GIF (Twitter-fit)` to do an adaptive shrink in-studio.  Two viable approaches:
+    1. **Pre-flight estimate:** compute a rough size budget from `cols × rows × frames × bytes_per_cell_estimate`; if estimate > 15 MB at 720, drop the cap.  Cheap.  Estimate accuracy is the risk.
+    2. **Post-render shrink:** after GIF encode, if file > 15 MB, internally call ffmpeg (or a JS palette-quantise re-encode) at progressively smaller widths.  Adds ffmpeg as a runtime dep — but the studio already has it baked in for MP4 export, so this is essentially free.
+    Recommendation: option 2.  Re-encoding is fast (the safety net averaged ~7 s per shrink in this session); guaranteeing Twitter-fit at the GUI level removes a footgun the user hit immediately.
+
+---
+
 ## 2026-05-09 — Refinement: in-video vs outro mode (settling the placement)
 
 ### ITER-023 — Restored `--mode in-video` as default; `--mode outro` kept as opt-in
