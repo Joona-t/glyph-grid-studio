@@ -423,9 +423,15 @@ def build_patch_prompt(hyp: dict[str, Any], baseline_ms: dict[str, float]) -> st
           src-tauri/entitlements.plist, package.json dependencies,
           .github/workflows/, BUGS_AND_ITERATIONS.md (existing entries),
           tests/run-all.sh, scripts/loop_orchestrator/.
-        - Bit-exact reproducibility: same (source, config, seed) must produce
-          identical bytes pre/post change. If the change introduces non-
-          determinism, REJECT yourself.
+        - **Determinism (NOT byte-stability):** the patched code, run
+          repeatedly with the same (source, config, seed), must produce
+          identical bytes *every run*. The patch IS allowed to change the
+          output bytes vs the unpatched code — that's what optimizations
+          do, and the SSIM ≥ 0.985 gate is what evaluates whether the
+          visual change is acceptable. REJECT yourself only if the change
+          introduces NEW non-determinism (e.g. reading uninitialized
+          memory, racing on shared state, depending on `Date.now()` or
+          `Math.random()` outside an existing seeded RNG).
         - **Hunk headers and context lines must match the embedded source
           EXACTLY.** Do NOT fabricate `// HOT-PATH:` comments or any other
           context that is not present in the excerpts above. The orchestrator
