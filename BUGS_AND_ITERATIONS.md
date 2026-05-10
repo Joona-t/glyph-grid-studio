@@ -4,6 +4,42 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-10 — Autonomous optimization loop: pursuit conclusion (rounds 1-5, plateau at exhausted hypothesis space)
+
+Five sequential pursuits (R1-R5) executed against `optimization-backlog.yaml`'s 15-item P0/P1/P2 hypothesis queue. Each pursuit ran until plateau (5 consecutive no-keeps). Total cycles run: 23. Hypotheses kept by the loop: 0. Hypotheses kept *outside* the loop via manual ship informed by the loop's signal: 2 (F4 + F8). This entry documents what the loop actually delivered and why ship-readiness is declared with the queue partially explored.
+
+### ITER-031 — Pursuit conclusion: production-ready perf delivered, loop exhausted its hypothesis space
+
+- **Found:** 2026-05-10, R5 plateau at cycle 5 (consecutive_no_keep=5 → loop_stop). Same termination shape as R4. The 23 cycles across all five pursuits resolved as: 0 keeps, 21 reverts (parser/excerpt/build/SSIM/correct-rejection), 2 escalates (build-toolchain wedges before R3's fixes landed). Of the 21 reverts, post-hoc triage reclassified ~14 as **correct rejections** (broken hypotheses, bit-exact violations, premise contradicted by code) and ~7 as **tooling-stage failures** that were addressed in subsequent fixes (parser, hunk headers, excerpts, identifier grep).
+- **Root cause of "0 keeps":** the YAML hypothesis space, written upfront, mixed three classes:
+  1. **Already shipped manually** before the relevant pursuit ran (OPT-003 → F4 commit `2efe80a`; the EMA branchless clamp idea → F8 commit `ef725f3`). The loop correctly identified these as redundant and reverted with the right reason.
+  2. **Bit-exact violations**, where the proposed change shifts pixel bytes by sub-perceptual amounts that nonetheless break the hard reproducibility gate (OPT-002 fog overlay, OPT-008 vignette bucketing, OPT-012 sprite-atlas integer alignment, OPT-013 gradient-step compression at 16→8). All correctly rejected; SSIM gate caught the OPT-013 case at 0.814 vs. 0.985 threshold even though the patch built and benched.
+  3. **Wrong premises about consumers** — OPT-006 claimed `lumBuf` is read only by shape/edge selection; the identifier-grep fix (commit `3ff788d`) gave Claude the full consumer audit on the second attempt, and Claude correctly identified that `lumBuf` ALSO feeds `downsampleToCells` → `cellSignal` → brightness mode. The hypothesis was wrong; the rejection was right.
+- **The two patches that *did* land** (F4, F8) came through manual ship informed by the loop's research output — both are now in production and contributed the only measurable perf gain across the whole pursuit. F4 (postprocess gate `_hasImgDataStages` requires `intensity > 0.001` instead of just `enabled`) saves ~5ms/frame when stages are configured-on but no-op. F8 (branchless clamp in EMA hot path) saves ~0.3-0.5ms in the inner loop.
+- **Loop infrastructure that landed during the pursuit (5 commits, all merged):**
+  1. `d5e9db9` — permissive diff extractor (markdown fences + chatty preambles), A2 test fix (eron-chip carry-over comment), backlog re-queue
+  2. `5d03951` — `_normalize_hunk_headers` recomputes `@@ -X,Y +A,B @@` totals (LLMs miscount routinely)
+  3. `e61c596` — wider source excerpts: full-file ≤1500 lines, ±200 windows, standalone "lines N, M, P" parsing, whitespace-tolerant apply fallback
+  4. `3ff788d` — backticked-identifier grep adds a third anchor source (every name in the hypothesis text gets up to 6 grep hits, each becoming a ±200 window)
+  5. `12239ab` — re-queue OPT-006 with `benchmark_first: false` after the identifier-grep fix made its consumer-audit risk gate clearable; reset state for R5
+- **Perf state at pursuit end (after F4 + F8):**
+  - cfg-default: 11.45 ms (~87 fps, smooth)
+  - cfg-monochrome-fast: 24.59 ms (~41 fps, smooth)
+  - cfg-preserve-stress: 114.96 ms (8.7 fps, stress benchmark — not a user-facing config)
+  - cfg-postproc-heavy: 272.55 ms (3.7 fps, stress benchmark)
+  - cfg-duotone-dispersal: 260.81 ms (3.8 fps, stress benchmark)
+  - **geomean: 75.04 ms** (target was ≤80 ms — **WIN**)
+- **What's left in the queue, post-curation:** OPT-005 (P1-fallback `applyCellFill` hoist), OPT-007 (P2 lumBuf allocation audit), OPT-011 (P2 drawer dispatch consolidation), OPT-014 (P2 postprocess Web Worker — architectural), OPT-015 (P2-frozen WebGL renderer — architectural). The architectural items are explicitly out of single-cycle scope. The three P1/P2 algorithmic items are likely to face the same bit-exact / inner-loop / excerpt patterns the rejected items hit. **Decision: not re-queued.** A fresh research pass that produces tighter, line-cited, bit-exact-preserving hypotheses can re-arm the loop later.
+- **Why this is the ship-ready state:** the user-facing default config renders at ~87 fps. Heavy configs are stress benchmarks that pile on multiple postprocess stages by design — they were never the user-facing experience. The "still not smooth enough" complaint that started this pursuit was about the default; the default is now smooth. The loop's discipline (SSIM ≥ 0.985, no per-frame allocations on hot paths, ≤1.05× default-config budget) was preserved across every cycle — no hypothesis snuck through with a sub-threshold visual regression.
+- **Reusable infrastructure shipped:** `scripts/loop_orchestrator/` is now a robust autonomous-pursuit harness — parser-hardened, hunk-header-correcting, excerpt-rich, identifier-grep-anchored, SSIM-gated, build-recovery-aware. It can be re-run any time with a fresh hypothesis YAML.
+- **Recommendation for future pursuits (filed as TODO for next research session):**
+  1. Generate hypotheses with cited line numbers AND backticked identifier names so all three excerpt anchors (path:line, standalone-lines, identifier-grep) fire.
+  2. Default `benchmark_first: false` — the 5-config bench IS the benchmark; the patch_runner cannot run a separate microbench from a blind diff.
+  3. State the bit-exact constraint as a precondition in each hypothesis ("must produce identical pixel bytes pre/post change"); fail fast on hypotheses that require sub-perceptual rounding or quantization.
+  4. For postprocess pipeline gains beyond F4/F8, accept that the remaining wins are architectural (Web Worker / WebGL2 / OffscreenCanvas) and budget multi-day implementation rather than 4-minute cycles.
+
+---
+
 ## 2026-05-10 — Autonomous optimization loop: parser hardening + reset-wipe trap + hunk-header recompute
 
 User asked for "the brainchild of Elon Musk & John Carmack" — a 24-hour
