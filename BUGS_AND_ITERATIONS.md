@@ -4,14 +4,60 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
-## 2026-05-10 — Autonomous optimization loop: parser hardening + reset-wipe trap
+## 2026-05-10 — Autonomous optimization loop: parser hardening + reset-wipe trap + hunk-header recompute
 
 User asked for "the brainchild of Elon Musk & John Carmack" — a 24-hour
 research → patch → build → measure → verify → decide → commit loop chasing
 FFmpeg-level latency discipline.  After approving `OPTIMIZATION-LOOP-PLAN.md`
 with "implement it all", the existing `scripts/loop_orchestrator/` Python
 harness ran its first pursuit.  Five P0 hypotheses (OPT-001..006) landed in
-the trash for two distinct reasons; this entry captures both.
+the trash for two distinct reasons; this entry captures both — plus a third
+class (ITER-027) that surfaced on the second pursuit after the parser fix
+landed.
+
+### ITER-027 — `patch_runner._normalize_hunk_headers` recomputes hunk counts
+
+- **Found:** 2026-05-10, second pursuit, cycle 0 (OPT-003 retry under the new
+  inline-excerpts prompt).  Claude produced a structurally valid diff whose
+  *content* was ground-truth-correct (the HOT-PATH comments and function
+  body matched the source exactly).  But the hunk header was
+  `@@ -2892,17 +2892,29 @@` while the actual hunk had **16 old / 25 new**
+  lines.  `git apply` reads the count from the header, expects 17 old-side
+  lines, gets 16, walks one past EOF, and dies with
+  `corrupt patch at line 41`.
+- **Root cause:** LLMs are bad at counting.  `git diff` always emits correct
+  per-side totals (`Y` and `B` in `@@ -X,Y +A,B @@`); LLM-generated diffs
+  routinely overstate by 1-4 because counting `+`-prefixed lines while
+  writing them is essentially a math exercise we ask the model to do under
+  output-token pressure.  Three of the cycle 0/1 reverts in the *previous*
+  pursuit (OPT-001, OPT-002, OPT-006 sketches) plausibly had the same bug
+  underneath their semantic-sounding rejections.
+- **Fix:** `_normalize_hunk_headers(diff_body)` in `patch_runner.py`.  Pure
+  textual pass: split the diff into hunks, count ` ` (context, both sides),
+  `-` (old only), `+` (new only), skip `\\ No newline …` markers, rewrite
+  the `@@ -X,Y +A,B @@` line with the recomputed totals.  Preserves the
+  starts (`X`, `A`) and the optional tail text after the second `@@`
+  (function-name hint).  Called from `_extract_diff` so every diff that
+  reaches `git apply --check` has correct header math.
+- **Verification:**
+  - 6 hand-written unit tests cover off-by-one, single-line `@@ -X +A @@`
+    form, multi-hunk diffs, the `\\ No newline at end of file` marker, tail
+    text preservation, and idempotence on already-correct diffs (all pass).
+  - The actual failing patch from cycle 0 (`runs/cycle-000/patch.diff`,
+    header `@@ -2892,17 +2892,29 @@`) is rewritten to `@@ -2892,16 +2892,25 @@`
+    and then `git apply --check` returns clean.  So the OPT-003 diff
+    *would have applied* under this normalizer — content was correct,
+    only the header math was off.
+- **Out of scope (filed for the next loop iteration):** a stricter
+  *content-vs-source* validator that, after normalize, also re-verifies
+  every context line (` `-prefix) appears verbatim in the source at the
+  claimed line range.  Today the only check is `git apply --check`, which
+  catches header math AND content drift but reports the latter as "patch
+  does not apply" without saying which line.  A pre-flight content check
+  would let the orchestrator REJECT with a precise reason instead of
+  REVERTing on a generic apply failure.
+
+### ITER-026 — `patch_runner.py` rewrite: permissive diff extractor + inline source excerpts
 
 ### ITER-026 — `patch_runner.py` rewrite: permissive diff extractor + inline source excerpts
 

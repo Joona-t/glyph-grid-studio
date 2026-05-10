@@ -50,6 +50,12 @@ def _extract_diff(stdout: str) -> str | None:
       1. Pure diff (already starts with `diff --git`)
       2. ```diff\\n<diff>\\n```  (markdown fenced block)
       3. <prose preamble>\\n\\ndiff --git …\\n…  (chatty preamble)
+
+    After extraction, hunk headers are recomputed from the actual `+`/`-`/` `
+    line counts via :func:`_normalize_hunk_headers` — claude often miscounts
+    the per-side line totals (e.g. `@@ -2892,17 +2892,29 @@` when the actual
+    hunk has 16 / 25), and `git apply` reads to EOF expecting the missing
+    lines and fails with `corrupt patch at line N`.
     """
     if not stdout:
         return None
@@ -70,7 +76,97 @@ def _extract_diff(stdout: str) -> str | None:
     fence_in_body = diff_body.find("\n```")
     if fence_in_body != -1:
         diff_body = diff_body[:fence_in_body].rstrip()
+    diff_body = _normalize_hunk_headers(diff_body)
     return diff_body + "\n"  # trailing newline for clean `git apply`
+
+
+_HUNK_HEADER_RE = re.compile(
+    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))?"
+    r" \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?P<tail>.*)$"
+)
+
+
+def _normalize_hunk_headers(diff_body: str) -> str:
+    """Recompute `@@ -X,Y +A,B @@` counts from the actual hunk content.
+
+    LLM-generated diffs frequently miscount Y and B (the per-side line
+    totals).  Standard tools like `git diff` always emit correct counts,
+    but `git apply` is strict and fails with `corrupt patch at line N` if
+    the header overstates the count (it tries to read more content lines
+    than exist).
+
+    This pass is purely textual — it does NOT touch context, deletes, or
+    adds, so the resulting diff still has whatever ground-truth-vs-real
+    drift the LLM produced.  If those CONTEXT lines don't actually match
+    the source, `git apply --check` will reject for a different reason
+    ("patch does not apply") that points at the real mismatch instead of
+    the fictional EOF problem.
+
+    Algorithm: split the diff into header lines (everything up to the first
+    `@@`) and hunks (each starting with `@@`).  For each hunk, count
+    ` `-prefixed (context) → both sides; `-`-prefixed → old side only;
+    `+`-prefixed → new side only.  Skip the special "\\ No newline at end
+    of file" marker.  Rewrite the header with correct totals.
+    """
+    if "@@ " not in diff_body:
+        return diff_body
+
+    lines = diff_body.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        m = _HUNK_HEADER_RE.match(ln)
+        if not m:
+            out.append(ln)
+            i += 1
+            continue
+
+        # Walk hunk body until the next `@@` or end of file/diff.
+        body_start = i + 1
+        j = body_start
+        old_count = 0
+        new_count = 0
+        while j < len(lines):
+            cur = lines[j]
+            if _HUNK_HEADER_RE.match(cur):
+                break
+            # New `diff --git` starts a different file — end of this hunk.
+            if cur.startswith("diff --git "):
+                break
+            if not cur:
+                # Trailing blank inside diff body: treated as context by
+                # `git apply` only if it's preceded by content; we keep it
+                # but don't count it.
+                j += 1
+                continue
+            prefix = cur[0]
+            if prefix == " ":
+                old_count += 1
+                new_count += 1
+            elif prefix == "-":
+                old_count += 1
+            elif prefix == "+":
+                new_count += 1
+            elif prefix == "\\":
+                # `\\ No newline at end of file` — neutral
+                pass
+            else:
+                # Anything else (e.g. another git header) — stop.
+                break
+            j += 1
+
+        # Rewrite header. Preserve old/new starts and any tail text after
+        # the last `@@`.
+        old_start = m.group("old_start")
+        new_start = m.group("new_start")
+        tail = m.group("tail") or ""
+        # If a side has count 0, git uses `-X,0` form (no special-case).
+        new_header = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{tail}"
+        out.append(new_header)
+        out.extend(lines[body_start:j])
+        i = j
+    return "\n".join(out)
 
 
 # Maximum lines of source to embed per cited file. Glyph Grid's `index.html`
