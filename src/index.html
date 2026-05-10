@@ -2113,6 +2113,8 @@
     _gradColorLutKey = key;
   }
 
+  // HOT-PATH: drawBrightnessGrid — autonomous optimization loop tracks no
+  // per-frame allocations / no new branches in this function body.
   function drawBrightnessGrid(cellIndex, signal, cols, rows, cellW, cellH) {
     const palette = PALETTES[CONFIG.palette];
     const bgC = color(palette.bg);
@@ -2452,6 +2454,8 @@
   }
 
   /* ---- shape grid drawer — 6D shape-vector match. ---- */
+  // HOT-PATH: drawShapeGrid — autonomous optimization loop tracks no
+  // per-frame allocations / no new branches in this function body.
   function drawShapeGrid(g, cols, rows, cellW, cellH, cellPxW, cellPxH, edgeAware) {
     const palette = PALETTES[CONFIG.palette];
     const bgC = color(palette.bg);
@@ -2643,6 +2647,8 @@
   }
 
   /* ---- edge-directional drawer (cheap alt). ---- */
+  // HOT-PATH: drawEdgeDirectionalGrid — autonomous optimization loop tracks
+  // no per-frame allocations / no new branches in this function body.
   function drawEdgeDirectionalGrid(cols, rows, cellW, cellH) {
     const palette = PALETTES[CONFIG.palette];
     const bgC = color(palette.bg);
@@ -2883,6 +2889,8 @@
     return _vignetteOverlay;
   }
 
+  // HOT-PATH: _hasImgDataStages — gate function for the postprocess
+  // pixel-readback round-trip. Optimization loop may inline-rewrite this.
   function _hasImgDataStages(p) {
     if (!p) return false;
     return !!(
@@ -2898,6 +2906,8 @@
     );
   }
 
+  // HOT-PATH: applyPostprocess — pixel-stage round-trip. Optimization loop
+  // tracks no per-frame allocations + may rewrite the gate logic.
   function applyPostprocess() {
     const ctx = drawingContext;
     const w = width, h = height;
@@ -3057,16 +3067,62 @@
        Each `job` is { name: 'human-label', path: '/abs/path/foo.gif',
        config: { palette: 'spice', colorMode: 'duotone', dither: {mode:'stbn'} },
        frames: 24 }.
-       opts: { onProgress(idx,total,name), onComplete({ ok, errors }), settleMs:120 }. */
+       opts: { onProgress(idx,total,name), onComplete({ ok, errors }),
+              settleMs:120, perf:false }.
+       When opts.perf === true: clears the __pfRing before each job, snapshots
+       per-stage timings + p50/p95 totals after each job, and emits a
+       `PERF_JOB <json>` NDJSON line via the cli_log Tauri command (stderr).
+       The orchestrator (scripts/loop_orchestrator/) parses these lines. */
     runBatchExport(jobs, opts) {
       opts = opts || {};
       const total = jobs.length;
       const errors = [];
       let idx = 0;
       const settle = opts.settleMs != null ? opts.settleMs : 120;
+      const perfMode = !!opts.perf;
       const tauri = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
       if (!tauri) { console.warn('batch: not in Tauri, aborting'); return; }
       const self = this;
+
+      /* Snapshot the in-process perf ring into a flat per-stage avg + total
+         p50/p95. Ring is { stages: {name: ms, ...}, total: ms }[]. Caller
+         already cleared the ring before recording started, so this captures
+         only the just-finished job's frames. */
+      function snapshotPerf(jobName, jobFrames, framesB64) {
+        const ring = (window.__perfRing && window.__perfRing()) || [];
+        if (!ring.length) return null;
+        const stageSums = {};
+        const totals = [];
+        for (let i = 0; i < ring.length; i++) {
+          const f = ring[i];
+          if (f.stages) {
+            for (const k in f.stages) stageSums[k] = (stageSums[k] || 0) + f.stages[k];
+          }
+          if (typeof f.total === 'number') totals.push(f.total);
+        }
+        const n = ring.length;
+        const avgMs = { total: totals.reduce(function (a, b) { return a + b; }, 0) / n };
+        for (const k in stageSums) avgMs[k] = stageSums[k] / n;
+        totals.sort(function (a, b) { return a - b; });
+        const p50 = totals[Math.floor(totals.length * 0.5)] || 0;
+        const p95 = totals[Math.floor(totals.length * 0.95)] || totals[totals.length - 1] || 0;
+        const anchors = [];
+        if (framesB64 && framesB64.length) {
+          var idxs = [0, Math.floor(framesB64.length / 2), framesB64.length - 1];
+          for (var i = 0; i < idxs.length; i++) {
+            anchors.push(framesB64[idxs[i]] || '');
+          }
+        }
+        return {
+          name: jobName,
+          frames: jobFrames || (framesB64 ? framesB64.length : 0),
+          frames_seen: n,
+          avg_ms: avgMs,
+          p50: p50,
+          p95: p95,
+          frame_anchors: anchors,
+        };
+      }
 
       function applyConfig(cfg) {
         if (!cfg) return;
@@ -3107,6 +3163,12 @@
         const savedFps = CONFIG.animation.fps;
         CONFIG.animation.fps = effFps;
 
+        /* Reset the perf ring so the snapshot in onFinish captures only
+           this job's frames (perfMode only). */
+        if (perfMode && typeof window.__perfClear === 'function') {
+          try { window.__perfClear(); } catch (_) {}
+        }
+
         setTimeout(() => {
           self.beginRecord({
             total: job.frames || 24,
@@ -3146,6 +3208,18 @@
               .then(p => {
                 console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);
                 tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p }).catch(()=>{});
+                /* Emit PERF_JOB NDJSON when in perf mode — orchestrator
+                   parses this from the studio's stderr. */
+                if (perfMode) {
+                  try {
+                    const snap = snapshotPerf(job.name, job.frames || 24, frames);
+                    if (snap) {
+                      tauri('cli_log', { msg: 'PERF_JOB ' + JSON.stringify(snap) }).catch(()=>{});
+                    }
+                  } catch (e) {
+                    tauri('cli_log', { msg: 'PERF_JOB_ERR ' + job.name + ' ' + String(e) }).catch(()=>{});
+                  }
+                }
                 CONFIG.animation.fps = savedFps;     // restore on success
                 idx++;
                 setTimeout(next, 50);
@@ -3647,8 +3721,9 @@
           capWidth: (j.capWidth && j.capWidth > 0) ? j.capWidth : 0,
         };
       });
-      console.log('CLI: batch mode — ' + batchJobs.length + ' jobs queued');
+      console.log('CLI: batch mode — ' + batchJobs.length + ' jobs queued' + (job.perf ? ' (perf:on)' : ''));
       __glyphGridTest.runBatchExport(batchJobs, {
+        perf: !!job.perf,
         onComplete: function (result) {
           var ok = result && result.errors && result.errors.length === 0;
           var summary = 'batch complete: ' + (result.ok || 0) + '/' + batchJobs.length + ' ok';

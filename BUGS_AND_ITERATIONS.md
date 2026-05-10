@@ -4,6 +4,116 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-10 — Autonomous optimization loop: parser hardening + reset-wipe trap
+
+User asked for "the brainchild of Elon Musk & John Carmack" — a 24-hour
+research → patch → build → measure → verify → decide → commit loop chasing
+FFmpeg-level latency discipline.  After approving `OPTIMIZATION-LOOP-PLAN.md`
+with "implement it all", the existing `scripts/loop_orchestrator/` Python
+harness ran its first pursuit.  Five P0 hypotheses (OPT-001..006) landed in
+the trash for two distinct reasons; this entry captures both.
+
+### ITER-026 — `patch_runner.py` rewrite: permissive diff extractor + inline source excerpts
+
+- **Found:** 2026-05-10, first pursuit. Five cycles in 8 minutes, all `revert`.
+  - **Cycles 0 & 1** (OPT-003 postprocess gate, OPT-004 scratch buffers) died at
+    `patch_runner.py:130` — the strict `stdout.startswith("diff --git")` check
+    rejected any `claude -p` output that prepended a one-line ack or wrapped
+    the diff in a markdown fence.  Both diffs were probably structurally fine;
+    we never got to find out.
+  - **Cycles 2-4** (OPT-006 luminance gate, OPT-001 preserve-fast-path,
+    OPT-002 fog overlay) were *semantically* rejected by Claude with concrete
+    code-grounded reasons — e.g. *"lumBuf is consumed by `downsampleToCells`
+    (src/index.html:1565) on every frame"*.  These rejects were correct; the
+    hypotheses had bugs.  Healthy auto-audit, **but** the code-shape sketch
+    in the backlog YAML was the only ground truth claude saw, so it had to
+    guess at line numbers and context — half the time the guess matched, half
+    the time it fabricated `// HOT-PATH:` comments that don't exist in the
+    source (cycle 0 retry under the parser fix produced exactly that — a
+    structurally valid diff with hallucinated context, `git apply --check`
+    rejected with `corrupt patch at line 34`).
+  - Loop tripped its `plateau_5_no_keeps` stop after 5 reverts.  Net change to
+    the codebase: zero, by design.
+- **Root cause:**
+  1. **Parser was too strict.** `claude -p` in headless mode often produces
+     `<one-line ack>\n\n<diff>` or ```` ```diff … ``` ```` even when told not
+     to.  Strict prefix matching threw away parser-clean output.
+  2. **Sub-agent had no ground truth.** Without tool access (and we don't want
+     `--dangerously-skip-permissions` on an autonomous loop — that's an
+     unbounded agent gate the platform correctly blocks), Claude was building
+     diffs from the hypothesis description + `code_shape` sketch alone.  The
+     sketch is *illustrative*; matching it to the real file's hunk header is
+     a 50/50 guess.
+- **Fix:** rewrote `scripts/loop_orchestrator/patch_runner.py`:
+  - New `_extract_diff(stdout)` helper — strips outer markdown fence, finds
+    `diff --git` anywhere in stdout via `re.MULTILINE`, trims any trailing
+    fence, returns the body with a guaranteed trailing newline. Six unit
+    tests covering pure / fenced / preamble / REJECT / empty / whitespace
+    inputs all pass.
+  - New `_file_excerpts(hyp)` helper — parses `<path>:<line>` references out
+    of the hypothesis text via regex, takes a ±60-line window per ref (200
+    lines from the head as fallback if no refs found), merges overlapping
+    windows, and renders each excerpt prefixed with **absolute line numbers**.
+    The full file content for the cited line range is now embedded in the
+    prompt, so Claude can match hunk headers exactly without guessing.
+  - Prompt rewritten — explicit *"You have NO tool access"* up front, hard
+    rule *"Hunk headers and context lines must match the embedded source
+    EXACTLY"*, prior-attempt note included if the hypothesis carries one.
+  - **No `--dangerously-skip-permissions` on the `claude -p` invocation.**
+    The platform's permission system blocks the autonomous-loop pattern; the
+    inline-excerpts approach gives Claude everything it needs without skipping
+    gates.
+- **Verification:**
+  - `python3 -c "import patch_runner; …"` smoke covers the parser (5/5 pass)
+    and excerpt builder (line 2886 in `src/index.html` correctly windowed,
+    `_hasImgDataStages` present in the rendered excerpt).
+  - Full prompt size for OPT-003: 8,161 chars (~2,040 tokens) — well under
+    any context limit, and dominated by the ground-truth excerpt rather than
+    repeated boilerplate.
+  - Loop restart pending — will be observed in a follow-up entry once the
+    OPT-003 retry produces a `git apply --check`-clean diff.
+- **Out of scope (filed for the next loop iteration):** if specific hypotheses
+  keep getting *semantically* rejected with "the code shape doesn't match
+  what's actually there", refresh the `code_shape` field in
+  `optimization-backlog.yaml` from the embedded excerpt response — the
+  rejections themselves are useful research output and should feed back into
+  the hypothesis library.
+
+### BUG-006 — `git reset --hard` in revert path wiped the staged-but-uncommitted orchestrator
+
+- **Found:** 2026-05-10. After the first pursuit ended at 05:04:54 UTC, a
+  second pursuit kicked off at 05:08:22 UTC.  Two cycles in, every patch
+  attempt was escalating with `tests_broken`.  Investigation showed the
+  entire `scripts/loop_orchestrator/` directory was missing from disk —
+  only `__pycache__/`, `manifests/`, `runs/`, `optimization-backlog.yaml`,
+  and `state.json` survived.  The `.py` files were gone.
+- **Root cause:** the orchestrator's `revert_to_main()` does `git reset --hard`
+  to undo a failed patch.  The orchestrator's own files were `git add`-staged
+  but not yet committed — `git reset --hard` wipes the index AND the working
+  tree, including unmerged staged additions.  Each cycle's revert wiped its
+  own scaffolding.  The running orchestrator process kept the modules in
+  memory (Python's import cache), so cycles continued — but `tests/run-all.sh`
+  invocations and any future `--resume` would fail because the .py files no
+  longer existed on disk.
+- **Fix:**
+  - **Recovered all 12 files** from a dangling git tree
+    (`f4d7c8e1a3e8518da031e7a7e7851a43c13cb301`, found via
+    `git fsck --lost-found`) — `git cat-file -p <blob> > <dest>` per file.
+  - **Permanent fix lands in the next commit:** the loop_orchestrator
+    directory + the `tests/sources/` bench inputs (cream-paper.png,
+    ghost-I.gif, synthetic-noise.png, thor.png — also untracked) get
+    committed.  After that, `git reset --hard` is benign for the
+    orchestrator's own files because they're in HEAD.
+- **Verification:**
+  - `git ls-tree f4d7c8e1` listed all 12 expected files; restoration script
+    re-materialized each at the documented byte size.
+  - Once committed: `git reset --hard` on a follow-up cycle should leave
+    the orchestrator intact.  Will be re-verified on the next pursuit.
+- **Status:** files recovered ✅. Commit pending (this entry is committed
+  alongside the orchestrator).
+
+---
+
 ## 2026-05-10 — Production-readiness: single-session batch CLI + Twitter-fit safety net (ghost-I.gif 64-variant proof)
 
 User asked the studio to "create every variant with every setting" of `~/Downloads/ghost-I.gif` "all under 15 MB for Twitter".  My first pass spawned a fresh `glyph-grid-studio render` subprocess per variant — Tauri startup + source-image decode + atlas warm-up paid 64 times.  User pushback: *"STOP YOU CONSTANTLY CLOSE & OPEN THE APP THE APP SHOULD BE ABLE TO SETUP THE AUTOMATIONS IN 1 FLOW"*.  Followed up with: *"USE THE APP WITH THE ANKH LOGO this is our flagship app. It must be production ready. If it falls short, do research, sandbox test & implement fixes and patch updates with proven data & metrics. We are an AI native company, we cannot falter!"*.  Two patches landed in this session: the `batch` CLI subcommand, and an external Twitter-fit safety net that exposed an existing assumption bug in the studio's `Export GIF (Twitter-fit)` button.

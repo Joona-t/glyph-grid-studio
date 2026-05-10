@@ -234,6 +234,11 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let frames = manifest.get("frames").and_then(|v| v.as_u64()).unwrap_or(24) as u32;
+    // Optional manifest-level "perf": true — when set, the JS side emits
+    // PERF_JOB NDJSON via cli_log per finished job (parsed by the
+    // optimization-loop orchestrator). Default false (no overhead for
+    // regular batch users).
+    let perf = manifest.get("perf").and_then(|v| v.as_bool()).unwrap_or(false);
     let jobs_arr = manifest.get("jobs").and_then(|v| v.as_array());
 
     let (in_path, jobs_arr) = match (in_path, jobs_arr) {
@@ -273,6 +278,7 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
         "batch": true,
         "inPath": in_path,
         "frames": frames,
+        "perf": perf,
         "jobs": jobs_js,
     });
 
