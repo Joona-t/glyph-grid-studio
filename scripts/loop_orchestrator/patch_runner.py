@@ -210,6 +210,29 @@ def _read_lines(path: Path) -> list[str]:
         return []
 
 
+# Backticked identifiers: `linearizeToLuminance`, `_ensureRampSprite`,
+# `lumBuf`, etc. The 4th pursuit's cycles 2 and 3 (OPT-006, OPT-001) both
+# rejected with "embedded excerpts omit <function-name>" — Claude needs to
+# audit the call sites and related sprite/buffer infrastructure that the
+# hypothesis discusses by name. Greping the cited files for every backticked
+# token gives us those locations cheaply.
+_IDENTIFIER_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]{2,})`")
+# Common JS/CSS/Python keywords to skip when grepping (would match
+# everywhere and bloat the prompt).
+_IDENT_SKIP = frozenset({
+    "const", "let", "var", "function", "return", "true", "false", "null",
+    "undefined", "this", "new", "typeof", "instanceof", "void", "for",
+    "while", "if", "else", "switch", "case", "break", "continue", "throw",
+    "try", "catch", "finally", "class", "extends", "import", "export",
+    "from", "default", "async", "await", "yield", "delete", "in", "of",
+    "true", "false", "Math", "Number", "String", "Array", "Object",
+    "Boolean", "JSON", "Date", "Error", "Map", "Set", "Promise", "Symbol",
+    "RegExp", "console", "window", "document", "globalThis",
+})
+# Cap matches per identifier to avoid exploding the prompt on common names.
+_MAX_IDENT_HITS = 6
+
+
 def _extract_line_refs(text: str, listed_files: list[str]) -> dict[str, list[int]]:
     """Return {file: [line_numbers]} from both qualified and standalone refs.
 
@@ -248,18 +271,59 @@ def _extract_line_refs(text: str, listed_files: list[str]) -> dict[str, list[int
     return refs
 
 
+def _grep_identifier_anchors(
+    text: str, listed_files: list[str], file_lines: dict[str, list[str]]
+) -> dict[str, list[int]]:
+    """For each backticked identifier in `text`, find up to _MAX_IDENT_HITS
+    occurrences in each listed file. Returns {file: [line_numbers]}.
+
+    The cycles-2/3 rejections from the 4th pursuit (`OPT-006` / `OPT-001`)
+    explicitly named functions/buffers that the hypothesis discusses but
+    that live elsewhere in the file from the cited line. This catches them.
+    """
+    idents = sorted({
+        m.group(1) for m in _IDENTIFIER_RE.finditer(text)
+        if m.group(1) not in _IDENT_SKIP
+    })
+    if not idents:
+        return {}
+    anchors: dict[str, list[int]] = {}
+    for ident in idents:
+        pat = re.compile(rf"\b{re.escape(ident)}\b")
+        for f in listed_files:
+            lines = file_lines.get(f) or []
+            hits: list[int] = []
+            for i, ln in enumerate(lines):
+                if pat.search(ln):
+                    hits.append(i + 1)
+                    if len(hits) >= _MAX_IDENT_HITS:
+                        break
+            if hits:
+                anchors.setdefault(f, []).extend(hits)
+    return anchors
+
+
 def _file_excerpts(hyp: dict[str, Any]) -> str:
     """Build inline source excerpts for every file the hypothesis cites.
 
     Small files ship in full. Large files ship merged ±200-line windows
-    around every detected line reference (qualified and standalone). Each
-    excerpt is rendered with absolute line numbers so Claude can match them
-    to hunk headers without guessing.
+    around every detected line reference (qualified and standalone) AND
+    around every grep-hit of backticked identifiers in the hypothesis text.
+    Each excerpt is rendered with absolute line numbers so Claude can
+    match them to hunk headers without guessing.
     """
-    text = " ".join(str(hyp.get(k, "")) for k in
-                    ("hypothesis", "code_shape", "area", "risks"))
+    text = " ".join(str(hyp.get(k, "") or "") for k in
+                    ("hypothesis", "code_shape", "area", "risks",
+                     "prior_attempt", "reason"))
     listed_files: list[str] = list(hyp.get("files", []))
     refs = _extract_line_refs(text, listed_files)
+    # Pre-load file content once per file (used by grep anchors and below).
+    file_lines: dict[str, list[str]] = {}
+    for f in listed_files:
+        path = REPO_ROOT / f
+        if path.exists():
+            file_lines[f] = _read_lines(path)
+    ident_anchors = _grep_identifier_anchors(text, listed_files, file_lines)
 
     out_blocks: list[str] = []
     for f in listed_files:
@@ -267,7 +331,7 @@ def _file_excerpts(hyp: dict[str, Any]) -> str:
         if not path.exists():
             out_blocks.append(f"  ### {f}\n  (file does not exist)\n")
             continue
-        lines = _read_lines(path)
+        lines = file_lines.get(f, [])
         n = len(lines)
 
         # Small file: ship the whole thing.
@@ -278,9 +342,10 @@ def _file_excerpts(hyp: dict[str, Any]) -> str:
             out_blocks.append("\n".join(body_lines))
             continue
 
-        # Large file: window around references.
+        # Large file: window around references AND identifier hits.
+        anchors: list[int] = list(refs.get(f, [])) + list(ident_anchors.get(f, []))
         windows: list[tuple[int, int]] = []
-        for ln in refs.get(f, []):
+        for ln in anchors:
             lo = max(1, ln - _EXCERPT_BEFORE)
             hi = min(n, ln + _EXCERPT_AFTER)
             windows.append((lo, hi))
