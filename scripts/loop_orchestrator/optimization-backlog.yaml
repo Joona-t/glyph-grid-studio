@@ -1,7 +1,7 @@
 - id: OPT-016
   area: boxBlurLinear + applyBloom persistent Float32Array scratch buffers
   priority: P0
-  status: queued
+  status: in_progress
   files:
   - src/lib/glyph-crt.js
   hypothesis: '`boxBlurLinear` at glyph-crt.js:85 allocates `out = new Float32Array(src.length)`
@@ -62,189 +62,253 @@
     '
   expected_gain_ms: -15 to -30 on cfg-postproc-heavy; 0 on cfg-default
   benchmark_first: false
-  risks: "Sole risk: re-entrant or concurrent calls to boxBlurLinear (impossible in single-\nthreaded JS and synchronous applyChain\
-    \ at lines 345-350). Confirm both applyBloom\ncalls at lines 346 and 349 are sequential if-branches with no async or callbacks\n\
-    between them \u2014 they are. No new branches added to any HOT-PATH function.\n"
-  code_shape: "// After glyph-crt.js:28 ('use strict'), before srgbToLinear at line 30:\nlet _crtBlurOut = null;\nlet _crtBlurTmp\
-    \ = null;\nlet _bloomLinBuf = null;\n\n// boxBlurLinear (line 85): replace lines 86-87 only, rest unchanged:\nfunction\
-    \ boxBlurLinear(src, w, h, radius) {\n  const N = src.length;\n  if (!_crtBlurOut || _crtBlurOut.length < N) {\n    _crtBlurOut\
-    \ = new Float32Array(N);\n    _crtBlurTmp = new Float32Array(N);\n  }\n  const out = _crtBlurOut, tmp = _crtBlurTmp;\n\
-    \  // ... rest of boxBlurLinear unchanged (horizontal pass, vertical pass, return out)\n}\n\n// applyBloom (line 127):\
-    \ replace line 132 only, rest unchanged:\nfunction applyBloom(rgba, w, h, opts) {\n  const threshold = opts.threshold\
-    \ == null ? 0.75 : opts.threshold;\n  const intensity = opts.intensity == null ? 0.5 : opts.intensity;\n  const radius\
-    \ = opts.radius == null ? 6 : opts.radius;\n  const N = rgba.length / 4;\n  if (!_bloomLinBuf || _bloomLinBuf.length <\
-    \ N * 3) _bloomLinBuf = new Float32Array(N * 3);\n  const lin = _bloomLinBuf;\n  // ... lines 133-153 unchanged\n}\n"
-  prior_attempt: "Attempted in round 6 cycle 0. Loop reported visual_drift_below_0.985 but with delta_ms 0 (no measurable\
-    \ perf change). Same SSIM value (0.6785773141414008) reported across cycles 0/1/2 \u2014 this is the bench-non-determinism\
-    \ signature, not real drift. The hypothesis remains sound; verify by manual ship + thor-png byte-identity check similar\
-    \ to F9."
+  risks: "Sole risk: re-entrant or concurrent calls to boxBlurLinear (impossible in\
+    \ single-\nthreaded JS and synchronous applyChain at lines 345-350). Confirm both\
+    \ applyBloom\ncalls at lines 346 and 349 are sequential if-branches with no async\
+    \ or callbacks\nbetween them \u2014 they are. No new branches added to any HOT-PATH\
+    \ function.\n"
+  code_shape: "// After glyph-crt.js:28 ('use strict'), before srgbToLinear at line\
+    \ 30:\nlet _crtBlurOut = null;\nlet _crtBlurTmp = null;\nlet _bloomLinBuf = null;\n\
+    \n// boxBlurLinear (line 85): replace lines 86-87 only, rest unchanged:\nfunction\
+    \ boxBlurLinear(src, w, h, radius) {\n  const N = src.length;\n  if (!_crtBlurOut\
+    \ || _crtBlurOut.length < N) {\n    _crtBlurOut = new Float32Array(N);\n    _crtBlurTmp\
+    \ = new Float32Array(N);\n  }\n  const out = _crtBlurOut, tmp = _crtBlurTmp;\n\
+    \  // ... rest of boxBlurLinear unchanged (horizontal pass, vertical pass, return\
+    \ out)\n}\n\n// applyBloom (line 127): replace line 132 only, rest unchanged:\n\
+    function applyBloom(rgba, w, h, opts) {\n  const threshold = opts.threshold ==\
+    \ null ? 0.75 : opts.threshold;\n  const intensity = opts.intensity == null ?\
+    \ 0.5 : opts.intensity;\n  const radius = opts.radius == null ? 6 : opts.radius;\n\
+    \  const N = rgba.length / 4;\n  if (!_bloomLinBuf || _bloomLinBuf.length < N\
+    \ * 3) _bloomLinBuf = new Float32Array(N * 3);\n  const lin = _bloomLinBuf;\n\
+    \  // ... lines 133-153 unchanged\n}\n"
+  prior_attempt: "Attempted in round 6 cycle 0. Loop reported visual_drift_below_0.985\
+    \ but with delta_ms 0 (no measurable perf change). Same SSIM value (0.6785773141414008)\
+    \ reported across cycles 0/1/2 \u2014 this is the bench-non-determinism signature,\
+    \ not real drift. The hypothesis remains sound; verify by manual ship + thor-png\
+    \ byte-identity check similar to F9."
 - id: OPT-018
   area: srgbToLinear 256-entry LUT in glyph-crt.js eliminates Math.pow per pixel
   priority: P0
   status: keep
   files:
   - src/lib/glyph-crt.js
-  hypothesis: "`srgbToLinear` at glyph-crt.js:30 calls `Math.pow((s + 0.055) / 1.055, 2.4)` for\ninputs above 10/255. In `applyBloom`\
-    \ at glyph-crt.js:127, `srgbToLinear` is called\n3 times per pixel in the first scan (lines 134-136) and 3 times per pixel\
-    \ in the\naccumulation scan (lines 146-148) \u2014 6 Math.pow calls per pixel per `applyBloom`.\ncfg-postproc-heavy calls\
-    \ `applyBloom` twice (halation line 346, bloom line 349):\n12 Math.pow calls per pixel per frame. At 1024x504 = 516096\
-    \ pixels: ~6.2M Math.pow\ncalls per frame on cfg-postproc-heavy.\n\nAll `srgbToLinear` call sites in `applyBloom` (lines\
-    \ 134-136, 146-148) and\n`applyPhosphorDecay` (lines 55-57, 66-68) pass a Uint8ClampedArray byte (0-255).\nThe input domain\
-    \ is fully quantized to 256 values. Fix: add a 256-entry Float64Array\nLUT `_SRGB_TO_LINEAR_LUT` inside the IIFE after\
-    \ line 28, built with the same formula.\nThis pattern is already established in src/index.html:1769-1776 as `SRGB_LINEAR_LUT`.\n\
-    Replace `srgbToLinear`'s body with a LUT lookup.\n\nBit-exact argument: `_SRGB_TO_LINEAR_LUT[i]` is computed with the\
-    \ same IEEE 754\ndouble-precision Math.pow as the original function for each i in 0..255. Using\nFloat64Array (not Float32)\
-    \ guarantees zero precision loss. Since input is always\nan integer byte, LUT and direct computation produce bit-identical\
-    \ Float64 results.\nNote: `linearToSrgb` at line 34 is NOT changed \u2014 its input is a sum of linear\nfloats, not quantized\
+  hypothesis: "`srgbToLinear` at glyph-crt.js:30 calls `Math.pow((s + 0.055) / 1.055,\
+    \ 2.4)` for\ninputs above 10/255. In `applyBloom` at glyph-crt.js:127, `srgbToLinear`\
+    \ is called\n3 times per pixel in the first scan (lines 134-136) and 3 times per\
+    \ pixel in the\naccumulation scan (lines 146-148) \u2014 6 Math.pow calls per\
+    \ pixel per `applyBloom`.\ncfg-postproc-heavy calls `applyBloom` twice (halation\
+    \ line 346, bloom line 349):\n12 Math.pow calls per pixel per frame. At 1024x504\
+    \ = 516096 pixels: ~6.2M Math.pow\ncalls per frame on cfg-postproc-heavy.\n\n\
+    All `srgbToLinear` call sites in `applyBloom` (lines 134-136, 146-148) and\n`applyPhosphorDecay`\
+    \ (lines 55-57, 66-68) pass a Uint8ClampedArray byte (0-255).\nThe input domain\
+    \ is fully quantized to 256 values. Fix: add a 256-entry Float64Array\nLUT `_SRGB_TO_LINEAR_LUT`\
+    \ inside the IIFE after line 28, built with the same formula.\nThis pattern is\
+    \ already established in src/index.html:1769-1776 as `SRGB_LINEAR_LUT`.\nReplace\
+    \ `srgbToLinear`'s body with a LUT lookup.\n\nBit-exact argument: `_SRGB_TO_LINEAR_LUT[i]`\
+    \ is computed with the same IEEE 754\ndouble-precision Math.pow as the original\
+    \ function for each i in 0..255. Using\nFloat64Array (not Float32) guarantees\
+    \ zero precision loss. Since input is always\nan integer byte, LUT and direct\
+    \ computation produce bit-identical Float64 results.\nNote: `linearToSrgb` at\
+    \ line 34 is NOT changed \u2014 its input is a sum of linear\nfloats, not quantized\
     \ to 256 values.\n"
   expected_gain_ms: -8 to -20 on cfg-postproc-heavy; 0 on cfg-default
   benchmark_first: false
-  risks: "Precision: using Float64Array (not Float32Array) eliminates any single-precision\ntruncation risk. The LUT is 256\
-    \ x 8 bytes = 2 KB \u2014 trivial memory cost.\nBuild-time correctness: verify max(|LUT[i] - srgbToLinear_old(i)|) ===\
-    \ 0 for all i.\n"
-  code_shape: "// After glyph-crt.js:28 ('use strict'), before srgbToLinear at line 30:\nconst _SRGB_TO_LINEAR_LUT = (function\
-    \ () {\n  const lut = new Float64Array(256);\n  for (let i = 0; i < 256; i++) {\n    const s = i / 255;\n    lut[i] =\
-    \ s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);\n  }\n  return lut;\n})();\n\n// Replace srgbToLinear\
-    \ body (lines 30-33):\nfunction srgbToLinear(c) {\n  return _SRGB_TO_LINEAR_LUT[c < 0 ? 0 : c > 255 ? 255 : (c | 0)];\n\
-    }\n"
-  reason: 'Manually shipped as F9 after the loop SSIM gate false-positive-rejected it. LUT was mathematically proven bit-identical
-    (256/256 identical, max diff = 0). Verified at runtime: thor-png x cfg-postproc-heavy bytes-identical post-F9. The OTHER
-    drift observations in the loop runs traced to bench non-determinism, not the LUT. See BUGS_AND_ITERATIONS.md ITER-033.'
+  risks: "Precision: using Float64Array (not Float32Array) eliminates any single-precision\n\
+    truncation risk. The LUT is 256 x 8 bytes = 2 KB \u2014 trivial memory cost.\n\
+    Build-time correctness: verify max(|LUT[i] - srgbToLinear_old(i)|) === 0 for all\
+    \ i.\n"
+  code_shape: "// After glyph-crt.js:28 ('use strict'), before srgbToLinear at line\
+    \ 30:\nconst _SRGB_TO_LINEAR_LUT = (function () {\n  const lut = new Float64Array(256);\n\
+    \  for (let i = 0; i < 256; i++) {\n    const s = i / 255;\n    lut[i] = s <=\
+    \ 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);\n  }\n  return lut;\n\
+    })();\n\n// Replace srgbToLinear body (lines 30-33):\nfunction srgbToLinear(c)\
+    \ {\n  return _SRGB_TO_LINEAR_LUT[c < 0 ? 0 : c > 255 ? 255 : (c | 0)];\n}\n"
+  reason: 'Manually shipped as F9 after the loop SSIM gate false-positive-rejected
+    it. LUT was mathematically proven bit-identical (256/256 identical, max diff =
+    0). Verified at runtime: thor-png x cfg-postproc-heavy bytes-identical post-F9.
+    The OTHER drift observations in the loop runs traced to bench non-determinism,
+    not the LUT. See BUGS_AND_ITERATIONS.md ITER-033.'
 - id: OPT-019
   area: applyChromaticAberration persistent Uint8ClampedArray copy buffer
   priority: P1
-  status: queued
+  status: rejected
   files:
   - src/lib/glyph-crt.js
-  hypothesis: "`applyChromaticAberration` at glyph-crt.js:176 allocates\n`const src = new Uint8ClampedArray(rgba)` at line\
-    \ 180 on every call. This copies\nthe full pixel buffer (1024x504x4 = 2,064,384 bytes = ~2 MB) to preserve original\n\
-    values for channel-shift reads while writing output in-place. cfg-postproc-heavy\nhas chromaticAberration enabled (benchmark.py:118)\
-    \ \u2014 this is a 2 MB allocation\nand copy per frame.\n\nFix: add module-scope persistent `_chromaticSrcBuf` (Uint8ClampedArray)\
-    \ after\nglyph-crt.js:28 ('use strict'). Grow only when rgba.length exceeds current size\n(canvas resize). Copy rgba via\
-    \ `_chromaticSrcBuf.set(rgba)` at the top of\n`applyChromaticAberration`. Replace line 180 with the persistent buffer.\n\
-    \nBit-exact argument: `Uint8ClampedArray.set(source)` copies each byte verbatim.\nThe downstream reads from `src` and\
-    \ writes to `rgba` are unchanged. Output bytes\nare identical.\n"
+  hypothesis: "`applyChromaticAberration` at glyph-crt.js:176 allocates\n`const src\
+    \ = new Uint8ClampedArray(rgba)` at line 180 on every call. This copies\nthe full\
+    \ pixel buffer (1024x504x4 = 2,064,384 bytes = ~2 MB) to preserve original\nvalues\
+    \ for channel-shift reads while writing output in-place. cfg-postproc-heavy\n\
+    has chromaticAberration enabled (benchmark.py:118) \u2014 this is a 2 MB allocation\n\
+    and copy per frame.\n\nFix: add module-scope persistent `_chromaticSrcBuf` (Uint8ClampedArray)\
+    \ after\nglyph-crt.js:28 ('use strict'). Grow only when rgba.length exceeds current\
+    \ size\n(canvas resize). Copy rgba via `_chromaticSrcBuf.set(rgba)` at the top\
+    \ of\n`applyChromaticAberration`. Replace line 180 with the persistent buffer.\n\
+    \nBit-exact argument: `Uint8ClampedArray.set(source)` copies each byte verbatim.\n\
+    The downstream reads from `src` and writes to `rgba` are unchanged. Output bytes\n\
+    are identical.\n"
   expected_gain_ms: -2 to -5 on cfg-postproc-heavy; 0 elsewhere
   benchmark_first: false
-  risks: 'None for bit-exactness. _chromaticSrcBuf is fully overwritten by .set(rgba) before
+  risks: 'None for bit-exactness. _chromaticSrcBuf is fully overwritten by .set(rgba)
+    before
 
     any read on each call. Re-entrant calls impossible in synchronous applyChain.
 
     '
-  code_shape: "// After glyph-crt.js:28 ('use strict'):\nlet _chromaticSrcBuf = null;\n\n// In applyChromaticAberration (line\
-    \ 176), replace line 180:\nfunction applyChromaticAberration(rgba, w, h, opts) {\n  const maxOffset = opts.offset == null\
-    \ ? 0.5 : opts.offset;\n  if (!_chromaticSrcBuf || _chromaticSrcBuf.length < rgba.length) {\n    _chromaticSrcBuf = new\
-    \ Uint8ClampedArray(rgba.length);\n  }\n  _chromaticSrcBuf.set(rgba);\n  const src = _chromaticSrcBuf;\n  // ... lines\
-    \ 181-193 unchanged\n}\n"
+  code_shape: "// After glyph-crt.js:28 ('use strict'):\nlet _chromaticSrcBuf = null;\n\
+    \n// In applyChromaticAberration (line 176), replace line 180:\nfunction applyChromaticAberration(rgba,\
+    \ w, h, opts) {\n  const maxOffset = opts.offset == null ? 0.5 : opts.offset;\n\
+    \  if (!_chromaticSrcBuf || _chromaticSrcBuf.length < rgba.length) {\n    _chromaticSrcBuf\
+    \ = new Uint8ClampedArray(rgba.length);\n  }\n  _chromaticSrcBuf.set(rgba);\n\
+    \  const src = _chromaticSrcBuf;\n  // ... lines 181-193 unchanged\n}\n"
+  reason: no_signal_(delta_-0.77ms_<_keep_floor)
+  cycle: 0
 - id: OPT-020
   area: applyScanlines skip no-op row multiply when darken equals 1
   priority: P1
-  status: queued
+  status: rejected
   files:
   - src/lib/glyph-crt.js
-  hypothesis: "`applyScanlines` at glyph-crt.js:158 computes `darken` per row at line 163 as\neither the literal 1 (for rows\
-    \ where `(y + phase) % period === 0`) or\n`(1 - intensity)` for all other rows. The inner loop (lines 164-169) runs for\
-    \ every\nrow including those where `darken === 1`, executing 3 multiply-and-store operations\nper pixel that are no-ops\
-    \ (x * 1.0 === x for Uint8ClampedArray integer values).\n\ncfg-postproc-heavy has `scanlines: { enabled: true, period:\
-    \ 2 }` (benchmark.py:117).\nWith period=2, exactly 252 of 504 rows have darken===1. Skipping the inner loop\nfor those\
-    \ rows saves 252 rows x 1024 pixels x 3 channel operations = 774,144\nno-op multiply-and-stores per frame.\n\nFix: add\
-    \ `if (darken === 1) continue;` after line 163, before the inner x-loop.\n\nBit-exact argument: for Uint8ClampedArray\
-    \ values 0-255, `x * 1.0` assigned back\nto a Uint8ClampedArray slot produces x unchanged (clamp rounds to same integer).\n\
-    Skipping `rgba[i] = rgba[i] * 1.0` leaves rgba[i] unchanged \u2014 byte-identical.\nThe strict equality `darken === 1`\
-    \ fires only for the literal 1 from the ternary;\nnon-integer phase or period=1 edge cases either never fire the skip\
-    \ or make\napplyScanlines correctly a no-op (period=1 means all rows are full-brightness).\n"
+  hypothesis: "`applyScanlines` at glyph-crt.js:158 computes `darken` per row at line\
+    \ 163 as\neither the literal 1 (for rows where `(y + phase) % period === 0`) or\n\
+    `(1 - intensity)` for all other rows. The inner loop (lines 164-169) runs for\
+    \ every\nrow including those where `darken === 1`, executing 3 multiply-and-store\
+    \ operations\nper pixel that are no-ops (x * 1.0 === x for Uint8ClampedArray integer\
+    \ values).\n\ncfg-postproc-heavy has `scanlines: { enabled: true, period: 2 }`\
+    \ (benchmark.py:117).\nWith period=2, exactly 252 of 504 rows have darken===1.\
+    \ Skipping the inner loop\nfor those rows saves 252 rows x 1024 pixels x 3 channel\
+    \ operations = 774,144\nno-op multiply-and-stores per frame.\n\nFix: add `if (darken\
+    \ === 1) continue;` after line 163, before the inner x-loop.\n\nBit-exact argument:\
+    \ for Uint8ClampedArray values 0-255, `x * 1.0` assigned back\nto a Uint8ClampedArray\
+    \ slot produces x unchanged (clamp rounds to same integer).\nSkipping `rgba[i]\
+    \ = rgba[i] * 1.0` leaves rgba[i] unchanged \u2014 byte-identical.\nThe strict\
+    \ equality `darken === 1` fires only for the literal 1 from the ternary;\nnon-integer\
+    \ phase or period=1 edge cases either never fire the skip or make\napplyScanlines\
+    \ correctly a no-op (period=1 means all rows are full-brightness).\n"
   expected_gain_ms: -2 to -5 on cfg-postproc-heavy with period:2; 0 on cfg-default
   benchmark_first: false
-  risks: 'None for bit-exactness. The skip fires only when darken is the literal 1, which
+  risks: 'None for bit-exactness. The skip fires only when darken is the literal 1,
+    which
 
     is a proven no-op for Uint8ClampedArray. No new branches added to any HOT-PATH
 
     function. The only change is a single continue statement inside applyScanlines.
 
     '
-  code_shape: "// In applyScanlines (glyph-crt.js:158), add one line after line 163:\nfunction applyScanlines(rgba, w, h,\
-    \ opts) {\n  const intensity = opts.intensity == null ? 0.25 : opts.intensity;\n  const period = Math.max(1, opts.period\
-    \ | 0 || 2);\n  const phase = opts.phase || 0;\n  for (let y = 0; y < h; y++) {\n    const darken = ((y + phase) % period\
-    \ === 0) ? 1 : (1 - intensity);\n    if (darken === 1) continue;\n    for (let x = 0; x < w; x++) {\n      const i = (y\
-    \ * w + x) * 4;\n      rgba[i]     = rgba[i]     * darken;\n      rgba[i + 1] = rgba[i + 1] * darken;\n      rgba[i +\
-    \ 2] = rgba[i + 2] * darken;\n    }\n  }\n  return rgba;\n}\n"
+  code_shape: "// In applyScanlines (glyph-crt.js:158), add one line after line 163:\n\
+    function applyScanlines(rgba, w, h, opts) {\n  const intensity = opts.intensity\
+    \ == null ? 0.25 : opts.intensity;\n  const period = Math.max(1, opts.period |\
+    \ 0 || 2);\n  const phase = opts.phase || 0;\n  for (let y = 0; y < h; y++) {\n\
+    \    const darken = ((y + phase) % period === 0) ? 1 : (1 - intensity);\n    if\
+    \ (darken === 1) continue;\n    for (let x = 0; x < w; x++) {\n      const i =\
+    \ (y * w + x) * 4;\n      rgba[i]     = rgba[i]     * darken;\n      rgba[i +\
+    \ 1] = rgba[i + 1] * darken;\n      rgba[i + 2] = rgba[i + 2] * darken;\n    }\n\
+    \  }\n  return rgba;\n}\n"
+  reason: no_signal_(delta_-0.46ms_<_keep_floor)
+  cycle: 1
 - id: OPT-017
   area: applyChain Object.assign allocation elimination (halation + scanlines opts)
   priority: P1
-  status: queued
+  status: rejected
   files:
   - src/lib/glyph-crt.js
-  hypothesis: "`applyChain` at glyph-crt.js:327 creates two new plain objects per frame when\nhalation and scanlines are enabled.\
-    \ At glyph-crt.js:346:\n  `applyBloom(d, w, h, Object.assign({ threshold:0.6, intensity:0.3, radius:4 }, postOpts.halation))`\n\
-    creates a merged object every frame to supply halation defaults. At glyph-crt.js:356:\n  `applyScanlines(d, w, h, Object.assign({},\
-    \ postOpts.scanlines, { phase: phase }))`\ncreates another object every frame to inject the computed phase value. Both\
-    \ objects\nare throwaway \u2014 allocated, passed, and released each frame.\n\nFix: replace both `Object.assign` calls\
-    \ with module-scope persistent opts objects\n`_halationOpts` and `_scanlinesOpts` that are mutated in-place before each\
-    \ dispatch.\nThe key fields (threshold, intensity, radius for halation; intensity, period, phase\nfor scanlines) are set\
-    \ explicitly from postOpts each frame.\n\nBit-exact argument: `applyBloom` at lines 127-153 reads opts.threshold, opts.intensity,\n\
-    opts.radius only \u2014 no field enumeration, no reference retention. `applyScanlines` at\nlines 158-172 reads opts.intensity,\
-    \ opts.period, opts.phase only. A persistent object\nwith identical field values produces identical function execution\
-    \ and identical output.\n"
+  hypothesis: "`applyChain` at glyph-crt.js:327 creates two new plain objects per\
+    \ frame when\nhalation and scanlines are enabled. At glyph-crt.js:346:\n  `applyBloom(d,\
+    \ w, h, Object.assign({ threshold:0.6, intensity:0.3, radius:4 }, postOpts.halation))`\n\
+    creates a merged object every frame to supply halation defaults. At glyph-crt.js:356:\n\
+    \  `applyScanlines(d, w, h, Object.assign({}, postOpts.scanlines, { phase: phase\
+    \ }))`\ncreates another object every frame to inject the computed phase value.\
+    \ Both objects\nare throwaway \u2014 allocated, passed, and released each frame.\n\
+    \nFix: replace both `Object.assign` calls with module-scope persistent opts objects\n\
+    `_halationOpts` and `_scanlinesOpts` that are mutated in-place before each dispatch.\n\
+    The key fields (threshold, intensity, radius for halation; intensity, period,\
+    \ phase\nfor scanlines) are set explicitly from postOpts each frame.\n\nBit-exact\
+    \ argument: `applyBloom` at lines 127-153 reads opts.threshold, opts.intensity,\n\
+    opts.radius only \u2014 no field enumeration, no reference retention. `applyScanlines`\
+    \ at\nlines 158-172 reads opts.intensity, opts.period, opts.phase only. A persistent\
+    \ object\nwith identical field values produces identical function execution and\
+    \ identical output.\n"
   expected_gain_ms: -0.5 to -1.5 on cfg-postproc-heavy; 0 elsewhere
   benchmark_first: false
-  risks: 'None for bit-exactness. Risk: if caller passes halation/scanlines config with extra
+  risks: 'None for bit-exactness. Risk: if caller passes halation/scanlines config
+    with extra
 
     fields not in the persistent object, those would not be propagated. Audit confirms
 
     applyBloom and applyScanlines only read the named fields documented above.
 
     '
-  code_shape: "// After glyph-crt.js:28 ('use strict'), before srgbToLinear:\nconst _halationOpts = { threshold: 0.6, intensity:\
-    \ 0.3, radius: 4 };\nconst _scanlinesOpts = { intensity: 0.25, period: 2, phase: 0 };\n\n// Replace glyph-crt.js:346 (halation\
-    \ dispatch):\nif (postOpts.halation && postOpts.halation.enabled) {\n  _halationOpts.threshold = postOpts.halation.threshold\
-    \ != null ? postOpts.halation.threshold : 0.6;\n  _halationOpts.intensity = postOpts.halation.intensity != null ? postOpts.halation.intensity\
-    \ : 0.3;\n  _halationOpts.radius    = postOpts.halation.radius    != null ? postOpts.halation.radius    : 4;\n  applyBloom(d,\
-    \ w, h, _halationOpts);\n}\n\n// Replace glyph-crt.js:354-356 (scanlines dispatch):\nif (postOpts.scanlines && postOpts.scanlines.enabled)\
-    \ {\n  const phase = reduced ? 0 : (postOpts.scanlines.phase || 0);\n  _scanlinesOpts.intensity = postOpts.scanlines.intensity\
-    \ != null ? postOpts.scanlines.intensity : 0.25;\n  _scanlinesOpts.period    = postOpts.scanlines.period    != null ?\
-    \ (postOpts.scanlines.period | 0) : 2;\n  _scanlinesOpts.phase     = phase;\n  applyScanlines(d, w, h, _scanlinesOpts);\n\
+  code_shape: "// After glyph-crt.js:28 ('use strict'), before srgbToLinear:\nconst\
+    \ _halationOpts = { threshold: 0.6, intensity: 0.3, radius: 4 };\nconst _scanlinesOpts\
+    \ = { intensity: 0.25, period: 2, phase: 0 };\n\n// Replace glyph-crt.js:346 (halation\
+    \ dispatch):\nif (postOpts.halation && postOpts.halation.enabled) {\n  _halationOpts.threshold\
+    \ = postOpts.halation.threshold != null ? postOpts.halation.threshold : 0.6;\n\
+    \  _halationOpts.intensity = postOpts.halation.intensity != null ? postOpts.halation.intensity\
+    \ : 0.3;\n  _halationOpts.radius    = postOpts.halation.radius    != null ? postOpts.halation.radius\
+    \    : 4;\n  applyBloom(d, w, h, _halationOpts);\n}\n\n// Replace glyph-crt.js:354-356\
+    \ (scanlines dispatch):\nif (postOpts.scanlines && postOpts.scanlines.enabled)\
+    \ {\n  const phase = reduced ? 0 : (postOpts.scanlines.phase || 0);\n  _scanlinesOpts.intensity\
+    \ = postOpts.scanlines.intensity != null ? postOpts.scanlines.intensity : 0.25;\n\
+    \  _scanlinesOpts.period    = postOpts.scanlines.period    != null ? (postOpts.scanlines.period\
+    \ | 0) : 2;\n  _scanlinesOpts.phase     = phase;\n  applyScanlines(d, w, h, _scanlinesOpts);\n\
     }\n"
+  reason: geomean_regressed
+  cycle: 2
 - id: OPT-021
   area: applyBarrel persistent Uint8ClampedArray copy buffer
   priority: P2
-  status: queued
+  status: rejected
   files:
   - src/lib/glyph-crt.js
-  hypothesis: "`applyBarrel` at glyph-crt.js:197 allocates `const src = new Uint8ClampedArray(rgba)`\nat line 199 on every\
-    \ call \u2014 identical pattern to `applyChromaticAberration` at\nline 180 (addressed by OPT-019). At 1024x504 this is\
-    \ a 2 MB allocation per frame\nwhen barrel distortion is enabled. cfg-postproc-heavy does NOT have barrel enabled\n(benchmark.py:112-120),\
-    \ so bench gain is 0 ms. Targets interactive user sessions\nwith barrel enabled.\n\nFix: add module-scope persistent `_barrelSrcBuf`\
-    \ (Uint8ClampedArray) after\nglyph-crt.js:28. Grow only on canvas resize. Use `.set(rgba)` to copy. Replace\nline 199\
-    \ with the persistent buffer.\n\nBit-exact argument: identical to OPT-019.\n"
+  hypothesis: "`applyBarrel` at glyph-crt.js:197 allocates `const src = new Uint8ClampedArray(rgba)`\n\
+    at line 199 on every call \u2014 identical pattern to `applyChromaticAberration`\
+    \ at\nline 180 (addressed by OPT-019). At 1024x504 this is a 2 MB allocation per\
+    \ frame\nwhen barrel distortion is enabled. cfg-postproc-heavy does NOT have barrel\
+    \ enabled\n(benchmark.py:112-120), so bench gain is 0 ms. Targets interactive\
+    \ user sessions\nwith barrel enabled.\n\nFix: add module-scope persistent `_barrelSrcBuf`\
+    \ (Uint8ClampedArray) after\nglyph-crt.js:28. Grow only on canvas resize. Use\
+    \ `.set(rgba)` to copy. Replace\nline 199 with the persistent buffer.\n\nBit-exact\
+    \ argument: identical to OPT-019.\n"
   expected_gain_ms: 0 on current 5-config bench suite; -2 to -4 when barrel is enabled
   benchmark_first: false
-  risks: "None for bit-exactness. If OPT-019 and OPT-021 both land, the two persistent\nbuffers (_chromaticSrcBuf and _barrelSrcBuf)\
-    \ are separate \u2014 no aliasing when\nboth stages run (they are sequential in applyChain lines 358-363).\n"
-  code_shape: "// After glyph-crt.js:28 ('use strict'):\nlet _barrelSrcBuf = null;\n\n// In applyBarrel (line 197), replace\
-    \ line 199:\nfunction applyBarrel(rgba, w, h, opts) {\n  const strength = opts.strength == null ? 0.08 : opts.strength;\n\
-    \  if (!_barrelSrcBuf || _barrelSrcBuf.length < rgba.length) {\n    _barrelSrcBuf = new Uint8ClampedArray(rgba.length);\n\
-    \  }\n  _barrelSrcBuf.set(rgba);\n  const src = _barrelSrcBuf;\n  // ... lines 200-220 unchanged\n}\n"
+  risks: "None for bit-exactness. If OPT-019 and OPT-021 both land, the two persistent\n\
+    buffers (_chromaticSrcBuf and _barrelSrcBuf) are separate \u2014 no aliasing when\n\
+    both stages run (they are sequential in applyChain lines 358-363).\n"
+  code_shape: "// After glyph-crt.js:28 ('use strict'):\nlet _barrelSrcBuf = null;\n\
+    \n// In applyBarrel (line 197), replace line 199:\nfunction applyBarrel(rgba,\
+    \ w, h, opts) {\n  const strength = opts.strength == null ? 0.08 : opts.strength;\n\
+    \  if (!_barrelSrcBuf || _barrelSrcBuf.length < rgba.length) {\n    _barrelSrcBuf\
+    \ = new Uint8ClampedArray(rgba.length);\n  }\n  _barrelSrcBuf.set(rgba);\n  const\
+    \ src = _barrelSrcBuf;\n  // ... lines 200-220 unchanged\n}\n"
+  reason: geomean_regressed
+  cycle: 3
 - id: OPT-022
   area: drawEdgeDirectionalGrid monochrome sprite atlas (String.fromCodePoint elimination)
   priority: P2
-  status: queued
+  status: rejected
   files:
   - src/index.html
   - src/lib/glyph-edge.js
-  hypothesis: "`drawEdgeDirectionalGrid` at src/index.html:2656 has a monochrome fast path\n(lines 2707-2725) that calls `fill(monoR,\
-    \ monoG, monoB, a > 255 ? 255 : a)` and\n`text(String.fromCodePoint(cp), cx, cy)` per non-space cell at line 2720.\nEach\
-    \ `String.fromCodePoint(cp)` allocates a new string object. Each p5 `fill()`\ncall has function-call overhead. At 28,800\
-    \ cells this is 28,800 string allocs +\n28,800 fill() calls per frame when edge-directional mode is active.\n\nThe directional\
-    \ alphabet in glyph-edge.js:37-46 (`DEFAULT_ALPHABET`) is a fixed\nset of 5 unique codepoints: 0x2500, 0x2571, 0x2502,\
-    \ 0x2572, 0x20. Only 4 of these\nare non-space. A sprite atlas for these 4 codepoints can be built once per\n(fontFamily,\
-    \ fontSizePx, inkColor) tuple using the `_ensureRampSprite` pattern from\nsrc/index.html:2065. Replace `fill()+text(String.fromCodePoint(cp))`\
-    \ with\n`ctx.globalAlpha=a/255; ctx.drawImage(...)` \u2014 same pattern as drawBrightnessGrid's\nITER-016 win (57ms->9ms,\
-    \ 6x faster).\n\nNOTE: none of the 5 bench configs use selectionMode='edge-directional', so bench\ngain is 0 ms. The SSIM\
-    \ gate trivially passes since drawEdgeDirectionalGrid is not\ncalled in any bench config. This targets interactive user\
-    \ sessions with edge-\ndirectional mode and is a correctness-preserving quality-of-life win.\n"
-  expected_gain_ms: 0 on all 5 bench configs; -5 to -12 real-use edge-directional mode
+  hypothesis: "`drawEdgeDirectionalGrid` at src/index.html:2656 has a monochrome fast\
+    \ path\n(lines 2707-2725) that calls `fill(monoR, monoG, monoB, a > 255 ? 255\
+    \ : a)` and\n`text(String.fromCodePoint(cp), cx, cy)` per non-space cell at line\
+    \ 2720.\nEach `String.fromCodePoint(cp)` allocates a new string object. Each p5\
+    \ `fill()`\ncall has function-call overhead. At 28,800 cells this is 28,800 string\
+    \ allocs +\n28,800 fill() calls per frame when edge-directional mode is active.\n\
+    \nThe directional alphabet in glyph-edge.js:37-46 (`DEFAULT_ALPHABET`) is a fixed\n\
+    set of 5 unique codepoints: 0x2500, 0x2571, 0x2502, 0x2572, 0x20. Only 4 of these\n\
+    are non-space. A sprite atlas for these 4 codepoints can be built once per\n(fontFamily,\
+    \ fontSizePx, inkColor) tuple using the `_ensureRampSprite` pattern from\nsrc/index.html:2065.\
+    \ Replace `fill()+text(String.fromCodePoint(cp))` with\n`ctx.globalAlpha=a/255;\
+    \ ctx.drawImage(...)` \u2014 same pattern as drawBrightnessGrid's\nITER-016 win\
+    \ (57ms->9ms, 6x faster).\n\nNOTE: none of the 5 bench configs use selectionMode='edge-directional',\
+    \ so bench\ngain is 0 ms. The SSIM gate trivially passes since drawEdgeDirectionalGrid\
+    \ is not\ncalled in any bench config. This targets interactive user sessions with\
+    \ edge-\ndirectional mode and is a correctness-preserving quality-of-life win.\n"
+  expected_gain_ms: 0 on all 5 bench configs; -5 to -12 real-use edge-directional
+    mode
   benchmark_first: false
-  risks: 'Rasterization parity: the sprite atlas pre-renders codepoints via ctx.fillText on
+  risks: 'Rasterization parity: the sprite atlas pre-renders codepoints via ctx.fillText
+    on
 
     an offscreen canvas. The per-cell path uses p5''s text() which also calls fillText
 
@@ -255,12 +319,17 @@
     shows visible drift, escalate rather than revert.
 
     '
-  code_shape: "// In src/index.html, add edge dir sprite cache near line 2064:\nlet _edgeDirSprite = null, _edgeDirKey = null;\n\
-    function _ensureEdgeDirSprite(cpArr, fontFamily, fontSizePx, fillColor) {\n  const key = cpArr.join(',') + '|' + fontFamily\
-    \ + '|' + fontSizePx + '|' + fillColor;\n  if (_edgeDirKey === key && _edgeDirSprite) return _edgeDirSprite;\n  // ...\
-    \ build offscreen canvas with each codepoint at i*tileW, 0\n  _edgeDirKey = key;\n  return _edgeDirSprite;\n}\n\n// GlyphGrid.edge\
-    \ DEFAULT_ALPHABET (glyph-edge.js:37-46) \u2014 4 unique non-space cps:\nconst _edgeCpArr = [0x2500, 0x2571, 0x2502, 0x2572];\n\
-    // ... swap fill()+text() loop with drawImage from atlas\n"
+  code_shape: "// In src/index.html, add edge dir sprite cache near line 2064:\nlet\
+    \ _edgeDirSprite = null, _edgeDirKey = null;\nfunction _ensureEdgeDirSprite(cpArr,\
+    \ fontFamily, fontSizePx, fillColor) {\n  const key = cpArr.join(',') + '|' +\
+    \ fontFamily + '|' + fontSizePx + '|' + fillColor;\n  if (_edgeDirKey === key\
+    \ && _edgeDirSprite) return _edgeDirSprite;\n  // ... build offscreen canvas with\
+    \ each codepoint at i*tileW, 0\n  _edgeDirKey = key;\n  return _edgeDirSprite;\n\
+    }\n\n// GlyphGrid.edge DEFAULT_ALPHABET (glyph-edge.js:37-46) \u2014 4 unique\
+    \ non-space cps:\nconst _edgeCpArr = [0x2500, 0x2571, 0x2502, 0x2572];\n// ...\
+    \ swap fill()+text() loop with drawImage from atlas\n"
+  reason: geomean_regressed
+  cycle: 4
 - id: OPT-003
   area: postprocess gate
   priority: P0
@@ -285,35 +354,43 @@
   risks: 'Negligible; pixel-identical when stage was already a no-op.
 
     '
-  code_shape: "function _hasImgDataStages(p) {\n  if (!p) return false;\n  function _on(s, ks) { if (!s || !s.enabled) return\
-    \ false;\n    for (const k of ks) if ((s[k] || 0) > 0.001) return true; return false; }\n  return _on(p.phosphorDecay,\
-    \ ['decay']) ||\n         _on(p.crtBeam, ['intensity']) ||\n         _on(p.halation, ['intensity', 'strength']) ||\n \
-    \        _on(p.bloom, ['intensity', 'strength']) ||\n         _on(p.godRays, ['strength', 'intensity']) ||\n         _on(p.scanlines,\
-    \ ['intensity', 'strength']) ||\n         _on(p.chromaticAberration, ['amount']) ||\n         _on(p.barrel, ['amount'])\
-    \ ||\n         _on(p.kawaii, ['intensity']);\n}\n"
-  prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug + reset-wipe (BUG-024). patch_runner.py
-    now extracts diff permissively and embeds inline source excerpts; no --dangerously-skip-permissions.
-  reason: 'patch_failed: `_hasImgDataStages` at src/index.html:2904-2923 already requires intensity > 0.001 via the inner
-    `_on` helper (shipped in commit 2efe80a, perf(F4)); the embedded source contradicts the hypothesis''s premise that the
-    gate "only checks `enabled`".'
+  code_shape: "function _hasImgDataStages(p) {\n  if (!p) return false;\n  function\
+    \ _on(s, ks) { if (!s || !s.enabled) return false;\n    for (const k of ks) if\
+    \ ((s[k] || 0) > 0.001) return true; return false; }\n  return _on(p.phosphorDecay,\
+    \ ['decay']) ||\n         _on(p.crtBeam, ['intensity']) ||\n         _on(p.halation,\
+    \ ['intensity', 'strength']) ||\n         _on(p.bloom, ['intensity', 'strength'])\
+    \ ||\n         _on(p.godRays, ['strength', 'intensity']) ||\n         _on(p.scanlines,\
+    \ ['intensity', 'strength']) ||\n         _on(p.chromaticAberration, ['amount'])\
+    \ ||\n         _on(p.barrel, ['amount']) ||\n         _on(p.kawaii, ['intensity']);\n\
+    }\n"
+  prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug
+    + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds
+    inline source excerpts; no --dangerously-skip-permissions.
+  reason: 'patch_failed: `_hasImgDataStages` at src/index.html:2904-2923 already requires
+    intensity > 0.001 via the inner `_on` helper (shipped in commit 2efe80a, perf(F4));
+    the embedded source contradicts the hypothesis''s premise that the gate "only
+    checks `enabled`".'
 - id: OPT-004
   area: postprocess scratch buffers
   priority: P0
   status: rejected
   files:
   - src/lib/glyph-crt.js
-  hypothesis: "`boxBlurLinear` at glyph-crt.js:85-87 allocates two\n`Float32Array(N*3)` per call. At 1024\xD7504 that's 6.2\
-    \ MB \xD7 2 per call\n\xD7 2 stages (bloom + halation) = ~25 MB allocated per frame when\nthose stages are on. Persist\
+  hypothesis: "`boxBlurLinear` at glyph-crt.js:85-87 allocates two\n`Float32Array(N*3)`\
+    \ per call. At 1024\xD7504 that's 6.2 MB \xD7 2 per call\n\xD7 2 stages (bloom\
+    \ + halation) = ~25 MB allocated per frame when\nthose stages are on. Persist\
     \ module-scope scratch buffers, grow only\nwhen N increases.\n"
   expected_gain_ms: -4 to -8 steady + GC pause smoothing
   benchmark_first: false
-  risks: "JS is single-threaded and `applyChain` is sequential \u2014 no aliasing\nrisk. Buffer-growing branch only fires\
-    \ on canvas resize.\n"
-  code_shape: "let _bbOut = null, _bbTmp = null;\nfunction boxBlurLinear(src, w, h, radius) {\n  const N = src.length;\n \
-    \ if (!_bbOut || _bbOut.length < N) {\n    _bbOut = new Float32Array(N);\n    _bbTmp = new Float32Array(N);\n  }\n  const\
-    \ out = _bbOut, tmp = _bbTmp;\n  // existing unchanged below\n}\n"
-  prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug + reset-wipe (BUG-024). patch_runner.py
-    now extracts diff permissively and embeds inline source excerpts; no --dangerously-skip-permissions.
+  risks: "JS is single-threaded and `applyChain` is sequential \u2014 no aliasing\n\
+    risk. Buffer-growing branch only fires on canvas resize.\n"
+  code_shape: "let _bbOut = null, _bbTmp = null;\nfunction boxBlurLinear(src, w, h,\
+    \ radius) {\n  const N = src.length;\n  if (!_bbOut || _bbOut.length < N) {\n\
+    \    _bbOut = new Float32Array(N);\n    _bbTmp = new Float32Array(N);\n  }\n \
+    \ const out = _bbOut, tmp = _bbTmp;\n  // existing unchanged below\n}\n"
+  prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug
+    + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds
+    inline source excerpts; no --dangerously-skip-permissions.
   cycle: 1
   reason: visual_drift_below_0.985
 - id: OPT-006
@@ -322,10 +399,11 @@
   status: rejected
   files:
   - src/index.html
-  hypothesis: "`linearizeToLuminance` (src/index.html:1774-1783) runs over the full\nsource every frame the v2 path fires\
-    \ (~245 K pixels at 1024\xD7504).\n`lumBuf` is read by shape/edge selection and prefilter only \u2014 for\nplain brightness\
-    \ selection the buffer is dead work.\nGate the call on `mode === 'shape'`/`shape-edge-aware` OR any prefilter\nthat consumes\
-    \ lumBuf.\n"
+  hypothesis: "`linearizeToLuminance` (src/index.html:1774-1783) runs over the full\n\
+    source every frame the v2 path fires (~245 K pixels at 1024\xD7504).\n`lumBuf`\
+    \ is read by shape/edge selection and prefilter only \u2014 for\nplain brightness\
+    \ selection the buffer is dead work.\nGate the call on `mode === 'shape'`/`shape-edge-aware`\
+    \ OR any prefilter\nthat consumes lumBuf.\n"
   expected_gain_ms: -3 to -5 on default-brightness configs
   benchmark_first: false
   risks: 'Hidden consumer of lumBuf could surface incorrect output. Audit
@@ -333,82 +411,103 @@
     every reference to `lumBuf` in src/ before writing the gate.
 
     '
-  code_shape: "const needsLum = (sel === 'shape' || sel === 'shape-edge-aware')\n              || GlyphGrid.compat.gatePrefilter(CONFIG)\n\
-    \              || (CONFIG.depth && CONFIG.depth.enabled);\nif (needsLum) linearizeToLuminance(pixels, lumBuf, srcW, srcH);\n"
-  prior_attempt: "Re-queued 2026-05-10 after Joona's 3ff788d identifier-grep fix. Two prior runs rejected with \"excerpt missing\
-    \ lumBuf consumers\" \u2014 identifier grep now embeds windows around all 9 lumBuf sites + 3 linearizeToLuminance sites,\
-    \ so the audit-references risk gate can be cleared. benchmark_first flipped to false: every patch goes through the 5-config\
-    \ bench; that IS the benchmark."
-  reason: "patch_failed: lumBuf feeds downsampleToCells at src/index.html:1565 to produce cellSignal, which drives brightness\
-    \ selection too \u2014 gating linearizeToLuminance on shape/prefilter would zero cellSignal in brightness mode."
+  code_shape: "const needsLum = (sel === 'shape' || sel === 'shape-edge-aware')\n\
+    \              || GlyphGrid.compat.gatePrefilter(CONFIG)\n              || (CONFIG.depth\
+    \ && CONFIG.depth.enabled);\nif (needsLum) linearizeToLuminance(pixels, lumBuf,\
+    \ srcW, srcH);\n"
+  prior_attempt: "Re-queued 2026-05-10 after Joona's 3ff788d identifier-grep fix.\
+    \ Two prior runs rejected with \"excerpt missing lumBuf consumers\" \u2014 identifier\
+    \ grep now embeds windows around all 9 lumBuf sites + 3 linearizeToLuminance sites,\
+    \ so the audit-references risk gate can be cleared. benchmark_first flipped to\
+    \ false: every patch goes through the 5-config bench; that IS the benchmark."
+  reason: "patch_failed: lumBuf feeds downsampleToCells at src/index.html:1565 to\
+    \ produce cellSignal, which drives brightness selection too \u2014 gating linearizeToLuminance\
+    \ on shape/prefilter would zero cellSignal in brightness mode."
 - id: OPT-001
   area: drawBrightnessGrid preserve fast path
   priority: P0
   status: rejected
   files:
   - src/index.html
-  hypothesis: "Preserve color mode (no fog) at src/index.html:2398 still calls\n`text(ch, cx, cy)` per cell \u2014 ~57 ms\
-    \ at 240\xD7120. The other three\nfast color modes already use sprite atlases (mono / duotone / gradient).\nBuild an alpha-only\
-    \ sprite atlas for the ramp + a per-cell solid\nfillStyle from `_sampleObj.r/g/b`, then composite via 'source-over'.\n"
-  expected_gain_ms: -30 to -45 on cfg-preserve-stress (and downstream wins when fog overlay lands)
+  hypothesis: "Preserve color mode (no fog) at src/index.html:2398 still calls\n`text(ch,\
+    \ cx, cy)` per cell \u2014 ~57 ms at 240\xD7120. The other three\nfast color modes\
+    \ already use sprite atlases (mono / duotone / gradient).\nBuild an alpha-only\
+    \ sprite atlas for the ramp + a per-cell solid\nfillStyle from `_sampleObj.r/g/b`,\
+    \ then composite via 'source-over'.\n"
+  expected_gain_ms: -30 to -45 on cfg-preserve-stress (and downstream wins when fog
+    overlay lands)
   benchmark_first: true
-  risks: "`globalCompositeOperation` toggle cost varies by browser. Validate\nthe toggle-pair cost on a 100\xD7100 dummy loop\
-    \ microbenchmark before\ncommitting. Composite-op churn could exceed `fillText` baseline on\nsome hardware.\n"
-  code_shape: "if (colorMode === 'preserve' && !depthFogActive) {\n  const sprite = _ensurePreserveSprite(ramp, fontFamily,\
-    \ fontSize);\n  const ctx = drawingContext;\n  for (let r = 0; r < rows; r++) {\n    for (let c = 0; c < cols; c++) {\n\
-    \      const i = r*cols+c;\n      if (spaceMask[i]) continue;\n      sampleCellInto(_sampleObj, pixels, stride, x0, y0,\
-    \ cellPxW, cellPxH, srcW, srcH);\n      ctx.fillStyle = `rgb(${_sampleObj.r|0},${_sampleObj.g|0},${_sampleObj.b|0})`;\n\
-    \      ctx.fillRect(cx, cy, tileW, tileH);\n      ctx.globalCompositeOperation = 'destination-in';\n      ctx.drawImage(sprite,\
-    \ idx*tileW, 0, tileW, tileH, cx, cy, tileW, tileH);\n      ctx.globalCompositeOperation = 'source-over';\n    }\n  }\n\
-    \  return;\n}\n"
-  prior_attempt: 'prior cycle rejected: patch_failed: Embedded excerpts omit `_ensureRampGradientSprite` and the sprite-atlas/space-mask
-    construction it mirrors, so a faithful `_ensurePreserveSprite` cannot be written without fabricating cache shape, tile
-    geometry, or `_rampGradientSpaceMask`-equivalent state; hypothesis also flags BENCHMARK FIRST for composite-op toggle
-    cost which cannot be validated from a blind diff.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
-  reason: 'patch_failed: Embedded excerpts omit `_ensureRampSprite`/`_ensureRampGradientSprite` definitions and `_rampSpriteSpaceMask`
-    construction, so a faithful `_ensurePreserveSprite` cannot be authored without fabricating cache shape, tile geometry,
-    and space-mask state; additionally BENCHMARK FIRST flag requires composite-op toggle microbenchmark validation that cannot
-    be performed from a blind diff.'
+  risks: "`globalCompositeOperation` toggle cost varies by browser. Validate\nthe\
+    \ toggle-pair cost on a 100\xD7100 dummy loop microbenchmark before\ncommitting.\
+    \ Composite-op churn could exceed `fillText` baseline on\nsome hardware.\n"
+  code_shape: "if (colorMode === 'preserve' && !depthFogActive) {\n  const sprite\
+    \ = _ensurePreserveSprite(ramp, fontFamily, fontSize);\n  const ctx = drawingContext;\n\
+    \  for (let r = 0; r < rows; r++) {\n    for (let c = 0; c < cols; c++) {\n  \
+    \    const i = r*cols+c;\n      if (spaceMask[i]) continue;\n      sampleCellInto(_sampleObj,\
+    \ pixels, stride, x0, y0, cellPxW, cellPxH, srcW, srcH);\n      ctx.fillStyle\
+    \ = `rgb(${_sampleObj.r|0},${_sampleObj.g|0},${_sampleObj.b|0})`;\n      ctx.fillRect(cx,\
+    \ cy, tileW, tileH);\n      ctx.globalCompositeOperation = 'destination-in';\n\
+    \      ctx.drawImage(sprite, idx*tileW, 0, tileW, tileH, cx, cy, tileW, tileH);\n\
+    \      ctx.globalCompositeOperation = 'source-over';\n    }\n  }\n  return;\n\
+    }\n"
+  prior_attempt: 'prior cycle rejected: patch_failed: Embedded excerpts omit `_ensureRampGradientSprite`
+    and the sprite-atlas/space-mask construction it mirrors, so a faithful `_ensurePreserveSprite`
+    cannot be written without fabricating cache shape, tile geometry, or `_rampGradientSpaceMask`-equivalent
+    state; hypothesis also flags BENCHMARK FIRST for composite-op toggle cost which
+    cannot be validated from a blind diff.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
+  reason: 'patch_failed: Embedded excerpts omit `_ensureRampSprite`/`_ensureRampGradientSprite`
+    definitions and `_rampSpriteSpaceMask` construction, so a faithful `_ensurePreserveSprite`
+    cannot be authored without fabricating cache shape, tile geometry, and space-mask
+    state; additionally BENCHMARK FIRST flag requires composite-op toggle microbenchmark
+    validation that cannot be performed from a blind diff.'
 - id: OPT-002
   area: depthFog overlay pass
   priority: P0
   status: rejected
   files:
   - src/index.html
-  hypothesis: "`depthFog` at lines 2142, 2485, 2668 forces all color modes\n(including monochrome) into the slow preserve\
-    \ path via the\n`needsSample` gate \u2014 penalty ~30 ms. The fog operation is per-cell\n`r = r*(1-tf) + fogR*tf`, an\
-    \ output-space tint that doesn't require\nper-pixel sampling. Decouple by computing the cellDepth \u2192 fogTint\noverlay\
-    \ once per frame and blending via drawImage 'multiply'.\n"
+  hypothesis: "`depthFog` at lines 2142, 2485, 2668 forces all color modes\n(including\
+    \ monochrome) into the slow preserve path via the\n`needsSample` gate \u2014 penalty\
+    \ ~30 ms. The fog operation is per-cell\n`r = r*(1-tf) + fogR*tf`, an output-space\
+    \ tint that doesn't require\nper-pixel sampling. Decouple by computing the cellDepth\
+    \ \u2192 fogTint\noverlay once per frame and blending via drawImage 'multiply'.\n"
   expected_gain_ms: -25 to -30 when fog is enabled
   benchmark_first: false
-  risks: "Pixel parity. Slow path lerps in display-output space pre-fog; if\nthe new overlay diverges (fog applied after monochrome\
-    \ alpha\nmultiplies the *char*, not the bg), \u0394E may spike. Gate behind\n`CONFIG.depthFogPath: 'overlay' | 'inline'`\
-    \ for safe rollout.\n"
-  code_shape: "// After the fast-path return:\nif (depthFogActive) _applyDepthFogOverlay(ctx, cellDepth, cols, rows, cellW,\
-    \ cellH, fog);\n\nfunction _applyDepthFogOverlay(ctx, cellDepth, cols, rows, cellW, cellH, fog) {\n  const overlay = _ensureFogOverlay(cols,\
-    \ rows, cellW, cellH, fog);\n  const id = overlay.imgData; const d = id.data;\n  for (let i = 0, n = cols*rows; i < n;\
-    \ i++) {\n    const tf = computeFogT(cellDepth[i], fog);\n    const k = i*4; d[k]=fog.r; d[k+1]=fog.g; d[k+2]=fog.b;\n\
-    \    d[k+3] = (tf*255)|0;\n  }\n  overlay.ctx.putImageData(id, 0, 0);\n  ctx.drawImage(overlay.canvas, 0, 0, ctx.canvas.width,\
-    \ ctx.canvas.height);\n}\n"
-  prior_attempt: 'prior cycle rejected: patch_failed: Source excerpts only show lines 1-200; cannot author a diff touching
-    depthFog at lines 2142/2485/2668 without seeing the actual code.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
-  reason: "patch_failed: The proposed overlay path applies fog tint over the entire canvas (bg + ink), whereas the inline\
-    \ slow path mixes fog only into the per-cell ink color via applyCellFill \u2014 producing materially different pixel bytes;\
-    \ gating behind a config flag preserves bit-exactness only if the default stays 'inline', in which case no benchmark config\
-    \ exercises the new path and there is no measurable gain on the current 5-config suite."
+  risks: "Pixel parity. Slow path lerps in display-output space pre-fog; if\nthe new\
+    \ overlay diverges (fog applied after monochrome alpha\nmultiplies the *char*,\
+    \ not the bg), \u0394E may spike. Gate behind\n`CONFIG.depthFogPath: 'overlay'\
+    \ | 'inline'` for safe rollout.\n"
+  code_shape: "// After the fast-path return:\nif (depthFogActive) _applyDepthFogOverlay(ctx,\
+    \ cellDepth, cols, rows, cellW, cellH, fog);\n\nfunction _applyDepthFogOverlay(ctx,\
+    \ cellDepth, cols, rows, cellW, cellH, fog) {\n  const overlay = _ensureFogOverlay(cols,\
+    \ rows, cellW, cellH, fog);\n  const id = overlay.imgData; const d = id.data;\n\
+    \  for (let i = 0, n = cols*rows; i < n; i++) {\n    const tf = computeFogT(cellDepth[i],\
+    \ fog);\n    const k = i*4; d[k]=fog.r; d[k+1]=fog.g; d[k+2]=fog.b;\n    d[k+3]\
+    \ = (tf*255)|0;\n  }\n  overlay.ctx.putImageData(id, 0, 0);\n  ctx.drawImage(overlay.canvas,\
+    \ 0, 0, ctx.canvas.width, ctx.canvas.height);\n}\n"
+  prior_attempt: 'prior cycle rejected: patch_failed: Source excerpts only show lines
+    1-200; cannot author a diff touching depthFog at lines 2142/2485/2668 without
+    seeing the actual code.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
+  reason: "patch_failed: The proposed overlay path applies fog tint over the entire\
+    \ canvas (bg + ink), whereas the inline slow path mixes fog only into the per-cell\
+    \ ink color via applyCellFill \u2014 producing materially different pixel bytes;\
+    \ gating behind a config flag preserves bit-exactness only if the default stays\
+    \ 'inline', in which case no benchmark config exercises the new path and there\
+    \ is no measurable gain on the current 5-config suite."
 - id: OPT-010
   area: default grid resolution
   priority: P1
   status: rejected
   files:
   - src/index.html
-  hypothesis: "Default grid is 240\xD7120 (28,800 cells) at src/index.html:133. The\n\"Phase 0.5\" win that came from defaults-tuning\
-    \ was 2.5\xD7; the next\ncandidate is grid resolution. 192\xD796 = 18,432 cells = 36 % fewer\ncells; 200\xD7100 = 30 %\
-    \ fewer. Aspect stays close to source (1.92:1\nvs 2:1).\n"
+  hypothesis: "Default grid is 240\xD7120 (28,800 cells) at src/index.html:133. The\n\
+    \"Phase 0.5\" win that came from defaults-tuning was 2.5\xD7; the next\ncandidate\
+    \ is grid resolution. 192\xD796 = 18,432 cells = 36 % fewer\ncells; 200\xD7100\
+    \ = 30 % fewer. Aspect stays close to source (1.92:1\nvs 2:1).\n"
   expected_gain_ms: -15 to -30 on cfg-default
   benchmark_first: true
-  risks: "Loss of microscopic detail. \u0394E94 < 2.0 on portfolio sources required\nto keep. Subjective A/B (3 viewers blind)\
-    \ before commit.\n"
+  risks: "Loss of microscopic detail. \u0394E94 < 2.0 on portfolio sources required\n\
+    to keep. Subjective A/B (3 viewers blind) before commit.\n"
   code_shape: 'cols: 192, rows: 96,  // was 240, 120
 
     '
@@ -448,23 +547,27 @@
     // pad bg fill on right/bottom: cols*cellWint may be < canvas.width
 
     '
-  prior_attempt: 'prior cycle rejected: patch_failed: Embedded source excerpt only covers lines 1-200, so the line-1870 `tileW`
-    site and the `cellW` blit site needed to construct exact-match hunks are not visible.. Re-queued after orchestrator fix
-    (parser/excerpts/hunk-header/A2-test).'
-  reason: "patch_failed: The hypothesis fundamentally requires changing pixel placement (snap canvas/cells to integer, alter\
-    \ sprite tileW from odd\u2192even halving), which shifts drawImage dst positions and tile sizes by sub-pixel amounts and\
-    \ adds a residual bg bar \u2014 all of which violate the bit-exact reproducibility constraint that \"same (source, config,\
-    \ seed) must produce identical bytes pre/post change.\""
+  prior_attempt: 'prior cycle rejected: patch_failed: Embedded source excerpt only
+    covers lines 1-200, so the line-1870 `tileW` site and the `cellW` blit site needed
+    to construct exact-match hunks are not visible.. Re-queued after orchestrator
+    fix (parser/excerpts/hunk-header/A2-test).'
+  reason: "patch_failed: The hypothesis fundamentally requires changing pixel placement\
+    \ (snap canvas/cells to integer, alter sprite tileW from odd\u2192even halving),\
+    \ which shifts drawImage dst positions and tile sizes by sub-pixel amounts and\
+    \ adds a residual bg bar \u2014 all of which violate the bit-exact reproducibility\
+    \ constraint that \"same (source, config, seed) must produce identical bytes pre/post\
+    \ change.\""
 - id: OPT-005
   area: applyCellFill hoist (slow path)
   priority: P1-fallback
   status: queued
   files:
   - src/index.html
-  hypothesis: "`applyCellFill` at lines 1386-1480 allocates 1-3 `p5.Color` objects\nper cell on the slow path. At 28,800 cells\
-    \ \xD7 3 allocs that's 86,400\nallocs per frame on cfg-preserve-stress. Hoist palette-derived\nconstants (monoR/G/B, dueR0\u2026\
-    1, gradLut) once per frame, pass into\ninner loop as numerics. Stacks with OPT-002 \u2014 DROP if OPT-002\neliminates\
-    \ the slow path entirely.\n"
+  hypothesis: "`applyCellFill` at lines 1386-1480 allocates 1-3 `p5.Color` objects\n\
+    per cell on the slow path. At 28,800 cells \xD7 3 allocs that's 86,400\nallocs\
+    \ per frame on cfg-preserve-stress. Hoist palette-derived\nconstants (monoR/G/B,\
+    \ dueR0\u20261, gradLut) once per frame, pass into\ninner loop as numerics. Stacks\
+    \ with OPT-002 \u2014 DROP if OPT-002\neliminates the slow path entirely.\n"
   expected_gain_ms: -10 to -18 on cfg-preserve-stress
   benchmark_first: false
   risks: 'API change at 3 call sites (drawBrightnessGrid, drawShapeGrid,
@@ -472,37 +575,45 @@
     drawEdgeDirectionalGrid); keep them in a single edit.
 
     '
-  code_shape: "function applyCellFill(sample, hoist, curved, bgR, bgG, bgB) {\n  const mode = CONFIG.colorMode;\n  let r,\
-    \ g, b, a = 255;\n  if (mode === 'monochrome') { r=hoist.monoR; g=hoist.monoG; b=hoist.monoB;\n    a = (curved*255*1.1)|0;\
-    \ if (a>255) a=255; }\n  // ... gradient/duotone/preserve branches with hoisted values\n  fill(r, g, b, a);\n}\n"
+  code_shape: "function applyCellFill(sample, hoist, curved, bgR, bgG, bgB) {\n  const\
+    \ mode = CONFIG.colorMode;\n  let r, g, b, a = 255;\n  if (mode === 'monochrome')\
+    \ { r=hoist.monoR; g=hoist.monoG; b=hoist.monoB;\n    a = (curved*255*1.1)|0;\
+    \ if (a>255) a=255; }\n  // ... gradient/duotone/preserve branches with hoisted\
+    \ values\n  fill(r, g, b, a);\n}\n"
 - id: OPT-008
   area: vignette overlay strength bucketing
   priority: P2
   status: rejected
   files:
   - src/index.html
-  hypothesis: "`_ensureVignetteOverlay` (line 2858) caches the gradient canvas but\nrebuilds when `_vignetteOverlay.key` mismatches.\
-    \ During slider\ndrags, this rebuild fires every frame (~80 ms freeze on 1024\xD7504).\nBucket the strength to 11 fixed\
-    \ values (0.0, 0.1, \u2026, 1.0) so drags\nskip the rebuild. Bound the cache at 32 entries.\n"
+  hypothesis: "`_ensureVignetteOverlay` (line 2858) caches the gradient canvas but\n\
+    rebuilds when `_vignetteOverlay.key` mismatches. During slider\ndrags, this rebuild\
+    \ fires every frame (~80 ms freeze on 1024\xD7504).\nBucket the strength to 11\
+    \ fixed values (0.0, 0.1, \u2026, 1.0) so drags\nskip the rebuild. Bound the cache\
+    \ at 32 entries.\n"
   expected_gain_ms: 0 ms steady; ~80 ms freeze elimination on drag
   benchmark_first: false
-  risks: "Memory bound: 32 entries \xD7 1024\xD7504\xD74 bytes = ~64 MB worst case.\nUse Map+LRU eviction at 8 entries instead\
-    \ if memory is tight.\n"
-  code_shape: "const _vigCache = new Map();\nfunction _ensureVignetteOverlay(w, h, strength) {\n  const sBucket = Math.round(strength\
-    \ * 10);\n  const key = `${w}x${h}:${sBucket}`;\n  let entry = _vigCache.get(key);\n  if (entry) return entry;\n  // existing\
-    \ build code, snapped to bucket\n  _vigCache.set(key, { canvas, key });\n  if (_vigCache.size > 8) _vigCache.delete(_vigCache.keys().next().value);\n\
-    \  return _vigCache.get(key);\n}\n"
-  reason: 'patch_failed: Bucketing strength to 0.1 increments changes vignette output bytes for any config whose strength
-    is not a multiple of 0.1, violating the bit-exact reproducibility constraint.'
+  risks: "Memory bound: 32 entries \xD7 1024\xD7504\xD74 bytes = ~64 MB worst case.\n\
+    Use Map+LRU eviction at 8 entries instead if memory is tight.\n"
+  code_shape: "const _vigCache = new Map();\nfunction _ensureVignetteOverlay(w, h,\
+    \ strength) {\n  const sBucket = Math.round(strength * 10);\n  const key = `${w}x${h}:${sBucket}`;\n\
+    \  let entry = _vigCache.get(key);\n  if (entry) return entry;\n  // existing\
+    \ build code, snapped to bucket\n  _vigCache.set(key, { canvas, key });\n  if\
+    \ (_vigCache.size > 8) _vigCache.delete(_vigCache.keys().next().value);\n  return\
+    \ _vigCache.get(key);\n}\n"
+  reason: 'patch_failed: Bucketing strength to 0.1 increments changes vignette output
+    bytes for any config whose strength is not a multiple of 0.1, violating the bit-exact
+    reproducibility constraint.'
 - id: OPT-009
   area: branchless inner-loop clamp
   priority: P2
   status: rejected
   files:
   - src/index.html
-  hypothesis: "Each fast-path inner loop runs `sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig)`\n\u2014 2 branches per cell \xD7\
-    \ 28,800 cells \xD7 6 inner loops = ~350K\nbranches/frame. Replace with `Math.min(1, Math.max(0, sig))` (V8\ninlines),\
-    \ or skip clamp where downstream multiplies anyway.\n"
+  hypothesis: "Each fast-path inner loop runs `sigQ = sig < 0 ? 0 : (sig > 1 ? 1 :\
+    \ sig)`\n\u2014 2 branches per cell \xD7 28,800 cells \xD7 6 inner loops = ~350K\n\
+    branches/frame. Replace with `Math.min(1, Math.max(0, sig))` (V8\ninlines), or\
+    \ skip clamp where downstream multiplies anyway.\n"
   expected_gain_ms: -1 to -3 (depends on V8 inlining)
   benchmark_first: true
   risks: 'V8 may already statically branch-predict this; gain may be zero.
@@ -510,8 +621,9 @@
     Run isolated 1 M-iter microbenchmark before committing.
 
     '
-  reason: 'patch_failed: Embedded source excerpt (lines 1-600) does not contain the `sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig)`
-    clamp expression referenced by the hypothesis; cannot construct a verifiable diff without the actual fast-path inner-loop
+  reason: 'patch_failed: Embedded source excerpt (lines 1-600) does not contain the
+    `sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig)` clamp expression referenced by the
+    hypothesis; cannot construct a verifiable diff without the actual fast-path inner-loop
     code.'
 - id: OPT-013
   area: gradient atlas step compression
@@ -530,8 +642,8 @@
     '
   expected_gain_ms: -1 ms on first-frame after palette change; mobile memory drop
   benchmark_first: true
-  risks: "Visible banding on long, thin gradient strips. Validate \u0394E94 < 1.0\non `gradient` mode + clean greyscale ramp\
-    \ source.\n"
+  risks: "Visible banding on long, thin gradient strips. Validate \u0394E94 < 1.0\n\
+    on `gradient` mode + clean greyscale ramp source.\n"
   reason: visual_drift_below_0.985
   cycle: 4
 - id: OPT-007
@@ -569,8 +681,8 @@
     '
   expected_gain_ms: -2 to -5 (JIT) + maintenance win
   benchmark_first: true
-  risks: "Major refactor. Validate by `__pfFrame.stages.grid` post-refactor\nnot regressing on any of 4 modes \xD7 3 selection\
-    \ modes.\n"
+  risks: "Major refactor. Validate by `__pfFrame.stages.grid` post-refactor\nnot regressing\
+    \ on any of 4 modes \xD7 3 selection modes.\n"
 - id: OPT-014
   area: postprocess Web Worker
   priority: P2
@@ -578,12 +690,14 @@
   files:
   - src/index.html
   - src/lib/glyph-crt.js
-  hypothesis: "Once OPT-001\u2026005 land, residual postproc cost is JS-side bloom +\nhalation pixel work. OffscreenCanvas\
-    \ + transferToImageBitmap\nenables running these on a worker. Main thread waits but doesn't\nblock GPU compositor.\n"
+  hypothesis: "Once OPT-001\u2026005 land, residual postproc cost is JS-side bloom\
+    \ +\nhalation pixel work. OffscreenCanvas + transferToImageBitmap\nenables running\
+    \ these on a worker. Main thread waits but doesn't\nblock GPU compositor.\n"
   expected_gain_ms: -15 to -30 on cfg-postproc-heavy; 0 elsewhere
   benchmark_first: true
-  risks: "SharedArrayBuffer requires COOP/COEP headers in production.\nTauri's CSP needs adjustment in tauri.conf.json \u2014\
-    \ DENIED by safety\nrails. So this hypothesis is FROZEN unless OPT-001 \u2192 OPT-005 leave\nbudget unmet.\n"
+  risks: "SharedArrayBuffer requires COOP/COEP headers in production.\nTauri's CSP\
+    \ needs adjustment in tauri.conf.json \u2014 DENIED by safety\nrails. So this\
+    \ hypothesis is FROZEN unless OPT-001 \u2192 OPT-005 leave\nbudget unmet.\n"
 - id: OPT-015
   area: WebGL renderer prototype
   priority: P2-frozen
@@ -602,5 +716,6 @@
     '
   expected_gain_ms: -40 to -80 on heavy configs
   benchmark_first: true
-  risks: "80-120 h scope. Major surface change. FROZEN unless 24-h loop\nexhausts every cheaper win and 60 fps becomes mandatory.\
-    \ The\nautonomous loop will NOT attempt this \u2014 escalate instead.\n"
+  risks: "80-120 h scope. Major surface change. FROZEN unless 24-h loop\nexhausts\
+    \ every cheaper win and 60 fps becomes mandatory. The\nautonomous loop will NOT\
+    \ attempt this \u2014 escalate instead.\n"
