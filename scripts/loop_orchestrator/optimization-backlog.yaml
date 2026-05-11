@@ -1,7 +1,7 @@
 - id: OPT-016
   area: boxBlurLinear + applyBloom persistent Float32Array scratch buffers
   priority: P0
-  status: in_progress
+  status: queued
   files:
   - src/lib/glyph-crt.js
   hypothesis: '`boxBlurLinear` at glyph-crt.js:85 allocates `out = new Float32Array(src.length)`
@@ -333,7 +333,7 @@
 - id: OPT-003
   area: postprocess gate
   priority: P0
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: '`_hasImgDataStages` (src/index.html:2886) only checks `enabled`,
@@ -366,14 +366,10 @@
   prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug
     + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds
     inline source excerpts; no --dangerously-skip-permissions.
-  reason: 'patch_failed: `_hasImgDataStages` at src/index.html:2904-2923 already requires
-    intensity > 0.001 via the inner `_on` helper (shipped in commit 2efe80a, perf(F4));
-    the embedded source contradicts the hypothesis''s premise that the gate "only
-    checks `enabled`".'
 - id: OPT-004
   area: postprocess scratch buffers
   priority: P0
-  status: rejected
+  status: queued
   files:
   - src/lib/glyph-crt.js
   hypothesis: "`boxBlurLinear` at glyph-crt.js:85-87 allocates two\n`Float32Array(N*3)`\
@@ -391,12 +387,10 @@
   prior_attempt: Re-queued 2026-05-10 after first 24-h pursuit died on parser bug
     + reset-wipe (BUG-024). patch_runner.py now extracts diff permissively and embeds
     inline source excerpts; no --dangerously-skip-permissions.
-  cycle: 1
-  reason: visual_drift_below_0.985
 - id: OPT-006
   area: linearizeToLuminance gate
   priority: P0
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: "`linearizeToLuminance` (src/index.html:1774-1783) runs over the full\n\
@@ -420,13 +414,10 @@
     \ grep now embeds windows around all 9 lumBuf sites + 3 linearizeToLuminance sites,\
     \ so the audit-references risk gate can be cleared. benchmark_first flipped to\
     \ false: every patch goes through the 5-config bench; that IS the benchmark."
-  reason: "patch_failed: lumBuf feeds downsampleToCells at src/index.html:1565 to\
-    \ produce cellSignal, which drives brightness selection too \u2014 gating linearizeToLuminance\
-    \ on shape/prefilter would zero cellSignal in brightness mode."
 - id: OPT-001
   area: drawBrightnessGrid preserve fast path
   priority: P0
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: "Preserve color mode (no fog) at src/index.html:2398 still calls\n`text(ch,\
@@ -455,15 +446,10 @@
     cannot be written without fabricating cache shape, tile geometry, or `_rampGradientSpaceMask`-equivalent
     state; hypothesis also flags BENCHMARK FIRST for composite-op toggle cost which
     cannot be validated from a blind diff.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
-  reason: 'patch_failed: Embedded excerpts omit `_ensureRampSprite`/`_ensureRampGradientSprite`
-    definitions and `_rampSpriteSpaceMask` construction, so a faithful `_ensurePreserveSprite`
-    cannot be authored without fabricating cache shape, tile geometry, and space-mask
-    state; additionally BENCHMARK FIRST flag requires composite-op toggle microbenchmark
-    validation that cannot be performed from a blind diff.'
 - id: OPT-002
   area: depthFog overlay pass
   priority: P0
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: "`depthFog` at lines 2142, 2485, 2668 forces all color modes\n(including\
@@ -488,16 +474,10 @@
   prior_attempt: 'prior cycle rejected: patch_failed: Source excerpts only show lines
     1-200; cannot author a diff touching depthFog at lines 2142/2485/2668 without
     seeing the actual code.. Re-queued after orchestrator fix (parser/excerpts/hunk-header/A2-test).'
-  reason: "patch_failed: The proposed overlay path applies fog tint over the entire\
-    \ canvas (bg + ink), whereas the inline slow path mixes fog only into the per-cell\
-    \ ink color via applyCellFill \u2014 producing materially different pixel bytes;\
-    \ gating behind a config flag preserves bit-exactness only if the default stays\
-    \ 'inline', in which case no benchmark config exercises the new path and there\
-    \ is no measurable gain on the current 5-config suite."
 - id: OPT-010
   area: default grid resolution
   priority: P1
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: "Default grid is 240\xD7120 (28,800 cells) at src/index.html:133. The\n\
@@ -511,13 +491,10 @@
   code_shape: 'cols: 192, rows: 96,  // was 240, 120
 
     '
-  reason: 'build_failed: check failed: error: patch failed: src/index.html:130
-
-    error: src/index.html: patch does not apply'
 - id: OPT-012
   area: sprite atlas integer alignment
   priority: P1
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: '`tileW = Math.ceil(fontSizePx * 1.1)` (line 1870) yields odd values
@@ -551,12 +528,6 @@
     covers lines 1-200, so the line-1870 `tileW` site and the `cellW` blit site needed
     to construct exact-match hunks are not visible.. Re-queued after orchestrator
     fix (parser/excerpts/hunk-header/A2-test).'
-  reason: "patch_failed: The hypothesis fundamentally requires changing pixel placement\
-    \ (snap canvas/cells to integer, alter sprite tileW from odd\u2192even halving),\
-    \ which shifts drawImage dst positions and tile sizes by sub-pixel amounts and\
-    \ adds a residual bg bar \u2014 all of which violate the bit-exact reproducibility\
-    \ constraint that \"same (source, config, seed) must produce identical bytes pre/post\
-    \ change.\""
 - id: OPT-005
   area: applyCellFill hoist (slow path)
   priority: P1-fallback
@@ -583,7 +554,7 @@
 - id: OPT-008
   area: vignette overlay strength bucketing
   priority: P2
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: "`_ensureVignetteOverlay` (line 2858) caches the gradient canvas but\n\
@@ -601,13 +572,10 @@
     \ build code, snapped to bucket\n  _vigCache.set(key, { canvas, key });\n  if\
     \ (_vigCache.size > 8) _vigCache.delete(_vigCache.keys().next().value);\n  return\
     \ _vigCache.get(key);\n}\n"
-  reason: 'patch_failed: Bucketing strength to 0.1 increments changes vignette output
-    bytes for any config whose strength is not a multiple of 0.1, violating the bit-exact
-    reproducibility constraint.'
 - id: OPT-009
   area: branchless inner-loop clamp
   priority: P2
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: "Each fast-path inner loop runs `sigQ = sig < 0 ? 0 : (sig > 1 ? 1 :\
@@ -621,14 +589,10 @@
     Run isolated 1 M-iter microbenchmark before committing.
 
     '
-  reason: 'patch_failed: Embedded source excerpt (lines 1-600) does not contain the
-    `sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig)` clamp expression referenced by the
-    hypothesis; cannot construct a verifiable diff without the actual fast-path inner-loop
-    code.'
 - id: OPT-013
   area: gradient atlas step compression
   priority: P2
-  status: rejected
+  status: queued
   files:
   - src/index.html
   hypothesis: '`MULTITINT_STEPS = 16` (line 1911) gives smoother gradients than
@@ -644,8 +608,6 @@
   benchmark_first: true
   risks: "Visible banding on long, thin gradient strips. Validate \u0394E94 < 1.0\n\
     on `gradient` mode + clean greyscale ramp source.\n"
-  reason: visual_drift_below_0.985
-  cycle: 4
 - id: OPT-007
   area: linearizeToLuminance allocation audit
   priority: P2

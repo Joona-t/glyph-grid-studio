@@ -19,10 +19,18 @@ class Decision(str, Enum):
 DEFAULT_CONFIG_BUDGET_FACTOR = 1.05
 
 # Minimum total speedup to count as a KEEP (anti-noise gate).
-MIN_KEEP_DELTA_MS = 2.0
+# Tuned to 4.0 ms after the first pursuit's 5/5 reverts showed
+# measurement variance of ±3 ms on the bench. A 2.0 ms threshold sat
+# inside the noise band → ambiguous wins kept getting rejected as
+# "no_signal".  4 ms is comfortably above noise + matches the floor a
+# Carmack-grade per-frame optimization would clear on at least one
+# heavy config (cfg-postproc-heavy or cfg-preserve-stress).
+MIN_KEEP_DELTA_MS = 4.0
 
-# Anti-regression: any worsening above +1ms blocks the cycle.
-MAX_ALLOWED_DELTA_MS = 1.0
+# Anti-regression: any worsening above +3 ms blocks the cycle. Symmetric
+# with the keep floor — patches must either clearly improve or clearly
+# regress; "no signal" rolls back.
+MAX_ALLOWED_DELTA_MS = 3.0
 
 # SSIM threshold mirrored from score_ssim.py.
 SSIM_KEEP_THRESHOLD = 0.985
