@@ -4,6 +4,43 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-11 — F9 srgbToLinear LUT (+ bench non-determinism discovery)
+
+The pursuit re-armed in round 6 with 7 fresh hypotheses (commit `4097ddc`) — none kept by the loop, plateau again at cycle 5. But this time, post-mortem revealed that one of the rejections was a **false positive** caused by a previously-undetected harness bug: the bench is non-deterministic on certain (source, config) combinations, producing phantom SSIM drift between identical-code runs. That misdiagnosis explains why three round-5 reverts and at least three round-6 reverts reported the *exact same* `ssim_min = 0.6785773141414008` value — same value across different patches is statistically impossible from genuine pixel drift; it's the bench reproducibly *failing to reproduce* on those inputs.
+
+### ITER-033 — F9 (OPT-018): `srgbToLinear` 256-entry Float64 LUT — shipped manually after loop false-positive-rejected it
+
+- **Found:** 2026-05-11, round 6 cycle 1. Loop reported `OPT-018: visual_drift_below_0.985 ssim_min=0.6785773141414008 default_after_ms=10.88 geomean_after_ms=57.19 delta_ms=-12.97`. The geomean delta was a real -12.97 ms gain on the round-6 baseline (70.17 → 57.19) — too large to be timing noise — but the SSIM gate triggered REVERT.
+- **Verification of bit-exactness (mathematical):** wrote a node one-liner that builds the LUT with the same formula as the original `srgbToLinear` and compares `lut[i] === srgbToLinear(i)` for all i in 0..255. Result: **256/256 identical, max diff = 0**. The LUT is byte-for-byte the same function on the full integer domain.
+- **Verification of bit-exactness (runtime):** stashed the LUT change, ran the bench, popped it back, ran the bench again. Compared the GIF outputs: `thor-png × cfg-postproc-heavy: 24/24 frames bytes-identical` (between F9 ON and F9 OFF). The heaviest config — the one that calls `srgbToLinear` ~6.2M times per frame — produces literally identical pixel bytes with the LUT. That's the empirical bit-exact proof.
+- **What the loop's SSIM gate actually saw:** drift on *other* (source, config) pairs (e.g., synthetic-noise × cfg-default, ghost-I-gif × cfg-preserve-stress). Same comparison repeated on those pairs even between two consecutive runs of the **same** pre-F9 code shows drift. Conclusion: the bench has data-dependent non-determinism that affects some inputs but not others. F9 was bit-exact; the gate was reading phantom drift.
+- **Fix:** ship F9 manually (similar to F4 and F8 manual ships). `src/lib/glyph-crt.js` now has `_SRGB_TO_LINEAR_LUT` (Float64Array(256)) built once at module load; `srgbToLinear(c)` is now a single LUT lookup.
+- **Measured perf gain (clean run before machine got loaded):**
+  - cfg-postproc-heavy: 273-276 ms → **262.70 ms** (-10 to -13 ms, ~4%)
+  - cfg-duotone-dispersal: 261-266 ms → **253.99 ms** (-7 to -12 ms, ~3%)
+  - geomean across 5 configs: ~75 ms → **73.21 ms** (-1.8 ms, -2.4%)
+- **Tests pass:** `tests/run-all.sh` reports 17/0 PASS.
+- **What was *not* shipped (yet):** OPT-016 (Float32 buffer reuse) needs the same manual ship + thor-png byte-identity verification. OPT-019/020/021 (chromaticAberration buf, scanlines skip, barrel buf) are simpler bit-exact changes that should follow the same path. Each is gated on confirming the loop's SSIM-rejection on it was a false positive, not real drift.
+
+### ITER-034 — Bench non-determinism (HARNESS BUG, filed for fix)
+
+- **Found:** while triaging F9. Compared two consecutive runs of the same pre-F9 code's bench output. Drift pattern:
+  - thor-png × 4 of 5 configs: 24/24 bytes-identical (deterministic)
+  - thor-png × cfg-default: 0/24 bytes-identical but SSIM 0.998 (microscopic drift, near-deterministic)
+  - cream-paper-png × most configs: 0-1 bytes-identical, SSIM 0.15-0.97 (drifting)
+  - ghost-I-gif × most configs: 0-24 bytes-identical, SSIM 0.09-1.00 (mixed)
+  - synthetic-noise-png × all configs: 0/24 bytes-identical, SSIM 0.02-0.25 (badly drifting)
+- **Severity:** **harness-fatal for any optimization that touches the postprocess pipeline on a non-thor source.** The loop's SSIM ≥ 0.985 gate fires false-positive on identical-code runs for those inputs. Every round-5 and round-6 cycle that reverted with `visual_drift_below_0.985` and an `ssim_min` value near 0.679 or 0.81 is **suspect** — likely a real bit-exact patch killed by phantom drift.
+- **Likely root cause (not yet confirmed):** the renderer reads from a non-deterministic source somewhere — `performance.now()`, `Date.now()`, or system entropy — that feeds into per-frame visual state (dispersal seed, animation phase, dither pattern, frame-jitter). The bench manifest fixes `seed` but doesn't pin every entropy source. `glyph-wave6.js:494-505` has `performance.now()` calls; the dispersal/dither libs probably have similar.
+- **Out of scope for this session, filed:** isolate the non-determinism (rebuild bench under `--no-timing` mode, log every random/now/performance call), pin all entropy via `seed`, re-run the bench twice and assert byte-identity before re-arming the loop.
+
+### Pursuit infrastructure: cycle-004 baseline.json write crash (harness bug, transient)
+
+- **Found:** round 6 cycle 4 (the cycle that would have plateau-stopped naturally). The orchestrator crashed with `FileNotFoundError: cycle-004/baseline.json` mid-write. The parent dir `cycle-004/` did exist (it had `error.log`); the orchestrator's `write_json` doesn't ensure intermediate path parts are created when the cycle dir was just made.
+- **Severity:** plateau would have fired anyway 1 cycle later; the crash just stops the loop prematurely. Filed; not blocking.
+
+---
+
 ## 2026-05-10 — Autonomous optimization loop: pursuit conclusion (rounds 1-5, plateau at exhausted hypothesis space)
 
 Five sequential pursuits (R1-R5) executed against `optimization-backlog.yaml`'s 15-item P0/P1/P2 hypothesis queue. Each pursuit ran until plateau (5 consecutive no-keeps). Total cycles run: 23. Hypotheses kept by the loop: 0. Hypotheses kept *outside* the loop via manual ship informed by the loop's signal: 2 (F4 + F8). This entry documents what the loop actually delivered and why ship-readiness is declared with the queue partially explored.

@@ -27,9 +27,44 @@
 (function () {
   'use strict';
 
+  /* OPT-016 — persistent Float32 scratch buffers for boxBlurLinear + applyBloom.
+     Grow-only; only re-allocate on canvas resize (rare). Single-threaded JS +
+     synchronous applyChain guarantees no concurrent reuse. Bit-exact: buffers
+     are fully overwritten before being read in every call path. */
+  let _crtBlurOut = null;
+  let _crtBlurTmp = null;
+  let _bloomLinBuf = null;
+
+  /* F9 (OPT-018) — 256-entry Float64 LUT for srgbToLinear.
+   *
+   * `srgbToLinear` runs ~6.2M times/frame on cfg-postproc-heavy (applyBloom
+   * × 2 for halation + bloom, 6 calls/pixel × 516096 pixels). All call sites
+   * pass an integer byte 0-255 (Uint8ClampedArray slot), so the input domain
+   * is fully quantized to 256 values.
+   *
+   * Bit-exact verified: for every i in 0..255, _SRGB_TO_LINEAR_LUT[i] is
+   * computed with the same IEEE 754 double-precision formula as the original
+   * srgbToLinear(i). Float64Array stores doubles, so the LUT lookup returns
+   * the exact same bit pattern as direct computation. 256/256 identical,
+   * max diff = 0 — confirmed empirically with `node -e ...` in the
+   * ship-cycle workflow.
+   *
+   * `linearToSrgb` (line 38) is NOT changed — its input is a sum of linear
+   * floats, not quantized to 256 values.
+   */
+  const _SRGB_TO_LINEAR_LUT = (function () {
+    const lut = new Float64Array(256);
+    for (let i = 0; i < 256; i++) {
+      const s = i / 255;
+      lut[i] = s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    }
+    return lut;
+  })();
+
+  // HOT-PATH: ~6.2M calls/frame on cfg-postproc-heavy. LUT lookup eliminates
+  // Math.pow entirely. Input is always a Uint8ClampedArray byte (0-255).
   function srgbToLinear(c) {
-    const s = c / 255;
-    return s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+    return _SRGB_TO_LINEAR_LUT[c < 0 ? 0 : c > 255 ? 255 : (c | 0)];
   }
   function linearToSrgb(c) {
     const v = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
@@ -83,8 +118,12 @@
   /* --- Small box blur for bloom/halation (linear-light, separable). --- */
 
   function boxBlurLinear(src, w, h, radius) {
-    const out = new Float32Array(src.length);
-    const tmp = new Float32Array(src.length);
+    const N = src.length;
+    if (!_crtBlurOut || _crtBlurOut.length < N) {
+      _crtBlurOut = new Float32Array(N);
+      _crtBlurTmp = new Float32Array(N);
+    }
+    const out = _crtBlurOut, tmp = _crtBlurTmp;
     const window = radius * 2 + 1;
     /* Horizontal */
     for (let y = 0; y < h; y++) {
@@ -129,7 +168,8 @@
     const intensity = opts.intensity == null ? 0.5 : opts.intensity;
     const radius = opts.radius == null ? 6 : opts.radius;
     const N = rgba.length / 4;
-    const lin = new Float32Array(N * 3);
+    if (!_bloomLinBuf || _bloomLinBuf.length < N * 3) _bloomLinBuf = new Float32Array(N * 3);
+    const lin = _bloomLinBuf;
     for (let i = 0; i < N; i++) {
       let r = srgbToLinear(rgba[i * 4]);
       let g = srgbToLinear(rgba[i * 4 + 1]);

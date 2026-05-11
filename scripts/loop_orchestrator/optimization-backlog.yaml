@@ -74,10 +74,14 @@
     \ == null ? 0.75 : opts.threshold;\n  const intensity = opts.intensity == null ? 0.5 : opts.intensity;\n  const radius\
     \ = opts.radius == null ? 6 : opts.radius;\n  const N = rgba.length / 4;\n  if (!_bloomLinBuf || _bloomLinBuf.length <\
     \ N * 3) _bloomLinBuf = new Float32Array(N * 3);\n  const lin = _bloomLinBuf;\n  // ... lines 133-153 unchanged\n}\n"
+  prior_attempt: "Attempted in round 6 cycle 0. Loop reported visual_drift_below_0.985 but with delta_ms 0 (no measurable\
+    \ perf change). Same SSIM value (0.6785773141414008) reported across cycles 0/1/2 \u2014 this is the bench-non-determinism\
+    \ signature, not real drift. The hypothesis remains sound; verify by manual ship + thor-png byte-identity check similar\
+    \ to F9."
 - id: OPT-018
   area: srgbToLinear 256-entry LUT in glyph-crt.js eliminates Math.pow per pixel
   priority: P0
-  status: queued
+  status: keep
   files:
   - src/lib/glyph-crt.js
   hypothesis: "`srgbToLinear` at glyph-crt.js:30 calls `Math.pow((s + 0.055) / 1.055, 2.4)` for\ninputs above 10/255. In `applyBloom`\
@@ -103,6 +107,9 @@
     \ s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);\n  }\n  return lut;\n})();\n\n// Replace srgbToLinear\
     \ body (lines 30-33):\nfunction srgbToLinear(c) {\n  return _SRGB_TO_LINEAR_LUT[c < 0 ? 0 : c > 255 ? 255 : (c | 0)];\n\
     }\n"
+  reason: 'Manually shipped as F9 after the loop SSIM gate false-positive-rejected it. LUT was mathematically proven bit-identical
+    (256/256 identical, max diff = 0). Verified at runtime: thor-png x cfg-postproc-heavy bytes-identical post-F9. The OTHER
+    drift observations in the loop runs traced to bench non-determinism, not the LUT. See BUGS_AND_ITERATIONS.md ITER-033.'
 - id: OPT-019
   area: applyChromaticAberration persistent Uint8ClampedArray copy buffer
   priority: P1
