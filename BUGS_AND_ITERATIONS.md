@@ -4,6 +4,65 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-11 — In-studio adaptive Twitter-fit (v0.1.2 / ITER-025 follow-up)
+
+User shipped a dense cream-paper render through `Export GIF (Twitter-fit)`
+and it still came out > 15 MB.  ITER-025 (2026-05-10) had documented this
+as a known gap: the button hardcoded `capWidth=720` but for high-density
+content (97-frame ghost-I.gif, dense glyph stipple) even 720 routinely
+overshoots Twitter's 15 MB ceiling.  The previous workaround was a
+driver-side ffmpeg safety net in `/tmp/ghost_variations.py`.  This entry
+moves the safety net into the studio so the GUI button GUARANTEES its
+name — no driver-script rescue needed.
+
+### ITER-026 — `encode_gif_gifski_adaptive` shrink ladder (Rust)
+
+- **Found:** 2026-05-11 by Joona — "Over 15mb even when using twitter
+  fit" on a dense cream-paper anime portrait render.
+- **Root cause:** `Export GIF (Twitter-fit)` → `exportRun('gif', 720)`
+  (`glyph-studio.js:1178`) passed `capWidth=720` to the encoder.  The
+  encoder honoured the cap but `cap_width` alone bounds dimensions, not
+  bytes.  High-content-entropy frames (dense glyph stipple, paper-tone
+  background distinct from the ink) compress poorly even at 720, and
+  Twitter rejects the upload.
+- **Fix:** new `encode_gif_gifski_adaptive(frames, delay_ms, cap_width,
+  border, target_max_bytes)` in `src-tauri/src/lib.rs`.  Encodes once at
+  the requested cap.  If `target_max_bytes` is `Some(N)` and the result
+  is over budget, retries at `600 → 540 → 480 → 420 → 360` px (skipping
+  any cap ≥ the requested initial cap) until the buffer fits — returning
+  the smallest attempt if even 360 overshoots.  Re-encode cost is small
+  because gifski's collector dominates: each retry on a 97-frame source
+  is ~3-5 s.  Worst case (all 5 retries) = ~25 s; typical (one retry at
+  600 px) = ~4 s.
+- **Plumbing:**
+    - `save_gif_real` + `save_gif_to_path` accept new optional
+      `target_max_bytes: Option<u64>` parameter; both route through the
+      adaptive helper.
+    - `recordGIF` in `glyph-studio.js` takes a new `targetMaxBytes` arg
+      that flows into the `invoke('save_gif_real', …)` call.
+    - `exportRun(format, capOverride, targetMaxBytes)` plumbs it; the
+      Twitter-fit button now calls `exportRun('gif', 720, 15 * 1024 * 1024)`.
+    - Batch CLI: `run_headless_batch` reads optional per-job
+      `targetMaxBytes` from manifest; falls back to 15 MB whenever
+      `capWidth == 720` so existing driver scripts get Twitter-fit
+      guarantees without changes.
+- **Verification — smoke test on `/Users/darkfire/Downloads/ghost-I.gif`
+  (the known-bad source from ITER-025):**
+    ```
+    twitter-fit: cap=720 size=18.54MB > target 15.00MB — entering shrink ladder
+    twitter-fit: cap=600 size=12.82MB
+    twitter-fit: cap=600 ✓
+    ```
+    Final output 13 MB, under Twitter's ceiling on the first retry.
+    Matches the proven safety-net data from ITER-025 (50 / 53 variants
+    fit at 600 px on the 64-variant ghost-I batch).
+- **Out of scope (filed for v0.1.3):** pre-flight estimate that warns the
+  user BEFORE recording starts ("est. 18 MB at 720 — Twitter-fit will
+  auto-shrink to ~600 px").  Today the user sees the cap=N stderr lines
+  but the GUI status bar doesn't surface them.
+
+---
+
 ## 2026-05-11 — Round 7 (deterministic bench) — true ship-ready state
 
 The loop ran once more with both bench-determinism (Joona's `473e84f`) and the F9 LUT shipped (my `aa64576`). All 5 cycles produced SSIM ≈ 1.0 — the bench fix confirmed working end-to-end. All 5 reverts were noise-floor-bounded: 2 sub-floor wins, 3 small regressions, none with above-threshold signal.

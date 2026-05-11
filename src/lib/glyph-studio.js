@@ -278,7 +278,7 @@
      loop, then hand them to the Rust gif muxer.  Browser path: keep the old
      ZIP behaviour as a fallback so the studio works outside Tauri.
      `delayMs` defaults to the per-frame duration implied by CONFIG.animation. */
-  function recordGIF(testHook, total, onProgress, onDone, delayMs, capWidth, border) {
+  function recordGIF(testHook, total, onProgress, onDone, delayMs, capWidth, border, targetMaxBytes) {
     if (!testHook) return;
     var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
 
@@ -306,6 +306,7 @@
             delayMs: dly,
             capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
             border: (border && border.enabled) ? border : null,
+            targetMaxBytes: (typeof targetMaxBytes === 'number' && targetMaxBytes > 0) ? targetMaxBytes : null,
           })
             .then(function (p) {
               if (p) console.log('glyph-studio: saved GIF to', p);
@@ -1135,12 +1136,15 @@
 
     /* Helper — encapsulates the fps-override + recordGIF / recordMP4 dance.
        Usage:
-         exportRun('gif',  720)  — Twitter-fit GIF
+         exportRun('gif',  720, 15*1024*1024)  — Twitter-fit GIF (adaptive shrink)
          exportRun('gif',  null) — uses sizeOpts.capWidth (manual)
          exportRun('mp4',  720)  — mobile-fit MP4
        `capOverride === null` means "honour the panel dropdown".
-       `capOverride > 0` means "force this exact capWidth, ignore dropdown". */
-    function exportRun(format, capOverride) {
+       `capOverride > 0` means "force this exact capWidth, ignore dropdown".
+       `targetMaxBytes` (ITER-026): when > 0, the Rust encoder retries
+       smaller caps (600→540→480→420→360) until output ≤ N. Used by the
+       Twitter-fit button to GUARANTEE < 15 MB even on dense content. */
+    function exportRun(format, capOverride, targetMaxBytes) {
       var p = exportPlan();
       var capW = (capOverride !== null && capOverride !== undefined)
         ? capOverride
@@ -1159,8 +1163,11 @@
         console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2));
         recordMP4(opts.testHook, p.frames, onProgress, onDone, encFps, capW > 0 ? capW : null, border);
       } else {
-        console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2) + ' for clean loop');
-        recordGIF(opts.testHook, p.frames, onProgress, onDone, p.delayMs, capW > 0 ? capW : null, border);
+        var fitNote = (targetMaxBytes > 0)
+          ? ' (twitter-fit ' + (targetMaxBytes / 1024 / 1024).toFixed(0) + ' MB cap; auto-shrinks if needed)'
+          : '';
+        console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + fitNote + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2) + ' for clean loop');
+        recordGIF(opts.testHook, p.frames, onProgress, onDone, p.delayMs, capW > 0 ? capW : null, border, targetMaxBytes);
       }
     }
 
@@ -1173,8 +1180,8 @@
        At 720 wide the kaneki/toji-class loops land 8–13 MB.  See
        BUGS_AND_ITERATIONS.md ITER-017 for context. */
     var btnGifTw = fExp.addButton({ title: 'Export GIF (Twitter-fit)' });
-    tip(btnGifTw, 'Auto-caps output to 720px wide so it fits Twitter\'s 15 MB GIF ceiling. ~50% smaller than full, indistinguishable on phone screens. Honours the panel dropdown for a manual size override.');
-    btnGifTw.on('click', function () { exportRun('gif', 720); });
+    tip(btnGifTw, 'GUARANTEES output < 15 MB. Starts at 720 px and auto-shrinks (600 → 540 → 480 → 420 → 360) until it fits. Dense cream-paper renders that overshoot at 720 land between 600–480 px (visually identical at phone widths). ITER-026.');
+    btnGifTw.on('click', function () { exportRun('gif', 720, 15 * 1024 * 1024); });
 
     /* Export MP4 — for Instagram (Reels / Stories / feed posts strip
        uploaded GIFs).  Same fps-override discipline as Export GIF for

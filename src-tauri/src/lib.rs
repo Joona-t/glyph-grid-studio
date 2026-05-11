@@ -273,6 +273,18 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
                 .get("in")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            // ITER-026: optional adaptive Twitter-fit per job.  Manifest
+            // can set `targetMaxBytes: 15728640` (15 MB) and the encoder
+            // walks the shrink ladder until it fits.  When unset AND
+            // capWidth==720, we DEFAULT to 15 MB — preserves the implicit
+            // "Twitter-fit" promise of 720-cap manifests without forcing
+            // every driver script to pass the field explicitly.
+            let target_max_bytes_explicit: Option<u64> = j
+                .get("targetMaxBytes")
+                .and_then(|v| v.as_u64());
+            let target_max_bytes = target_max_bytes_explicit.or_else(|| {
+                if cap_width == 720 { Some(15 * 1024 * 1024) } else { None }
+            });
             serde_json::json!({
                 "name": name,
                 "outPath": out_path,
@@ -280,6 +292,7 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
                 "format": format,
                 "config": config,
                 "capWidth": cap_width,
+                "targetMaxBytes": target_max_bytes,
             })
         })
         .collect();
@@ -548,10 +561,85 @@ fn encode_gif_gifski(
     Ok(output)
 }
 
+/// Adaptive Twitter-fit wrapper.  ITER-025 surfaced that the GUI's
+/// `Export GIF (Twitter-fit)` button hardcoded 720 px, which routinely
+/// overshot Twitter's 15 MB cap on high-density content (cream-paper
+/// monochrome / dense glyph stipple).  This wrapper retries the encoder
+/// at progressively smaller widths until the output fits, matching the
+/// driver-level safety-net pipeline that proved 53 / 53 rescue on the
+/// ghost-I.gif 64-variant batch (see ITER-024 / ITER-025).
+///
+/// `target_max_bytes`: when `Some(N)`, the function tries `cap_width`
+/// first, then `[600, 540, 480, 420, 360]` (skipping any caps ≥ the
+/// initial cap), and returns the first buffer ≤ N.  If all six caps
+/// overshoot the target, returns the smallest attempt and logs a warning.
+/// When `None`, behaves identically to `encode_gif_gifski` (single try).
+fn encode_gif_gifski_adaptive(
+    frames: &[GifFrame],
+    delay_ms: u32,
+    cap_width: Option<u32>,
+    border: Option<&BorderConfig>,
+    target_max_bytes: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    let single = encode_gif_gifski(frames, delay_ms, cap_width, border)?;
+    let target = match target_max_bytes {
+        Some(t) if t > 0 => t,
+        _ => return Ok(single),
+    };
+    if (single.len() as u64) <= target {
+        eprintln!(
+            "twitter-fit: cap={:?} size={:.2}MB ≤ target {:.2}MB ✓",
+            cap_width,
+            single.len() as f64 / 1024.0 / 1024.0,
+            target as f64 / 1024.0 / 1024.0,
+        );
+        return Ok(single);
+    }
+    // Try shrink ladder.
+    let initial_cap = cap_width.unwrap_or(720);
+    let ladder: [u32; 5] = [600, 540, 480, 420, 360];
+    let mut best = single;
+    eprintln!(
+        "twitter-fit: cap={} size={:.2}MB > target {:.2}MB — entering shrink ladder",
+        initial_cap,
+        best.len() as f64 / 1024.0 / 1024.0,
+        target as f64 / 1024.0 / 1024.0,
+    );
+    for cap in ladder.iter() {
+        if *cap >= initial_cap {
+            continue;
+        }
+        let buf = encode_gif_gifski(frames, delay_ms, Some(*cap), border)?;
+        eprintln!(
+            "twitter-fit: cap={} size={:.2}MB",
+            cap,
+            buf.len() as f64 / 1024.0 / 1024.0,
+        );
+        let fits = (buf.len() as u64) <= target;
+        if buf.len() < best.len() {
+            best = buf;
+        }
+        if fits {
+            eprintln!("twitter-fit: cap={} ✓", cap);
+            return Ok(best);
+        }
+    }
+    eprintln!(
+        "twitter-fit: WARNING — even {} px ({:.2}MB) > target {:.2}MB; returning smallest",
+        ladder[ladder.len() - 1],
+        best.len() as f64 / 1024.0 / 1024.0,
+        target as f64 / 1024.0 / 1024.0,
+    );
+    Ok(best)
+}
+
 /// Save a recorded sequence of PNG frames as a single animated GIF.
 /// Pops the native save dialog and writes the encoded bytes there.
 /// `cap_width` (optional) resizes frames before encoding for smaller
 /// output files (Twitter's 15 MB GIF limit, etc.).
+/// `target_max_bytes` (optional, ITER-026): when set, walks a shrink
+/// ladder (720 → 600 → 540 → 480 → 420 → 360) until output ≤ N.  The
+/// GUI's `Export GIF (Twitter-fit)` button passes 15 MB.
 #[tauri::command]
 async fn save_gif_real(
     app: tauri::AppHandle,
@@ -559,8 +647,9 @@ async fn save_gif_real(
     delay_ms: u32,
     cap_width: Option<u32>,
     border: Option<BorderConfig>,
+    target_max_bytes: Option<u64>,
 ) -> Result<String, String> {
-    let gif_buf = encode_gif_gifski(&frames, delay_ms, cap_width, border.as_ref())?;
+    let gif_buf = encode_gif_gifski_adaptive(&frames, delay_ms, cap_width, border.as_ref(), target_max_bytes)?;
 
     let path: Option<PathBuf> = app
         .dialog()
@@ -589,8 +678,9 @@ async fn save_gif_to_path(
     path: String,
     cap_width: Option<u32>,
     border: Option<BorderConfig>,
+    target_max_bytes: Option<u64>,
 ) -> Result<String, String> {
-    let gif_buf = encode_gif_gifski(&frames, delay_ms, cap_width, border.as_ref())?;
+    let gif_buf = encode_gif_gifski_adaptive(&frames, delay_ms, cap_width, border.as_ref(), target_max_bytes)?;
     let p = PathBuf::from(&path);
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;

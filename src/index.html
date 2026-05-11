@@ -3242,6 +3242,7 @@
                     delayMs: delayMs,
                     path: job.path,
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+                    targetMaxBytes: (typeof job.targetMaxBytes === 'number' && job.targetMaxBytes > 0) ? job.targetMaxBytes : null,
                   };
               tauri(cmd, args)
               .then(p => {
@@ -3761,13 +3762,14 @@
     if (job.batch && Array.isArray(job.jobs)) {
       var batchJobs = job.jobs.map(function (j) {
         return {
-          name:     j.name || 'job',
-          path:     j.outPath,
-          inPath:   j.inPath || null,
-          frames:   job.frames || 24,
-          format:   j.format,
-          config:   j.config || {},
-          capWidth: (j.capWidth && j.capWidth > 0) ? j.capWidth : 0,
+          name:           j.name || 'job',
+          path:           j.outPath,
+          inPath:         j.inPath || null,
+          frames:         job.frames || 24,
+          format:         j.format,
+          config:         j.config || {},
+          capWidth:       (j.capWidth && j.capWidth > 0) ? j.capWidth : 0,
+          targetMaxBytes: (j.targetMaxBytes && j.targetMaxBytes > 0) ? j.targetMaxBytes : null,
         };
       });
       console.log('CLI: batch mode — ' + batchJobs.length + ' jobs queued' + (job.perf ? ' (perf:on)' : ''));
