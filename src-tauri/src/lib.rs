@@ -264,9 +264,19 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
                 });
             let config = j.get("config").cloned().unwrap_or(serde_json::json!({}));
             let cap_width = j.get("capWidth").and_then(|v| v.as_u64()).unwrap_or(0);
+            // Optional per-job source override — when set, the JS batch
+            // driver swaps `sourceImg` before this job's render. Lets
+            // ONE studio session cover N sources × M configs without
+            // re-spawning the process per source (the autonomous loop
+            // needs this: 4 sources × 5 configs in one Tauri launch).
+            let in_path_job: Option<String> = j
+                .get("in")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             serde_json::json!({
                 "name": name,
                 "outPath": out_path,
+                "inPath": in_path_job,
                 "format": format,
                 "config": config,
                 "capWidth": cap_width,

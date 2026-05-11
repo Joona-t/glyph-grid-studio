@@ -3161,6 +3161,29 @@
         }
         const job = jobs[idx];
         if (opts.onProgress) opts.onProgress(idx, total, job.name);
+
+        /* Multi-source manifest support: if this job's source differs
+           from the currently-loaded one, swap before applying config.
+           Keeps the batch in ONE Tauri session even when N source
+           images need exercising (autonomous loop bench: 4 sources × 5
+           configs in a single studio process, not 4). */
+        const wantSrc = job.inPath || null;
+        if (wantSrc && wantSrc !== __cliCurrentSource
+            && typeof _cliLoadSource === 'function'
+            && window.__TAURI__ && window.__TAURI__.core) {
+          _cliLoadSource(wantSrc).then(function () {
+            _runJob();
+          }).catch(function (e) {
+            console.warn('batch: source swap failed for', job.name, e);
+            errors.push({ name: job.name, err: 'source-swap: ' + String(e) });
+            idx++;
+            setTimeout(next, 50);
+          });
+          return;
+        }
+        _runJob();
+
+      function _runJob() {
         applyConfig(job.config);
         // Force loop on so draw() advances
         try { loop(); } catch (e) {}
@@ -3251,7 +3274,8 @@
             }
           });
         }, settle);
-      }
+      }  // _runJob
+      }  // next
       next();
     },
   };
@@ -3667,6 +3691,29 @@
      a single-job batch, and signal exit.  In GUI mode the call returns null
      and we do nothing.
      =========================================================================== */
+  /* CLI/batch source loader — shared by tryHeadlessRender (initial load)
+     and runBatchExport (per-job source swap when manifest jobs have
+     heterogeneous `in` fields). Awaits decode + fit + one settle frame
+     so the caller can immediately apply config and begin recording. */
+  let __cliCurrentSource = null;
+  async function _cliLoadSource(inPath) {
+    const dataUrl = await window.__TAURI__.core.invoke('read_image_file',
+                                                      { path: inPath });
+    await new Promise(function (resolve, reject) {
+      window.loadImage(dataUrl, function (img) {
+        sourceImg = img;
+        try { fitCanvasToImage(img); } catch (e) { console.warn(e); }
+        try { loop(); } catch (e) {}
+        resolve();
+      }, function (err) {
+        reject(err);
+      });
+    });
+    __cliCurrentSource = inPath;
+    // Settle one or two frames so the canvas reflects the loaded image.
+    await new Promise(function (r) { setTimeout(r, 300); });
+  }
+
   async function tryHeadlessRender() {
     if (!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)) {
       // Not running in Tauri at all (browser preview): nothing to do.
@@ -3685,52 +3732,38 @@
     }
     console.log('CLI: render job received', job);
 
-    // Read the source image via the existing Rust file-reader command.
-    // Errors here are common (path typo, file moved, permission denied).
-    // Critically: AWAIT the exit_with_status call so the process actually
-    // shuts down with the right exit code instead of returning to no-op.
-    let dataUrl;
-    try {
-      dataUrl = await window.__TAURI__.core.invoke('read_image_file', { path: job.inPath });
-    } catch (e) {
-      console.error('CLI: read_image_file failed:', e);
+    // Pick the initial source — top-level `inPath`, or first job's `in`
+    // (multi-source manifests may omit the top-level field).
+    let initialSource = job.inPath;
+    if (!initialSource && job.batch && Array.isArray(job.jobs) && job.jobs.length) {
+      initialSource = job.jobs[0].inPath || null;
+    }
+    if (!initialSource) {
+      console.error('CLI: no source path in manifest');
       try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
     }
 
-    // Decode + assign the source image. Wrap in promise so the next steps
-    // wait for the actual image bytes to be ready. Auto-fit the canvas
-    // to the source aspect ratio (same behavior as the GUI imageRef.set).
     try {
-      await new Promise(function (resolve, reject) {
-        window.loadImage(dataUrl, function (img) {
-          sourceImg = img;
-          try { fitCanvasToImage(img); } catch (e) { console.warn(e); }
-          try { loop(); } catch (e) {}
-          resolve();
-        }, function (err) {
-          reject(err);
-        });
-      });
+      await _cliLoadSource(initialSource);
     } catch (e) {
-      console.error('CLI: loadImage failed:', e);
+      console.error('CLI: initial loadImage failed:', e);
       try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
     }
 
-    // Settle one or two frames so the canvas reflects the loaded image
-    // before we apply config + start recording.
-    await new Promise(function (r) { setTimeout(r, 300); });
-
-    /* Batch mode (ITER-024): the Rust side may pass `batch:true` with a
-       jobs array.  In that shape, run runBatchExport with all jobs in a
-       single Tauri session — Tauri startup + source-image decode happen
-       once.  ~10× faster than spawning a fresh `render` per variant. */
+    /* Batch mode (ITER-024 + multi-source extension): the Rust side may
+       pass `batch:true` with a jobs array.  Each job may carry its own
+       `inPath` (multi-source manifests — used by the autonomous
+       optimization loop's 4-source × 5-config bench).  When a job's
+       inPath differs from the currently-loaded source, runBatchExport
+       async-swaps the source via _cliLoadSource before the render. */
     if (job.batch && Array.isArray(job.jobs)) {
       var batchJobs = job.jobs.map(function (j) {
         return {
           name:     j.name || 'job',
           path:     j.outPath,
+          inPath:   j.inPath || null,
           frames:   job.frames || 24,
           format:   j.format,
           config:   j.config || {},

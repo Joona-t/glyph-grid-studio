@@ -131,45 +131,43 @@ def _suite() -> list[tuple[str, dict]]:
 # ---- Manifest construction ----
 
 def build_manifest(out_dir: Path, perf: bool = True) -> Path:
-    """Builds the bench manifest at <out_dir>/bench-manifest.json.
+    """Builds a SINGLE bench manifest with all 4 sources × 5 configs = 20
+    jobs. Each job carries its own `in` (source path); the studio's batch
+    driver swaps `sourceImg` between jobs when sources differ, so the
+    whole suite runs in ONE Tauri session (~one process spawn per bench
+    instead of four).
+
+    The top-level `in` is the FIRST job's source — the studio's initial
+    load uses it. Subsequent jobs trigger an async source swap via
+    `_cliLoadSource` inside `runBatchExport.next()`.
 
     Output GIFs land at <out_dir>/<source>__<cfg_name>.gif. The studio
     emits PERF_JOB NDJSON via cli_log when perf=True.
-
-    The manifest's `in` (source path) is set to the FIRST source. The
-    studio loads exactly one source per session, so we group jobs by
-    source — meaning callers actually call this once per source.
-
-    To run all 4×5 = 20 variants, callers iterate sources and call
-    run_benchmark() per source manifest. Total = 4 manifests × 5 jobs
-    each.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifests: list[Path] = []
+    jobs: list[dict] = []
     for src in SOURCES:
         src_path = SOURCES_DIR / src
-        jobs = []
         for cfg_name, cfg in _suite():
             slug = src.replace(".", "-").replace("/", "-")
             out_path = out_dir / f"{slug}__{cfg_name}.gif"
             jobs.append({
                 "name":     f"{slug}__{cfg_name}",
+                "in":       str(src_path),           # per-job source
                 "out":      str(out_path),
                 "format":   "gif",
                 "config":   cfg,
             })
-        m = {"in": str(src_path), "frames": BENCH_FRAMES, "perf": perf, "jobs": jobs}
-        m_path = out_dir / f"manifest-{src.replace('.', '-')}.json"
-        with open(m_path, "w") as f:
-            json.dump(m, f, indent=2)
-        manifests.append(m_path)
-    # Convenience: a top-level pointer
-    pointer = out_dir / "bench-manifest.json"
-    with open(pointer, "w") as f:
-        json.dump({"manifests": [str(p) for p in manifests],
-                   "sources": SOURCES,
-                   "configs": [c[0] for c in _suite()]}, f, indent=2)
-    return pointer
+    m_path = out_dir / "bench-manifest.json"
+    m = {
+        "in":     str(SOURCES_DIR / SOURCES[0]),     # initial source
+        "frames": BENCH_FRAMES,
+        "perf":   perf,
+        "jobs":   jobs,
+    }
+    with open(m_path, "w") as f:
+        json.dump(m, f, indent=2)
+    return m_path
 
 
 # ---- Studio invocation ----
@@ -222,32 +220,22 @@ def run_benchmark(manifest_path: Path, *, timeout_s: int = 600,
 
 def run_full_suite(out_dir: Path, *, timeout_s: int = 900,
                    bin_path: str = PROD_BIN) -> dict:
-    """Build + run all 4 source manifests sequentially, aggregate results.
-    Returns {by_variant: {variant_name: perf_dict}, totals: {...}}."""
-    pointer = build_manifest(out_dir, perf=True)
-    with open(pointer) as f:
-        idx = json.load(f)
+    """Build + run the ONE multi-source manifest. ONE studio launch
+    covers all 20 variants (was previously 4 launches, one per source).
+    Returns {by_variant, n_variants, n_failures, total_dur_s, runs,
+    manifest_idx}."""
+    m_path = build_manifest(out_dir, perf=True)
+    res = run_benchmark(m_path, timeout_s=timeout_s, bin_path=bin_path)
     by_variant: dict[str, dict] = {}
-    runs: list[dict] = []
-    total_t = 0.0
-    total_jobs = 0
-    failures = 0
-    for m_path in idx["manifests"]:
-        res = run_benchmark(Path(m_path), timeout_s=timeout_s, bin_path=bin_path)
-        runs.append(res)
-        total_t += res["duration_s"]
-        if res["exit_code"] != 0:
-            failures += 1
-        for pj in res["perf_jobs"]:
-            by_variant[pj["name"]] = pj
-            total_jobs += 1
+    for pj in res["perf_jobs"]:
+        by_variant[pj["name"]] = pj
     return {
         "by_variant":   by_variant,
-        "n_variants":   total_jobs,
-        "n_failures":   failures,
-        "total_dur_s":  total_t,
-        "runs":         runs,
-        "manifest_idx": str(pointer),
+        "n_variants":   len(by_variant),
+        "n_failures":   0 if res["exit_code"] == 0 else 1,
+        "total_dur_s":  res["duration_s"],
+        "runs":         [res],
+        "manifest_idx": str(m_path),
     }
 
 
