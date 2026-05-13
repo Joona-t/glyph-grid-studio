@@ -34,6 +34,14 @@
   let _crtBlurOut = null;
   let _crtBlurTmp = null;
   let _bloomLinBuf = null;
+  /* OPT-103 — persistent Uint8ClampedArray scratch buffers for
+   * applyChromaticAberration + applyBarrel. Both functions need a frozen
+   * snapshot of rgba to read original pixels while writing in-place. Per-call
+   * allocation of a ~2 MB Uint8ClampedArray on each (4 MB/frame combined on
+   * cfg-postproc-heavy) was pure GC pressure. Two separate buffers preserve
+   * the chromatic→barrel order-of-operations exactly. */
+  let _chromaticSrcBuf = null;
+  let _barrelSrcBuf = null;
 
   /* F9 (OPT-018) — 256-entry Float64 LUT for srgbToLinear.
    *
@@ -226,6 +234,11 @@
     const phase = opts.phase || 0;
     for (let y = 0; y < h; y++) {
       const darken = ((y + phase) % period === 0) ? 1 : (1 - intensity);
+      /* OPT-101 — bright rows (darken === 1) leave every pixel unchanged
+       * (x * 1.0 === x for Uint8ClampedArray). At period=2 that's ~252 of
+       * 504 rows × 1024 pixels × 3 channels = 774K no-op multiply-stores
+       * per frame on cfg-postproc-heavy. Skip the inner loop. */
+      if (darken === 1) continue;
       for (let x = 0; x < w; x++) {
         const i = (y * w + x) * 4;
         rgba[i]     = rgba[i]     * darken;
@@ -242,7 +255,12 @@
     const maxOffset = opts.offset == null ? 0.5 : opts.offset;
     /* CR-9: clamp to <= 0.5 * cellSize in the caller's opts; caller should
        compute `offset` based on cellSize; we just obey. */
-    const src = new Uint8ClampedArray(rgba);
+    /* OPT-103 — persistent scratch buffer; alloc only on first use or grow. */
+    if (!_chromaticSrcBuf || _chromaticSrcBuf.length < rgba.length) {
+      _chromaticSrcBuf = new Uint8ClampedArray(rgba.length);
+    }
+    _chromaticSrcBuf.set(rgba);
+    const src = _chromaticSrcBuf;
     const dx = Math.min(Math.max(-5, maxOffset), 5);
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
@@ -261,7 +279,12 @@
 
   function applyBarrel(rgba, w, h, opts) {
     const strength = opts.strength == null ? 0.08 : opts.strength;
-    const src = new Uint8ClampedArray(rgba);
+    /* OPT-103 — persistent scratch buffer; alloc only on first use or grow. */
+    if (!_barrelSrcBuf || _barrelSrcBuf.length < rgba.length) {
+      _barrelSrcBuf = new Uint8ClampedArray(rgba.length);
+    }
+    _barrelSrcBuf.set(rgba);
+    const src = _barrelSrcBuf;
     const cx = w / 2, cy = h / 2;
     const maxR2 = cx * cx + cy * cy;
     for (let y = 0; y < h; y++) {
