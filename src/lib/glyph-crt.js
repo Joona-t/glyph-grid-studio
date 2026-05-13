@@ -66,9 +66,34 @@
   function srgbToLinear(c) {
     return _SRGB_TO_LINEAR_LUT[c < 0 ? 0 : c > 255 ? 255 : (c | 0)];
   }
+
+  /* OPT-100 — 1024-entry Uint8ClampedArray LUT for linearToSrgb.
+   *
+   * `linearToSrgb` runs ~9.2M times/frame on cfg-postproc-heavy across
+   * applyBloom (halation + bloom: 3 calls/pixel × 2 stages), applyPhosphorDecay,
+   * applyVignette, and applyGodRays. Input is a non-quantized linear float; the
+   * output is always clamped to a 0..255 integer byte before being written back
+   * into a Uint8ClampedArray. A 1024-bin precomputed table maps input bins
+   * (linear in [0,1]) directly to output bytes, eliminating Math.pow from the
+   * hot path. Quantization error is bounded by ~1/1024 of the linear input
+   * range — sub-visual and SSIM-gated.
+   *
+   * Measured: -50.97ms/frame geomean across 5 configs (cfg-postproc-heavy
+   * -67.28ms = -43%); SSIM 0.9876 vs 0.985 floor. See ITER-100 entry in
+   * BUGS_AND_ITERATIONS.md.
+   */
+  const _LINEAR_TO_SRGB_LUT = (function () {
+    const lut = new Uint8ClampedArray(1024);
+    for (let i = 0; i < 1024; i++) {
+      const lin = i / 1023;
+      const v = lin <= 0.0031308 ? 12.92 * lin : 1.055 * Math.pow(lin, 1 / 2.4) - 0.055;
+      lut[i] = Math.round(v * 255);
+    }
+    return lut;
+  })();
+
   function linearToSrgb(c) {
-    const v = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
-    return Math.max(0, Math.min(255, Math.round(v * 255)));
+    return _LINEAR_TO_SRGB_LUT[c < 0 ? 0 : c > 1 ? 1023 : (c * 1023) | 0];
   }
 
   function makeState(w, h) {
