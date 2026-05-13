@@ -721,3 +721,106 @@ Future entries should include:
 - **Diagnosis** — root cause from source reading
 - **Fix** — source change made (file path, line number)
 - **Verification** — how it was confirmed fixed
+
+---
+
+## ITER-100 — `linearToSrgb` 1024-entry LUT (2026-05-13)
+
+**Symptom** — On `cfg-postproc-heavy` the postprocess chain spends ~9.2M
+calls/frame in `linearToSrgb` (3 calls/pixel × 2 stages in applyBloom for
+halation+bloom, plus applyPhosphorDecay/Vignette/GodRays). Every call ran
+`Math.pow(c, 1/2.4)`.
+
+**Diagnosis** — `Math.pow` is the bottleneck. Input is a non-quantized
+linear float, but the output is always clamped to a 0..255 integer byte
+before being written to a Uint8ClampedArray. The byte quantization
+swallows any sub-bin error from a precomputed table.
+
+**Fix** — `src/lib/glyph-crt.js` — 1024-entry `Uint8ClampedArray`
+`_LINEAR_TO_SRGB_LUT` built once at module scope; `linearToSrgb` now does
+a single integer index lookup instead of `Math.pow`.
+
+**Verification** — Autonomous loop cycle 0 measured `−50.97 ms/frame
+geomean` across 5 configs with SSIM `0.9876` (above the `0.985` hard
+floor). Per-config: `cfg-postproc-heavy −67.28 ms (−43%)`,
+`cfg-duotone −74.49 ms (−47%)`, `cfg-default −28.82 ms (−35%)`.
+Commit `f655800`.
+
+---
+
+## ITER-101 + ITER-103 — scanline no-op skip + persistent chromatic/barrel buffers (2026-05-13)
+
+**Symptom** — On the same `cfg-postproc-heavy` config, two small leaks
+remained after ITER-100: (a) `applyScanlines` ran 774K no-op
+multiply-stores per frame on bright rows (`darken === 1` in period-2
+mode); (b) `applyChromaticAberration` and `applyBarrel` each allocated
+a fresh ~2 MB `Uint8ClampedArray` copy per call to snapshot `rgba` for
+the in-place read/write pattern — 4 MB allocated and GC-released per
+frame.
+
+**Diagnosis** —
+- Scanlines: `Uint8ClampedArray × 1.0 === x` for any byte, so the inner
+  x-loop's full row pass is wasted work whenever `darken === 1`.
+- Buffers: standard "snapshot then mutate" pattern; the snapshots can
+  live module-scope and reuse forever, eliminating GC pressure.
+
+**Fix** — `src/lib/glyph-crt.js`:
+- Scanlines: added `if (darken === 1) continue;` after the per-row
+  ternary, before the inner x-loop.
+- Buffers: declared `_chromaticSrcBuf` and `_barrelSrcBuf` at module
+  scope next to the existing `_crtBlurOut`/`_crtBlurTmp`/`_bloomLinBuf`;
+  both functions now grow-on-first-use and `set(rgba)` each call.
+  Buffers kept SEPARATE so the chromatic→barrel order-of-operations is
+  preserved bit-exactly.
+
+**Verification** — Compound bench against the `cfg-postproc-heavy` 20-variant
+suite measured `−1.36 ms geomean` on top of ITER-100, for cumulative
+`136.33 → 84.00 ms (−38%)` across the suite. `cfg-default` now at
+`50.93 ms (~20 fps)` — under the 80 ms loop-stop target. Commit `a5bd10f`.
+
+---
+
+## LOOP-BUG-001 — orchestrator empty-queue infinite spin (2026-05-13)
+
+**Symptom** — After the loop ran cycle 0 (KEEP OPT-100) and cycle 1
+(REVERT OPT-101 via patch failure) and cycle 2 (REVERT OPT-103), all
+remaining queued candidates had been popped. The orchestrator then
+ran `cycles_completed` from `2` to `777347` in ~25 minutes (≈ 8500
+cycles/min, no actual work), creating empty `runs/cycle-NNNNNN/`
+directories and clobbering the working tree's just-shipped OPT-100
+patch via the per-cycle `git reset --hard` pre-baseline reset.
+
+**Diagnosis** — `scripts/loop_orchestrator/orchestrator.py` at line 395:
+```python
+if hyp is None:
+    out["mode"] = "no-hypothesis"
+    out["reason"] = "backlog exhausted (synthesis not yet implemented)"
+    write_json(cdir / "outcome.json", out)
+    return out
+```
+The early-return when the queue is exhausted does NOT increment
+`state.consecutive_no_keep` or any other stop counter. The outer loop's
+`should_stop` only checks plateau, build timeouts, time, max-cycles, and
+the lock-sentinel — none of which fire when the queue is empty. So the
+outer loop calls `run_cycle` again immediately, the inner pick returns
+`hyp is None` again, and the cycle counter spins.
+
+**Fix** — Two changes needed (NOT applied this session — orchestrator.py
+is on the autonomous-loop deny-list and the user reverted prior session
+edits to harness files):
+
+1. After line 397 ("backlog exhausted"), set
+   `state.consecutive_no_keep += 1` (and `save_state(state)`) so the
+   `PLATEAU_CYCLES` check fires after 5 empty-queue cycles.
+2. Better: add an explicit early stop in `should_stop` — read the
+   backlog YAML at each loop iteration and exit on `no queued items`.
+
+**Workaround** — Always launch the orchestrator with `--max-cycles N`
+(e.g. `--max-cycles 10`). The current `runs/STOP` sentinel works once
+the bug fires but the user has no signal to send it (the loop appears
+"running" because it's busy spinning).
+
+**Verification** — N/A until fix is applied. Recovery this session:
+killed PID 46184, re-applied OPT-100 patch from in-context memory
+(`runs/cycle-000/` was auto-pruned during the spin), re-committed
+manually as `f655800`. Future loop runs MUST use `--max-cycles`.
