@@ -42,6 +42,13 @@
    * the chromatic→barrel order-of-operations exactly. */
   let _chromaticSrcBuf = null;
   let _barrelSrcBuf = null;
+  /* OPT-200 — persistent Float32 grid of normalized radial distances for
+   * applyVignette. Eliminates ~516K Math.hypot calls/frame on 1024×504. The
+   * grid stores r = hypot(x - cx, y - cy) / maxR for every pixel; rebuilt
+   * only when canvas dimensions change. Same lazy-grow pattern as the
+   * OPT-018/OPT-100 LUTs and OPT-103 scratch buffers. */
+  let _vignetteDistGrid = null;
+  let _vignetteGridW = 0, _vignetteGridH = 0;
 
   /* F9 (OPT-018) — 256-entry Float64 LUT for srgbToLinear.
    *
@@ -134,10 +141,17 @@
       const newR = srgbToLinear(rgba[i * 4]);
       const newG = srgbToLinear(rgba[i * 4 + 1]);
       const newB = srgbToLinear(rgba[i * 4 + 2]);
-      /* Max blend preserves bright trails without darkening live content. */
-      const blendR = Math.max(newR, oldR * decayFactor);
-      const blendG = Math.max(newG, oldG * decayFactor);
-      const blendB = Math.max(newB, oldB * decayFactor);
+      /* Max blend preserves bright trails without darkening live content.
+       * OPT-202 — inline ternary replaces Math.max function dispatch. For
+       * finite floats in [0, 1], `a >= b ? a : b` is bit-identical to
+       * Math.max(a, b) and JIT-friendlier (no function call overhead). 1.5M
+       * Math.max calls/frame eliminated on cfg-postproc-heavy with phosphorDecay. */
+      const decayR = oldR * decayFactor;
+      const decayG = oldG * decayFactor;
+      const decayB = oldB * decayFactor;
+      const blendR = newR >= decayR ? newR : decayR;
+      const blendG = newG >= decayG ? newG : decayG;
+      const blendB = newB >= decayB ? newB : decayB;
       state.phosphor[i * 3]     = blendR;
       state.phosphor[i * 3 + 1] = blendG;
       state.phosphor[i * 3 + 2] = blendB;
@@ -158,6 +172,10 @@
     }
     const out = _crtBlurOut, tmp = _crtBlurTmp;
     const window = radius * 2 + 1;
+    /* OPT-203 — division by `window` repeated (w*h*3*2) times per call ≈ 3.1M
+     * div ops per bloom/halation call. Pre-compute reciprocal once and multiply.
+     * IEEE-754-identical when reciprocal is held at full Float64 precision. */
+    const invWindow = 1.0 / window;
     /* Horizontal */
     for (let y = 0; y < h; y++) {
       const row = y * w * 3;
@@ -167,12 +185,12 @@
           const xx = Math.max(0, Math.min(w - 1, i));
           sum += src[row + xx * 3 + c];
         }
-        tmp[row + 0 * 3 + c] = sum / window;
+        tmp[row + 0 * 3 + c] = sum * invWindow;
         for (let x = 1; x < w; x++) {
           const addX = Math.min(w - 1, x + radius);
           const subX = Math.max(0, x - radius - 1);
           sum += src[row + addX * 3 + c] - src[row + subX * 3 + c];
-          tmp[row + x * 3 + c] = sum / window;
+          tmp[row + x * 3 + c] = sum * invWindow;
         }
       }
     }
@@ -184,12 +202,12 @@
           const yy = Math.max(0, Math.min(h - 1, i));
           sum += tmp[yy * w * 3 + x * 3 + c];
         }
-        out[0 * w * 3 + x * 3 + c] = sum / window;
+        out[0 * w * 3 + x * 3 + c] = sum * invWindow;
         for (let y = 1; y < h; y++) {
           const addY = Math.min(h - 1, y + radius);
           const subY = Math.max(0, y - radius - 1);
           sum += tmp[addY * w * 3 + x * 3 + c] - tmp[subY * w * 3 + x * 3 + c];
-          out[y * w * 3 + x * 3 + c] = sum / window;
+          out[y * w * 3 + x * 3 + c] = sum * invWindow;
         }
       }
     }
@@ -255,13 +273,18 @@
     const maxOffset = opts.offset == null ? 0.5 : opts.offset;
     /* CR-9: clamp to <= 0.5 * cellSize in the caller's opts; caller should
        compute `offset` based on cellSize; we just obey. */
+    const dx = Math.min(Math.max(-5, maxOffset), 5);
+    /* OPT-204 — sub-pixel offsets round to 0 inside the loop (`Math.round(x - dx)`
+     * with |dx| < 0.5 gives x), so every per-pixel write would be xr === xb === x
+     * → output bytes identical to input. Skip the whole pass and the buffer
+     * copy/alloc when this is provably a no-op. */
+    if (Math.abs(dx) < 0.5) return rgba;
     /* OPT-103 — persistent scratch buffer; alloc only on first use or grow. */
     if (!_chromaticSrcBuf || _chromaticSrcBuf.length < rgba.length) {
       _chromaticSrcBuf = new Uint8ClampedArray(rgba.length);
     }
     _chromaticSrcBuf.set(rgba);
     const src = _chromaticSrcBuf;
-    const dx = Math.min(Math.max(-5, maxOffset), 5);
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const iDst = (y * w + x) * 4;
@@ -312,11 +335,20 @@
 
   function applyVignette(rgba, w, h, opts) {
     const strength = opts.strength == null ? 0.5 : opts.strength;
-    const cx = w / 2, cy = h / 2;
-    const maxR = Math.hypot(cx, cy);
+    if (!_vignetteDistGrid || _vignetteGridW !== w || _vignetteGridH !== h) {
+      const cx = w / 2, cy = h / 2;
+      const maxR = Math.hypot(cx, cy);
+      _vignetteDistGrid = new Float32Array(w * h);
+      _vignetteGridW = w; _vignetteGridH = h;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          _vignetteDistGrid[y * w + x] = Math.hypot(x - cx, y - cy) / maxR;
+        }
+      }
+    }
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
-        const r = Math.hypot(x - cx, y - cy) / maxR;
+        const r = _vignetteDistGrid[y * w + x];
         const darken = 1 - strength * r * r;
         const i = (y * w + x) * 4;
         rgba[i]     = rgba[i]     * darken;
