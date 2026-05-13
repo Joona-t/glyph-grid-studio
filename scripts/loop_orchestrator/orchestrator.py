@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -122,11 +123,59 @@ def log_event(event: dict) -> None:
 
 # ---------- Backlog ----------
 
+def _load_historical_attempts() -> dict[str, dict]:
+    """Scan runs/cycle-*/outcome.json for prior hypothesis attempts.
+
+    The backlog YAML's in-memory `status` updates are clobbered by the
+    per-cycle `git checkout main` (the YAML on disk holds whatever Joona
+    last committed, which is usually "all queued" plus whatever newly-
+    added items). To prevent the loop from re-attempting candidates it
+    has already burned cycles on, replay each cycle's outcome.json into
+    an `attempts` dict keyed by hypothesis id.
+
+    A "keep" outcome wins over earlier reverts (the candidate landed at
+    some point); otherwise the first revert reason is preserved.
+    """
+    attempts: dict[str, dict] = {}
+    if not RUNS_DIR.exists():
+        return attempts
+    for outcome_path in RUNS_DIR.glob("cycle-*/outcome.json"):
+        try:
+            o = json.loads(outcome_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        hid = o.get("hypothesis")
+        decision = o.get("decision")
+        if not hid or not decision:
+            continue  # dry-run / no-hypothesis cycles don't poison the history
+        if decision == "keep":
+            attempts[hid] = {"status": "kept", "reason": o.get("reason", "")}
+        elif hid not in attempts:
+            attempts[hid] = {
+                "status": "rejected",
+                "reason": (o.get("reason", "") or "")[:200],
+            }
+    return attempts
+
+
 def load_backlog() -> list[dict]:
     if not BACKLOG_PATH.exists():
         return []
     with open(BACKLOG_PATH) as f:
         data = yaml.safe_load(f) or []
+    # Merge historical attempts so previously-rejected candidates aren't
+    # re-tried just because git checkout reset their status. Only escalates
+    # `queued` items — never overrides a YAML-author-set `kept` / `frozen`.
+    history = _load_historical_attempts()
+    if history:
+        for h in data:
+            cur = h.get("status", "queued")
+            if cur != "queued":
+                continue
+            past = history.get(h["id"])
+            if past:
+                h["status"] = past["status"]
+                h["reason"] = past["reason"]
     return data
 
 
@@ -307,18 +356,43 @@ def run_verify(cycle_n: int, baseline_suite: dict,
 
 # ---- Phase: DECIDE + COMMIT ----
 
+_PATCH_FILE_RE = re.compile(r"^diff --git a/\S+ b/(?P<path>\S+)$", re.MULTILINE)
+
+
+def _files_in_patch(patch_path: Path) -> list[str]:
+    """Extract `b/<path>` from every `diff --git` line in a unified diff.
+
+    The autonomous commit must stage ONLY the source files actually
+    touched by the patch. Using `git add -A` (the prior implementation)
+    also staged the orchestrator's own metadata changes —
+    backlog.yaml status updates, run artifacts under runs/, etc — all
+    of which are on the pre-commit deny-list and caused every KEEP
+    commit to fail. Path-specific staging is the contract that lets
+    the loop commit cleanly without bypass.
+    """
+    if not patch_path.exists():
+        return []
+    text = patch_path.read_text(errors="replace")
+    return sorted({m.group("path") for m in _PATCH_FILE_RE.finditer(text)})
+
+
 def commit_and_push(cycle_n: int, hyp: dict, outcome: dec.Outcome) -> dict:
     """On KEEP: ff-merge auto branch into main, commit ITER entry,
-    push origin/main."""
+    push origin/main.
+
+    Path-specific staging (2026-05-13 fix): stages only the source files
+    actually modified by the patch, plus BUGS_AND_ITERATIONS.md for the
+    audit-trail append. backlog.yaml status updates live in memory; if
+    they need persistence across restarts that happens via the separate
+    save_backlog() call (which writes to disk but is NOT included in the
+    autonomous commit).
+    """
     cdir = cycle_dir(cycle_n)
-    branch = None
     apply_meta_path = cdir / "apply.json"
-    if apply_meta_path.exists():
-        try:
-            apply_meta = json.loads(apply_meta_path.read_text())
-        except json.JSONDecodeError:
-            apply_meta = {}
-    else:
+    try:
+        apply_meta = json.loads(apply_meta_path.read_text()) \
+            if apply_meta_path.exists() else {}
+    except json.JSONDecodeError:
         apply_meta = {}
 
     msg = (
@@ -341,21 +415,30 @@ def commit_and_push(cycle_n: int, hyp: dict, outcome: dec.Outcome) -> dict:
     with open(iter_path, "a") as f:
         f.write(iter_text)
 
+    # Stage ONLY the patch-touched source files + the BUGS_AND_ITERATIONS
+    # append. Everything else (backlog.yaml status, runs/ artifacts,
+    # state.json) stays local to the working tree.
+    patch_files = _files_in_patch(cdir / "patch.diff")
+    stage_paths = patch_files + ["BUGS_AND_ITERATIONS.md"]
+
     cmds = [
-        ["git", "add", "-A"],
+        ["git", "add", "--", *stage_paths],
         ["git", "commit", "-m", msg],
         ["git", "checkout", "main"],
         ["git", "merge", "--ff-only", apply_meta.get("branch") or "HEAD"],
         ["git", "push", "origin", "main"],
     ]
     notes = []
+    committed_ok = False
     for cmd in cmds:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            cwd=str(REPO_ROOT))
         notes.append({"cmd": " ".join(cmd), "rc": r.returncode,
                        "stderr": r.stderr.strip()[:300]})
-    return {"committed": True, "msg": msg, "iter_id": iter_id,
-            "log": notes}
+        if cmd[1] == "commit" and r.returncode == 0:
+            committed_ok = True
+    return {"committed": committed_ok, "msg": msg, "iter_id": iter_id,
+            "log": notes, "staged": stage_paths}
 
 
 # ---- One full cycle ----
@@ -393,9 +476,16 @@ def run_one_cycle(cycle_n: int, state: State, backlog: list[dict],
         return out
 
     if hyp is None:
+        # LOOP-BUG-001 fix (2026-05-13): when the queue is exhausted, bump
+        # consecutive_no_keep so should_stop's PLATEAU_CYCLES check fires
+        # within a few iterations instead of spinning forever. Also sleep
+        # briefly so the spin (until plateau triggers) doesn't burn CPU.
         out["mode"] = "no-hypothesis"
         out["reason"] = "backlog exhausted (synthesis not yet implemented)"
         write_json(cdir / "outcome.json", out)
+        state.consecutive_no_keep += 1
+        save_state(state)
+        time.sleep(2)  # avoid tight loop until plateau threshold trips
         return out
 
     out["hypothesis"] = hyp["id"]
