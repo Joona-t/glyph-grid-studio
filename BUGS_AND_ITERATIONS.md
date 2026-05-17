@@ -4,6 +4,96 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-17 — Carmack audit WIN B: preserve sprite path — −70 ms but SSIM 0.71, REVERTED (architectural finding)
+
+- **Hypothesis (audit WIN B):** preserve colour mode uses `text()`/
+  fillText per cell (~66 ms / 97 % of cfg-preserve-stress) because per-
+  cell colour is continuous source-sampled RGB, not a palette index.
+  Render glyph SHAPES once via the existing monochrome sprite atlas into
+  an offscreen alpha mask, build a cols×rows preserve-colour tint grid,
+  then ONE `globalCompositeOperation='source-in'` upscales the grid onto
+  the mask (sidestepping OPT-001's rejected per-cell gCO by doing exactly
+  one save()/gCO/restore() bracket). Predicted ~46–50 ms saved, SSIM
+  ≈ 0.99+.
+- **Measured (full 20-variant bench vs HEAD `de7449a` baseline):**
+  - Perf: cfg-preserve-stress **141.02 → 71.07 ms (−69.95 ms, −50 %)**;
+    geomean **79.53 → 69.18 (−10.35 ms)**. *Exceeded* the prediction.
+  - Isolation: all 16 non-preserve variants **SSIM 1.0000** — the
+    preserve-only branch is perfectly scoped, zero collateral.
+  - **Gate FAIL:** cfg-preserve-stress SSIM **0.7142 / 0.7142 / 0.7359
+    / 0.9020** (cream-paper / synthetic-noise / thor / ghost) — far
+    below the 0.985 floor.
+- **Root cause (the architectural finding):** glyph tiles are
+  `ceil(fontSize*1.1)` ≈ 9 px wide; at 240 cols on a 1024 px canvas a
+  cell is ≈ 4.27 px. **Glyphs are ~2× cell width and deliberately
+  overlap** — that overlap *is* the dense-stipple aesthetic. The slow
+  path fills each whole glyph with ONE flat colour (its own cell's
+  preserve colour). The WIN B tint grid is upscaled by **screen
+  position** (nearest-neighbor), so each glyph pixel takes the colour of
+  whatever cell-*column* that x-coordinate lands in — a glyph spanning
+  cells c and c+1 gets two-tone banding. Position-space tint ≠
+  glyph-space colour whenever glyphs overlap cells.
+- **Why this is fundamental, not a tuning bug:** any single-global-
+  composite scheme colours by destination/source *pixel position*. Per-
+  glyph colour binding (glyph (c,r) ⇒ colour(c,r)) when glyphs overlap
+  requires per-cell draw state — exactly the per-cell gCO that OPT-001
+  was rejected for, or a per-cell clip/fill (which is the slow path).
+  Clamping the glyph tile to cell size removes the overlap that creates
+  the texture (changes the look). **Conclusion: the preserve fast path
+  is not achievable via a single composite. It needs per-cell colour
+  state by construction.** This supersedes the audit's WIN B design and
+  closes that avenue — future audits must not re-propose a position-
+  upscaled tint for preserve.
+- **Decision:** REVERT per the rule table (SSIM 0.71 ≪ 0.985). −70 ms is
+  worthless if every preserve render is corrupted. `git checkout
+  src/index.html`; rebuilt + reinstalled HEAD to `~/Applications`.
+  Studio source net-unchanged from `de7449a`.
+- **Open (future):** a *correct* preserve speed-up would render glyphs
+  pre-tinted per cell but via `fillRect`-sized cell blits instead of
+  `fillText` (fillRect ≈ 10× faster than fillText), accepting the
+  overlap-bleed and measuring SSIM — a NEW hypothesis with its own
+  design + gate cycle, not a WIN B variant. Filed for a future pursuit;
+  not attempted here (the disciplined call is revert + document, not
+  guess-and-burn-cycles).
+
+---
+
+## 2026-05-17 — Carmack audit WIN A: shared bright-pass — REVERTED (machine disproved op-count)
+
+- **Hypothesis (audit WIN A):** `applyBloom` calls `srgbToLinear` on the
+  source `rgba` twice per pixel — once in the bright-pass extraction,
+  again in the recompose. Within a call `rgba` is unchanged between the
+  two, so the values are bit-identical. Stash the linearized source in a
+  persistent `_bloomSrcLin` Float32Array during extraction; read it back
+  in recompose. Predicted −6 to −10 ms on cfg-postproc-heavy by
+  eliminating ~3.1M redundant LUT lookups/frame.
+- **Measured (full 20-variant bench, HEAD `de7449a` baseline geomean
+  79.53 ms):** geomean **79.53 → 80.60 (+1.07 ms)**; cfg-postproc-heavy
+  **82.81 → 84.60 (+1.79 ms)** — the *target* config regressed hardest.
+  Every config got slightly slower.
+- **Root cause of the miss:** the op-count was right but the machine
+  model was wrong. `_SRGB_TO_LINEAR_LUT` is a 256-entry Float64Array —
+  2 KB, permanently L1-resident. Recomputing `srgbToLinear` is nearly
+  free (one bounds branch + one L1 load). Threading the eliminated value
+  through a 6.2 MB `_bloomSrcLin` buffer instead adds a full-frame
+  Float32 write in pass-1 and a full-frame read in pass-3 — ~12 MB of
+  extra cache-cold memory traffic per `applyBloom` call, ×2 calls on
+  cfg-postproc-heavy. Memory bandwidth lost more than the LUT lookups
+  saved. **A cached LUT recompute beats buffering its result** when the
+  LUT fits in L1 and the buffer doesn't fit in L2.
+- **Decision:** REVERT per the audit rule table (delta > 0). No ego,
+  no salvage — eliminating the redundancy *requires* storing the linear
+  source somewhere, and any such buffer reintroduces the bandwidth cost.
+  The premise ("redundant LUT lookups are expensive here") is false on
+  this hardware. `git checkout src/lib/glyph-crt.js`; glyph-crt.js
+  unchanged from HEAD.
+- **Trail value:** future audits must not re-propose buffering a
+  cache-resident-LUT result to dedupe lookups. The LUT *is* the
+  optimization; recompute is the fast path. boxBlurLinear / the LUTs /
+  scratch buffers remain the optimal set.
+
+---
+
 ## 2026-05-11 — In-studio adaptive Twitter-fit (v0.1.2 / ITER-025 follow-up)
 
 User shipped a dense cream-paper render through `Export GIF (Twitter-fit)`
