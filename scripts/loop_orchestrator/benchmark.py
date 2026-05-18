@@ -30,10 +30,13 @@ PROD_BIN = (
 REPO_ROOT = Path("/Users/darkfire/glyph-grid-studio")
 SOURCES_DIR = REPO_ROOT / "tests" / "sources"
 
-# Bench frame count is 24 (matches __pfMaxRing capacity → ring captures
-# every frame of the job, no shifting). Cycle time at ~6 s/job × 20 jobs =
-# ~2 min per BASELINE/MEASURE phase.
-BENCH_FRAMES = 24
+# Bench frame count. Lowered 24→12 for the scaling sweep: the suite now
+# spans regimes 10–1000× apart in cost (5 ms → >6 s/frame), so 12 frames
+# resolves them with huge margin while keeping the catastrophic corner
+# (400×300 @ 2560×1600, CPU ~6 s/frame) affordable: 12 × ~6 s = ~72 s for
+# the single worst variant, well under the 900 s manifest timeout across
+# ~23 variants. Still ≤ __pfMaxRing (30) so the ring captures every frame.
+BENCH_FRAMES = 12
 
 # ---- BASE config (mirrors src/index.html:111 CONFIG) ----
 
@@ -66,14 +69,42 @@ BASE: dict[str, Any] = {
 }
 
 
-# ---- Suite (4 sources × 5 configs) ----
+# ---- Suite (scaling sweep — Sutskever v3) ----
+#
+# The old suite was 4 sources × 5 configs at ONE operating point
+# (240×120 grid, 1024×504 canvas). It was blind to the regimes users
+# actually hit: grid cost is O(cells) → 545 ms at 400×300; postproc cost
+# is O(canvas_px × stages) → >6 s at dense+heavy. Optimizing that
+# fixed-point geomean optimized the easy middle while the corners were
+# catastrophic.
+#
+# The reframed suite SWEEPS the two dominant cost axes — grid density and
+# canvas pixels — crossed with the two structurally-distinct postproc
+# regimes (vignette-only "light" vs the 5-stage "heavy" stack). The
+# headline metric becomes per-regime geomeans + `max_regime_ms` (the
+# catastrophic corner). "Lower the worst regime" is the frontier the GPU
+# pipeline crushes and CPU micro-opts cannot move.
 
 SOURCES = [
-    "thor.png",          # high-contrast portrait (current default)
-    "ghost-I.gif",       # animated 97-frame source (worst-case density)
-    "cream-paper.png",   # tri-modal luminance (ITER-022 test material)
-    "synthetic-noise.png",  # high-frequency stress
+    "thor.png",          # deterministic sweep source (fit disabled)
+    "ghost-I.gif",       # animated sanity point
+    "cream-paper.png",   # source-sensitivity point
+    "synthetic-noise.png",  # source-sensitivity point
 ]
+
+# Grid densities (cols, rows): sparse / current / dense.
+_DENSITIES = [(120, 60), (240, 120), (400, 300)]
+# Canvas sizes (w, h): small / current / large.
+_CANVASES = [(640, 360), (1024, 504), (1920, 1008)]
+# The two structurally-distinct postproc regimes.
+_PP_LIGHT = {"vignette": {"enabled": True, "strength": 0.55}}
+_PP_HEAVY = {
+    "vignette":            {"enabled": True, "strength": 0.55},
+    "bloom":               {"enabled": True, "strength": 0.6, "radius": 5},
+    "halation":            {"enabled": True, "strength": 0.4},
+    "scanlines":           {"enabled": True, "period": 2},
+    "chromaticAberration": {"enabled": True, "amount": 0.3},
+}
 
 
 def _deep_merge(target: dict, src: dict) -> dict:
@@ -91,41 +122,68 @@ def _config(overrides: dict) -> dict:
     return cfg
 
 
-def _suite() -> list[tuple[str, dict]]:
-    """Return [(cfg_name, config_dict), ...] for the 5 bench configs."""
-    pp_off = {"vignette": {"enabled": False}}
-    return [
-        ("cfg-default", _config({})),
-        ("cfg-monochrome-fast", _config({
-            "colorMode": "monochrome",
-            "selectionMode": "shape-edge-aware",
-            "glyphSet": "ascii",
-            "postprocess": pp_off,
-        })),
-        ("cfg-preserve-stress", _config({
-            "colorMode": "preserve",
-            "depth": {"enabled": True, "fog": {"enabled": True,
-                                                "strength": 0.6,
-                                                "r": 200, "g": 180, "b": 160}},
-            "postprocess": pp_off,
-        })),
-        ("cfg-postproc-heavy", _config({
-            "postprocess": {
-                "vignette":            {"enabled": True, "strength": 0.55},
-                "bloom":               {"enabled": True, "strength": 0.6, "radius": 5},
-                "halation":            {"enabled": True, "strength": 0.4},
-                "scanlines":           {"enabled": True, "period": 2},
-                "chromaticAberration": {"enabled": True, "amount": 0.3},
-            },
-        })),
-        ("cfg-duotone-dispersal", _config({
-            "colorMode": "duotone",
-            "dispersal": {"enabled": True, "startT": 0.5, "endT": 0.95,
-                          "intensity": 0.5, "upwardBias": 0.5,
-                          "swayAmount": 0.4, "rippleAmt": 0.2},
-            "postprocess": pp_off,
-        })),
-    ]
+def _sweep_cfg(pp: dict, cols: int, rows: int, cw: int, ch: int) -> dict:
+    """Build a sweep variant config: pin grid density + canvas size, and
+    DISABLE fitCanvasToImage so canvas.w/h is authoritative (otherwise the
+    source image aspect would override it and the canvas axis of the sweep
+    would be meaningless)."""
+    return _config({
+        "grid":   {"cols": cols, "rows": rows},
+        "canvas": {"w": cw, "h": ch},
+        "postprocess": pp,
+        "studio": {"fitCanvasToImage": False},
+    })
+
+
+def _suite() -> list[tuple[str, dict, str]]:
+    """Return [(variant_name, config, source_filename), ...].
+
+    ~23 variants in ONE studio launch:
+      * 2 regimes × 3 densities × 3 canvases = 18 sweep points (thor,
+        fit disabled — deterministic)
+      * 2 catastrophic torture points (400×300 @ 2560×1600, light+heavy)
+      * 1 animated sanity point (ghost-I.gif, fit enabled, default op-pt)
+      * 2 source-sensitivity points (cream-paper, synthetic-noise at the
+        old default operating point)
+
+    Variant name encodes the regime: `<light|heavy>__d<C>x<R>__c<W>x<H>`
+    (+ a source tag when the source isn't thor). headline_ms() groups by
+    regime and surfaces max_regime_ms (the catastrophic corner).
+    """
+    variants: list[tuple[str, dict, str]] = []
+
+    # 18-point sweep on the deterministic source.
+    for pp_name, pp in (("light", _PP_LIGHT), ("heavy", _PP_HEAVY)):
+        for (cols, rows) in _DENSITIES:
+            for (cw, chh) in _CANVASES:
+                name = f"{pp_name}__d{cols}x{rows}__c{cw}x{chh}"
+                variants.append((name, _sweep_cfg(pp, cols, rows, cw, chh), "thor.png"))
+
+    # Catastrophic corner — CPU is >6 s here; this is the GPU pipeline's
+    # entire reason to exist. Kept IN the suite so the reframed objective
+    # SEES the regime instead of being blind to it.
+    for pp_name, pp in (("light", _PP_LIGHT), ("heavy", _PP_HEAVY)):
+        name = f"{pp_name}__d400x300__c2560x1600"
+        variants.append((name, _sweep_cfg(pp, 400, 300, 2560, 1600), "thor.png"))
+
+    # Animated-source sanity (fit enabled — exercises the real GIF path).
+    variants.append((
+        "light__ghost__d240x120__c1024x504",
+        _config({"grid": {"cols": 240, "rows": 120},
+                 "postprocess": _PP_LIGHT}),
+        "ghost-I.gif",
+    ))
+
+    # Source-sensitivity at the legacy operating point.
+    for src, tag in (("cream-paper.png", "creampaper"),
+                     ("synthetic-noise.png", "noise")):
+        variants.append((
+            f"light__{tag}__d240x120__c1024x504",
+            _sweep_cfg(_PP_LIGHT, 240, 120, 1024, 504),
+            src,
+        ))
+
+    return variants
 
 
 # ---- Manifest construction ----
@@ -145,22 +203,21 @@ def build_manifest(out_dir: Path, perf: bool = True) -> Path:
     emits PERF_JOB NDJSON via cli_log when perf=True.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    variants = _suite()
     jobs: list[dict] = []
-    for src in SOURCES:
+    for name, cfg, src in variants:
         src_path = SOURCES_DIR / src
-        for cfg_name, cfg in _suite():
-            slug = src.replace(".", "-").replace("/", "-")
-            out_path = out_dir / f"{slug}__{cfg_name}.gif"
-            jobs.append({
-                "name":     f"{slug}__{cfg_name}",
-                "in":       str(src_path),           # per-job source
-                "out":      str(out_path),
-                "format":   "gif",
-                "config":   cfg,
-            })
+        out_path = out_dir / f"{name}.gif"
+        jobs.append({
+            "name":   name,                          # regime-encoded
+            "in":     str(src_path),                  # per-job source
+            "out":    str(out_path),
+            "format": "gif",
+            "config": cfg,
+        })
     m_path = out_dir / "bench-manifest.json"
     m = {
-        "in":     str(SOURCES_DIR / SOURCES[0]),     # initial source
+        "in":     str(SOURCES_DIR / variants[0][2]),  # initial source
         "frames": BENCH_FRAMES,
         "perf":   perf,
         "jobs":   jobs,
@@ -241,25 +298,94 @@ def run_full_suite(out_dir: Path, *, timeout_s: int = 900,
 
 # ---- Aggregate ms-per-frame for the suite (the loop's headline metric) ----
 
-def headline_ms(suite_result: dict) -> dict:
-    """Compress the suite's 20 variant readings into headline numbers
-    the orchestrator cares about: per-config geometric mean + global
-    geometric mean. Lower is better."""
+def _geomean(vals: list[float]) -> float:
     import math
-    by_cfg: dict[str, list[float]] = {}
-    for name, pj in suite_result["by_variant"].items():
-        cfg = name.split("__", 1)[1] if "__" in name else "default"
+    vals = [v for v in vals if v > 0]
+    if not vals:
+        return 0.0
+    return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+
+def headline_ms(suite_result: dict) -> dict:
+    """Reframed (Sutskever v3): the headline is a SCALING PROFILE, not a
+    single fixed-point geomean.
+
+    Returns:
+      * one key per variant (regime-encoded name → avg total ms)
+      * `geomean_light` / `geomean_heavy` — per-postproc-regime geomeans
+      * `max_regime_ms` — the single worst variant (the catastrophic
+        corner). THIS is the new optimization frontier: "lower the worst
+        regime." The GPU pipeline crushes it; CPU micro-opts cannot.
+      * `__geomean__` — overall geomean (kept for orchestrator back-compat)
+      * `cfg-default` — alias for the light__d240x120__c1024x504 variant
+        (the closest analog of the legacy default operating point), so
+        the orchestrator's default-ceiling guard keeps working until B4
+        reworks decide.py onto the composite objective.
+    """
+    by_variant = suite_result["by_variant"]
+    headline: dict[str, float] = {}
+    all_ms: list[float] = []
+    light_ms: list[float] = []
+    heavy_ms: list[float] = []
+    worst_name, worst_ms = None, 0.0
+
+    for name, pj in by_variant.items():
         ms = pj.get("avg_ms", {}).get("total", 0.0)
-        if ms > 0:
-            by_cfg.setdefault(cfg, []).append(ms)
-    headline = {}
-    all_ms = []
-    for cfg, vals in by_cfg.items():
-        if vals:
-            headline[cfg] = math.exp(sum(math.log(v) for v in vals) / len(vals))
-            all_ms.extend(vals)
+        if ms <= 0:
+            continue
+        headline[name] = ms
+        all_ms.append(ms)
+        if name.startswith("heavy"):
+            heavy_ms.append(ms)
+        else:
+            light_ms.append(ms)
+        if ms > worst_ms:
+            worst_ms, worst_name = ms, name
+
+    if light_ms:
+        headline["geomean_light"] = _geomean(light_ms)
+    if heavy_ms:
+        headline["geomean_heavy"] = _geomean(heavy_ms)
     if all_ms:
-        headline["__geomean__"] = math.exp(sum(math.log(v) for v in all_ms) / len(all_ms))
+        headline["__geomean__"] = _geomean(all_ms)
+    if worst_name is not None:
+        headline["max_regime_ms"] = worst_ms
+        headline["__worst_variant__"] = worst_name  # str — diagnostic only
+
+    # ---- B4: composite objective ----
+    # The render geomean is only one of three felt costs. Surface the two
+    # the loop has never measured — interactive switch latency and export
+    # wall-time (the dominant real cost, ITER-026) — and a weighted
+    # composite. Weights are IMPORTANCE weights (export ≈ half of felt
+    # time and was never optimized). decide.py self-serves these from the
+    # headline dict it already carries; missing terms (old binary) drop
+    # out and the remaining weights renormalize, so it degrades to
+    # render-only gracefully.
+    import statistics
+    switch_vals = [pj["switch_ms"] for pj in by_variant.values()
+                   if isinstance(pj.get("switch_ms"), (int, float))]
+    export_vals = [pj["encode_ms"] for pj in by_variant.values()
+                   if isinstance(pj.get("encode_ms"), (int, float))]
+    render_term = headline.get("__geomean__", 0.0)
+    headline["__render_ms__"] = render_term
+    if switch_vals:
+        headline["__switch_ms__"] = statistics.median(switch_vals)
+    if export_vals:
+        headline["__export_ms__"] = statistics.median(export_vals)
+
+    terms = [(0.3, render_term if render_term > 0 else None),
+             (0.2, headline.get("__switch_ms__")),
+             (0.5, headline.get("__export_ms__"))]
+    present = [(w, v) for w, v in terms if v is not None]
+    if present:
+        wsum = sum(w for w, _ in present)
+        headline["__score__"] = sum((w / wsum) * v for w, v in present)
+
+    # Back-compat alias for the orchestrator's default-ceiling guard.
+    if "light__d240x120__c1024x504" in headline:
+        headline["cfg-default"] = headline["light__d240x120__c1024x504"]
+    elif all_ms:
+        headline["cfg-default"] = _geomean(all_ms)
     return headline
 
 

@@ -1276,6 +1276,10 @@
   };
   window.__perfClear = function () { __pfRing = []; __pfLastChange = null; __pfLastLatency = null; };
   window.__perfRing = () => __pfRing;
+  /* Sutskever B2 — expose the last measured switch latency so the bench
+     can surface interactive felt-latency (config-change → first frame
+     that reflects it) as a first-class PERF_JOB objective term. */
+  window.__perfLastLatency = () => __pfLastLatency;
 
   /* Detect whether v2 advanced pipeline is needed. Returns false when every
      new gate is inert, in which case we take the legacy path (byte-identical). */
@@ -3129,6 +3133,11 @@
             anchors.push(framesB64[idxs[i]] || '');
           }
         }
+        /* Sutskever B2 — interactive switch latency: time from this
+           job's config being applied to the first frame that reflects
+           it (set by __pfCommit on the first recorded frame). null if
+           the change was never observed (no recorded frame). */
+        var _lat = (window.__perfLastLatency && window.__perfLastLatency()) || null;
         return {
           name: jobName,
           frames: jobFrames || (framesB64 ? framesB64.length : 0),
@@ -3136,6 +3145,7 @@
           avg_ms: avgMs,
           p50: p50,
           p95: p95,
+          switch_ms: _lat ? _lat.ms : null,
           frame_anchors: anchors,
         };
       }
@@ -3209,6 +3219,17 @@
         }
 
         setTimeout(() => {
+          /* Sutskever B2 — mark the switch point AFTER the artificial
+             settle, immediately before the first recorded draw. The
+             first __pfCommit then yields __pfLastLatency = wall time of
+             the first frame that reflects this job's config (atlas
+             rebuild / buffer realloc included). That is exactly the
+             interactive "slider → visible" cost; the artificial settle
+             delay is deliberately excluded so switch_ms reflects felt
+             latency, not the bench's pacing. */
+          if (perfMode && typeof window.__markChange === 'function') {
+            try { window.__markChange('job:' + job.name); } catch (_) {}
+          }
           self.beginRecord({
             total: job.frames || 24,
             collectFrames: true,
@@ -3244,8 +3265,15 @@
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
                     targetMaxBytes: (typeof job.targetMaxBytes === 'number' && job.targetMaxBytes > 0) ? job.targetMaxBytes : null,
                   };
+              /* Sutskever B3 — export wall-time is the dominant real cost
+                 (gifski encode 3–25 s/job, ITER-026) and no optimization
+                 has ever measured it. Time the full encode round-trip
+                 (frame IPC serialize + Rust encode + adaptive shrink) —
+                 exactly what a user waits on at export. */
+              const _encT0 = performance.now();
               tauri(cmd, args)
               .then(p => {
+                const _encMs = performance.now() - _encT0;
                 console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);
                 tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p }).catch(()=>{});
                 /* Emit PERF_JOB NDJSON when in perf mode — orchestrator
@@ -3254,6 +3282,7 @@
                   try {
                     const snap = snapshotPerf(job.name, job.frames || 24, frames);
                     if (snap) {
+                      snap.encode_ms = _encMs;
                       tauri('cli_log', { msg: 'PERF_JOB ' + JSON.stringify(snap) }).catch(()=>{});
                     }
                   } catch (e) {

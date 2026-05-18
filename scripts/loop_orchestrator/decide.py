@@ -35,6 +35,19 @@ MAX_ALLOWED_DELTA_MS = 3.0
 # SSIM threshold mirrored from score_ssim.py.
 SSIM_KEEP_THRESHOLD = 0.985
 
+# B4 — per-component regression guard. A patch may not regress ANY felt
+# cost beyond its own noise floor, even if the weighted composite
+# improves (prevents trading interactive latency for throughput, or
+# tanking export to shave render). Floors scale with each term's
+# magnitude: render ~4 ms (matches MIN_KEEP), switch ~10 ms (slider
+# felt-latency noise), export ~200 ms (gifski encode is 3–25 s; 200 ms
+# is well inside its run-to-run variance). Keyed to headline_ms() keys.
+COMPONENT_REGRESS_FLOORS = {
+    "__render_ms__": 4.0,
+    "__switch_ms__": 10.0,
+    "__export_ms__": 200.0,
+}
+
 
 @dataclass
 class CycleInputs:
@@ -110,6 +123,22 @@ def decide(inp: CycleInputs) -> Outcome:
                               f"({inp.default_after_ms:.1f}>{default_ceiling:.1f})",
                        delta_ms=delta, ssim_min=inp.ssim_global_min,
                        build_ok=inp.build_ok, tests_ok=inp.tests_ok)
+
+    # Rule 5.5 — B4 per-component regression guard. Self-served from the
+    # headline dicts CycleInputs already carries. Any felt cost (render /
+    # switch / export) regressing beyond its own floor reverts the cycle
+    # even if the composite or geomean improved. Missing terms (old
+    # binary, MP4 path) are skipped — degrades to render-only cleanly.
+    bH, aH = inp.baseline_headline or {}, inp.after_headline or {}
+    for key, floor in COMPONENT_REGRESS_FLOORS.items():
+        bv, av = bH.get(key), aH.get(key)
+        if isinstance(bv, (int, float)) and isinstance(av, (int, float)):
+            if (av - bv) > floor:
+                return Outcome(Decision.REVERT,
+                               reason=f"component_regressed_{key}_"
+                                      f"(+{av - bv:.1f}>{floor:.0f})",
+                               delta_ms=delta, ssim_min=inp.ssim_global_min,
+                               build_ok=inp.build_ok, tests_ok=inp.tests_ok)
 
     # Rule 6 — net win must clear the noise floor.
     if delta > -MIN_KEEP_DELTA_MS:

@@ -4,6 +4,61 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-18 — Sutskever audit, Part B: objective reframe (the loss was wrong)
+
+The Carmack audit optimized a fixed point and concluded CPU headroom was
+exhausted. The Sutskever audit's first finding: **the loop was minimising
+the wrong scalar.** It measured a geomean of 5 configs at ONE operating
+point (240×120 / 1024×504 / 24 frames), headless steady-state only —
+blind to (a) the scaling regimes users actually hit, (b) interactive
+slider latency, (c) export wall-time, the dominant real cost (gifski
+encode 3–25 s, ITER-026), which no optimization in the loop's history
+had ever measured. "Fix the loss before scaling" — landed before any
+GPU work.
+
+### ITER-027 — benchmark reframed to a scaling profile + 3-term composite
+
+- **B1 — scaling sweep.** `benchmark.py:_suite()` replaced: 4×5 fixed
+  point → 23 variants sweeping the two dominant cost axes (grid density
+  {120×60, 240×120, 400×300} × canvas {640×360, 1024×504, 1920×1008})
+  crossed with the two structurally-distinct postproc regimes (light =
+  vignette-only, heavy = 5-stage stack) + the catastrophic corner
+  (400×300 @ 2560×1600) + an animated-source sanity point + 2
+  source-sensitivity points. `fitCanvasToImage:false` on sweep points so
+  the canvas axis is authoritative. `BENCH_FRAMES` 24→12 to hold suite
+  wall-time (validated: 59 s, ≈ the old suite). `headline_ms()` now
+  emits per-regime geomeans + **`max_regime_ms`** — the new frontier
+  ("lower the worst regime," which the GPU pipeline crushes and CPU
+  micro-opts cannot).
+- **B2 — interactive switch latency.** Exposed `window.__perfLastLatency`
+  (`src/index.html`); the batch driver `__markChange('job:'+name)` right
+  before the first recorded draw (after the artificial settle, so it
+  measures the true config→first-frame cost, not bench pacing);
+  `snapshotPerf` emits `switch_ms`. Flows through `parse_perf_jobs`
+  untouched (json.loads).
+- **B3 — export wall-time.** Timed the full encode round-trip
+  (frame-IPC + Rust `encode_gif_gifski_adaptive` + adaptive shrink) in
+  the batch driver's `.then()`; `snap.encode_ms`. Zero Rust/parser risk.
+- **B4 — composite objective.** `headline_ms` adds `__render_ms__` /
+  `__switch_ms__` / `__export_ms__` and `__score__ =
+  0.3·render + 0.2·switch + 0.5·export` (importance weights;
+  renormalised over present terms so an old binary degrades to
+  render-only). `decide.py` gains a **per-component regression guard**
+  (render 4 ms / switch 10 ms / export 200 ms floors) self-served from
+  the headline dicts `CycleInputs` already carries — zero orchestrator
+  restructuring. Existing smoke tests still pass (guard skips when
+  component keys absent).
+- **Validation (one studio launch, 23 variants, 0 failures, 59 s):**
+  the scaling law is now visible — the old bench saw
+  `light__d240x120` = 7.9 ms and called the studio fast; the reframe
+  exposes `heavy__d400x300` at **114–138 ms** (15–18×) and the
+  dense+large corner at 119 ms. `geomean_light` 22 vs `geomean_heavy`
+  77; `__switch_ms__` 70 ms and `__export_ms__` 466 ms now measured for
+  the first time ever. The loss function finally sees the regimes the
+  GPU substrate (Part A, next) is built to flatten.
+
+---
+
 ## 2026-05-17 — Carmack audit WIN B: preserve sprite path — −70 ms but SSIM 0.71, REVERTED (architectural finding)
 
 - **Hypothesis (audit WIN B):** preserve colour mode uses `text()`/
