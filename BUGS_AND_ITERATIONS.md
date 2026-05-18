@@ -4,6 +4,55 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-05-18 — Sutskever audit, Part A Stage 1: WebGL substrate wired (correct, default-off; win deferred to Stage 2 as planned)
+
+The bitter-lesson move: a complete WebGL2 instanced renderer was already
+dormant in `glyph-wave6.js`. Stage 1 wires it behind a flag so the p5
+draw path can drive it.
+
+### ITER-028 — `CONFIG.renderer='webgl'` instanced-grid path (opt-in, gated, CPU-fallback)
+
+- **Landed:** `glyph-wave6.js` exposes `window.GlyphGrid.wave6.{make,draw}`
+  (a callable surface over the existing makeWebGLRenderer/drawWebGL
+  closures — no new render logic). `src/index.html`: `drawGridWebGL`
+  adapter (detached GL canvas → per-cell instPos/glyphIdx/colour from
+  the same gamma-LUT + ramp-idx resolution the CPU path uses; monochrome
+  intensity folded into per-cell colour as a bg→ink lerp so the shader's
+  glyph mask reproduces the CPU `globalAlpha=curved*1.1` look) →
+  one `drawImage` composite onto the p5 canvas. `CONFIG.renderer`
+  ('cpu' default | 'webgl'), gate at the top of `drawBrightnessGrid`
+  (monochrome + brightness + !depthFog + !dispersal + !_hasImgDataStages),
+  `_glOk` latches false on any GL exception → permanent CPU fallback.
+  Tweakpane toggle in the Grid folder (config-bound → auto-fires
+  `__markChange('renderer')`, feeding the B2 switch-latency term).
+- **A/B (light-monochrome, thor, renderer cpu vs webgl):**
+  | point | cpu ms | webgl ms | SSIM |
+  |---|---|---|---|
+  | default 240×120/1024×504 | 8.4 | 42.3 | 0.9998 |
+  | dense 400×300/1024×504 | 63.2 | 63.1 | 1.0000 |
+  | torture 400×300/2560×1600 | 35.4 | 35.6 | 0.9997 |
+- **Reading (not a failure — the plan predicted this exactly):**
+  - **Correctness proven:** SSIM 0.9997–1.0000 on the simplest
+    (monochrome) case — the GL port is faithful; flag + `_glOk`
+    fallback + default-cpu-unchanged all verified.
+  - **No bench win, default regresses 5×, because the recording path
+    reads every frame back.** A GL-composited canvas turns the bench's
+    per-frame frame-capture into a 28–50 ms GPU→CPU readback (default:
+    ~8 ms work + ~34 ms readback = 42 ms). This is the exact "readback
+    trap" the plan flagged: *Stage 1's win is in the INTERACTIVE path
+    (present the GPU canvas, never read back); a recording bench
+    structurally cannot show it.* It is also the headless-vs-interactive
+    objective mismatch the audit's Part B (ITER-027) identified.
+  - **Disposition:** Stage 1 ships as the correct, safe, **default-off**
+    substrate. No user regresses (opt-in; CPU default untouched —
+    verified). The performance payoff requires Stage 2's FBO chain
+    (grid→FBO, postproc as GPU fragment passes, ONE readback only at
+    export, never per interactive frame). Stage 2 is the next unit;
+    Stage 1 is its proven foundation. Sequenced exactly as the approved
+    plan specified.
+
+---
+
 ## 2026-05-18 — Sutskever audit, Part B: objective reframe (the loss was wrong)
 
 The Carmack audit optimized a fixed point and concluded CPU headroom was

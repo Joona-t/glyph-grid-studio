@@ -112,6 +112,12 @@
     /* --- v2 gate (single switch) --- */
     compat: 'v2',
 
+    /* Sutskever Stage 1 — render substrate. 'cpu' (default, the proven
+       canvas-2D sprite path) | 'webgl' (instanced-quad GPU path, opt-in,
+       gated to the monochrome/no-postproc signature path in v1, auto
+       CPU-fallback on GL failure). Stage 2 lifts the postproc gate. */
+    renderer: 'cpu',
+
     /* --- v1 fields ---
        Canvas matches the reference photo's 1356x668 (≈2.03:1).  Grid
        220x55 ≈ 12,100 cells (cell ~5.8 × 11.5, mono-char aspect).
@@ -2121,6 +2127,113 @@
     _gradColorLutKey = key;
   }
 
+  /* Sutskever Stage 1 — WebGL instanced-grid path (opt-in, gated).
+     `_glOk` latches false on the first GL exception for the session, so
+     a failed/absent GL context permanently falls back to the proven CPU
+     path. `_glCanvas` is a detached canvas the renderer draws into; its
+     result is composited onto the p5 canvas with one drawImage
+     (GPU→GPU, ~0 ms per ITER-015). Scope of v1: the signature path only
+     — monochrome + brightness selection + no depthFog + no dispersal +
+     no imgData postproc stage (the readback trap). Anything else falls
+     through to the unchanged CPU code below. */
+  let _glOk = true;
+  let _glCanvas = null;
+  let _glInstPos = null, _glGlyphIdx = null, _glColor = null;  // grow-only
+
+  function _glEnsureBuffers(n) {
+    if (!_glInstPos || _glInstPos.length < n * 4) {
+      _glInstPos = new Float32Array(n * 4);
+      _glColor   = new Float32Array(n * 3);
+    }
+    if (!_glGlyphIdx || _glGlyphIdx.length < n) {
+      _glGlyphIdx = new Float32Array(n);
+    }
+  }
+
+  /* Returns true if it rendered via WebGL (caller returns), false to
+     fall through to the CPU path. Never throws — GL failure latches
+     _glOk=false and returns false. */
+  function drawGridWebGL(cellIndex, signal, cols, rows, cellW, cellH,
+                         palette, ramp, rampLast) {
+    try {
+      const wave6 = window.GlyphGrid && window.GlyphGrid.wave6;
+      if (!wave6) { _glOk = false; return false; }
+      const W = width | 0, H = height | 0;
+      if (!_glCanvas) _glCanvas = document.createElement('canvas');
+      if (_glCanvas.width !== W || _glCanvas.height !== H) {
+        _glCanvas.width = W; _glCanvas.height = H;
+      }
+      const fontPx = CONFIG.font.size;
+      const fam = fontFamilyForActive();
+      // Atlas tile ~ the CPU sprite tile metrics so glyph size matches.
+      const aCW = Math.max(4, Math.ceil(fontPx * 1.1));
+      const aCH = Math.max(4, Math.ceil(fontPx * 1.4));
+      const r = wave6.make(_glCanvas, ramp, fam, fontPx, aCW, aCH);
+
+      const N = cols * rows;
+      _glEnsureBuffers(N);
+      const instPos = _glInstPos, glyphIdx = _glGlyphIdx, color = _glColor;
+      const cw = W / cols, ch = H / rows;
+      // monochrome: glyph stamped in ink, intensity = curved*1.1 folded
+      // into the per-cell colour as bg→ink lerp (the shader has no
+      // per-cell alpha; pre-dimming the colour reproduces the CPU
+      // globalAlpha=curved*1.1 look exactly).
+      const ink = (palette.inks && palette.inks[0]) || '#000';
+      const _ic = _hexToRgb(ink);
+      const inkR = _ic[0], inkG = _ic[1], inkB = _ic[2];
+      for (let rr = 0; rr < rows; rr++) {
+        const rowI = rr * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const sigI = signal[i];
+          const sigQ = sigI < 0 ? 0 : (sigI > 1 ? 1 : sigI);
+          const curved = _gammaLut[(sigQ * 255) | 0];
+          let idx;
+          if (cellIndex) {
+            idx = cellIndex[i];
+          } else {
+            idx = (curved * rampLast + 0.0001) | 0;
+            if (idx > rampLast) idx = rampLast;
+            else if (idx < 0) idx = 0;
+          }
+          let a = curved * 1.1; if (a > 1) a = 1; else if (a < 0) a = 0;
+          const o4 = i * 4, o3 = i * 3;
+          instPos[o4]     = (c + 0.5) * cw;
+          instPos[o4 + 1] = (rr + 0.5) * ch;
+          instPos[o4 + 2] = cw;
+          instPos[o4 + 3] = ch;
+          glyphIdx[i]     = idx;
+          color[o3]     = (bgR + (inkR - bgR) * a) / 255;
+          color[o3 + 1] = (bgG + (inkG - bgG) * a) / 255;
+          color[o3 + 2] = (bgB + (inkB - bgB) * a) / 255;
+        }
+      }
+      // The renderer's drawArraysInstanced uses instPos.length/4 as the
+      // instance count — pass exact-length views when the grow-only
+      // buffer is larger than N.
+      const ip = instPos.length === N * 4 ? instPos : instPos.subarray(0, N * 4);
+      const gi = glyphIdx.length === N ? glyphIdx : glyphIdx.subarray(0, N);
+      const cl = color.length === N * 3 ? color : color.subarray(0, N * 3);
+      wave6.draw(r, _glCanvas, ip, gi, cl,
+                 [bgR / 255, bgG / 255, bgB / 255]);
+      drawingContext.drawImage(_glCanvas, 0, 0);
+      return true;
+    } catch (e) {
+      console.warn('glyph-studio: WebGL path failed, latching CPU fallback:', e);
+      _glOk = false;
+      try { if (CONFIG) CONFIG.renderer = 'cpu'; } catch (_) {}
+      return false;
+    }
+  }
+
+  function _hexToRgb(hex) {
+    if (typeof hex !== 'string') return [0, 0, 0];
+    let h = hex.charAt(0) === '#' ? hex.slice(1) : hex;
+    if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+    const n = parseInt(h, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+
   // HOT-PATH: drawBrightnessGrid — autonomous optimization loop tracks no
   // per-frame allocations / no new branches in this function body.
   function drawBrightnessGrid(cellIndex, signal, cols, rows, cellW, cellH) {
@@ -2220,6 +2333,25 @@
     const _dispRippleAmt = _dispCfg.rippleAmt || 0;
     const _dispRippleSpan = Math.max(0.01, 1 - _dispRippleAmt);
     const _dispSeedBase = (CONFIG.seed | 0) >>> 0;
+
+    /* Sutskever Stage 1 gate. Opt-in via CONFIG.renderer==='webgl'.
+       v1 scope = the signature path: monochrome + brightness selection +
+       no depthFog + no dispersal + NO imgData postproc stage (the
+       getImageData readback trap — a GL-composited canvas forces a
+       28-50ms GPU→CPU readback, which would regress postproc-heavy;
+       Stage 2's FBO chain removes that constraint). Any miss → fall
+       through to the unchanged CPU code. Returns/short-circuits only on
+       a successful GL draw; _glOk latches false on GL failure. */
+    if (CONFIG.renderer === 'webgl' && _glOk
+        && colorMode === 'monochrome' && !depthFogActive && !_dispActive
+        && !(typeof _hasImgDataStages === 'function'
+             && _hasImgDataStages(CONFIG.postprocess))) {
+      if (drawGridWebGL(cellIndex, signal, cols, rows, cellW, cellH,
+                        palette, ramp, rampLast)) {
+        currentCellDepth = -1;
+        return;
+      }
+    }
 
     /* Fast path: monochrome + no depthFog. ~85% of users hit this.
        Sprite-atlas accelerated — pre-rasterised ramp tiles get blitted

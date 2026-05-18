@@ -717,4 +717,33 @@
     state: function () { return audioState.ac ? audioState.ac.state : 'uninit'; },
   });
 
+  /* Sutskever Stage 1 — expose the instanced renderer so the p5 draw
+     path can drive it directly against a detached GL canvas (the
+     `output.webgl-canvas` pipeline stage is not on the studio's draw
+     path). `make` lazily builds + caches a renderer per (canvas, ramp,
+     font, size); `draw` issues the single instanced draw. Both throw on
+     GL failure — the caller latches `_glOk=false` and falls back to the
+     CPU path. Kept minimal: no new logic, just a callable surface over
+     the existing makeWebGLRenderer/drawWebGL closures. */
+  const _wave6RendererCache = new WeakMap();
+  window.GlyphGrid.wave6 = Object.freeze({
+    /* Returns a cached renderer for `canvas`, rebuilt when the ramp
+       string or font metrics change (atlas is ramp/font-specific). */
+    make: function (canvas, rampStr, fontFamily, fontPx, atlasCellW, atlasCellH) {
+      let byCanvas = _wave6RendererCache.get(canvas);
+      const key = rampStr + '|' + fontFamily + '|' + fontPx + '|'
+                + atlasCellW + 'x' + atlasCellH;
+      if (byCanvas && byCanvas.key === key) return byCanvas.r;
+      const r = makeWebGLRenderer(canvas, rampStr, fontFamily, fontPx,
+                                  atlasCellW, atlasCellH);
+      _wave6RendererCache.set(canvas, { key: key, r: r });
+      return r;
+    },
+    /* instPos: Float32Array(N*4) [cx,cy,cellW,cellH]; glyphIdx:
+       Float32Array(N); color: Float32Array(N*3) 0..1; bg: [r,g,b] 0..1. */
+    draw: function (r, canvas, instPos, glyphIdx, color, bg) {
+      drawWebGL(r, canvas, instPos, glyphIdx, color, bg);
+    },
+  });
+
 })();

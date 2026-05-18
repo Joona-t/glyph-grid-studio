@@ -710,6 +710,14 @@
     if (!config.font) config.font = { family: 'monospace', size: 8 };
     tip(fGrid.addInput(config.font, 'size', { min: 3, max: 14, step: 1 }),
         'Glyph pixel size. Tune until characters bleed into neighbours and the grid pattern dissolves.');
+    /* Sutskever Stage 1 — render substrate. cpu = proven canvas-2D
+       sprite path. webgl = instanced-quad GPU path (opt-in; v1 covers
+       the monochrome/no-postproc signature path, auto-falls back to cpu
+       on GL failure). Bound to config so the panel's onChange fires
+       __markChange('renderer') → switch-latency captured by the bench. */
+    if (config.renderer === undefined) config.renderer = 'cpu';
+    tip(fGrid.addInput(config, 'renderer', { options: { cpu: 'cpu', webgl: 'webgl' } }),
+        'Render substrate. webgl uses one instanced GPU draw for the whole grid (massive dense-grid win); v1 is gated to the monochrome no-postproc path and auto-falls back to cpu if WebGL is unavailable.');
 
     var fMap = pane.addFolder({ title: 'Mapping' });
     if (opts.ramps) {
