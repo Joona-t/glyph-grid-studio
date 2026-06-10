@@ -21,14 +21,22 @@
       box-sizing: border-box;
     }
     canvas { display: block; }
+    /* Status bar (audit 2026-06-10, WCAG 1.4.3): solid chip instead of
+       55%-opacity bare text.  The old style washed out to ~2.4:1 when the
+       window was short enough for the bar to overlay the cream canvas.
+       #d9d2c4 on rgba(10,10,10,.82) ≥ 9:1 on any backdrop. */
     #status {
       position: fixed;
       bottom: 10px; left: 12px;
       font-size: 11px;
-      opacity: 0.55;
+      color: #d9d2c4;
+      background: rgba(10, 10, 10, 0.82);
+      padding: 3px 9px;
+      border-radius: 5px;
       pointer-events: none;
       white-space: nowrap;
     }
+    #status:empty { display: none; }
     /* Fallback @font-face is injected at runtime by glyph-fonts.js; the
        snippet below only kicks in if the loader fails before injection. */
   </style>
@@ -883,6 +891,16 @@
   function setup() {
     createCanvas(CONFIG.canvas.w, CONFIG.canvas.h);
     pixelDensity(1);
+    /* a11y (audit 2026-06-10): the p5 canvas is the app's primary
+       content; without a role/name VoiceOver announces nothing. */
+    try {
+      const _cv = document.querySelector('canvas');
+      if (_cv) {
+        _cv.setAttribute('role', 'img');
+        _cv.setAttribute('aria-label',
+          'Live glyph-grid render of the loaded image. Controls are in the glyph studio panel.');
+      }
+    } catch (e) {}
     src = createGraphics(CONFIG.canvas.w, CONFIG.canvas.h);
     src.pixelDensity(1);
 
@@ -1233,6 +1251,22 @@
   let __pfLastT = 0;
   let __pfLastChange = null;       // {key, t} — last config change that hasn't been observed yet
   let __pfLastLatency = null;      // last measured switch latency (for status bar)
+
+  /* prefers-reduced-motion (audit 2026-06-10, WCAG 2.3.3 / CLAUDE.md
+     a11y mandate).  Cached MediaQueryList — live `matches` reads stay
+     cheap on the hot path.  Policy: AMBIENT interactive motion
+     (breathing oscillation/jitter, live dispersal preview) is stilled
+     when the user asks for reduced motion; RECORDINGS are exempt —
+     dispersal/breathing in an export the user explicitly configured is
+     content, not interface chrome.  The CRT postprocess chain already
+     honors the same flag via applyChain's prefersReducedMotion. */
+  let __rmQuery = null;
+  function __prefersReducedMotion() {
+    if (!__rmQuery && window.matchMedia) {
+      __rmQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    }
+    return !!(__rmQuery && __rmQuery.matches);
+  }
 
   function __pfStart() {
     __pfFrame = { stages: {}, total: 0 };
@@ -1611,8 +1645,12 @@
     const _t_ema0 = performance.now();
     const _br = (CONFIG.studio && CONFIG.studio.breathing) || {};
     const _emaA = (typeof _br.emaAlpha === 'number') ? _br.emaAlpha : 0.35;
-    const _gainSwing = (typeof _br.gainSwing === 'number') ? _br.gainSwing : 0.30;
-    const _jitterAmt = (typeof _br.jitter === 'number') ? _br.jitter : 0.05;
+    /* Reduced-motion: still the ambient oscillation + jitter in the live
+       view (EMA smoothing itself is not motion).  Recording is exempt —
+       see __prefersReducedMotion's policy note. */
+    const _rmStill = __prefersReducedMotion() && !(recState && !recState.done);
+    const _gainSwing = _rmStill ? 0 : ((typeof _br.gainSwing === 'number') ? _br.gainSwing : 0.30);
+    const _jitterAmt = _rmStill ? 0 : ((typeof _br.jitter === 'number') ? _br.jitter : 0.05);
     const _pulseHz = (typeof _br.pulseHz === 'number') ? _br.pulseHz : 0.7;
     const _frameIdx = recState ? recState.frameIdx : (frameCount - 1);
     const _loopPhase = (_frameIdx / CONFIG.animation.fps) / CONFIG.animation.duration * Math.PI * 2;
@@ -2309,7 +2347,11 @@
        continue (no extra cost when dispersal is off — basePhase=0
        short-circuits the per-cell branch). */
     const _dispCfg = CONFIG.dispersal || {};
-    const _dispOn = !!(_dispCfg.enabled && _dispCfg.endT > _dispCfg.startT);
+    /* Reduced-motion stills the LIVE dispersal preview; recordings keep
+       the effect (explicit user-configured content — policy note at
+       __prefersReducedMotion). */
+    const _dispRmStill = __prefersReducedMotion() && !(recState && !recState.done);
+    const _dispOn = !_dispRmStill && !!(_dispCfg.enabled && _dispCfg.endT > _dispCfg.startT);
     let _dispBasePhase = 0;
     let _dispSwayPhase = 0;
     if (_dispOn) {
@@ -3067,7 +3109,7 @@
     const frameIdx = (recState && typeof recState.frameIdx === 'number')
       ? recState.frameIdx
       : (frameCount - 1);
-    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const reduced = __prefersReducedMotion();
 
     /* Phase A — only when any imgData stage is active. */
     if (_hasImgDataStages(post)) {
