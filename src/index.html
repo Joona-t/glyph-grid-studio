@@ -13,6 +13,14 @@
       color: #888;
       font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       min-height: 100vh;
+      /* Audit 2026-06-10 (live finding): wheel-scrolling the Tweakpane
+         panel scrolled the whole document, pushing the canvas out of
+         view while reaching the Export buttons at the bottom of the
+         panel.  The document never needs to scroll — the canvas centers
+         in the viewport and the panel scrolls internally (rule on
+         .tp-dfwv below). */
+      height: 100vh;
+      overflow: hidden;
     }
     body {
       display: grid;
@@ -21,6 +29,18 @@
       box-sizing: border-box;
     }
     canvas { display: block; }
+    /* Audit 2026-06-10 (WCAG 2.4.7): guarantee a visible focus indicator
+       on every interactive element — Tweakpane v3 ships no :focus-visible
+       styling of its own, so keyboard navigation was invisible. */
+    :focus-visible {
+      outline: 2px solid #8fb5ff;
+      outline-offset: 1px;
+    }
+    /* Tweakpane panel scrolls internally instead of the document. */
+    .tp-dfwv {
+      max-height: calc(100vh - 16px);
+      overflow-y: auto;
+    }
     /* Status bar (audit 2026-06-10, WCAG 1.4.3): solid chip instead of
        55%-opacity bare text.  The old style washed out to ~2.4:1 when the
        window was short enough for the bar to overlay the cream canvas.
@@ -1293,7 +1313,13 @@
   }
   function __pfLatencyTag() {
     if (!__pfLastLatency) return '';
-    return ` | switch ${__pfLastLatency.key}=${__pfLastLatency.ms.toFixed(0)}ms`;
+    /* Audit 2026-06-10: Tweakpane v3 change events sometimes lack
+       ev.target.key, which used to surface as the literal string
+       "switch unknown=21ms" in the user-facing status bar.  Drop the
+       key when we don't have one — the timing is still useful. */
+    const k = __pfLastLatency.key;
+    const label = (k && k !== 'unknown') ? k + '=' : '';
+    return ` | switch ${label}${__pfLastLatency.ms.toFixed(0)}ms`;
   }
 
   /* Public API: log every config change so we can compute switch latency.
@@ -3202,7 +3228,13 @@
     recState.zip.generateAsync({ type: 'blob' }).then((blob) => {
       if (typeof recState.onFinish === 'function') {
         recState.onFinish(blob);
-        statusEl().textContent = `RECORDED ${recState.total} frames → handled by test hook`;
+        /* This path IS the normal GUI export (recordGIF/recordMP4 hand
+           frames to the Rust encoder).  Audit 2026-06-10: the old
+           "handled by test hook" wording was developer jargon, and the
+           encode that follows can take 10–30 s with zero feedback — say
+           what is actually happening. */
+        statusEl().textContent =
+          `RECORDED ${recState.total} frames — encoding… (save dialog opens when done)`;
         return;
       }
       const url = URL.createObjectURL(blob);
@@ -3337,6 +3369,20 @@
         }
       }
 
+      /* Audit 2026-06-10: jobs with PARTIAL configs used to inherit
+         whatever the previous job set (e.g. job 1 sets dither.mode=
+         'jarvisJudiceNinke', job 2 only overrides `ramp` → silently
+         renders with job 1's dither).  Snapshot the pre-batch CONFIG
+         once and restore it before every job so each job's config is
+         applied against the same deterministic baseline. */
+      const baselineConfig = JSON.parse(JSON.stringify(CONFIG));
+      function resetToBaseline() {
+        for (const k in baselineConfig) {
+          const v = baselineConfig[k];
+          CONFIG[k] = (v && typeof v === 'object') ? JSON.parse(JSON.stringify(v)) : v;
+        }
+      }
+
       function next() {
         if (idx >= total) {
           console.log('batch: complete', total, 'jobs,', errors.length, 'errors');
@@ -3368,6 +3414,7 @@
         _runJob();
 
       function _runJob() {
+        resetToBaseline();          // audit 2026-06-10: no cross-job leakage
         applyConfig(job.config);
         // Force loop on so draw() advances
         try { loop(); } catch (e) {}

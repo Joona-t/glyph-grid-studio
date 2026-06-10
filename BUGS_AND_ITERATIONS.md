@@ -4,6 +4,59 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-06-10 — Full audit sprint CS-2 (v0.1.2): daily-use UX
+
+### ITER-030 — Export feedback (live-verified gap)
+
+- **Problem:** live GUI audit timed the export flow: after frame capture
+  the status bar read "RECORDED 133 frames → handled by test hook"
+  (developer jargon), then ~20 s of total silence during the gifski
+  encode, then the save dialog; after saving, success/path went ONLY to
+  the devtools console.  Encoder errors were also console-only.
+- **Fix:** status now reads "RECORDED N frames — encoding… (save dialog
+  opens when done)"; new `exportFeedback()` writes status bar + toast on
+  save success ("Saved GIF → path"), on encoder failure (error toast +
+  ZIP fallback note), and clears quietly on user-cancelled dialogs.
+  Reused the existing `showToast` utility — no new UI machinery.
+
+### ITER-031 — Batch jobs inherited the previous job's config
+
+- **Problem (adjacent find from the adversarial verify pass):** a batch
+  job with a PARTIAL config silently inherited every field the previous
+  job had set (job 1 sets `dither.mode='jarvisJudiceNinke'`, job 2 only
+  overrides `ramp` → renders with job 1's dither).  Driver scripts
+  worked around this by always sending full snapshots.
+- **Fix:** `runBatchExport` snapshots CONFIG once at batch start and
+  restores that baseline before every job's `applyConfig` — each job now
+  applies against the same deterministic base.
+- Plus: Rust `run_headless_batch` now rejects any job with a missing/empty
+  `out` BEFORE rendering starts (previously surfaced as a cryptic
+  fs::write error after the whole render had run).
+
+### ITER-032 — Keyboard/scroll/jargon polish (live-verified)
+
+- `:focus-visible` outline for every control (Tab previously produced
+  ZERO visible focus anywhere — WCAG 2.4.7).
+- Panel wheel-scroll no longer scrolls the document (canvas used to get
+  pushed out of view while reaching the Export buttons); the Tweakpane
+  root scrolls internally, body is overflow:hidden.
+- Status bar no longer shows the literal "switch unknown=21ms" when
+  Tweakpane v3 omits the changed-key name; timing is kept, broken label
+  dropped.
+
+### Sprint confession — gate hang false alarm (process finding)
+
+The first CS-2 gate run hung 35+ min on B4's 6-frame render.  Bisection
+(4 builds: CS-2 full, index-reverted, full control, exact-command
+control) proved the code was innocent — a one-off WKWebView first-launch
+flake; the rerun passed 18/18 in ~6 min.  Two real findings fell out:
+(1) `tests/run-all.sh` had NO per-test timeouts, so any webview flake
+hangs the gate forever (fixed in CS-3); (2) `render --in <relative-path>`
+hangs instead of erroring — driver scripts always pass absolute paths,
+which is why it was never seen (logged as deferred follow-up).
+
+---
+
 ## 2026-06-10 — Full audit sprint CS-1 (v0.1.1): P0 correctness
 
 Audit method: 3-dimension parallel code audit + adversarial verification of
