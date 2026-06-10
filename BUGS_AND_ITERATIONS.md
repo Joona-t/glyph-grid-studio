@@ -4,6 +4,33 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-06-10 — Full audit sprint CS-4 (v0.1.4): loop-harness hardening
+
+### ITER-035 — Orchestrator resilience (audit arch findings, all confirmed by adversarial re-read)
+
+- **Zombie studio on bench timeout:** `subprocess.run(timeout=…)` raises
+  but does NOT kill the child — a timed-out bench left the studio
+  rendering in the background while the loop moved on.  `run_benchmark`
+  now uses Popen + explicit `kill()` + bounded drain.
+- **state.json corruption window:** `save_state` wrote the tmp file
+  without fsync; a SIGKILL mid-write left a truncated tmp and
+  `load_state` silently fell back to a FRESH state on restart (all
+  pursuit progress lost).  Now fsync-before-rename + tmp cleanup on
+  failure.
+- **Signal handler could raise:** the SIGINT/SIGTERM lambda called
+  `save_state` unguarded — an exception there killed the loop without
+  marking `interrupted`.  Now a proper function with try/except.
+- **Git chain ran past failures:** `commit_and_push` kept executing
+  checkout/merge/push after a failed commit (e.g. pre-commit hook
+  rejection), leaving the cycle branch unmerged with the failure
+  half-hidden.  Now aborts the chain on first non-zero rc (+120 s
+  timeouts on every git step; `git apply` in patch_runner got the same).
+- **PERF_JOB_ERR silently dropped:** when the studio's perf snapshot
+  threw, it emitted `PERF_JOB_ERR …` which matched nothing in the
+  parser regex — invisible.  Now surfaced as a WARNING line.
+
+---
+
 ## 2026-06-10 — Full audit sprint CS-3 (v0.1.3): tests + docs
 
 ### ITER-033 — Coverage for every untested shipped feature

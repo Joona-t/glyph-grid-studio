@@ -558,7 +558,7 @@ def apply_patch(diff_text: str, *, branch: str) -> dict:
 
     # Branch + apply with the same flags that passed --check
     subprocess.run(["git", "checkout", "-B", branch], capture_output=True,
-                   text=True, cwd=str(REPO_ROOT))
+                   text=True, cwd=str(REPO_ROOT), timeout=60)
     apply_flags = ["--ignore-whitespace", "--recount"] if mode == "ws-relaxed" else []
     rc, err = _run(apply_flags)
     if rc != 0:
