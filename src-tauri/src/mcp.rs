@@ -73,7 +73,7 @@ pub struct GlyphGridServer;
 impl GlyphGridServer {
     #[tool(
         description = "Render an image to an animated character-grid GIF (ASCII / Unicode glyphs). \
-                       Returns the absolute path of the written GIF on success."
+                       Returns the absolute path of the written file (GIF or MP4, per `format`) on success."
     )]
     fn glyph_grid_render(
         &self,

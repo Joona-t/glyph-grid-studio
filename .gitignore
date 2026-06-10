@@ -26,3 +26,4 @@ package-lock.json
 *.dmg
 *.zip
 tests/scratch/
+tests/RESULTS-V0.1.md
