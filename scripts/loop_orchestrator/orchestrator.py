@@ -93,9 +93,22 @@ class State:
 
 
 def save_state(s: State) -> None:
+    # Audit 2026-06-10 (CS-4): fsync before the atomic rename — a SIGKILL
+    # mid-write used to leave a truncated .tmp and, on restart, load_state
+    # silently fell back to a fresh State (all cycle progress lost).
     tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(s.to_dict(), indent=2))
-    os.replace(tmp, STATE_PATH)
+    try:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(s.to_dict(), indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_PATH)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def load_state() -> State | None:
@@ -432,11 +445,19 @@ def commit_and_push(cycle_n: int, hyp: dict, outcome: dec.Outcome) -> dict:
     committed_ok = False
     for cmd in cmds:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           cwd=str(REPO_ROOT))
+                           cwd=str(REPO_ROOT), timeout=120)
         notes.append({"cmd": " ".join(cmd), "rc": r.returncode,
                        "stderr": r.stderr.strip()[:300]})
         if cmd[1] == "commit" and r.returncode == 0:
             committed_ok = True
+        if r.returncode != 0:
+            # Audit 2026-06-10 (CS-4): previously the loop kept executing
+            # checkout/merge/push after a failed commit (e.g. pre-commit
+            # hook rejection), leaving the repo on main with the cycle
+            # branch unmerged and the failure half-hidden in the notes.
+            print(f"orchestrator: git step failed, aborting chain: "
+                  f"{' '.join(cmd)} rc={r.returncode}", flush=True)
+            break
     return {"committed": committed_ok, "msg": msg, "iter_id": iter_id,
             "log": notes, "staged": stage_paths}
 
@@ -686,7 +707,13 @@ def main() -> int:
         "max_cycles": args.max_cycles, "resume": args.resume,
     })
 
-    sigint_handler = lambda *_: setattr(state, "interrupted", True) or save_state(state)
+    def sigint_handler(*_):
+        state.interrupted = True
+        try:
+            save_state(state)
+        except Exception as e:   # audit CS-4: never let the handler raise
+            print(f"orchestrator: save_state failed in signal handler: {e}",
+                  flush=True)
     signal.signal(signal.SIGINT, sigint_handler)
     signal.signal(signal.SIGTERM, sigint_handler)
 

@@ -242,23 +242,33 @@ def run_benchmark(manifest_path: Path, *, timeout_s: int = 600,
     import time
     cmd = [bin_path, "batch", "--manifest", str(manifest_path)]
     t0 = time.time()
+    # Audit 2026-06-10 (CS-4): subprocess.run(timeout=...) raises
+    # TimeoutExpired but does NOT kill the child — the studio kept
+    # rendering in the background as a zombie while the orchestrator
+    # moved on to the next cycle.  Popen + explicit kill() guarantees
+    # the process tree dies with the timeout.
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True, text=True,
-            timeout=timeout_s,
-        )
+        stdout, stderr = proc.communicate(timeout=timeout_s)
         rc = proc.returncode
-        stdout = proc.stdout
-        stderr = proc.stderr
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
         rc = 124
-        stdout = (e.stdout or b"").decode("utf-8", "replace") if e.stdout else ""
-        stderr = (e.stderr or b"").decode("utf-8", "replace") if e.stderr else ""
     duration_s = time.time() - t0
 
     perf_jobs = []
     for line in stderr.splitlines():
+        # Audit 2026-06-10 (CS-4): surface snapshot failures instead of
+        # silently dropping them (regex below only matches PERF_JOB {...}).
+        if "PERF_JOB_ERR" in line:
+            print(f"benchmark: WARNING perf snapshot failed: {line.strip()[:200]}",
+                  flush=True)
         m = PERF_LINE.search(line)
         if m:
             try:
