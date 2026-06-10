@@ -328,6 +328,16 @@
     if (msg) {
       try { showToast((isError ? '⚠ ' : '') + msg, isError ? 6000 : 3200); } catch (e) {}
     }
+    /* BUG-009: finishRecording sets __statusHold so the resumed draw
+       loop doesn't clobber export feedback.  Every export settles
+       through here (saved / cancelled / failed) — keep the final
+       message on the bar briefly, then hand the bar back to draw(). */
+    try {
+      clearTimeout(window.__statusHoldTimer);
+      window.__statusHoldTimer = setTimeout(function () {
+        window.__statusHold = false;
+      }, msg ? 3500 : 0);
+    } catch (e) {}
   }
 
   /* Native (Tauri) path: collect frame base64 strings during the recording
@@ -348,6 +358,7 @@
           var frames = rs && rs.framesB64 ? rs.framesB64 : [];
           if (!frames.length) {
             console.warn('glyph-studio: no frames collected, falling back to ZIP');
+            exportFeedback('No frames collected — saved raw frames as ZIP instead', true);
             saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
             return;
           }
@@ -365,10 +376,10 @@
             targetMaxBytes: (typeof targetMaxBytes === 'number' && targetMaxBytes > 0) ? targetMaxBytes : null,
           })
             .then(function (p) {
-              if (p) {
-                console.log('glyph-studio: saved GIF to', p);
-                exportFeedback('Saved GIF → ' + p);
-              }
+              /* Always settle through exportFeedback — it releases the
+                 BUG-009 status hold even when p is unexpectedly empty. */
+              if (p) console.log('glyph-studio: saved GIF to', p);
+              exportFeedback(p ? 'Saved GIF → ' + p : '');
             })
             .catch(function (e) {
               if (e === 'cancelled') { exportFeedback(''); return; }
@@ -410,6 +421,7 @@
           var frames = rs && rs.framesB64 ? rs.framesB64 : [];
           if (!frames.length) {
             console.warn('glyph-studio: no frames collected, falling back to ZIP');
+            exportFeedback('No frames collected — saved raw frames as ZIP instead', true);
             saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
             return;
           }
@@ -427,10 +439,10 @@
             border: (border && border.enabled) ? border : null,
           })
             .then(function (p) {
-              if (p) {
-                console.log('glyph-studio: saved MP4 to', p);
-                exportFeedback('Saved MP4 → ' + p);
-              }
+              /* Always settle through exportFeedback — it releases the
+                 BUG-009 status hold even when p is unexpectedly empty. */
+              if (p) console.log('glyph-studio: saved MP4 to', p);
+              exportFeedback(p ? 'Saved MP4 → ' + p : '');
             })
             .catch(function (e) {
               if (e === 'cancelled') { exportFeedback(''); return; }
