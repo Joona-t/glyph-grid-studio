@@ -8,8 +8,15 @@
 set -u
 cd "$(dirname "$0")/.."  # repo root
 
-BIN="$HOME/glyph-grid-studio/src-tauri/target/release/bundle/macos/Glyph Grid Studio.app/Contents/MacOS/glyph-grid-studio"
-TEST_IMG="$HOME/Downloads/Thor.png"
+# BIN overridable via env (audit 2026-06-10) — lets worktrees/CI point the
+# gate at their own build instead of the hardcoded primary-tree bundle.
+BIN="${BIN:-$HOME/glyph-grid-studio/src-tauri/target/release/bundle/macos/Glyph Grid Studio.app/Contents/MacOS/glyph-grid-studio}"
+TEST_IMG="${TEST_IMG:-$HOME/Downloads/Thor.png}"
+
+# Per-invocation timeout (audit 2026-06-10): a single WKWebView first-launch
+# flake used to hang the whole gate forever (35 min observed). Any render
+# that needs >3 min is a failure, not a wait.
+bin_t() { timeout "${TEST_TIMEOUT:-180}" "$BIN" "$@"; }
 SCRATCH="tests/scratch"
 RESULTS="tests/RESULTS-V0.1.md"
 
@@ -93,13 +100,17 @@ fi
 # ---------- Phase B: CLI ----------
 section "Phase B — CLI surface"
 
-# B1: --help lists subcommands
+# B1: --help lists ALL FIVE subcommands (audit 2026-06-10: previously only
+# checked 4 — batch could vanish from the CLI without failing the gate).
 HELP=$("$BIN" --help 2>&1)
-if echo "$HELP" | grep -q "studio" && echo "$HELP" | grep -q "render" && \
-   echo "$HELP" | grep -q "catalog" && echo "$HELP" | grep -q "mcp"; then
-  pass "B1 --help lists all 4 subcommands"
+B1_OK=1
+for sub in studio render batch catalog mcp; do
+  echo "$HELP" | grep -q "$sub" || { B1_OK=0; B1_MISSING="$sub"; }
+done
+if [[ $B1_OK -eq 1 ]]; then
+  pass "B1 --help lists all 5 subcommands (studio/render/batch/catalog/mcp)"
 else
-  fail "B1 --help lists all 4 subcommands" "$HELP"
+  fail "B1 --help lists all 5 subcommands" "missing: $B1_MISSING"
 fi
 
 # B2: render --help lists all 14 flags
@@ -135,7 +146,7 @@ fi
 # B4: minimal render
 B4_OUT="$SCRATCH/b4_minimal.gif"
 rm -f "$B4_OUT"
-if "$BIN" render --in "$TEST_IMG" --out "$B4_OUT" --frames 6 >/dev/null 2>&1 && [[ -f "$B4_OUT" ]]; then
+if bin_t render --in "$TEST_IMG" --out "$B4_OUT" --frames 6 >/dev/null 2>&1 && [[ -f "$B4_OUT" ]]; then
   if file "$B4_OUT" | grep -q "GIF image data, version 89a"; then
     SIZE=$(stat -f%z "$B4_OUT")
     if [[ $SIZE -gt 200000 && $SIZE -lt 15000000 ]]; then
@@ -153,7 +164,7 @@ fi
 # B5: full-flag render
 B5_OUT="$SCRATCH/b5_full.gif"
 rm -f "$B5_OUT"
-if "$BIN" render \
+if bin_t render \
     --in "$TEST_IMG" --out "$B5_OUT" --frames 6 \
     --palette spice --color-mode gradient --ramp blockAscend \
     --dither stbn --selection-mode shape-edge-aware --glyph-set octant \
@@ -167,10 +178,79 @@ else
 fi
 
 # B7: error path - bad input
-if "$BIN" render --in /tmp/__nonexistent_file__.png --out "$SCRATCH/b7.gif" --frames 6 >/dev/null 2>&1; then
+if bin_t render --in /tmp/__nonexistent_file__.png --out "$SCRATCH/b7.gif" --frames 6 >/dev/null 2>&1; then
   fail "B7 bad input fails non-zero" "exited zero with bad input"
 else
   pass "B7 bad input exits non-zero"
+fi
+
+# B8-B11 (audit 2026-06-10): the batch CLI, multi-source manifests,
+# PERF_JOB emission, MP4 export, and the twitter-fit shrink ladder all
+# shipped with ZERO automated coverage. One multi-job batch session
+# covers the first four; a second tiny batch exercises the ladder.
+REPO_ABS="$(pwd -P)"
+B8_MANIFEST="$SCRATCH/b8-manifest.json"
+cat > "$B8_MANIFEST" <<EOF
+{
+  "in": "$REPO_ABS/tests/sources/thor.png",
+  "frames": 4,
+  "perf": true,
+  "jobs": [
+    {"name": "b8a-gif", "in": "$REPO_ABS/tests/sources/thor.png",
+     "out": "$REPO_ABS/$SCRATCH/b8a.gif", "format": "gif", "config": {}},
+    {"name": "b8b-mp4", "in": "$REPO_ABS/tests/sources/synthetic-noise.png",
+     "out": "$REPO_ABS/$SCRATCH/b8b.mp4", "format": "mp4", "config": {}}
+  ]
+}
+EOF
+B8_STDERR="$SCRATCH/b8-stderr.txt"
+if bin_t batch --manifest "$B8_MANIFEST" 2>"$B8_STDERR" >/dev/null \
+   && [[ -f "$SCRATCH/b8a.gif" && -f "$SCRATCH/b8b.mp4" ]]; then
+  pass "B8 batch CLI: 2-job multi-source manifest renders both outputs"
+else
+  fail "B8 batch CLI multi-source manifest" "exit=$? a=$([[ -f $SCRATCH/b8a.gif ]] && echo y || echo n) b=$([[ -f $SCRATCH/b8b.mp4 ]] && echo y || echo n) $(tail -2 "$B8_STDERR" | tr '\n' ' ')"
+fi
+
+# B9: MP4 output is a real ISO-BMFF file (ftyp box at offset 4)
+if [[ -f "$SCRATCH/b8b.mp4" ]] && head -c 12 "$SCRATCH/b8b.mp4" | tail -c 8 | grep -q "ftyp"; then
+  pass "B9 MP4 export produces ISO-BMFF (ftyp) container"
+else
+  fail "B9 MP4 export ftyp magic" "header: $(head -c 12 "$SCRATCH/b8b.mp4" 2>/dev/null | xxd -p 2>/dev/null | head -1)"
+fi
+
+# B10: PERF_JOB NDJSON emitted when manifest sets perf:true
+if grep -q "PERF_JOB {" "$B8_STDERR"; then
+  pass "B10 PERF_JOB NDJSON emitted in perf mode"
+else
+  fail "B10 PERF_JOB NDJSON emitted" "no PERF_JOB line in batch stderr"
+fi
+
+# B11: twitter-fit adaptive shrink ladder engages when targetMaxBytes is
+# tiny, and the output is genuinely smaller than the 720px cap would give.
+B11_MANIFEST="$SCRATCH/b11-manifest.json"
+cat > "$B11_MANIFEST" <<EOF
+{
+  "in": "$REPO_ABS/tests/sources/thor.png",
+  "frames": 4,
+  "jobs": [
+    {"name": "b11-fit", "out": "$REPO_ABS/$SCRATCH/b11.gif", "format": "gif",
+     "capWidth": 720, "targetMaxBytes": 200000, "config": {}}
+  ]
+}
+EOF
+B11_STDERR="$SCRATCH/b11-stderr.txt"
+bin_t batch --manifest "$B11_MANIFEST" 2>"$B11_STDERR" >/dev/null
+B11_W=$(python3 -c "
+import struct,sys
+try:
+    d=open('$SCRATCH/b11.gif','rb').read(10)
+    print(struct.unpack('<H', d[6:8])[0])
+except Exception: print(0)")
+if grep -q "twitter-fit:" "$B11_STDERR" && grep -q "shrink ladder" "$B11_STDERR" \
+   && [[ -f "$SCRATCH/b11.gif" && "$B11_W" -le 600 && "$B11_W" -gt 0 ]]; then
+  pass "B11 twitter-fit ladder engages (output ${B11_W}px <= 600)"
+else
+  fail "B11 twitter-fit ladder" "width=$B11_W ladder_lines=$(grep -c 'twitter-fit:' "$B11_STDERR" 2>/dev/null || echo 0)"
 fi
 
 # ---------- Phase C: MCP ----------

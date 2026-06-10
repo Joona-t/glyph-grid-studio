@@ -30,7 +30,8 @@ def kill_studio() -> dict:
 
 
 def revert_workspace() -> dict:
-    """Hard-reset the working tree, switch back to main, delete branch."""
+    """Hard-reset the working tree and switch back to main (branches are
+    left in place — deletion is the orchestrator's call, not recovery's)."""
     cmds = [
         ["git", "reset", "--hard"],
         ["git", "checkout", "main"],
