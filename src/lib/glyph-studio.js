@@ -52,6 +52,42 @@
   var PRESET_PREFIX = 'glyph-studio:';
   function presetKey(n) { return PRESET_PREFIX + n; }
 
+  /* Rust-backed persistence mirror (BUG-006, audit 2026-06-10).
+     WKWebView does NOT persist localStorage for Tauri's custom-scheme
+     origin — the on-disk LocalStorage store has been empty since first
+     install, so presets ("Save current") and recent-sources silently
+     vanished on every relaunch.  localStorage stays the synchronous
+     in-session store; every write is mirrored to
+     app_config_dir()/persist.json via the kv_save command, and on
+     startup kv_load_all seeds localStorage.  Panel dropdowns that read
+     this data subscribe to _persistReady and rebuild once the seed
+     lands (init() runs before the async load resolves). */
+  var _tauriInvoke = (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
+    ? function (cmd, args) { return window.__TAURI__.core.invoke(cmd, args); }
+    : null;
+  function persistMirror(key) {
+    if (!_tauriInvoke) return;
+    var v = localStorage.getItem(key);   // null ⇒ delete on the Rust side
+    _tauriInvoke('kv_save', { key: key, value: v }).catch(function (e) {
+      console.warn('glyph-studio: persist mirror failed for', key, e);
+    });
+  }
+  var _persistReady = _tauriInvoke
+    ? _tauriInvoke('kv_load_all').then(function (json) {
+        var data = {};
+        try { data = JSON.parse(json || '{}'); } catch (e) {}
+        for (var k in data) {
+          if (typeof data[k] === 'string' && localStorage.getItem(k) === null) {
+            try { localStorage.setItem(k, data[k]); } catch (e) {}
+          }
+        }
+        return true;
+      }).catch(function (e) {
+        console.warn('glyph-studio: kv_load_all failed', e);
+        return false;
+      })
+    : Promise.resolve(false);
+
   function listPresets() {
     var out = [];
     for (var i = 0; i < localStorage.length; i++) {
@@ -62,7 +98,11 @@
   }
   function savePreset(name, snap) {
     if (!name) return false;
-    try { localStorage.setItem(presetKey(name), JSON.stringify(snap)); return true; }
+    try {
+      localStorage.setItem(presetKey(name), JSON.stringify(snap));
+      persistMirror(presetKey(name));   // BUG-006: survive relaunch
+      return true;
+    }
     catch (e) { console.warn('glyph-studio: localStorage full?', e); return false; }
   }
   function loadPreset(name) {
@@ -481,6 +521,11 @@
       return Array.isArray(arr) ? arr : [];
     } catch (e) { return []; }
   }
+  /* Set by the Recent dropdown builder in init(); lets addRecentSource
+     refresh the visible options in-session (Tweakpane v3 bakes list
+     options at addInput time — without this, a freshly-loaded image
+     never appears until relaunch). */
+  var _refreshRecentDropdown = null;
   function addRecentSource(path) {
     if (!path) return;
     var list = getRecentSources();
@@ -488,6 +533,8 @@
     list.unshift({ path: path, name: basename(path), ts: Date.now() });
     list = list.slice(0, 5);
     try { localStorage.setItem(RECENT_KEY, JSON.stringify(list)); } catch (e) {}
+    persistMirror(RECENT_KEY);          // BUG-006: survive relaunch
+    if (_refreshRecentDropdown) { try { _refreshRecentDropdown(); } catch (e) {} }
   }
   /* Expose to setupImageDrop so the drag-drop path also tracks recents. */
   window.__glyphAddRecentSource = addRecentSource;
@@ -652,11 +699,13 @@
       }
     });
 
-    /* Recent sources dropdown — last 5 image paths persisted in
-       localStorage (key `glyphgrid:recentSources`).  Selecting a recent
-       re-loads via the read_image_file Tauri command (Tauri only).
-       Rebuilt every time the dropdown opens so freshly-loaded images
-       appear without a panel reload.  Browser preview: shows nothing. */
+    /* Recent sources dropdown — last 5 image paths persisted via the
+       Rust kv store (BUG-006) with localStorage as the in-session cache.
+       Tweakpane v3 bakes list options at addInput time, so the input is
+       disposed + re-added in place whenever the list changes: after each
+       image load (via _refreshRecentDropdown ← addRecentSource) and once
+       _persistReady seeds localStorage from disk.  Browser preview:
+       shows nothing. */
     var inTauriForRecent = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
     if (inTauriForRecent) {
       var recentBox = { sel: '' };
@@ -666,11 +715,8 @@
         for (var i = 0; i < list.length; i++) opt[list[i].name] = list[i].path;
         return opt;
       }
-      var _recentBinding = fImg.addInput(recentBox, 'sel', {
-        label: 'Recent', options: rebuildRecentOptions(),
-      });
-      tip(_recentBinding, 'Last 5 images you opened. Pick one to re-load. Cleared by clearing browser localStorage.');
-      _recentBinding.on('change', function (e) {
+      var _recentBinding = null;
+      function onRecentChange(e) {
         if (!e.value) return;
         window.__TAURI__.core.invoke('read_image_file', { path: e.value })
           .then(function (dataUrl) {
@@ -698,7 +744,23 @@
             console.warn('Recent sources: load failed for', e.value, err);
           });
         recentBox.sel = '';
-      });
+      }
+      function buildRecentInput() {
+        var index;
+        if (_recentBinding) {
+          index = fImg.children.indexOf(_recentBinding);
+          _recentBinding.dispose();
+        }
+        var params = { label: 'Recent', options: rebuildRecentOptions() };
+        if (typeof index === 'number' && index >= 0) params.index = index;
+        recentBox.sel = '';
+        _recentBinding = fImg.addInput(recentBox, 'sel', params);
+        tip(_recentBinding, 'Last 5 images you opened. Pick one to re-load.');
+        _recentBinding.on('change', onRecentChange);
+      }
+      buildRecentInput();
+      _refreshRecentDropdown = buildRecentInput;
+      _persistReady.then(function (seeded) { if (seeded) buildRecentInput(); });
     }
 
     var fGrid = pane.addFolder({ title: 'Grid' });
@@ -976,7 +1038,12 @@
       if (!presetState.name) return;
       savePreset(presetState.name, snapshotConfig(config));
       console.log('glyph-studio: saved preset', presetState.name);
+      try { showToast('Preset saved: ' + presetState.name, 2600); } catch (e) {}
+      buildLoadInput();   // make the new preset selectable immediately
     });
+    /* Load dropdown — same dispose+re-add pattern as the Recent input
+       (Tweakpane v3 bakes options at addInput time; BUG-006 seeds
+       presets from disk asynchronously after init). */
     var slot = { sel: '' };
     function rebuildLoad() {
       var pres = listPresets();
@@ -984,12 +1051,25 @@
       pres.forEach(function (n) { o[n] = n; });
       return o;
     }
-    fPre.addInput(slot, 'sel', { label: 'Load', options: rebuildLoad() })
-      .on('change', function (e) {
+    var _loadBinding = null;
+    function buildLoadInput() {
+      var index;
+      if (_loadBinding) {
+        index = fPre.children.indexOf(_loadBinding);
+        _loadBinding.dispose();
+      }
+      var params = { label: 'Load', options: rebuildLoad() };
+      if (typeof index === 'number' && index >= 0) params.index = index;
+      slot.sel = '';
+      _loadBinding = fPre.addInput(slot, 'sel', params);
+      _loadBinding.on('change', function (e) {
         if (!e.value) return;
         var p = loadPreset(e.value);
         if (p) { applyPreset(config, p); pane.refresh(); }
       });
+    }
+    buildLoadInput();
+    _persistReady.then(function (seeded) { if (seeded) buildLoadInput(); });
     fPre.addButton({ title: 'Export JSON' }).on('click', function () {
       var snap = snapshotConfig(config);
       if (savePresetNative(snap)) return;

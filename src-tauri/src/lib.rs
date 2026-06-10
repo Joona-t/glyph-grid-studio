@@ -351,7 +351,7 @@ pub fn catalog_json() -> String {
         "palettes": [
             "monochrome", "phosphor", "bauhaus", "lovespark", "mono-amber",
             "cyber-phosphor", "amber-phosphor", "bone-charcoal",
-            "cream-paper", "silver-charcoal", "spice"
+            "cream-paper", "silver-charcoal", "spice", "kawaii-pink"
         ],
         "color_modes": ["preserve", "monochrome", "duotone", "gradient"],
         "ramps": [
@@ -1040,6 +1040,57 @@ async fn read_image_file(path: String) -> Result<String, String> {
     read_path_as_data_url(&p)
 }
 
+/// ---- Rust-backed key-value persistence (AUDIT-2026-06-10 / BUG-006) ----
+///
+/// WKWebView does NOT persist localStorage for Tauri's custom-scheme origin:
+/// ~/Library/WebKit/<bundle-id>/WebsiteData/LocalStorage/ has been empty since
+/// first install, so user presets ("Save current") and the recent-sources list
+/// silently vanished on every relaunch.  The JS side keeps using localStorage
+/// as its in-session store but mirrors every write here; on startup it seeds
+/// localStorage from this file.  Storage: one JSON object map in
+/// app_config_dir()/persist.json, written atomically (tmp + rename).
+fn persist_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("app_config_dir: {}", e))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {:?}: {}", dir, e))?;
+    Ok(dir.join("persist.json"))
+}
+
+#[tauri::command]
+fn kv_load_all(app: tauri::AppHandle) -> Result<String, String> {
+    let p = persist_path(&app)?;
+    if !p.exists() {
+        return Ok("{}".into());
+    }
+    fs::read_to_string(&p).map_err(|e| format!("read {:?}: {}", p, e))
+}
+
+#[tauri::command]
+fn kv_save(app: tauri::AppHandle, key: String, value: Option<String>) -> Result<(), String> {
+    let p = persist_path(&app)?;
+    let mut map: serde_json::Map<String, serde_json::Value> = if p.exists() {
+        let raw = fs::read_to_string(&p).map_err(|e| format!("read {:?}: {}", p, e))?;
+        serde_json::from_str(&raw).unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    match value {
+        Some(v) => {
+            map.insert(key, serde_json::Value::String(v));
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
+    let body = serde_json::to_string(&map).map_err(|e| e.to_string())?;
+    let tmp = p.with_extension("json.tmp");
+    fs::write(&tmp, body).map_err(|e| format!("write {:?}: {}", tmp, e))?;
+    fs::rename(&tmp, &p).map_err(|e| format!("rename {:?}: {}", tmp, e))?;
+    Ok(())
+}
+
 fn read_path_as_data_url(p: &PathBuf) -> Result<String, String> {
     let bytes = fs::read(p).map_err(|e| e.to_string())?;
     let _ = Cursor::new(&bytes); // sanity import use
@@ -1178,6 +1229,8 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             pick_image,
             pick_image_with_path,
             read_image_file,
+            kv_load_all,
+            kv_save,
             save_preset_json,
             load_preset_json,
             get_cli_render_job,

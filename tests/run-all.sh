@@ -79,6 +79,17 @@ else
   fail "A6 src/assets/eron.png removed" "still present"
 fi
 
+# A7 (audit 2026-06-10): version sync — Cargo.toml / tauri.conf.json /
+# package.json must agree. Drift between them is now a test failure.
+V_CARGO=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+V_TAURI=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+V_NPM=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
+if [[ -n "$V_CARGO" && "$V_CARGO" == "$V_TAURI" && "$V_TAURI" == "$V_NPM" ]]; then
+  pass "A7 version sync ($V_CARGO across Cargo.toml/tauri.conf.json/package.json)"
+else
+  fail "A7 version sync" "cargo=$V_CARGO tauri=$V_TAURI npm=$V_NPM"
+fi
+
 # ---------- Phase B: CLI ----------
 section "Phase B — CLI surface"
 

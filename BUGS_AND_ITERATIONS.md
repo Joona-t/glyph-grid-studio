@@ -4,6 +4,74 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-06-10 — Full audit sprint CS-1 (v0.1.1): P0 correctness
+
+Audit method: 3-dimension parallel code audit + adversarial verification of
+every high/medium claim (26 confirmed, 10 debunked — 28 % false-positive
+rate among raw findings) + live GUI runtime audit with screenshot evidence.
+CS-1 ships the P0 correctness fixes as one independently-green change-set.
+
+### BUG-006 — User presets + recent-sources silently lost on every relaunch
+
+- **Problem:** "Save current" presets and the Recent dropdown never survived
+  an app restart. Live evidence: loaded an image, exported, relaunched —
+  Recent still "(none)"; on-disk proof: `~/Library/WebKit/<bundle-id>/
+  WebsiteData/LocalStorage/` empty since first install (May 5).
+- **Root cause:** WKWebView does not persist localStorage for Tauri's
+  custom-scheme origin. Every `localStorage.setItem` (presets at
+  glyph-studio.js:65, recents at :490) wrote to ephemeral storage;
+  the silent `catch {}` wrappers hid it.
+- **Fix:** Rust-backed kv store — new `kv_load_all` / `kv_save` Tauri
+  commands persisting a JSON map at `app_config_dir()/persist.json`
+  (atomic tmp+rename). JS keeps localStorage as the sync in-session store,
+  mirrors every write (`persistMirror`), seeds localStorage from disk at
+  startup (`_persistReady`), and rebuilds the two affected dropdowns when
+  the seed lands.
+- **Prevention rule:** any browser-storage API used inside the Tauri shell
+  must have a Rust-side persistence path; never trust WKWebView
+  web-storage durability for custom-scheme origins.
+
+### BUG-007 — `kawaii-pink` missing from catalog_json() (CLI + MCP)
+
+- **Problem:** catalog advertised 11 palettes; the front-end registry has 12.
+  MCP/CLI clients asking for `kawaii-pink` were told it doesn't exist while
+  the GUI renders it fine.
+- **Root cause:** hand-synced list in `catalog_json()` (lib.rs:354) drifted
+  when the palette landed in index.html.
+- **Fix:** added `kawaii-pink` to the catalog; new C4b test pins the
+  palette count at 12 so the next drift fails the suite.
+
+### BUG-008 — Recent dropdown could never update (even in-session)
+
+- **Problem/Root cause:** code comment claimed the options list is "rebuilt
+  every time the dropdown opens", but Tweakpane v3 bakes options at
+  `addInput` time — `rebuildRecentOptions()` ran exactly once at init.
+  Same latent issue in the Presets Load dropdown.
+- **Fix:** dispose + re-add-in-place pattern (`buildRecentInput` /
+  `buildLoadInput`), invoked after every image load, after "Save current",
+  and once the BUG-006 disk seed arrives.
+
+### ITER-029 — a11y/P0 batch (audit findings, live-verified)
+
+- **prefers-reduced-motion** (WCAG 2.3.3): new cached `__prefersReducedMotion()`
+  helper; ambient breathing oscillation/jitter and the LIVE dispersal
+  preview still themselves when set. Recordings are exempt by policy —
+  a user-configured dispersal export is content, not interface chrome.
+  The CRT postproc chain already honored the flag; now unified on one
+  matcher.
+- **Status-bar contrast** (WCAG 1.4.3): replaced 55 %-opacity bare text
+  with a solid chip (`#d9d2c4` on `rgba(10,10,10,.82)` ≥ 9:1). The old
+  style washed out to ~2.4:1 whenever a short window put the bar over the
+  cream canvas.
+- **Canvas semantics:** p5 canvas now has `role="img"` + descriptive
+  `aria-label`; previously VoiceOver had nothing to announce for the app's
+  primary content.
+- **Version discipline:** 0.1.0 → 0.1.1 across Cargo.toml /
+  tauri.conf.json / package.json — first bump after ~15 feature commits —
+  and new A7 test makes any future three-way drift a suite failure.
+
+---
+
 ## 2026-05-18 — Sutskever audit, Part A Stage 1: WebGL substrate wired (correct, default-off; win deferred to Stage 2 as planned)
 
 The bitter-lesson move: a complete WebGL2 instanced renderer was already

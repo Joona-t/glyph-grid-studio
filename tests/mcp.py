@@ -135,6 +135,13 @@ try:
         ok("C4 MCP catalog == CLI catalog (%d palettes)" % len(mcp_catalog["palettes"]))
     else:
         bad("C4 MCP catalog == CLI catalog", "values differ")
+    # AUDIT-2026-06-10: pin the palette count so catalog_json() drift vs the
+    # front-end PALETTES registry (12 entries incl. kawaii-pink) fails loudly
+    # instead of silently advertising an incomplete list.
+    if len(mcp_catalog.get("palettes", [])) == 12:
+        ok("C4b catalog palette count == 12")
+    else:
+        bad("C4b catalog palette count == 12", "got %d" % len(mcp_catalog.get("palettes", [])))
 except Exception as e:
     bad("C4 MCP catalog == CLI catalog", str(e))
 
