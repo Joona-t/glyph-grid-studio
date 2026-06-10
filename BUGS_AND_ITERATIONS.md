@@ -4,6 +4,63 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-06-10 — v0.1.5: Animate Still landed + export encode 20 % faster
+
+### ITER-036 — Animate Still feature completed (was WIP failing gate A1)
+
+- **Problem:** the draft "Animate Still" folder hardcoded
+  `/Users/darkfire/Downloads/hermes2.jpeg` in its load button — a
+  personal path that tripped gate A1 and was useless on any other
+  machine.
+- **Fix:** button is now generic **"Pick image + animate…"** — native
+  picker via the existing `pick_image_with_path` flow, feeds the Recent
+  list + BUG-006 persistence like every other load route, then applies
+  the Portrait ASCII preset.  The four preset buttons (Subtle shimmer /
+  Living glyphs / Stardust outro / Portrait ASCII) are unchanged.  The
+  orphaned `loadImagePathIntoStudio` helper (zero callers after the fix)
+  was removed.  A1 green.
+
+### EXPORT-OPT-1/2/3 — export encode wall-time (the cost no optimization had ever touched)
+
+The objective-reframe audit identified export wall-time as the dominant
+user-felt cost (gifski encode 3–25 s/job) — and the entire optimization
+saga had never touched it.  Three changes, zero new dependencies:
+
+1. **Parallel frame decode** (`decode_frames_parallel`, std scoped
+   threads): the sequential base64→PNG→RGBA loop was the
+   single-threaded head of every export.  120 frames now decode in
+   **188 ms** across cores.
+2. **Decode once across the twitter-fit ladder**: every ladder rung
+   used to re-decode ALL frames from base64; a 6-rung walk decoded the
+   set six times.  `encode_gif_gifski_decoded` now reuses one decoded
+   set for every rung.
+3. **Parallel MP4 preprocessing**: PNG decode + Lanczos3 resize + RGB
+   repack per frame parallelized; only the stateful H.264 encoder stays
+   sequential.
+
+**Measured (120-frame thor export, same machine, /usr/bin/time):**
+| Workload | v0.1.4 | v0.1.5 | Δ |
+|---|---|---|---|
+| Plain GIF export | 15.14 s | 14.43 s | −4.7 % |
+| Full 6-rung twitter-fit ladder | 22.33 s | **17.75 s** | **−20.5 %** |
+
+**Correctness:** ladder output byte-identical pre/post.  The plain
+output differed by 0.01 % — investigation showed **v0.1.4 was
+nondeterministic against itself** (two runs of the old binary differ at
+the same palette offset; gifski-internal thread-timing, pre-existing,
+newly discovered at 120-frame/22 MB scale).  v0.1.5 is self-consistent
+across runs.  Net: the optimization also made output MORE deterministic.
+
+### Also fixed — relative `--in` paths hung instead of erroring
+
+Found during the CS-2 gate bisection: a relative source path flowed into
+the webview's `read_image_file` with a different effective cwd and hung
+the session forever.  `render --in` is now canonicalized at the CLI
+boundary (fail-fast with a clear message); batch manifests canonicalize
+the top-level `in` (hard error) and per-job `in` (per-job error).
+
+---
+
 ## 2026-06-10 — Full audit sprint CS-4 (v0.1.4): loop-harness hardening
 
 ### ITER-035 — Orchestrator resilience (audit arch findings, all confirmed by adversarial re-read)
@@ -1207,3 +1264,22 @@ the bug fires but the user has no signal to send it (the loop appears
 killed PID 46184, re-applied OPT-100 patch from in-context memory
 (`runs/cycle-000/` was auto-pruned during the spin), re-committed
 manually as `f655800`. Future loop runs MUST use `--max-cycles`.
+
+## 2026-05-27 — Still Image Animation Presets
+
+**Problem** — Glyph Grid Studio had the raw ingredients for animated glyph art
+(temporal dither, breathing, dispersal, GIF/MP4 export), but no first-class
+workflow for turning a static portrait such as `/Users/darkfire/Downloads/hermes2.jpeg`
+into an animated ASCII/glyph loop.
+
+**Root cause** — The studio UI exposed each animation control separately.
+Users had to manually coordinate duration, fps, dither, breathing, palette,
+mapping, and dispersal before export.
+
+**Fix** — Added an `Animate Still` folder in `src/lib/glyph-studio.js` with
+one-click still-animation presets and a Tauri-only `Load hermes2.jpeg` button
+that uses the existing `read_image_file` command, scene cache clearing,
+pane refresh, and recorder-compatible CONFIG fields.
+
+**Verification** — `npm run build`, `node --check src/lib/glyph-studio.js`,
+and `ls-check .` all pass.

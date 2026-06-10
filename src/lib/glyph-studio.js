@@ -625,6 +625,143 @@
   }
   window.__glyphMaybeSuggestInvert = maybeSuggestInvert;
 
+  /* Still-image animation presets. These intentionally mutate only the
+     existing renderer config: temporal dither, breathing, dispersal,
+     mapping, palette, and export timing. */
+  function ensureStillAnimDefaults(config) {
+    if (!config.animation) config.animation = { fps: 30, duration: 6, loop: true };
+    if (!config.dither) config.dither = {};
+    if (!config.studio) config.studio = {};
+    if (!config.studio.breathing) {
+      config.studio.breathing = {
+        emaAlpha: 0.35,
+        gainSwing: 0.30,
+        jitter: 0.05,
+        pulseHz: 0.7,
+      };
+    }
+    if (!config.dispersal) {
+      config.dispersal = {
+        enabled: false,
+        startT: 0.5,
+        endT: 0.95,
+        intensity: 0.4,
+        upwardBias: 0.7,
+        swayAmount: 0.5,
+        rippleAmt: 0.2,
+      };
+    }
+    if (!config.postprocess) config.postprocess = {};
+    if (!config.postprocess.vignette) config.postprocess.vignette = { enabled: false, strength: 0.55 };
+    if (!config.postprocess.bloom) config.postprocess.bloom = { enabled: false, radius: 2.5, strength: 0.95 };
+    if (!config.postprocess.halation) config.postprocess.halation = { enabled: false, strength: 0.70 };
+  }
+
+  function applyStillAnimationPreset(config, flavor) {
+    ensureStillAnimDefaults(config);
+    config.compat = 'v2';
+    config.renderer = config.renderer || 'cpu';
+    config.scene = 'studio';
+    config.animation.loop = true;
+    config.dither.mode = 'temporal';
+    config.dither.asSourcePrefilter = true;
+    config.selectionMode = 'brightness';
+
+    if (flavor === 'subtle') {
+      config.animation.duration = 5.0;
+      config.animation.fps = 30;
+      config.ramp = 'gradient';
+      config.palette = 'cream-paper';
+      config.colorMode = 'monochrome';
+      config.glyphSet = null;
+      config.brightnessGamma = 0.62;
+      config.studio.breathing.emaAlpha = 0.30;
+      config.studio.breathing.gainSwing = 0.16;
+      config.studio.breathing.jitter = 0.025;
+      config.studio.breathing.pulseHz = 0.55;
+      config.dispersal.enabled = false;
+      config.postprocess.vignette.enabled = true;
+      config.postprocess.vignette.strength = 0.45;
+      config.postprocess.bloom.enabled = false;
+      config.postprocess.halation.enabled = false;
+    } else if (flavor === 'living') {
+      config.animation.duration = 6.0;
+      config.animation.fps = 30;
+      config.ramp = 'gradientNoSpace';
+      config.palette = 'cyber-phosphor';
+      config.colorMode = 'gradient';
+      config.glyphSet = 'asciiDense';
+      config.brightnessGamma = 0.70;
+      config.studio.breathing.emaAlpha = 0.42;
+      config.studio.breathing.gainSwing = 0.34;
+      config.studio.breathing.jitter = 0.08;
+      config.studio.breathing.pulseHz = 0.85;
+      config.dispersal.enabled = false;
+      config.postprocess.vignette.enabled = true;
+      config.postprocess.vignette.strength = 0.58;
+      config.postprocess.bloom.enabled = true;
+      config.postprocess.bloom.radius = 1.4;
+      config.postprocess.bloom.strength = 0.35;
+      config.postprocess.halation.enabled = false;
+    } else if (flavor === 'stardust') {
+      config.animation.duration = 7.0;
+      config.animation.fps = 30;
+      config.ramp = 'gradient';
+      config.palette = 'silver-charcoal';
+      config.colorMode = 'gradient';
+      config.glyphSet = null;
+      config.brightnessGamma = 0.58;
+      config.studio.breathing.emaAlpha = 0.34;
+      config.studio.breathing.gainSwing = 0.26;
+      config.studio.breathing.jitter = 0.04;
+      config.studio.breathing.pulseHz = 0.65;
+      config.dispersal.enabled = true;
+      config.dispersal.startT = 0.66;
+      config.dispersal.endT = 0.96;
+      config.dispersal.intensity = 0.72;
+      config.dispersal.upwardBias = 0.72;
+      config.dispersal.swayAmount = 0.75;
+      config.dispersal.rippleAmt = 0.22;
+      config.postprocess.vignette.enabled = true;
+      config.postprocess.vignette.strength = 0.62;
+      config.postprocess.bloom.enabled = true;
+      config.postprocess.bloom.radius = 1.8;
+      config.postprocess.bloom.strength = 0.40;
+      config.postprocess.halation.enabled = true;
+      config.postprocess.halation.strength = 0.28;
+    } else {
+      config.animation.duration = 6.0;
+      config.animation.fps = 30;
+      config.ramp = 'gradient';
+      config.palette = 'bone-charcoal';
+      config.colorMode = 'monochrome';
+      config.glyphSet = null;
+      config.brightnessGamma = 0.52;
+      config.invertSignal = true;
+      config.bgThreshold = 0;
+      config.studio.breathing.emaAlpha = 0.38;
+      config.studio.breathing.gainSwing = 0.24;
+      config.studio.breathing.jitter = 0.045;
+      config.studio.breathing.pulseHz = 0.72;
+      config.dispersal.enabled = false;
+      config.postprocess.vignette.enabled = true;
+      config.postprocess.vignette.strength = 0.50;
+      config.postprocess.bloom.enabled = false;
+      config.postprocess.halation.enabled = false;
+    }
+  }
+
+  function clearSceneCaches(sceneCacheKeys) {
+    if (sceneCacheKeys && window.SCENES) {
+      for (var i = 0; i < sceneCacheKeys.length; i++) {
+        for (var name in window.SCENES) {
+          if (window.SCENES[name][sceneCacheKeys[i]]) delete window.SCENES[name][sceneCacheKeys[i]];
+        }
+      }
+    }
+  }
+
+
   /* ----------------------------------------------------------------
    * 5.  Build Tweakpane panel
    * ---------------------------------------------------------------- */
@@ -718,6 +855,57 @@
           }
         }
       }
+    });
+
+    var fStill = pane.addFolder({ title: 'Animate Still' });
+    /* One-click "pick a still photo → animated glyph loop". Generic
+       picker (audit 2026-06-10: the draft hardcoded a personal
+       /Users/... path, which also tripped gate A1); path-aware variant
+       feeds the Recent list + BUG-006 persistence like every other
+       load route. */
+    fStill.addButton({ title: 'Pick image + animate…' }).on('click', function () {
+      if (!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)) {
+        if (window.__glyphToast) window.__glyphToast('Image picking needs the desktop app.', 5000);
+        return;
+      }
+      window.__TAURI__.core.invoke('pick_image_with_path')
+        .then(function (result) {
+          if (!(result && result.dataUrl && window.loadImage)) return;
+          window.loadImage(result.dataUrl, function (img) {
+            if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(img);
+            clearSceneCaches(opts.sceneCacheKeys);
+            try { addRecentSource(result.path); } catch (e) {}
+            applyStillAnimationPreset(config, 'portrait');
+            if (opts.__refreshPane) opts.__refreshPane();
+            if (window.__glyphToast) {
+              window.__glyphToast('Loaded ' + basename(result.path) + ' with Portrait ASCII motion — try the other presets below.', 4500);
+            }
+            try { loop(); } catch (e) {}
+          });
+        })
+        .catch(function (e) {
+          if (e !== 'cancelled') console.warn('glyph-studio: pick+animate failed:', e);
+        });
+    });
+    fStill.addButton({ title: 'Subtle shimmer' }).on('click', function () {
+      applyStillAnimationPreset(config, 'subtle');
+      if (opts.__refreshPane) opts.__refreshPane();
+      try { loop(); } catch (e) {}
+    });
+    fStill.addButton({ title: 'Living glyphs' }).on('click', function () {
+      applyStillAnimationPreset(config, 'living');
+      if (opts.__refreshPane) opts.__refreshPane();
+      try { loop(); } catch (e) {}
+    });
+    fStill.addButton({ title: 'Stardust outro' }).on('click', function () {
+      applyStillAnimationPreset(config, 'stardust');
+      if (opts.__refreshPane) opts.__refreshPane();
+      try { loop(); } catch (e) {}
+    });
+    fStill.addButton({ title: 'Portrait ASCII' }).on('click', function () {
+      applyStillAnimationPreset(config, 'portrait');
+      if (opts.__refreshPane) opts.__refreshPane();
+      try { loop(); } catch (e) {}
     });
 
     /* Recent sources dropdown — last 5 image paths persisted via the

@@ -249,6 +249,23 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
         }
     };
 
+    // Audit 2026-06-10: canonicalize source paths up front. Relative
+    // paths used to flow into the webview's read_image_file with a
+    // different effective cwd and hang the session instead of erroring.
+    let canon = |p: &str| -> Result<String, String> {
+        PathBuf::from(p)
+            .canonicalize()
+            .map(|c| c.to_string_lossy().to_string())
+            .map_err(|e| format!("{}: {}", p, e))
+    };
+    let in_path = match canon(&in_path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("batch: cannot resolve manifest `in` path — {}", e);
+            return 2;
+        }
+    };
+
     // Audit 2026-06-10: reject jobs with a missing/empty `out` up front —
     // previously the empty string flowed through to fs::write deep inside
     // the encode pipeline and surfaced as a cryptic IO error after the
@@ -292,7 +309,11 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
             let in_path_job: Option<String> = j
                 .get("in")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+                // Canonicalize per-job sources too (relative path = hang,
+                // see audit 2026-06-10). Fall back to the raw string if
+                // resolution fails — the JS side surfaces a per-job error
+                // for missing files rather than killing the whole batch.
+                .map(|s| canon(s).unwrap_or_else(|_| s.to_string()));
             // ITER-026: optional adaptive Twitter-fit per job.  Manifest
             // can set `targetMaxBytes: 15728640` (15 MB) and the encoder
             // walks the shrink ladder until it fits.  When unset AND
@@ -504,16 +525,89 @@ async fn save_png(app: tauri::AppHandle, data_url: String) -> Result<String, Str
 /// (gifski handles the resize internally).  `None` keeps the source size.
 /// At Twitter's recommended 720 px wide for posts, kaneki drops from
 /// ~30 MB → ~6-8 MB without visible quality change on phone screens.
-fn encode_gif_gifski(
+/// Decode one base64-PNG frame to RGBA, applying the optional border.
+/// Pure per-frame function — safe to run on any thread (EXPORT-OPT-1).
+fn decode_one_frame(
+    f: &GifFrame,
+    idx: usize,
+    border: Option<&BorderConfig>,
+) -> Result<imgref::ImgVec<rgb::RGBA8>, String> {
+    let bytes = general_purpose::STANDARD
+        .decode(&f.b64)
+        .map_err(|e| format!("frame {} b64: {}", idx, e))?;
+    let mut img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .map_err(|e| format!("frame {} decode: {}", idx, e))?
+        .to_rgba8();
+    if let Some(b) = border {
+        img = apply_border(img, b);
+    }
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let pixels: Vec<rgb::RGBA8> = img
+        .pixels()
+        .map(|p| rgb::RGBA8 { r: p[0], g: p[1], b: p[2], a: p[3] })
+        .collect();
+    Ok(imgref::ImgVec::new(pixels, w, h))
+}
+
+/// EXPORT-OPT-1 (2026-06-10): parallel frame decode with std scoped
+/// threads (no new deps).  The old sequential base64→PNG→RGBA loop was
+/// the single-threaded head of every export: ~40-60 % of GIF encode
+/// wall-time on a 150-frame loop, while 7+ cores idled.  Each frame is
+/// an independent pure decode, so this is bit-exact by construction —
+/// frame N's bytes are identical regardless of which thread decoded it.
+fn decode_frames_parallel(
     frames: &[GifFrame],
     delay_ms: u32,
-    cap_width: Option<u32>,
     border: Option<&BorderConfig>,
+) -> Result<Vec<(imgref::ImgVec<rgb::RGBA8>, f64)>, String> {
+    let n = frames.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(n);
+    let chunk = n.div_ceil(threads);
+
+    let mut slots: Vec<Option<Result<imgref::ImgVec<rgb::RGBA8>, String>>> =
+        Vec::with_capacity(n);
+    slots.resize_with(n, || None);
+
+    std::thread::scope(|s| {
+        for (t, slot_chunk) in slots.chunks_mut(chunk).enumerate() {
+            let base = t * chunk;
+            s.spawn(move || {
+                for (i, slot) in slot_chunk.iter_mut().enumerate() {
+                    let idx = base + i;
+                    *slot = Some(decode_one_frame(&frames[idx], idx, border));
+                }
+            });
+        }
+    });
+
+    let mut out = Vec::with_capacity(n);
+    for (idx, slot) in slots.into_iter().enumerate() {
+        let img = slot.ok_or_else(|| format!("frame {}: decode slot empty", idx))??;
+        let pts = (idx as f64) * (delay_ms as f64) / 1000.0;
+        out.push((img, pts));
+    }
+    Ok(out)
+}
+
+/// Encode pre-decoded frames with gifski.  Split out of
+/// `encode_gif_gifski` so the twitter-fit ladder can decode ONCE and
+/// re-encode at each cap width (EXPORT-OPT-2) — previously every ladder
+/// rung re-decoded all frames from base64.  Frames are cloned one at a
+/// time into the collector (gifski wants owned ImgVecs); transient peak
+/// is the decoded set + one frame.
+fn encode_gif_gifski_decoded(
+    decoded: &[(imgref::ImgVec<rgb::RGBA8>, f64)],
+    cap_width: Option<u32>,
 ) -> Result<Vec<u8>, String> {
-    if frames.is_empty() {
+    if decoded.is_empty() {
         return Err("no frames provided".into());
     }
-
     let settings = gifski::Settings {
         width: cap_width,
         height: None,
@@ -523,62 +617,56 @@ fn encode_gif_gifski(
     };
     let (collector, writer) = gifski::new(settings).map_err(|e| format!("gifski init: {}", e))?;
 
-    // Decode all frames up-front. PNG decode is fast; doing it before
-    // launching the collector thread lets us surface decode errors
-    // synchronously.  Border (if enabled) is applied after decode so the
-    // matte expands the source dims; gifski then resizes the bordered
-    // frame to cap_width preserving the new aspect.
-    let mut decoded: Vec<(imgref::ImgVec<rgb::RGBA8>, f64)> = Vec::with_capacity(frames.len());
-    for (idx, f) in frames.iter().enumerate() {
-        let bytes = general_purpose::STANDARD
-            .decode(&f.b64)
-            .map_err(|e| format!("frame {} b64: {}", idx, e))?;
-        let mut img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-            .map_err(|e| format!("frame {} decode: {}", idx, e))?
-            .to_rgba8();
-        if let Some(b) = border {
-            img = apply_border(img, b);
-        }
-        let (w, h) = (img.width() as usize, img.height() as usize);
-        let pixels: Vec<rgb::RGBA8> = img
-            .pixels()
-            .map(|p| rgb::RGBA8 { r: p[0], g: p[1], b: p[2], a: p[3] })
-            .collect();
-        let imgvec = imgref::ImgVec::new(pixels, w, h);
-        // Presentation timestamp for this frame, in seconds.
-        let pts = (idx as f64) * (delay_ms as f64) / 1000.0;
-        decoded.push((imgvec, pts));
-    }
-
-    // gifski's collector and writer must run on separate threads — the
-    // collector quantises each frame as it arrives, the writer assembles
-    // the final palette + LZW stream after the collector closes.
-    let collector_handle = std::thread::spawn(move || -> Result<(), String> {
-        for (idx, (imgvec, pts)) in decoded.into_iter().enumerate() {
-            collector
-                .add_frame_rgba(idx, imgvec, pts)
-                .map_err(|e| format!("frame {} add: {}", idx, e))?;
-        }
-        // Dropping the collector signals the writer to finalise.
-        drop(collector);
-        Ok(())
-    });
-
     struct Silent;
     impl gifski::progress::ProgressReporter for Silent {
         fn increase(&mut self) -> bool { true }
         fn done(&mut self, _msg: &str) {}
     }
 
+    // Collector and writer must run concurrently — the collector
+    // quantises each frame as it arrives, the writer assembles the final
+    // palette + LZW stream after the collector closes.  Scoped thread so
+    // the collector can borrow `decoded`.
     let mut output: Vec<u8> = Vec::new();
-    writer
-        .write(&mut output, &mut Silent)
-        .map_err(|e| format!("gifski write: {}", e))?;
-    collector_handle
-        .join()
-        .map_err(|_| "gifski collector thread panicked".to_string())??;
+    std::thread::scope(|s| -> Result<(), String> {
+        let handle = s.spawn(move || -> Result<(), String> {
+            for (idx, (imgvec, pts)) in decoded.iter().enumerate() {
+                collector
+                    .add_frame_rgba(idx, imgvec.clone(), *pts)
+                    .map_err(|e| format!("frame {} add: {}", idx, e))?;
+            }
+            drop(collector); // signals the writer to finalise
+            Ok(())
+        });
+        writer
+            .write(&mut output, &mut Silent)
+            .map_err(|e| format!("gifski write: {}", e))?;
+        handle
+            .join()
+            .map_err(|_| "gifski collector thread panicked".to_string())??;
+        Ok(())
+    })?;
 
     Ok(output)
+}
+
+fn encode_gif_gifski(
+    frames: &[GifFrame],
+    delay_ms: u32,
+    cap_width: Option<u32>,
+    border: Option<&BorderConfig>,
+) -> Result<Vec<u8>, String> {
+    let t0 = std::time::Instant::now();
+    let decoded = decode_frames_parallel(frames, delay_ms, border)?;
+    let t_decode = t0.elapsed();
+    let out = encode_gif_gifski_decoded(&decoded, cap_width)?;
+    eprintln!(
+        "encode: {} frames — decode {:.0}ms (parallel) + gifski {:.0}ms",
+        frames.len(),
+        t_decode.as_secs_f64() * 1000.0,
+        t0.elapsed().as_secs_f64() * 1000.0 - t_decode.as_secs_f64() * 1000.0,
+    );
+    Ok(out)
 }
 
 /// Adaptive Twitter-fit wrapper.  ITER-025 surfaced that the GUI's
@@ -601,7 +689,18 @@ fn encode_gif_gifski_adaptive(
     border: Option<&BorderConfig>,
     target_max_bytes: Option<u64>,
 ) -> Result<Vec<u8>, String> {
-    let single = encode_gif_gifski(frames, delay_ms, cap_width, border)?;
+    // EXPORT-OPT-2 (2026-06-10): decode ONCE for the entire ladder.
+    // Previously every rung re-ran the full base64→PNG→RGBA decode of
+    // all frames; a 5-rung walk decoded the set 6 times. gifski resizes
+    // internally from cap_width, so one decoded set serves every rung.
+    let t0 = std::time::Instant::now();
+    let decoded = decode_frames_parallel(frames, delay_ms, border)?;
+    eprintln!(
+        "encode: {} frames decoded once in {:.0}ms (parallel, shared across ladder)",
+        frames.len(),
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
+    let single = encode_gif_gifski_decoded(&decoded, cap_width)?;
     let target = match target_max_bytes {
         Some(t) if t > 0 => t,
         _ => return Ok(single),
@@ -629,7 +728,7 @@ fn encode_gif_gifski_adaptive(
         if *cap >= initial_cap {
             continue;
         }
-        let buf = encode_gif_gifski(frames, delay_ms, Some(*cap), border)?;
+        let buf = encode_gif_gifski_decoded(&decoded, Some(*cap))?;
         eprintln!(
             "twitter-fit: cap={} size={:.2}MB",
             cap,
@@ -781,32 +880,74 @@ fn encode_mp4_h264(
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), cfg)
         .map_err(|e| format!("openh264 init: {}", e))?;
 
+    // EXPORT-OPT-3 (2026-06-10): the per-frame preprocessing (base64 →
+    // PNG decode → border → Lanczos3 resize → RGB repack) dominated MP4
+    // export wall-time and ran on one core.  It is a pure per-frame
+    // function — parallelize it with scoped threads; only the STATEFUL
+    // H.264 encoder stays sequential below.
+    let t_pre = std::time::Instant::now();
+    let n_frames = frames.len();
+    let pre_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(n_frames);
+    let pre_chunk = n_frames.div_ceil(pre_threads);
+    let mut rgb_slots: Vec<Option<Result<Vec<u8>, String>>> = Vec::with_capacity(n_frames);
+    rgb_slots.resize_with(n_frames, || None);
+    std::thread::scope(|s| {
+        for (t, slot_chunk) in rgb_slots.chunks_mut(pre_chunk).enumerate() {
+            let base = t * pre_chunk;
+            s.spawn(move || {
+                for (i, slot) in slot_chunk.iter_mut().enumerate() {
+                    let idx = base + i;
+                    *slot = Some((|| -> Result<Vec<u8>, String> {
+                        let bytes = general_purpose::STANDARD
+                            .decode(&frames[idx].b64)
+                            .map_err(|e| format!("frame {} b64: {}", idx, e))?;
+                        let dyn_img = image::load_from_memory_with_format(
+                            &bytes,
+                            image::ImageFormat::Png,
+                        )
+                        .map_err(|e| format!("frame {} decode: {}", idx, e))?;
+                        let mut rgba_img = dyn_img.to_rgba8();
+                        if let Some(b) = border {
+                            rgba_img = apply_border(rgba_img, b);
+                        }
+                        let img_dyn = image::DynamicImage::ImageRgba8(rgba_img);
+                        let img_dyn = if img_dyn.width() != target_w
+                            || img_dyn.height() != target_h
+                        {
+                            img_dyn.resize_exact(
+                                target_w,
+                                target_h,
+                                image::imageops::FilterType::Lanczos3,
+                            )
+                        } else {
+                            img_dyn
+                        };
+                        Ok(img_dyn.to_rgb8().into_raw())
+                    })());
+                }
+            });
+        }
+    });
+    let mut rgb_frames: Vec<Vec<u8>> = Vec::with_capacity(n_frames);
+    for (idx, slot) in rgb_slots.into_iter().enumerate() {
+        rgb_frames.push(slot.ok_or_else(|| format!("frame {}: preprocess slot empty", idx))??);
+    }
+    eprintln!(
+        "encode-mp4: {} frames preprocessed in {:.0}ms (parallel)",
+        n_frames,
+        t_pre.elapsed().as_secs_f64() * 1000.0,
+    );
+
     // Walk frames, encode, capture SPS/PPS once and slice NALs per frame.
     let mut sps: Option<Vec<u8>> = None;
     let mut pps: Option<Vec<u8>> = None;
     let mut samples: Vec<(Vec<u8>, bool)> = Vec::with_capacity(frames.len());
 
-    for (idx, f) in frames.iter().enumerate() {
-        let bytes = general_purpose::STANDARD
-            .decode(&f.b64)
-            .map_err(|e| format!("frame {} b64: {}", idx, e))?;
-        let dyn_img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-            .map_err(|e| format!("frame {} decode: {}", idx, e))?;
-        let mut rgba_img = dyn_img.to_rgba8();
-        if let Some(b) = border {
-            rgba_img = apply_border(rgba_img, b);
-        }
-        // Wrap as DynamicImage so we can use resize_exact + to_rgb8.
-        let img_dyn = image::DynamicImage::ImageRgba8(rgba_img);
-        let img_dyn = if img_dyn.width() != target_w || img_dyn.height() != target_h {
-            img_dyn.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3)
-        } else {
-            img_dyn
-        };
-        let rgb = img_dyn.to_rgb8();
-        let rgb_data: Vec<u8> = rgb.into_raw();
-
-        let rgb_source = RgbSliceU8::new(&rgb_data, (target_w as usize, target_h as usize));
+    for (idx, rgb_data) in rgb_frames.iter().enumerate() {
+        let rgb_source = RgbSliceU8::new(rgb_data, (target_w as usize, target_h as usize));
         let yuv = YUVBuffer::from_rgb_source(rgb_source);
 
         let bitstream = encoder
