@@ -4,6 +4,69 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-06-10 — v0.1.6: three SOTA features
+
+### ITER-037 — Temporal glyph stability (anti-flicker, measured 97.8 % suppression)
+
+- **Problem (the classic video-stylization flicker):** temporal dither +
+  breathing perturb the per-cell signal every frame, so the GLYPH choice
+  oscillates between adjacent characters — measured: **~13,000 of 28,800
+  cells (45 % of the grid) attempted a character swap EVERY frame** on
+  the default config.
+- **Design:** two mechanisms behind one toggle
+  (`CONFIG.temporalStability`):
+  - *continuous path* (no dithered cellIndex): Schmitt trigger on the
+    ramp index — adopt only when the continuous index clearly crosses
+    into another bucket (band = 0.5 + strength).
+  - *dithered path* (cellIndex from the upstream quantizer — the
+    continuous value is already discarded): K-frame integer debounce —
+    a new glyph is adopted only after persisting K consecutive frames;
+    A/B/A/B dither oscillation never persists, real transitions land
+    after K frames (~100 ms). K = 2 + round(strength·2).
+  Brightness ALPHA stays continuous — the substrate-breathing aesthetic
+  is untouched; only character swaps are damped. OFF by default
+  (existing outputs bit-identical).
+- **Measured (PERF_JOB `stab` counters, 40-frame default config):**
+  strength 0.75 → **12,997 swaps suppressed / 291 real transitions per
+  frame (97.8 %)**; strength 1.5 → 12,723 / 6 (99.95 %).
+- **Debug confession:** v1 shipped Schmitt-only and measured ZERO effect
+  — byte-identical output. Diagnosis via unconditional PERF_JOB gate
+  diagnostics: the default config populates `cellIndex` (dithered
+  quantization upstream), which the Schmitt path explicitly skipped.
+  Wrong assumption, caught by measuring instead of trusting the design.
+
+### ITER-038 — Vector SVG + plain-text export
+
+- The grid IS typeset characters — now exportable in its native forms:
+  **Export SVG (vector)** (every glyph a real `<text>` element, exact
+  palette colours + per-glyph opacity, infinite resolution for print /
+  posters / plotters) and **Export TXT (plain text)**.
+- New `captureGridSnapshot()` test-hook replays the brightness-mode
+  glyph+colour selection from the PERSISTENT `cellSignal` buffer outside
+  the draw loop — zero cost to hot paths.  Honors temporal stability
+  (reads the displayed `_stabIdx`).  Brightness selection mode only
+  (shape/edge picks aren't persisted per cell); exporter shows a hint
+  otherwise.
+
+### ITER-039 — Flow mode (edge-tangent-flow glyph orientation)
+
+- New `selectionMode: 'flow'` — structure-tensor ETF in the
+  Kang/Lee/Chui flow-based-abstraction lineage: per-cell Sobel →
+  tensor (Jxx Jxy Jyy) → N box-smoothing passes ON THE TENSOR (immune
+  to angle-wraparound) → eigen-analysis for tangent + coherence +
+  energy.  Coherently-oriented cells render stroke glyphs aligned to
+  the flow (─ ╱ │ ╲); isotropic cells fall back to the brightness ramp.
+  Reads like pen hatching that follows the image's contours.
+- Implementation: `flowField`/`flowGlyph` in glyph-edge.js (persistent
+  buffers, zero per-frame allocations); `drawFlowGrid` builds the cps
+  grid and reuses the edge-directional drawer's full colour-mode
+  machinery via a new `cpsOverride` parameter (zero duplication).
+  Tunables: `CONFIG.flow.{coherence, energy, smoothing}` + panel
+  sliders.  `gateEdgeDirectional` extended so 'flow' rides the v2
+  pipeline.
+
+---
+
 ## 2026-06-10 — v0.1.5: Animate Still landed + export encode 20 % faster
 
 ### ITER-036 — Animate Still feature completed (was WIP failing gate A1)

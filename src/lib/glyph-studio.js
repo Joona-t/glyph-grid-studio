@@ -115,7 +115,8 @@
     var keys = ['canvas', 'grid', 'font', 'ramp', 'brightnessGamma',
       'samplingStrategy', 'colorMode', 'palette', 'glyphSet',
       'selectionMode', 'dither', 'prefilter', 'postprocess',
-      'depth', 'paletteMorph', 'animation', 'seed', 'studio'];
+      'depth', 'paletteMorph', 'animation', 'seed', 'studio',
+      'temporalStability', 'flow'];
     var out = {};
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
@@ -1054,8 +1055,15 @@
       options: {
         brightness: 'brightness', shape: 'shape',
         'shape-edge-aware': 'shape-edge-aware', 'edge-directional': 'edge-directional',
+        flow: 'flow (ETF)',
       },
-    }), 'How glyphs are picked per cell. `brightness` = fast ramp lookup. `shape-edge-aware` = best aesthetic, ~4× slower.');
+    }), 'How glyphs are picked per cell. `brightness` = fast ramp lookup. `shape-edge-aware` = best aesthetic, ~4× slower. `flow` = strokes follow the image contours (structure-tensor ETF).');
+    /* Flow (ETF) tuning — v0.1.6. */
+    if (!config.flow) config.flow = { coherence: 0.30, energy: 0.06, smoothing: 2 };
+    tip(fSel.addInput(config.flow, 'coherence', { min: 0, max: 0.9, step: 0.05, label: 'flow coherence' }),
+        'How directionally consistent a neighbourhood must be before its cells become flow strokes. Lower = more hatching, higher = strokes only on clean edges.');
+    tip(fSel.addInput(config.flow, 'smoothing', { min: 0, max: 6, step: 1, label: 'flow smoothing' }),
+        'Structure-tensor smoothing passes. More = longer, calmer strokes that bridge texture noise.');
     var glyphSetVal = { v: config.glyphSet || 'null' };
     var _gsBinding = fSel.addInput(glyphSetVal, 'v', {
       label: 'glyphSet',
@@ -1184,6 +1192,14 @@
     fAnim.addInput(config.animation, 'duration', { min: 0.5, max: 60, step: 0.1 });
     fAnim.addInput(config.animation, 'fps', { min: 12, max: 60, step: 6 });
     fAnim.addInput(config.animation, 'loop');
+    /* Temporal glyph stability (v0.1.6) — per-cell Schmitt trigger on
+       the ramp index. Damps character shimmer in animated renders while
+       keeping the continuous alpha breathing. */
+    if (!config.temporalStability) config.temporalStability = { enabled: false, strength: 0.75 };
+    tip(fAnim.addInput(config.temporalStability, 'enabled', { label: 'stabilize glyphs' }),
+        'Anti-flicker: a cell only swaps characters when its brightness clearly crosses into another bucket. Kills shimmer in animated exports; breathing alpha is unaffected.');
+    tip(fAnim.addInput(config.temporalStability, 'strength', { min: 0, max: 2, step: 0.05 }),
+        'Hysteresis width. Higher = steadier glyphs, slower to react to real changes.');
 
     /* Perf — Phase 0 instrumentation. Live rolling averages of per-stage
        frame time + last switch latency. Click "Report (console)" to
@@ -1305,6 +1321,81 @@
     fExp.addButton({ title: 'Snapshot PNG' }).on('click', function () {
       snapshotPNG(document.querySelector('canvas'));
     });
+    /* ── Vector + plain-text export (v0.1.6, SOTA feature 2) ─────────
+       The grid IS typeset characters — export it in its native forms:
+       SVG (infinite-resolution vector for print/posters/plotters) and
+       plain text.  Brightness selection mode only (shape/edge picks
+       aren't persisted per-cell); the hook returns null otherwise. */
+    function xmlEsc(ch) {
+      if (ch === '&') return '&amp;';
+      if (ch === '<') return '&lt;';
+      if (ch === '>') return '&gt;';
+      return ch;
+    }
+    function buildSvg(snap) {
+      var fs = Math.max(snap.cellH, snap.cellW * 0.9).toFixed(2);
+      var parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n',
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + snap.w + ' ' + snap.h + '">\n',
+        '<!-- Glyph Grid Studio — ' + snap.palette + ' / ' + snap.ramp + ' / ' +
+          snap.cols + 'x' + snap.rows + ' -->\n',
+        '<rect width="100%" height="100%" fill="' + snap.bg + '"/>\n',
+        '<g font-family="' + snap.fontFamily + ', Menlo, monospace" font-size="' + fs +
+          '" text-anchor="middle">\n',
+      ];
+      for (var i = 0; i < snap.cells.length; i++) {
+        var cell = snap.cells[i];
+        var x = ((cell.col + 0.5) * snap.cellW).toFixed(1);
+        var y = ((cell.row + 0.5) * snap.cellH + snap.cellH * 0.35).toFixed(1);
+        var op = (cell.o != null && cell.o < 1) ? '" fill-opacity="' + cell.o : '';
+        parts.push('<text x="' + x + '" y="' + y + '" fill="' + cell.f + op + '">' +
+                   xmlEsc(cell.c) + '</text>\n');
+      }
+      parts.push('</g>\n</svg>\n');
+      return parts.join('');
+    }
+    function buildTxt(snap) {
+      var grid = [];
+      for (var r = 0; r < snap.rows; r++) grid.push(new Array(snap.cols).fill(' '));
+      for (var i = 0; i < snap.cells.length; i++) {
+        var cell = snap.cells[i];
+        grid[cell.row][cell.col] = cell.c;
+      }
+      var lines = [];
+      for (var r2 = 0; r2 < snap.rows; r2++) {
+        lines.push(grid[r2].join('').replace(/\s+$/, ''));
+      }
+      return lines.join('\n') + '\n';
+    }
+    function exportGridAs(kind) {
+      var snap = opts.testHook && opts.testHook.captureGridSnapshot
+        ? opts.testHook.captureGridSnapshot() : null;
+      if (!snap) {
+        exportFeedback('Vector/text export needs selectionMode "brightness" and a loaded image.', true);
+        return;
+      }
+      var body = kind === 'svg' ? buildSvg(snap) : buildTxt(snap);
+      var name = 'glyph-grid_' + snap.palette + '_' + snap.cols + 'x' + snap.rows;
+      if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+        var b64 = btoa(unescape(encodeURIComponent(body)));
+        window.__TAURI__.core.invoke('save_blob', {
+          bytesB64: b64, suggestedName: name + '.' + kind, extension: kind,
+        }).then(function (path) {
+          if (path) exportFeedback('Saved ' + kind.toUpperCase() + ' → ' + path);
+        }).catch(function (e) {
+          if (e !== 'cancelled') exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
+        });
+      } else {
+        var blob = new Blob([body], { type: kind === 'svg' ? 'image/svg+xml' : 'text/plain' });
+        saveBlobBrowser(blob, name + '.' + kind);
+      }
+    }
+    var btnSvg = fExp.addButton({ title: 'Export SVG (vector)' });
+    tip(btnSvg, 'Infinite-resolution vector export — every glyph is real text. Perfect for print, posters, laser engraving. Brightness selection mode only.');
+    btnSvg.on('click', function () { exportGridAs('svg'); });
+    var btnTxt = fExp.addButton({ title: 'Export TXT (plain text)' });
+    tip(btnTxt, 'The grid as actual text — paste into a terminal, README, or anywhere monospace lives. Brightness selection mode only.');
+    btnTxt.on('click', function () { exportGridAs('txt'); });
     /* Compute the frame count + per-frame delay we'll actually pass to
        the GIF encoder.  The GIF format stores delays in centiseconds
        (10 ms units), so e.g. 30 fps wants 33.33 ms but the encoder
