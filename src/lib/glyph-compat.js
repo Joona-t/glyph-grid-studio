@@ -44,7 +44,8 @@
   function gateEdgeDirectional(config) {
     if (isV1(config)) return false;
     const mode = config.selectionMode;
-    return mode === 'edge-directional' || mode === 'shape-edge-aware';
+    /* 'flow' (v0.1.6) rides the same cell-signal gradient machinery. */
+    return mode === 'edge-directional' || mode === 'shape-edge-aware' || mode === 'flow';
   }
 
   function gateDither(config) {

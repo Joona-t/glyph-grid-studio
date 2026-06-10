@@ -113,14 +113,138 @@
     return emitDirectional(g.mag, g.dir, cols, rows, opts);
   }
 
+  /* ── Edge-tangent flow field (v0.1.6, SOTA feature 3) ────────────────
+     Structure-tensor ETF in the lineage of Kang/Lee/Chui's flow-based
+     abstraction: per-cell gradients → outer-product tensor (Jxx Jxy Jyy)
+     → N passes of 3×3 box smoothing ON THE TENSOR (immune to the angle-
+     wraparound artifacts of smoothing raw orientations) → eigen-analysis:
+       gradient dir  = ½·atan2(2Jxy, Jxx−Jyy)
+       tangent       = gradient + π/2   (the direction strokes FLOW)
+       coherence     = (λ1−λ2)/(λ1+λ2)  ∈ [0,1] — how oriented the
+                       neighbourhood is (1 = clean edge, 0 = isotropic)
+       energy        = λ1+λ2            — overall gradient strength
+     All buffers persistent (grow-only); zero per-frame allocations after
+     the first call at a given grid size. */
+  let _ffKey = '';
+  let _ffGx = null, _ffGy = null;
+  let _ffJxx = null, _ffJxy = null, _ffJyy = null, _ffTmp = null;
+  let _ffTangent = null, _ffCoherence = null, _ffEnergy = null;
+
+  function _ffEnsure(cols, rows) {
+    const key = cols + 'x' + rows;
+    if (_ffKey === key) return;
+    const n = cols * rows;
+    _ffGx = new Float32Array(n);   _ffGy = new Float32Array(n);
+    _ffJxx = new Float32Array(n);  _ffJxy = new Float32Array(n);
+    _ffJyy = new Float32Array(n);  _ffTmp = new Float32Array(n);
+    _ffTangent = new Float32Array(n);
+    _ffCoherence = new Float32Array(n);
+    _ffEnergy = new Float32Array(n);
+    _ffKey = key;
+  }
+
+  function _boxBlur3(buf, tmp, cols, rows) {
+    /* one 3×3 box pass, edge-clamped, in place via tmp */
+    for (let y = 0; y < rows; y++) {
+      const row = y * cols;
+      const up = (y > 0 ? y - 1 : 0) * cols;
+      const dn = (y < rows - 1 ? y + 1 : rows - 1) * cols;
+      for (let x = 0; x < cols; x++) {
+        const l = x > 0 ? x - 1 : 0;
+        const r = x < cols - 1 ? x + 1 : cols - 1;
+        tmp[row + x] = (
+          buf[up + l] + buf[up + x] + buf[up + r] +
+          buf[row + l] + buf[row + x] + buf[row + r] +
+          buf[dn + l] + buf[dn + x] + buf[dn + r]
+        ) / 9;
+      }
+    }
+    buf.set(tmp);
+  }
+
+  /* Compute the flow field for a cell-resolution signal.
+     opts.smoothPasses (default 2) — tensor smoothing iterations.
+     Returns persistent { tangent, coherence, energy } Float32Arrays
+     (valid until the next flowField call). */
+  function flowField(signal, cols, rows, opts) {
+    opts = opts || {};
+    const passes = opts.smoothPasses == null ? 2 : (opts.smoothPasses | 0);
+    _ffEnsure(cols, rows);
+    const n = cols * rows;
+
+    /* Sobel into persistent gx/gy. */
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        let gx = 0, gy = 0;
+        for (let ky = -1; ky <= 1; ky++) {
+          const yy = y + ky;
+          if (yy < 0 || yy >= rows) continue;
+          const row = yy * cols;
+          for (let kx = -1; kx <= 1; kx++) {
+            const xx = x + kx;
+            if (xx < 0 || xx >= cols) continue;
+            const idx = (ky + 1) * 3 + (kx + 1);
+            const v = signal[row + xx];
+            gx += v * SOBEL_X[idx];
+            gy += v * SOBEL_Y[idx];
+          }
+        }
+        const i = y * cols + x;
+        _ffGx[i] = gx;
+        _ffGy[i] = gy;
+      }
+    }
+
+    /* Structure tensor + smoothing. */
+    for (let i = 0; i < n; i++) {
+      const gx = _ffGx[i], gy = _ffGy[i];
+      _ffJxx[i] = gx * gx;
+      _ffJxy[i] = gx * gy;
+      _ffJyy[i] = gy * gy;
+    }
+    for (let p = 0; p < passes; p++) {
+      _boxBlur3(_ffJxx, _ffTmp, cols, rows);
+      _boxBlur3(_ffJxy, _ffTmp, cols, rows);
+      _boxBlur3(_ffJyy, _ffTmp, cols, rows);
+    }
+
+    /* Eigen-analysis. */
+    for (let i = 0; i < n; i++) {
+      const jxx = _ffJxx[i], jxy = _ffJxy[i], jyy = _ffJyy[i];
+      const tr = jxx + jyy;
+      const det = Math.sqrt((jxx - jyy) * (jxx - jyy) + 4 * jxy * jxy);
+      const l1 = (tr + det) * 0.5;
+      const l2 = (tr - det) * 0.5;
+      _ffEnergy[i] = tr;
+      _ffCoherence[i] = tr > 1e-9 ? (l1 - l2) / (l1 + l2 + 1e-9) : 0;
+      /* dominant gradient orientation; tangent is +90°. */
+      const gradAngle = 0.5 * Math.atan2(2 * jxy, jxx - jyy);
+      _ffTangent[i] = gradAngle + Math.PI / 2;
+    }
+    return { tangent: _ffTangent, coherence: _ffCoherence, energy: _ffEnergy };
+  }
+
+  /* Tangent (orientation, period π) → one of 4 stroke glyphs.
+     Bins centred on 0° ─, 45° ╱, 90° │, 135° ╲. */
+  const FLOW_ALPHABET = [0x2500, 0x2571, 0x2502, 0x2572];
+  function flowGlyph(tangentRad) {
+    let a = tangentRad % Math.PI;
+    if (a < 0) a += Math.PI;
+    const bin = Math.floor(((a + Math.PI / 8) % Math.PI) / (Math.PI / 4)) & 3;
+    return FLOW_ALPHABET[bin];
+  }
+
   const api = Object.freeze({
     SOBEL_X: SOBEL_X,
     SOBEL_Y: SOBEL_Y,
     DEFAULT_ALPHABET: DEFAULT_ALPHABET,
+    FLOW_ALPHABET: FLOW_ALPHABET,
     sobel: sobel,
     binDirection: binDirection,
     emitDirectional: emitDirectional,
     selectGrid: selectGrid,
+    flowField: flowField,
+    flowGlyph: flowGlyph,
   });
 
   const root = (typeof window !== 'undefined') ? window

@@ -264,6 +264,10 @@
     depth: { enabled: false },
 
     paletteMorph: null,
+    /* v0.1.6: anti-flicker Schmitt trigger on ramp index (off = legacy). */
+    temporalStability: { enabled: false, strength: 0.75 },
+    /* v0.1.6: ETF flow mode tuning (selectionMode: 'flow'). */
+    flow: { coherence: 0.30, energy: 0.06, smoothing: 2 },
     recording: { mode: 'legacy' },
 
     /* Dispersal — stardust effect.  Each inked cell drifts in a seeded
@@ -1272,6 +1276,73 @@
   let __pfLastChange = null;       // {key, t} — last config change that hasn't been observed yet
   let __pfLastLatency = null;      // last measured switch latency (for status bar)
 
+  /* ── Temporal glyph stability (v0.1.6, SOTA feature 1) ──────────────
+     The classic video-stylization flicker problem: temporal dither +
+     breathing intentionally perturb the per-cell signal every frame,
+     which makes the RAMP INDEX oscillate between adjacent characters —
+     visible as glyph "shimmer" on animated renders.  Fix: a per-cell
+     Schmitt trigger on the ramp index.  A cell only ADOPTS a new glyph
+     when the continuous index moves more than (0.5 + strength) away
+     from the incumbent — i.e. clearly into another character's bucket.
+     Brightness ALPHA stays continuous, so the substrate-breathing
+     aesthetic is preserved; only the character swaps are damped.
+     OFF by default (existing outputs stay bit-identical).
+     CONFIG.temporalStability = { enabled, strength }. */
+  let _stabIdx = null;          // Int16Array(cols*rows), -1 = no history
+  let _stabPend = null;         // pending candidate idx (cellIndex path)
+  let _stabPendN = null;        // consecutive frames candidate persisted
+  let _stabKey = '';
+  let _stabOn = false;          // continuous (signal-driven) path
+  let _stabDebounceK = 3;       // frames a new glyph must persist to adopt
+  let _stabStrength = 0.75;
+  function _ensureStabBuf(cols, rows) {
+    const key = cols + 'x' + rows;
+    if (_stabKey !== key || !_stabIdx) {
+      _stabIdx = new Int16Array(cols * rows).fill(-1);
+      _stabPend = new Int16Array(cols * rows).fill(-1);
+      _stabPendN = new Uint8Array(cols * rows);
+      _stabKey = key;
+    }
+    return _stabIdx;
+  }
+  /* Integer debounce for the DITHERED path (cellIndex) — the upstream
+     quantizer discarded the continuous value, so the Schmitt trigger
+     can't apply.  A new glyph is adopted only after persisting K
+     consecutive frames; ±1-bucket dither oscillation (A/B/A/B) never
+     persists and is suppressed; real transitions land after K frames
+     (~100 ms at 30 fps). */
+  function _stableIdxInt(i, raw) {
+    const prev = _stabIdx[i];
+    if (prev < 0) { _stabIdx[i] = raw; return raw; }
+    if (raw === prev) { _stabPendN[i] = 0; return prev; }
+    if (raw === _stabPend[i]) {
+      if (++_stabPendN[i] >= _stabDebounceK) {
+        _stabIdx[i] = raw; _stabPendN[i] = 0;
+        _stabSwapped++;
+        return raw;
+      }
+    } else {
+      _stabPend[i] = raw; _stabPendN[i] = 1;
+    }
+    _stabDamped++;
+    return prev;
+  }
+  /* Schmitt-trigger index select.  idxF = continuous index
+     (curved * rampLast); rawIdx = the would-be quantized index. */
+  let _stabDamped = 0;   // swaps suppressed this frame (the feature working)
+  let _stabSwapped = 0;  // swaps allowed through this frame
+  function _stableIdx(buf, i, idxF, rawIdx) {
+    const prev = buf[i];
+    if (prev < 0) { buf[i] = rawIdx; return rawIdx; }
+    if (idxF > prev + 0.5 + _stabStrength || idxF < prev - 0.5 - _stabStrength) {
+      if (rawIdx !== prev) _stabSwapped++;
+      buf[i] = rawIdx;
+      return rawIdx;
+    }
+    if (rawIdx !== prev) _stabDamped++;
+    return prev;
+  }
+
   /* prefers-reduced-motion (audit 2026-06-10, WCAG 2.3.3 / CLAUDE.md
      a11y mandate).  Cached MediaQueryList — live `matches` reads stay
      cheap on the hot path.  Policy: AMBIENT interactive motion
@@ -1765,6 +1836,8 @@
       }
     } else if (mode === 'edge-directional') {
       drawEdgeDirectionalGrid(cols, rows, cellW, cellH);
+    } else if (mode === 'flow') {
+      drawFlowGrid(cols, rows, cellW, cellH);
     } else {
       drawBrightnessGrid(cellIndex, cellSignal, cols, rows, cellW, cellH);
     }
@@ -2255,10 +2328,12 @@
           let idx;
           if (cellIndex) {
             idx = cellIndex[i];
+            if (_stabOnInt) idx = _stableIdxInt(i, idx);
           } else {
             idx = (curved * rampLast + 0.0001) | 0;
             if (idx > rampLast) idx = rampLast;
             else if (idx < 0) idx = 0;
+            if (_stabOn) idx = _stableIdx(_stabIdx, i, curved * rampLast, idx);
           }
           let a = curved * 1.1; if (a > 1) a = 1; else if (a < 0) a = 0;
           const o4 = i * 4, o3 = i * 3;
@@ -2312,6 +2387,25 @@
     const rampLast = ramp.length - 1;
     const gamma = CONFIG.brightnessGamma;
     _buildGammaLut(gamma);
+    /* Temporal stability hoist (v0.1.6): one flag read per frame, the
+       per-cell Schmitt trigger only runs when enabled. */
+    const _ts = CONFIG.temporalStability;
+    const _stabEnabled = !!(_ts && _ts.enabled);
+    _stabOn = _stabEnabled && !cellIndex;
+    const _stabOnInt = _stabEnabled && !!cellIndex;
+    /* publish last frame's counters + gate diagnostics (PERF_JOB.stab) */
+    window.__stabLastFrame = {
+      on: _stabEnabled,
+      cellIndexNull: !cellIndex,
+      damped: _stabDamped, swapped: _stabSwapped,
+    };
+    _stabDamped = 0; _stabSwapped = 0;
+    if (_stabEnabled) {
+      const _sv = (typeof _ts.strength === 'number') ? _ts.strength : 0.75;
+      _stabStrength = _sv;
+      _stabDebounceK = Math.max(2, 2 + Math.round(_sv * 2));
+      _ensureStabBuf(cols, rows);
+    }
     const gSrc = src;
     const pixels = gSrc.pixels;
     const srcW = gSrc.width;
@@ -2447,10 +2541,12 @@
           let idx;
           if (cellIndex) {
             idx = cellIndex[i];
+            if (_stabOnInt) idx = _stableIdxInt(i, idx);
           } else {
             idx = (curved * rampLast + 0.0001) | 0;
             if (idx > rampLast) idx = rampLast;
             else if (idx < 0) idx = 0;
+            if (_stabOn) idx = _stableIdx(_stabIdx, i, curved * rampLast, idx);
           }
           if (spaceMask[idx]) continue;
           let cx = ((c * cellW) | 0) + halfCellW;
@@ -2516,10 +2612,12 @@
           let idx;
           if (cellIndex) {
             idx = cellIndex[i];
+            if (_stabOnInt) idx = _stableIdxInt(i, idx);
           } else {
             idx = (curved * rampLast + 0.0001) | 0;
             if (idx > rampLast) idx = rampLast;
             else if (idx < 0) idx = 0;
+            if (_stabOn) idx = _stableIdx(_stabIdx, i, curved * rampLast, idx);
           }
           if (spaceMask[idx]) continue;
           const cx = ((c * cellW) | 0) + halfCellW;
@@ -2560,10 +2658,12 @@
           let idx;
           if (cellIndex) {
             idx = cellIndex[i];
+            if (_stabOnInt) idx = _stableIdxInt(i, idx);
           } else {
             idx = (curved * rampLast + 0.0001) | 0;
             if (idx > rampLast) idx = rampLast;
             else if (idx < 0) idx = 0;
+            if (_stabOn) idx = _stableIdx(_stabIdx, i, curved * rampLast, idx);
           }
           if (spaceMask[idx]) continue;
           const cx = ((c * cellW) | 0) + halfCellW;
@@ -2590,10 +2690,14 @@
         const curved = _gammaLut[(sigQ * 255) | 0];
         let ch;
         if (cellIndex) {
-          ch = ramp.charAt(cellIndex[i]);
+          let sIdx = cellIndex[i];
+          if (_stabOnInt) sIdx = _stableIdxInt(i, sIdx);
+          ch = ramp.charAt(sIdx);
         } else {
-          const idx = (curved * rampLast + 0.0001) | 0;
-          ch = ramp.charAt(idx > rampLast ? rampLast : (idx < 0 ? 0 : idx));
+          let idx = (curved * rampLast + 0.0001) | 0;
+          if (idx > rampLast) idx = rampLast; else if (idx < 0) idx = 0;
+          if (_stabOn) idx = _stableIdx(_stabIdx, i, curved * rampLast, idx);
+          ch = ramp.charAt(idx);
         }
         if (ch === ' ') continue;
         const x0 = (c * cellW) | 0;
@@ -2854,10 +2958,51 @@
     if (__pfFrame) __pfFrame.stages._draw = performance.now() - _t_draw0;
   }
 
+  /* ── Flow mode (v0.1.6, SOTA feature 3) ─────────────────────────────
+     Edge-tangent-flow glyph orientation: structure-tensor ETF over the
+     cell signal; cells whose neighbourhood is COHERENTLY oriented get a
+     stroke glyph aligned to the flow tangent (─ ╱ │ ╲); isotropic cells
+     fall back to the brightness ramp.  The result reads like pen
+     hatching that follows the image's contours.  Rendering reuses the
+     edge-directional drawer's full colour-mode machinery via its
+     cpsOverride parameter. */
+  let _flowCps = null;
+  let _flowCpsKey = '';
+  function drawFlowGrid(cols, rows, cellW, cellH) {
+    const fcfg = CONFIG.flow || {};
+    const cohT = (typeof fcfg.coherence === 'number') ? fcfg.coherence : 0.30;
+    const enT = (typeof fcfg.energy === 'number') ? fcfg.energy : 0.06;
+    const passes = (typeof fcfg.smoothing === 'number') ? fcfg.smoothing : 2;
+    const ff = GlyphGrid.edge.flowField(cellSignal, cols, rows, { smoothPasses: passes });
+
+    const key = cols + 'x' + rows;
+    if (_flowCpsKey !== key || !_flowCps) {
+      _flowCps = new Uint16Array(cols * rows);
+      _flowCpsKey = key;
+    }
+    const ramp = RAMPS[CONFIG.ramp];
+    const rampLast = ramp.length - 1;
+    _buildGammaLut(CONFIG.brightnessGamma);
+    const flowGlyph = GlyphGrid.edge.flowGlyph;
+    for (let i = 0; i < _flowCps.length; i++) {
+      if (ff.coherence[i] >= cohT && ff.energy[i] >= enT) {
+        _flowCps[i] = flowGlyph(ff.tangent[i]);
+      } else {
+        const sig = cellSignal[i];
+        const sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+        const curved = _gammaLut[(sigQ * 255) | 0];
+        let idx = (curved * rampLast + 0.0001) | 0;
+        if (idx > rampLast) idx = rampLast; else if (idx < 0) idx = 0;
+        _flowCps[i] = ramp.charCodeAt(idx);
+      }
+    }
+    drawEdgeDirectionalGrid(cols, rows, cellW, cellH, _flowCps);
+  }
+
   /* ---- edge-directional drawer (cheap alt). ---- */
   // HOT-PATH: drawEdgeDirectionalGrid — autonomous optimization loop tracks
   // no per-frame allocations / no new branches in this function body.
-  function drawEdgeDirectionalGrid(cols, rows, cellW, cellH) {
+  function drawEdgeDirectionalGrid(cols, rows, cellW, cellH, cpsOverride) {
     const palette = PALETTES[CONFIG.palette];
     const bgC = color(palette.bg);
     const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
@@ -2871,7 +3016,7 @@
     const stride = srcW * 4;
     const cellPxW = Math.max(1, Math.floor(cellW));
     const cellPxH = Math.max(1, Math.floor(cellH));
-    const cps = GlyphGrid.edge.selectGrid(cellSignal, cols, rows, {
+    const cps = cpsOverride || GlyphGrid.edge.selectGrid(cellSignal, cols, rows, {
       threshold: 0.15,
       fallbackCp: 0x20,
     });
@@ -3289,6 +3434,117 @@
     getRecState: () => recState,
     getSkillVersion: () => (window.GlyphGrid && GlyphGrid.compat ? GlyphGrid.compat.SKILL_VERSION : '1.x'),
 
+    /* ── captureGridSnapshot (v0.1.6, SOTA feature 2) ──────────────────
+       Vector/text export needs the grid AS DATA, not pixels.  Reads the
+       PERSISTENT cellSignal buffer (the post-EMA brightness the last
+       frame rendered from) and replays the brightness-mode glyph +
+       colour selection OUTSIDE the draw loop — zero cost to the hot
+       paths.  Honors temporal stability (reads the displayed _stabIdx).
+       Brightness selection mode only; shape/edge modes return null
+       (their per-cell picks aren't persisted) — callers show a hint. */
+    captureGridSnapshot() {
+      try {
+        const mode = GlyphGrid.compat.resolveSelectionMode(CONFIG);
+        if (mode !== 'brightness') return null;
+        if (!cellSignal || !sourceImg) return null;
+        const cols = CONFIG.grid.cols, rows = CONFIG.grid.rows;
+        if (cellSignal.length !== cols * rows) return null;
+        const ramp = RAMPS[CONFIG.ramp];
+        const rampLast = ramp.length - 1;
+        _buildGammaLut(CONFIG.brightnessGamma);
+        const palette = PALETTES[CONFIG.palette];
+        const bgC = color(palette.bg);
+        const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
+        const colorMode = CONFIG.colorMode;
+        const cellW = width / cols, cellH = height / rows;
+        const cellPxW = Math.max(1, Math.floor(cellW));
+        const cellPxH = Math.max(1, Math.floor(cellH));
+        const gSrc = src, pixels = gSrc.pixels, srcW = gSrc.width;
+        const stride = srcW * 4;
+        /* Colour hoists mirroring drawBrightnessGrid. */
+        let monoR = 0, monoG = 0, monoB = 0;
+        if (colorMode === 'monochrome' && palette.inks && palette.inks[0]) {
+          const ic = color(palette.inks[0]);
+          monoR = red(ic); monoG = green(ic); monoB = blue(ic);
+        }
+        let dueR0 = 0, dueG0 = 0, dueB0 = 0, dueR1 = 0, dueG1 = 0, dueB1 = 0;
+        if (colorMode === 'duotone' && palette.inks && palette.inks.length > 0) {
+          const c0 = color(palette.inks[0]);
+          const c1 = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
+          dueR0 = red(c0); dueG0 = green(c0); dueB0 = blue(c0);
+          dueR1 = red(c1); dueG1 = green(c1); dueB1 = blue(c1);
+        }
+        let useGrad = false;
+        if (colorMode === 'gradient') {
+          const gStops = resolveGradientStops(palette);
+          if (gStops && gStops.length > 0) {
+            const gmap = CONFIG.gradientColorMap || {};
+            _ensureGradColorLut(gStops, gmap.blend || 'oklab',
+                                (typeof gmap.curve === 'number') ? gmap.curve : 1.0);
+            useGrad = true;
+          }
+        }
+        const stab = (CONFIG.temporalStability && CONFIG.temporalStability.enabled
+                      && _stabIdx && _stabIdx.length === cols * rows) ? _stabIdx : null;
+        const cells = [];
+        for (let r = 0; r < rows; r++) {
+          for (let c = 0; c < cols; c++) {
+            const i = r * cols + c;
+            const sigI = cellSignal[i];
+            const sigQ = sigI < 0 ? 0 : (sigI > 1 ? 1 : sigI);
+            const curved = _gammaLut[(sigQ * 255) | 0];
+            let idx = (curved * rampLast + 0.0001) | 0;
+            if (idx > rampLast) idx = rampLast; else if (idx < 0) idx = 0;
+            if (stab && stab[i] >= 0) idx = stab[i];
+            const ch = ramp.charAt(idx);
+            if (ch === ' ') continue;
+            let fr, fg, fb, fo = 1;
+            if (colorMode === 'monochrome') {
+              fr = monoR; fg = monoG; fb = monoB;
+              fo = Math.min(1, curved * 1.1);
+            } else if (colorMode === 'duotone') {
+              const t = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
+              fr = dueR0 + (dueR1 - dueR0) * t;
+              fg = dueG0 + (dueG1 - dueG0) * t;
+              fb = dueB0 + (dueB1 - dueB0) * t;
+            } else if (colorMode === 'gradient' && useGrad) {
+              const o = ((curved * 255) | 0) * 3;
+              fr = _gradColorLut[o]; fg = _gradColorLut[o + 1]; fb = _gradColorLut[o + 2];
+            } else {
+              /* preserve — sample + contrast-stretch (applyCellFill math) */
+              const x0 = (c * cellW) | 0, y0 = (r * cellH) | 0;
+              sampleCellInto(_sampleObj, pixels, stride, x0, y0, cellPxW, cellPxH, srcW, gSrc.height);
+              const dr = _sampleObj.r - bgR, dg = _sampleObj.g - bgG, db = _sampleObj.b - bgB;
+              const m = Math.max(Math.abs(dr), Math.abs(dg), Math.abs(db), 1);
+              const sc = 255 / m;
+              fr = Math.max(0, Math.min(255, bgR + dr * sc));
+              fg = Math.max(0, Math.min(255, bgG + dg * sc));
+              fb = Math.max(0, Math.min(255, bgB + db * sc));
+            }
+            cells.push({
+              c: ch, col: c, row: r,
+              f: 'rgb(' + (fr | 0) + ',' + (fg | 0) + ',' + (fb | 0) + ')',
+              o: Math.round(fo * 1000) / 1000,
+            });
+          }
+        }
+        return {
+          cols: cols, rows: rows,
+          w: width, h: height,
+          cellW: cellW, cellH: cellH,
+          fontSize: CONFIG.font.size,
+          fontFamily: (CONFIG.font && CONFIG.font.family) || 'monospace',
+          bg: palette.bg,
+          ramp: CONFIG.ramp,
+          palette: CONFIG.palette,
+          cells: cells,
+        };
+      } catch (e) {
+        console.warn('captureGridSnapshot failed:', e);
+        return null;
+      }
+    },
+
     /* Batch GIF export — drive hundreds of variations unattended.
        Each `job` is { name: 'human-label', path: '/abs/path/foo.gif',
        config: { palette: 'spice', colorMode: 'duotone', dither: {mode:'stbn'} },
@@ -3352,6 +3608,7 @@
           p50: p50,
           p95: p95,
           switch_ms: _lat ? _lat.ms : null,
+          stab: window.__stabLastFrame || null,
           frame_anchors: anchors,
         };
       }
