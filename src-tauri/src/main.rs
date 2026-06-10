@@ -125,9 +125,24 @@ fn main() {
     match cli.command {
         None | Some(Command::Studio) => app_lib::run(),
         Some(Command::Render(args)) => {
+            // Audit 2026-06-10: canonicalize --in at the CLI boundary.
+            // A relative path used to flow into the webview's
+            // read_image_file with a different effective cwd and HANG the
+            // process instead of erroring (found during the CS-2 gate
+            // bisection). Fail fast, with a message, before Tauri spins up.
+            let in_path = match args.in_path.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "render: cannot resolve --in {:?}: {} (file must exist; relative paths resolve against the current directory)",
+                        args.in_path, e
+                    );
+                    std::process::exit(2);
+                }
+            };
             // Convert clap struct to a plain job struct that lib.rs can consume.
             let job = app_lib::HeadlessRenderJob {
-                in_path: args.in_path,
+                in_path,
                 out_path: args.out_path,
                 frames: args.frames,
                 show_window: args.show_window,
