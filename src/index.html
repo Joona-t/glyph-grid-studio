@@ -1246,7 +1246,10 @@
         const avgMs = sumTotal / __pfRing.length;
         if (avgMs > 0) fpsTag = ` | ${(1000 / avgMs).toFixed(0)} fps`;
       }
-      statusEl().textContent =
+      /* BUG-009: __statusHold lets export feedback ("encoding…", "Saved
+         GIF → …") survive on the bar while the draw loop runs underneath.
+         finishRecording sets it; exportFeedback releases it. */
+      if (!window.__statusHold) statusEl().textContent =
         `${CONFIG.scene} | ${CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
         `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag}${animTag}${fpsTag} | ` +
         `t=${t.toFixed(2)}s | compat=${CONFIG.compat}`;
@@ -3371,17 +3374,35 @@
   function finishRecording() {
     statusEl().textContent = `RECORDING DONE — building ZIP…`;
     recState.zip.generateAsync({ type: 'blob' }).then((blob) => {
-      if (typeof recState.onFinish === 'function') {
-        recState.onFinish(blob);
-        /* This path IS the normal GUI export (recordGIF/recordMP4 hand
-           frames to the Rust encoder).  Audit 2026-06-10: the old
-           "handled by test hook" wording was developer jargon, and the
-           encode that follows can take 10–30 s with zero feedback — say
-           what is actually happening. */
+      const total = recState.total;
+      const onFinish = (typeof recState.onFinish === 'function') ? recState.onFinish : null;
+      /* BUG-009: recState used to survive past this point forever, so
+         draw()'s `recState.done → noLoop()` froze the studio after every
+         GUI export — dead canvas, dead status bar, and "Clear image"
+         apparently broken (its handler ran, called loop(), draw() hit the
+         stale done-state and noLoop()'d again before painting).  Batch
+         mode dodged it because beginRecord installs a fresh recState per
+         job.  Fix: onFinish consumes framesB64 SYNCHRONOUSLY (recordGIF /
+         recordMP4 / batch all map frames before their async invoke), so
+         clear the recording state and re-engage the loop right after it
+         returns.  __statusHold keeps the encode/save feedback readable
+         while frames render underneath; exportFeedback releases it. */
+      if (onFinish) {
+        onFinish(blob);
+        recState = null;
+        clearTimeout(window.__statusHoldTimer);
+        window.__statusHold = true;
+        try { loop(); } catch (e) {}
+        /* The encode that follows can take 10–30 s — say what is
+           actually happening (audit 2026-06-10). */
         statusEl().textContent =
-          `RECORDED ${recState.total} frames — encoding… (save dialog opens when done)`;
+          `RECORDED ${total} frames — encoding… (save dialog opens when done)`;
         return;
       }
+      recState = null;
+      clearTimeout(window.__statusHoldTimer);
+      window.__statusHold = true;
+      try { loop(); } catch (e) {}
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -3392,7 +3413,8 @@
       a.remove();
       URL.revokeObjectURL(url);
       statusEl().textContent =
-        `RECORDED ${recState.total} frames → ZIP downloaded. Unzip + run export-gif.sh`;
+        `RECORDED ${total} frames → ZIP downloaded. Unzip + run export-gif.sh`;
+      window.__statusHoldTimer = setTimeout(() => { window.__statusHold = false; }, 4000);
     });
   }
 

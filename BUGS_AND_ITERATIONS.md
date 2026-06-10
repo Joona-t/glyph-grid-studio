@@ -4,7 +4,50 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
-## 2026-06-10 — v0.1.6: three SOTA features
+## 2026-06-10 — v0.1.7: GUI export freeze (P0)
+
+### BUG-009 — App permanently freezes after every GUI export; Clear image appears broken
+
+- **Report (Joona, live):** "when i export a gif the program freezes
+  then i cannot even clear image i have to restart it."
+- **Reproduced** on the installed v0.1.6 app via Export GIF
+  (Twitter-fit), 317-frame portrait source: export completed and saved
+  fine, but afterwards the canvas froze on the last frame, the status
+  bar stuck on "Saved GIF → …" (it is repainted per-frame by `draw()` —
+  stuck bar = dead loop), and clicking **Clear image** did nothing.
+- **Root cause:** `finishRecording()` never cleared `recState` after a
+  GUI export. `draw()`'s first line — `if (recState && recState.done)
+  { noLoop(); return; }` — then killed the loop **permanently**: every
+  panel handler's `try { loop() } catch {}` rescue (including Clear
+  image's) ran exactly one frame, hit the stale `done` state, and
+  `noLoop()`'d again *before painting anything*. The handlers all
+  worked; nothing ever repainted. Batch mode never saw it because
+  `beginRecord` installs a fresh `recState` per job (the BUG-001 fix
+  patched the *driver*, not the terminal state).
+- **Fix (src/index.html + src/lib/glyph-studio.js):**
+  - `finishRecording()` now clears `recState` and re-engages `loop()`
+    immediately after `onFinish` returns — safe because all three
+    consumers (recordGIF, recordMP4, batch driver) map `framesB64` into
+    their invoke payload *synchronously* inside `onFinish`.
+  - New `window.__statusHold`: the resumed draw loop would instantly
+    clobber the "encoding…" / "Saved GIF → …" messages, so the
+    per-frame status write is gated while an export settles.
+    `exportFeedback()` releases the hold (3.5 s linger on a message,
+    immediate on cancel); the no-frames ZIP fallbacks now also route
+    through `exportFeedback` so the hold cannot leak.
+- **Defense in depth (src-tauri/src/lib.rs):** `decode_frames_parallel`
+  and the MP4 preprocess pool now use `available_parallelism − 2`
+  (min 2) threads instead of every core — the draw loop is *live*
+  during the encode as of this fix, and a saturated CPU read as
+  "frozen" even while the encode progressed.
+- **Why the gate never caught it:** the entire test suite exercises
+  exports through the batch driver (`runBatchExport`), which re-arms
+  `recState` per job. The GUI single-export path
+  (`recordGIF → save_gif_real`) has no headless equivalent — found
+  only by live GUI runtime audit. Lesson logged: post-export *loop
+  liveness* is now part of the manual GUI verification checklist.
+
+
 
 ### ITER-037 — Temporal glyph stability (anti-flicker, measured 97.8 % suppression)
 

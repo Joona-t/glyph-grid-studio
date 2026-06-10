@@ -564,8 +564,12 @@ fn decode_frames_parallel(
     if n == 0 {
         return Ok(Vec::new());
     }
+    // BUG-009: leave 2 cores free — a GUI export runs this while the
+    // webview's draw loop is live (the loop resumes during encode since
+    // v0.1.7); saturating every core starves the UI thread and the app
+    // reads as frozen even though the encode is progressing.
     let threads = std::thread::available_parallelism()
-        .map(|p| p.get())
+        .map(|p| p.get().saturating_sub(2).max(2))
         .unwrap_or(4)
         .min(n);
     let chunk = n.div_ceil(threads);
@@ -887,8 +891,10 @@ fn encode_mp4_h264(
     // H.264 encoder stays sequential below.
     let t_pre = std::time::Instant::now();
     let n_frames = frames.len();
+    // BUG-009: same 2-core headroom as decode_frames_parallel — keep the
+    // webview responsive during GUI exports.
     let pre_threads = std::thread::available_parallelism()
-        .map(|p| p.get())
+        .map(|p| p.get().saturating_sub(2).max(2))
         .unwrap_or(4)
         .min(n_frames);
     let pre_chunk = n_frames.div_ceil(pre_threads);
