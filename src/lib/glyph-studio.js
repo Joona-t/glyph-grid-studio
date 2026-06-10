@@ -314,6 +314,21 @@
   /* ----------------------------------------------------------------
    * 4.  Recording + snapshot
    * ---------------------------------------------------------------- */
+  /* Export feedback (audit 2026-06-10): exports previously reported
+     success/failure ONLY via console.log/warn — a GUI user saw nothing
+     after the save dialog closed, and nothing at all on encoder errors.
+     Writes both the status bar and a toast; empty msg clears the bar
+     (used on user-cancelled save dialogs). */
+  function exportFeedback(msg, isError) {
+    try {
+      var el = document.getElementById('status');
+      if (el) el.textContent = msg;
+    } catch (e) {}
+    if (msg) {
+      try { showToast((isError ? '⚠ ' : '') + msg, isError ? 6000 : 3200); } catch (e) {}
+    }
+  }
+
   /* Native (Tauri) path: collect frame base64 strings during the recording
      loop, then hand them to the Rust gif muxer.  Browser path: keep the old
      ZIP behaviour as a fallback so the studio works outside Tauri.
@@ -349,13 +364,16 @@
             targetMaxBytes: (typeof targetMaxBytes === 'number' && targetMaxBytes > 0) ? targetMaxBytes : null,
           })
             .then(function (p) {
-              if (p) console.log('glyph-studio: saved GIF to', p);
+              if (p) {
+                console.log('glyph-studio: saved GIF to', p);
+                exportFeedback('Saved GIF → ' + p);
+              }
             })
             .catch(function (e) {
-              if (e !== 'cancelled') {
-                console.warn('save_gif_real failed:', e, '— falling back to ZIP');
-                saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
-              }
+              if (e === 'cancelled') { exportFeedback(''); return; }
+              console.warn('save_gif_real failed:', e, '— falling back to ZIP');
+              exportFeedback('GIF encode failed: ' + e + ' — frames saved as ZIP instead', true);
+              saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
             });
         } else {
           saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
@@ -408,13 +426,16 @@
             border: (border && border.enabled) ? border : null,
           })
             .then(function (p) {
-              if (p) console.log('glyph-studio: saved MP4 to', p);
+              if (p) {
+                console.log('glyph-studio: saved MP4 to', p);
+                exportFeedback('Saved MP4 → ' + p);
+              }
             })
             .catch(function (e) {
-              if (e !== 'cancelled') {
-                console.warn('save_mp4_real failed:', e, '— falling back to ZIP');
-                saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
-              }
+              if (e === 'cancelled') { exportFeedback(''); return; }
+              console.warn('save_mp4_real failed:', e, '— falling back to ZIP');
+              exportFeedback('MP4 encode failed: ' + e + ' — frames saved as ZIP instead', true);
+              saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
             });
         } else {
           saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');

@@ -249,6 +249,26 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
         }
     };
 
+    // Audit 2026-06-10: reject jobs with a missing/empty `out` up front —
+    // previously the empty string flowed through to fs::write deep inside
+    // the encode pipeline and surfaced as a cryptic IO error after the
+    // whole render had already run.
+    for (i, j) in jobs_arr.iter().enumerate() {
+        let out_ok = j
+            .get("out")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !out_ok {
+            let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            eprintln!(
+                "batch: job {} ({:?}) has no `out` path — refusing manifest before any render runs",
+                i, name
+            );
+            return 2;
+        }
+    }
+
     // Build the JS-shaped batch JSON.  Each job carries its own out/format/config.
     let jobs_js: Vec<serde_json::Value> = jobs_arr
         .into_iter()
