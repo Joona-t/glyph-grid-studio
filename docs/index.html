@@ -81,6 +81,7 @@
   .brand{ display:flex; align-items:center; gap:12px; min-width:0; }
   .mascot{ width:46px; height:46px; border-radius:50%; background:var(--ls-mascot-bubble); box-shadow:var(--ls-glow), inset 0 0 0 1.5px rgba(255,255,255,.6); display:flex; align-items:center; justify-content:center; flex:none; overflow:hidden; }
   .mascot img{ width:80%; height:80%; object-fit:contain; }
+  .brand .mascot img{ width:100%; height:100%; object-fit:cover; }  /* ankh fills the bubble, no empty ring */
   .brand-name{ font-family:var(--font-display); font-weight:700; font-size:1.15rem; color:var(--ls-heading); letter-spacing:.2px; line-height:1.1; }
   .brand-sub{ font-family:var(--mono); font-size:.62rem; letter-spacing:.22em; text-transform:uppercase; color:var(--ls-text-muted); }
   .nav-right{ display:flex; align-items:center; gap:12px; }
@@ -225,7 +226,7 @@
 
   <nav>
     <div class="brand">
-      <span class="mascot"><img src="assets/icon-ankh.png" alt="Glyph Grid Studio ankh icon"></span>
+      <span class="mascot"><img src="assets/icon-ankh-nav.png" alt="Glyph Grid Studio ankh icon"></span>
       <span>
         <span class="brand-name">Glyph Grid Studio</span><br>
         <span class="brand-sub">Specimen No. 01</span>
@@ -275,19 +276,19 @@
   <section class="wrap showcase">
     <div class="sec-head">
       <div class="sec-eyebrow" data-show-eyebrow>From the studio</div>
-      <h2 class="sec-title">Sparky, rendered in glyphs</h2>
+      <h2 class="sec-title">A portrait, rendered in glyphs</h2>
       <div class="sec-rule"></div>
     </div>
     <figure class="placard show-frame">
       <div class="mat">
         <img class="frame-img" id="showcaseImg"
-             src="assets/showcase-sparky.gif" loading="lazy"
-             alt="Sparky, the LoveSpark wolf mascot, rendered in full colour as a grid of typeset Unicode glyphs by Glyph Grid Studio.">
+             src="assets/kaneki.gif" loading="lazy"
+             alt="A portrait rendered as an ink-on-cream grid of typeset Unicode glyphs by Glyph Grid Studio.">
       </div>
       <figcaption class="plate">
         <span class="pl-no">PL. II</span>
-        <span class="pl-name">Sparky — Full Colour</span>
-        <span class="pl-med">octant grid · preserve colour · shape-edge-aware</span>
+        <span class="pl-name">Portrait — Ink on Cream</span>
+        <span class="pl-med">octant grid · inverted signal · breathing loop</span>
       </figcaption>
     </figure>
   </section>
