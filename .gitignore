@@ -27,3 +27,11 @@ package-lock.json
 *.zip
 tests/scratch/
 tests/RESULTS-V0.1.md
+
+# Internal planning / dev docs — kept local, not for the public repo
+docs/internal/
+scripts/loop_orchestrator/
+
+# Local editor / preview config
+.claude/
+*.sha256

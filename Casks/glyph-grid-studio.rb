@@ -1,8 +1,8 @@
 cask "glyph-grid-studio" do
-  version "0.1.0"
-  sha256 :no_check  # replace with actual SHA256 of the DMG once notarized
+  version "0.1.8"
+  sha256 "e86bbca32011b06d6d91f5e553fb5c2944608c14a9388593087f6b9492ba2f61"
 
-  url "https://github.com/Joona-t/glyph-grid-studio/releases/download/v#{version}/glyph-grid-studio.dmg"
+  url "https://github.com/Joona-t/glyph-grid-studio/releases/download/v#{version}/Glyph-Grid-Studio-macOS.dmg"
   name "Glyph Grid Studio"
   desc "Real-time character-grid image renderer (GUI + CLI + MCP server)"
   homepage "https://github.com/Joona-t/glyph-grid-studio"

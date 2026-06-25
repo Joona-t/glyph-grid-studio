@@ -38,11 +38,11 @@ section(){ echo; echo "=== $1 ==="; }
 # ---------- Phase A: Static source-grep ----------
 section "Phase A — Static source"
 
-# A1: no /Users/darkfire/ paths in source
-if ! grep -rqI "/Users/darkfire/" src/ src-tauri/src/ 2>/dev/null; then
-  pass "A1 no /Users/darkfire/ paths in source"
+# A1: no hardcoded home paths in source (catches any /Users/<name>/ leak)
+if ! grep -rqIE "/Users/[^/]+/" src/ src-tauri/src/ 2>/dev/null; then
+  pass "A1 no hardcoded home paths in source"
 else
-  fail "A1 no /Users/darkfire/ paths in source" "$(grep -rIn '/Users/darkfire/' src/ src-tauri/src/ 2>/dev/null | head -2)"
+  fail "A1 no hardcoded home paths in source" "$(grep -rInE '/Users/[^/]+/' src/ src-tauri/src/ 2>/dev/null | head -2)"
 fi
 
 # A2: no eron/claire/claymore strings
@@ -67,11 +67,11 @@ grep -q '^repository = "[^"]\+"' src-tauri/Cargo.toml || META_OK=false
 grep -q '^authors = \[' src-tauri/Cargo.toml || META_OK=false
 if $META_OK; then pass "A4 Cargo.toml metadata complete"; else fail "A4 Cargo.toml metadata complete" "missing field"; fi
 
-# A5: required files exist
+# A5: required public files exist (internal planning docs live in docs/internal/, not the public tree)
 ALL_FILES=true
 for f in src-tauri/src/mcp.rs docs/mcp.md Casks/glyph-grid-studio.rb \
-         BUGS_AND_ITERATIONS.md PRE-PUBLIC-CHECKLIST.md PUBLIC-LAUNCH-PLAN.md \
-         AGENT-INTEGRATION-PLAN.md TEST-PLAN-V0.1.md; do
+         README.md LICENSE USER-GUIDE.md RELEASING.md \
+         BUGS_AND_ITERATIONS.md docs/index.html; do
   if [[ ! -f "$f" ]]; then
     fail "A5 expected file exists" "$f missing"
     ALL_FILES=false
@@ -192,11 +192,11 @@ REPO_ABS="$(pwd -P)"
 B8_MANIFEST="$SCRATCH/b8-manifest.json"
 cat > "$B8_MANIFEST" <<EOF
 {
-  "in": "$REPO_ABS/tests/sources/thor.png",
+  "in": "$REPO_ABS/tests/sources/cream-paper.png",
   "frames": 4,
   "perf": true,
   "jobs": [
-    {"name": "b8a-gif", "in": "$REPO_ABS/tests/sources/thor.png",
+    {"name": "b8a-gif", "in": "$REPO_ABS/tests/sources/cream-paper.png",
      "out": "$REPO_ABS/$SCRATCH/b8a.gif", "format": "gif", "config": {}},
     {"name": "b8b-mp4", "in": "$REPO_ABS/tests/sources/synthetic-noise.png",
      "out": "$REPO_ABS/$SCRATCH/b8b.mp4", "format": "mp4", "config": {}}
@@ -230,7 +230,7 @@ fi
 B11_MANIFEST="$SCRATCH/b11-manifest.json"
 cat > "$B11_MANIFEST" <<EOF
 {
-  "in": "$REPO_ABS/tests/sources/thor.png",
+  "in": "$REPO_ABS/tests/sources/cream-paper.png",
   "frames": 4,
   "jobs": [
     {"name": "b11-fit", "out": "$REPO_ABS/$SCRATCH/b11.gif", "format": "gif",
