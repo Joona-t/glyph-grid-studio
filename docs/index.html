@@ -189,11 +189,9 @@
   .sp1{ top:120px; right:7%; } .sp2{ top:300px; left:5%; }
   @keyframes sparklePulse{ 0%,100%{ transform:scale(.85); opacity:.45; } 50%{ transform:scale(1.15); opacity:1; } }
 
-  /* showcase (kaneki signature render) */
+  /* showcase (Sparky full-colour render) */
   .showcase{ margin-top:6px; }
   .show-frame{ max-width:680px; }
-  /* candy: warm the cream/ink portrait toward rose so it sits in the palette */
-  :root[data-theme="candy"] #kanekiImg{ filter:saturate(1.3) hue-rotate(300deg) brightness(1.02); }
 
   @media (max-width:760px){ .specimens{ grid-template-columns:1fr; } nav{ flex-wrap:wrap; } }
   @media (max-width:520px){
@@ -265,20 +263,19 @@
   <section class="wrap showcase">
     <div class="sec-head">
       <div class="sec-eyebrow" data-show-eyebrow>From the studio</div>
-      <h2 class="sec-title">A portrait, rendered in glyphs</h2>
+      <h2 class="sec-title">Sparky, rendered in glyphs</h2>
       <div class="sec-rule"></div>
     </div>
     <figure class="placard show-frame">
       <div class="mat">
-        <img class="frame-img" id="kanekiImg"
-             src="assets/kaneki-poster.png"
-             data-gif="assets/kaneki.gif" data-still="assets/kaneki-poster.png"
-             alt="Ken Kaneki rendered as an ink-on-cream grid of typeset Unicode glyphs by Glyph Grid Studio.">
+        <img class="frame-img" id="showcaseImg"
+             src="assets/showcase-sparky.gif" loading="lazy"
+             alt="Sparky, the LoveSpark wolf mascot, rendered in full colour as a grid of typeset Unicode glyphs by Glyph Grid Studio.">
       </div>
       <figcaption class="plate">
         <span class="pl-no">PL. II</span>
-        <span class="pl-name">Portrait — Ink on Cream</span>
-        <span class="pl-med">octant grid · inverted signal · breathing loop</span>
+        <span class="pl-name">Sparky — Full Colour</span>
+        <span class="pl-med">octant grid · preserve colour · shape-edge-aware</span>
       </figcaption>
     </figure>
   </section>
@@ -388,12 +385,10 @@
   });
 
   // poster-first: stream the animated hero + showcase in after load (skip if reduced-motion)
-  var kan = document.getElementById('kanekiImg');
-  function setKaneki(){ if(!kan) return; kan.src = reduce.matches ? kan.getAttribute('data-still') : kan.getAttribute('data-gif'); }
   window.addEventListener('load', function(){
-    if(!reduce.matches){ setHero(root.dataset.theme || 'cream'); setKaneki(); }
+    if(!reduce.matches){ setHero(root.dataset.theme || 'cream'); }
   });
-  reduce.addEventListener && reduce.addEventListener('change', function(){ setHero(root.dataset.theme || 'cream'); setKaneki(); });
+  reduce.addEventListener && reduce.addEventListener('change', function(){ setHero(root.dataset.theme || 'cream'); });
 
   // copy-to-clipboard for the quarantine command
   var copyBtn = document.getElementById('copyBtn'), cmd = document.getElementById('cmd');
