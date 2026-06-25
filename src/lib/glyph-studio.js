@@ -116,7 +116,10 @@
       'samplingStrategy', 'colorMode', 'palette', 'glyphSet',
       'selectionMode', 'dither', 'prefilter', 'postprocess',
       'depth', 'paletteMorph', 'animation', 'seed', 'studio',
-      'temporalStability', 'flow'];
+      'temporalStability', 'flow',
+      /* BUG-011 (v0.1.8): these are live panel inputs but were missing
+         from the preset whitelist, so save → reload silently dropped them. */
+      'invertSignal', 'bgThreshold', 'dispersal', 'scene'];
     var out = {};
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
@@ -275,9 +278,15 @@
                 window.__glyphMaybeSuggestInvert(img, config);
               }
             } catch (e) {}
-          }, function (err) { console.warn('glyph-studio: image decode failed', err); });
+          }, function (err) {
+            console.warn('glyph-studio: image decode failed', err);
+            try { exportFeedback('Not a readable image: ' + String(absPath).split('/').pop(), true); } catch (e) {}
+          });
         })
-        .catch(function (e) { console.warn('glyph-studio: read_image_file failed:', e); });
+        .catch(function (e) {
+          console.warn('glyph-studio: read_image_file failed:', e);
+          try { exportFeedback('Could not read dropped file.', true); } catch (e2) {}
+        });
     }
     if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen) {
       var enterEvents = ['tauri://drag-enter', 'tauri://file-drop-hover', 'tauri://drag-over'];
@@ -473,8 +482,18 @@
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
   }
+  /* True when an image is loaded.  Bridges to index.html's module-scoped
+     `sourceImg` (this studio module can't see it directly).  Defaults to
+     true when the hook is absent (browser/test contexts) so we never block
+     a legitimate export. */
+  function hasSource() {
+    return typeof window.__glyphHasSource === 'function'
+      ? window.__glyphHasSource() : true;
+  }
+
   function snapshotPNG(canvas) {
     if (!canvas) return;
+    if (!hasSource()) { exportFeedback('Load an image before exporting.', true); return; }
     var url = canvas.toDataURL('image/png');
     /* In the Tauri app, prefer the native save dialog. */
     if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
@@ -1545,6 +1564,10 @@
        smaller caps (600→540→480→420→360) until output ≤ N. Used by the
        Twitter-fit button to GUARANTEE < 15 MB even on dense content. */
     function exportRun(format, capOverride, targetMaxBytes) {
+      /* BUG-010 (v0.1.8): block GIF/MP4 export before any image is loaded.
+         draw() early-returns in the empty state, so the recorder would
+         capture zero frames and never finish — the app appears frozen. */
+      if (!hasSource()) { exportFeedback('Load an image before exporting.', true); return; }
       var p = exportPlan();
       var capW = (capOverride !== null && capOverride !== undefined)
         ? capOverride

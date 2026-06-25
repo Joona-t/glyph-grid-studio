@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="cream">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glyph Grid Studio — render any image into living glyphs</title>
+<meta name="description" content="A free, open-source macOS app that renders any image into a tunable grid of typeset Unicode glyphs — ASCII, blocks, octants, braille — with live palettes, blue-noise dithering, CRT-beam effects and GIF / MP4 / SVG export.">
+<link rel="icon" type="image/png" href="assets/sparky.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Glyph Grid Studio">
+<meta property="og:description" content="Render any image into living glyphs. Free & open source for macOS.">
+<meta property="og:image" content="assets/hero-cream-poster.png">
+<meta property="og:url" content="https://lovespark.love/glyph-grid-studio/">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  @font-face{ font-family:'OpenDyslexic'; src:url('assets/fonts/opendyslexic-regular.woff2') format('woff2'); font-weight:400; font-style:normal; font-display:swap; }
+  @font-face{ font-family:'OpenDyslexic'; src:url('assets/fonts/opendyslexic-bold.woff2') format('woff2'); font-weight:700; font-style:normal; font-display:swap; }
+
+  /* ===== CREAM-PAPER (default) ===== */
+  :root{
+    --ls-bg-mid:#efe6d2;
+    --ls-bg-gradient:linear-gradient(170deg,#f4ecda 0%,#ece2cc 60%,#e7dcc2 100%);
+    --ls-cotton:#e6dcc4;
+    --ls-glass:#f3ecda; --ls-glass-solid:#f3ecda; --ls-glass-strong:#f8f2e4; --ls-glass-border:#d8c9a6;
+    --ls-pink-deep:#5e3a24;
+    --ls-text:#332b1d; --ls-text-muted:#5e5237; --ls-text-strong:#221c12; --ls-heading:#2a2418; --ls-text-inv:#f4ecda;
+    --ls-focus:#6e4326; --ls-btn-tx:#fff;
+    --ls-glow:0 4px 12px rgba(120,90,40,.16); --ls-glow-strong:0 8px 20px rgba(120,90,40,.22);
+    --ls-halo-btn:0 4px 10px rgba(94,58,36,.30); --ls-radius:12px; --ls-radius-sm:9px;
+    --ls-grad-btn:linear-gradient(135deg,#5e3a24,#43281a);
+    --ls-grad-text:linear-gradient(120deg,#54653f,#3e4a2e);
+    --ls-code-bg:#2a2418; --ls-code-tx:#f3ecda; --ls-grain:.30;
+    --ls-accent:#6a7a52; --ls-accent-deep:#54653f;     /* sage */
+    --ls-mascot-bubble:linear-gradient(135deg,#f8f2e4,#e6dcc4);
+    --ls-headline-mode:underline;                       /* cream uses an underline swash */
+    --ls-noise:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  }
+
+  /* ===== CANDY ===== */
+  :root[data-theme="candy"]{
+    --ls-bg-mid:#ffd9ec;
+    --ls-bg-gradient:linear-gradient(145deg,#ffd3e5 0%,#ffe8d9 28%,#ffd9ec 55%,#ffe2cc 78%,#ffcbe0 100%);
+    --ls-cotton:#ffd9e9;
+    --ls-glass:linear-gradient(135deg,#fffafd,#ffeef3 45%,#ffdfe9 75%,#ffcfe0); --ls-glass-solid:#fff3f8; --ls-glass-strong:#fffbfe; --ls-glass-border:rgba(255,255,255,.7);
+    --ls-pink-deep:#e91e8c;
+    --ls-text:#4a0827; --ls-text-muted:#6b2848; --ls-text-strong:#2a0413; --ls-heading:#2a0413; --ls-text-inv:#fff;
+    --ls-focus:#b3185c; --ls-btn-tx:#fff;
+    --ls-glow:0 8px 18px rgba(255,124,182,.30),0 1px 4px rgba(255,208,224,.45);
+    --ls-glow-strong:0 12px 30px rgba(255,73,166,.40),0 2px 8px rgba(255,208,224,.55);
+    --ls-halo-btn:0 6px 14px rgba(233,30,140,.40); --ls-radius:20px; --ls-radius-sm:14px;
+    --ls-grad-btn:linear-gradient(135deg,#d81b73 0%,#a51259 100%);
+    --ls-grad-text:linear-gradient(120deg,#c92e72 0%,#b3185c 45%,#d4327a 100%);
+    --ls-code-bg:#2a0413; --ls-code-tx:#fffafd; --ls-grain:.55;
+    --ls-accent:#ff49a6; --ls-accent-deep:#b3185c;     /* pink */
+    --ls-mascot-bubble:linear-gradient(135deg,#fff6fb,#ffd9e9);
+    --ls-headline-mode:gradient;
+  }
+
+  *{box-sizing:border-box;}
+  html{ background-image:var(--ls-bg-gradient); background-attachment:fixed; background-color:var(--ls-bg-mid); }
+  body{ margin:0; font-family:'OpenDyslexic','Atkinson Hyperlegible',system-ui,sans-serif; color:var(--ls-text); line-height:1.6; -webkit-font-smoothing:antialiased; position:relative; min-height:100vh; }
+  body::after{ content:""; position:fixed; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:calc(.10 * (var(--ls-grain) + .45)); pointer-events:none; z-index:1; }
+  .layer{ position:relative; z-index:2; }
+  a{ color:var(--ls-accent-deep); text-decoration-thickness:1px; text-underline-offset:3px; }
+  a:hover{ color:var(--ls-pink-deep); }
+  :focus-visible{ outline:2px solid var(--ls-focus); outline-offset:2px; border-radius:4px; }
+  .wrap{ max-width:1060px; margin:0 auto; padding:0 24px; }
+
+  /* ===== NAV ===== */
+  nav{ position:relative; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:18px 24px; max-width:1060px; margin:0 auto; }
+  .brand{ display:flex; align-items:center; gap:12px; min-width:0; }
+  .mascot{ width:46px; height:46px; border-radius:50%; background:var(--ls-mascot-bubble); box-shadow:var(--ls-glow), inset 0 0 0 1.5px rgba(255,255,255,.6); display:flex; align-items:center; justify-content:center; flex:none; overflow:hidden; }
+  .mascot img{ width:80%; height:80%; object-fit:contain; }
+  .brand-name{ font-weight:700; font-size:1.15rem; color:var(--ls-heading); letter-spacing:.2px; line-height:1.1; }
+  .brand-sub{ font-family:var(--mono); font-size:.62rem; letter-spacing:.22em; text-transform:uppercase; color:var(--ls-text-muted); }
+  .nav-right{ display:flex; align-items:center; gap:12px; }
+  .nav-links{ display:flex; align-items:center; gap:6px; }
+  .nav-links a{ font-family:var(--mono); font-size:.72rem; letter-spacing:.12em; text-transform:uppercase; color:var(--ls-text-muted); text-decoration:none; padding:10px; min-height:44px; display:inline-flex; align-items:center; }
+  .nav-links a:hover{ color:var(--ls-heading); }
+  .nav-ghost{ border:1.5px solid var(--ls-glass-border); border-radius:999px; background:var(--ls-glass-strong); box-shadow:inset 0 1px 0 rgba(255,255,255,.7); padding:10px 16px !important; color:var(--ls-heading) !important; }
+
+  /* theme toggle */
+  .theme-toggle{ display:inline-flex; padding:3px; gap:3px; border-radius:999px; background:var(--ls-glass-strong); border:1.5px solid var(--ls-glass-border); box-shadow:inset 0 1px 0 rgba(255,255,255,.6); }
+  .tg{ font-family:var(--mono); font-size:.66rem; letter-spacing:.14em; text-transform:uppercase; font-weight:700; border:0; cursor:pointer; background:transparent; color:var(--ls-text-muted); padding:8px 13px; min-height:36px; border-radius:999px; transition:background .16s,color .16s; }
+  .tg[aria-pressed="true"]{ background:var(--ls-grad-btn); color:var(--ls-btn-tx); box-shadow:var(--ls-halo-btn); }
+
+  /* ===== HERO ===== */
+  .hero{ padding:40px 0 24px; text-align:center; }
+  .kicker{ font-family:var(--mono); font-size:.66rem; letter-spacing:.34em; text-transform:uppercase; color:var(--ls-accent-deep); display:inline-block; margin-bottom:22px; padding-bottom:8px; border-bottom:1.5px solid var(--ls-glass-border); }
+  h1.headline{ font-size:clamp(2.1rem,5.6vw,3.6rem); line-height:1.08; font-weight:700; color:var(--ls-heading); margin:0 auto 18px; max-width:14ch; letter-spacing:-.5px; }
+  h1.headline em{ font-style:normal; position:relative; white-space:nowrap; color:var(--ls-accent-deep); }
+  /* cream: sage underline swash */
+  :root[data-theme="cream"] h1.headline em::after{ content:""; position:absolute; left:0; right:0; bottom:.04em; height:.14em; background:var(--ls-accent); opacity:.40; border-radius:2px; }
+  /* candy: pink gradient-text + swash */
+  :root[data-theme="candy"] h1.headline em{ background:var(--ls-grad-text); -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+  :root[data-theme="candy"] h1.headline em::after{ content:""; position:absolute; left:-.05em; right:-.05em; bottom:.02em; height:.34em; background:linear-gradient(90deg,#ff8fc2,#ff49a6); opacity:.30; border-radius:6px; z-index:-1; }
+  .sub{ font-size:clamp(1rem,1.5vw,1.12rem); color:var(--ls-text-muted); max-width:54ch; margin:0 auto 30px; }
+
+  /* hero frame (cream = mat placard; candy = glossy polaroid) */
+  .placard{ margin:8px auto 0; max-width:760px; background:linear-gradient(180deg,var(--ls-glass-strong),var(--ls-cotton)); border-radius:16px; padding:26px 26px 22px; box-shadow:var(--ls-glow-strong), inset 0 1px 0 rgba(255,255,255,.75), inset 0 0 0 1.5px rgba(255,255,255,.4); position:relative; }
+  .placard::before{ content:""; position:absolute; inset:14px; border:1px solid rgba(94,58,36,.20); border-radius:9px; pointer-events:none; }
+  :root[data-theme="candy"] .placard{ transform:rotate(-.5deg); }
+  :root[data-theme="candy"] .placard::before{ border:0; }
+  /* candy washi tape */
+  :root[data-theme="candy"] .placard::after{ content:""; position:absolute; top:-12px; left:50%; transform:translateX(-50%) rotate(-3deg); width:120px; height:30px; background:linear-gradient(180deg,rgba(255,143,194,.75),rgba(255,73,166,.55)); box-shadow:0 2px 6px rgba(233,30,140,.25); border-radius:2px; }
+  .mat{ position:relative; background:var(--ls-cotton); border-radius:10px; padding:18px; box-shadow:inset 0 2px 6px rgba(94,58,36,.20), inset 0 -1px 0 rgba(255,255,255,.5); }
+  :root[data-theme="candy"] .mat{ background:#ffeef5; box-shadow:inset 0 2px 8px rgba(233,30,140,.12), inset 0 -1px 0 rgba(255,255,255,.7); }
+  .frame-img{ display:block; width:100%; height:auto; border-radius:6px; background:var(--ls-glass-solid); box-shadow:0 2px 10px rgba(94,58,36,.24), 0 0 0 1px rgba(94,58,36,.16); }
+  :root[data-theme="candy"] .frame-img{ box-shadow:0 4px 14px rgba(233,30,140,.20), 0 0 0 1px rgba(255,255,255,.6); }
+  .plate{ margin:18px auto 0; max-width:560px; background:linear-gradient(180deg,var(--ls-glass-strong),var(--ls-cotton)); border-radius:7px; padding:11px 18px; box-shadow:inset 0 1px 0 rgba(255,255,255,.6), inset 0 -2px 4px rgba(94,58,36,.14), 0 1px 0 rgba(255,255,255,.4); font-family:var(--mono); display:flex; justify-content:center; gap:10px; flex-wrap:wrap; align-items:baseline; font-size:.74rem; letter-spacing:.06em; color:var(--ls-text-strong); }
+  .plate .pl-no{ color:var(--ls-accent-deep); letter-spacing:.2em; }
+  .plate .pl-name{ font-weight:700; }
+  .plate .pl-med{ color:var(--ls-text-muted); font-style:italic; }
+
+  /* ===== CTAs ===== */
+  .ctas{ display:flex; gap:14px; justify-content:center; flex-wrap:wrap; margin:34px auto 14px; }
+  .btn{ display:inline-flex; align-items:center; justify-content:center; gap:9px; min-height:44px; padding:13px 24px; border-radius:999px; font-family:'OpenDyslexic',system-ui,sans-serif; font-weight:700; font-size:1rem; text-decoration:none; cursor:pointer; border:0; transition:transform .16s ease, box-shadow .16s ease; }
+  .btn-primary{ background:var(--ls-grad-btn); color:var(--ls-btn-tx); border:1.5px solid rgba(255,255,255,.5); box-shadow:var(--ls-halo-btn); }
+  .btn-secondary{ background:var(--ls-glass-strong); color:var(--ls-heading); border:1.5px solid rgba(255,255,255,.85); box-shadow:var(--ls-glow), inset 0 1px 0 rgba(255,255,255,.6); }
+  .btn:hover{ transform:translateY(-2px); box-shadow:var(--ls-glow-strong); }
+  .micro{ text-align:center; font-family:var(--mono); font-size:.72rem; letter-spacing:.1em; color:var(--ls-text-muted); margin:6px 0 0; }
+
+  /* ===== SECTION HEADERS ===== */
+  .sec-head{ text-align:center; margin:74px 0 6px; }
+  .sec-eyebrow{ font-family:var(--mono); font-size:.66rem; letter-spacing:.32em; text-transform:uppercase; color:var(--ls-accent-deep); }
+  .sec-title{ font-size:clamp(1.5rem,3vw,2rem); font-weight:700; color:var(--ls-heading); margin:8px 0 0; }
+  .sec-rule{ width:64px; height:2px; background:var(--ls-glass-border); margin:16px auto 0; border-radius:2px; }
+
+  /* ===== CARDS ===== */
+  .specimens{ display:grid; grid-template-columns:repeat(3,1fr); gap:20px; margin-top:40px; }
+  .card{ position:relative; background:var(--ls-glass); border:0; border-radius:var(--ls-radius); box-shadow:var(--ls-glow); padding:24px 22px 22px; overflow:hidden; transition:transform .18s ease, box-shadow .18s ease; }
+  .card::before{ content:""; position:absolute; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:.08; pointer-events:none; }
+  .card::after{ content:""; position:absolute; left:0; right:0; top:0; height:55%; background:linear-gradient(180deg,rgba(255,255,255,.5),transparent); mix-blend-mode:plus-lighter; pointer-events:none; }
+  .card>*{ position:relative; z-index:1; }
+  .card:hover{ transform:translateY(-4px); box-shadow:var(--ls-glow-strong); }
+  .spec-no{ font-family:var(--mono); font-size:.7rem; letter-spacing:.2em; color:var(--ls-accent-deep); display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+  .spec-no::after{ content:""; flex:1; height:1px; background:var(--ls-glass-border); }
+  .spec-title{ font-weight:700; font-size:1.12rem; color:var(--ls-heading); margin:0 0 8px; line-height:1.25; }
+  .spec-desc{ font-family:var(--mono); font-size:.8rem; line-height:1.55; color:var(--ls-text-muted); margin:0; }
+
+  /* ===== GATEKEEPER ===== */
+  .firstlaunch{ margin-top:78px; }
+  .panel{ position:relative; background:var(--ls-glass); border:0; border-radius:var(--ls-radius); box-shadow:var(--ls-glow); padding:34px 32px; overflow:hidden; }
+  .panel::before{ content:""; position:absolute; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:.08; pointer-events:none; }
+  .panel::after{ content:""; position:absolute; left:0; right:0; top:0; height:40%; background:linear-gradient(180deg,rgba(255,255,255,.45),transparent); mix-blend-mode:plus-lighter; pointer-events:none; }
+  .panel>*{ position:relative; z-index:1; }
+  .panel h3{ font-size:1.3rem; color:var(--ls-heading); margin:0 0 6px; font-weight:700; }
+  .panel p.lead{ color:var(--ls-text-muted); margin:0 0 20px; font-size:.95rem; }
+  .gk-steps{ list-style:none; margin:0 0 22px; padding:0; display:grid; gap:10px; }
+  .gk-steps li{ display:flex; gap:12px; align-items:flex-start; font-size:.92rem; color:var(--ls-text); }
+  .gk-num{ flex:none; width:24px; height:24px; border-radius:50%; background:var(--ls-accent); color:#fff; font-family:var(--mono); font-size:.72rem; font-weight:700; display:flex; align-items:center; justify-content:center; margin-top:1px; }
+  .gk-steps code{ font-family:var(--mono); font-size:.82em; background:rgba(120,90,40,.12); color:var(--ls-text-strong); padding:1px 5px; border-radius:4px; }
+  :root[data-theme="candy"] .gk-steps code{ background:rgba(233,30,140,.10); }
+
+  .terminal{ background:var(--ls-code-bg); border-radius:var(--ls-radius-sm); box-shadow:0 6px 16px rgba(42,36,24,.34); overflow:hidden; margin-bottom:6px; }
+  .term-bar{ display:flex; align-items:center; gap:7px; padding:11px 14px; border-bottom:1px solid rgba(243,236,218,.12); }
+  .dot{ width:11px; height:11px; border-radius:50%; }
+  .d1{ background:#e0654f; } .d2{ background:#e2b13c; } .d3{ background:#7fbf52; }
+  .term-label{ margin-left:8px; font-family:var(--mono); font-size:.66rem; letter-spacing:.14em; text-transform:uppercase; color:rgba(243,236,218,.5); }
+  .term-copy{ margin-left:auto; font-family:var(--mono); font-size:.62rem; letter-spacing:.12em; text-transform:uppercase; font-weight:700; color:rgba(243,236,218,.72); background:rgba(243,236,218,.10); border:1px solid rgba(243,236,218,.18); border-radius:999px; padding:6px 12px; min-height:32px; cursor:pointer; transition:background .15s,color .15s; }
+  .term-copy:hover{ background:rgba(243,236,218,.18); color:#fff; }
+  .term-copy.ok{ color:#7fe0c4; border-color:rgba(127,224,196,.5); }
+  .term-body{ padding:16px 18px; font-family:var(--mono); font-size:.82rem; line-height:1.7; color:var(--ls-code-tx); overflow-x:auto; white-space:pre; }
+  .term-body .tprompt{ color:var(--ls-accent); }
+  .term-body .tcmd{ color:#e9dcb8; }
+  :root[data-theme="candy"] .term-body .tcmd{ color:#ffd9e9; }
+
+  .reqs{ display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:20px; font-family:var(--mono); font-size:.74rem; letter-spacing:.05em; color:var(--ls-text-muted); }
+  .reqs span{ display:inline-flex; align-items:center; gap:7px; }
+  .reqs span::before{ content:""; width:6px; height:6px; border-radius:50%; background:var(--ls-accent); }
+
+  /* ===== FOOTER ===== */
+  footer{ margin-top:84px; padding:46px 0 56px; border-top:1.5px solid var(--ls-glass-border); }
+  .foot-grid{ display:flex; justify-content:space-between; align-items:center; gap:24px; flex-wrap:wrap; }
+  .foot-built{ font-family:var(--mono); font-size:.74rem; letter-spacing:.06em; color:var(--ls-text-muted); max-width:30ch; line-height:1.7; }
+  .foot-links{ display:flex; gap:8px; flex-wrap:wrap; }
+  .foot-links a{ font-family:var(--mono); font-size:.72rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ls-text-muted); text-decoration:none; padding:9px 12px; min-height:44px; display:inline-flex; align-items:center; border:1px solid transparent; border-radius:999px; }
+  .foot-links a:hover{ color:var(--ls-heading); border-color:var(--ls-glass-border); background:var(--ls-glass-strong); }
+  .foot-spark{ display:flex; align-items:center; gap:13px; margin-top:30px; padding-top:24px; border-top:1px dashed var(--ls-glass-border); }
+  .foot-spark .mascot{ width:42px; height:42px; }
+  .foot-spark p{ margin:0; font-size:.9rem; color:var(--ls-text-muted); }
+  .foot-spark strong{ color:var(--ls-heading); }
+
+  /* candy-only flourishes */
+  .spark{ display:none; position:absolute; pointer-events:none; z-index:0; }
+  :root[data-theme="candy"] .spark{ display:block; color:#c4a7ff; font-size:20px; animation:sparklePulse 3s ease-in-out infinite; }
+  :root[data-theme="candy"] .spark.s2{ color:#ff8fc2; animation-delay:1.1s; }
+  .sp1{ top:120px; right:7%; } .sp2{ top:300px; left:5%; }
+  @keyframes sparklePulse{ 0%,100%{ transform:scale(.85); opacity:.45; } 50%{ transform:scale(1.15); opacity:1; } }
+
+  /* showcase (kaneki signature render) */
+  .showcase{ margin-top:6px; }
+  .show-frame{ max-width:680px; }
+  /* candy: warm the cream/ink portrait toward rose so it sits in the palette */
+  :root[data-theme="candy"] #kanekiImg{ filter:saturate(1.3) hue-rotate(300deg) brightness(1.02); }
+
+  @media (max-width:760px){ .specimens{ grid-template-columns:1fr; } nav{ flex-wrap:wrap; } }
+  @media (max-width:520px){
+    .nav-links a:not(.nav-ghost){ display:none; }
+    .brand-sub{ display:none; }
+    .plate{ font-size:.66rem; gap:7px; }
+  }
+  @media (max-width:360px){ .wrap{ padding:0 16px; } .placard{ padding:18px 16px 16px; } .tg{ padding:8px 10px; } }
+
+  @media (prefers-reduced-motion:reduce){
+    html{ scroll-behavior:auto; }
+    *,*::before,*::after{ transition:none !important; animation:none !important; }
+    .btn:hover,.card:hover{ transform:none; }
+  }
+</style>
+</head>
+<body>
+<div class="layer">
+
+  <nav>
+    <div class="brand">
+      <span class="mascot"><img src="assets/sparky.png" alt="Sparky, the LoveSpark wolf mascot"></span>
+      <span>
+        <span class="brand-name">Glyph Grid Studio</span><br>
+        <span class="brand-sub">Specimen No. 01</span>
+      </span>
+    </div>
+    <div class="nav-right">
+      <div class="theme-toggle" role="group" aria-label="Color theme">
+        <button class="tg" data-set="cream" aria-pressed="true">Cream</button>
+        <button class="tg" data-set="candy" aria-pressed="false">Candy</button>
+      </div>
+      <div class="nav-links">
+        <a href="https://github.com/Joona-t/glyph-grid-studio">GitHub</a>
+        <a class="nav-ghost" href="https://github.com/Joona-t/glyph-grid-studio/releases/latest/download/Glyph-Grid-Studio-macOS.dmg">Download</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero wrap">
+    <span class="spark sp1" aria-hidden="true">✦</span>
+    <span class="spark s2 sp2" aria-hidden="true">✦</span>
+    <span class="kicker" data-kicker>The Glyph Collection · Cream Stock</span>
+    <h1 class="headline">Render any image into <em>living</em> glyphs.</h1>
+    <p class="sub">Drop in a photo, dial in palettes, dithering and CRT-beam effects, and pull a clean character-grid render out in seconds. Animated. Exportable. Yours.</p>
+
+    <figure class="placard">
+      <div class="mat">
+        <img class="frame-img" id="heroImg"
+             src="assets/hero-cream-poster.png"
+             data-cream="assets/hero-cream.gif" data-cream-still="assets/hero-cream-poster.png"
+             data-candy="assets/hero-candy.gif" data-candy-still="assets/hero-candy-poster.png"
+             alt="The Sparky wolf mascot rendered as a grid of typeset Unicode glyphs by Glyph Grid Studio.">
+      </div>
+      <figcaption class="plate">
+        <span class="pl-no">PL. I</span>
+        <span class="pl-name" data-plate-name>Sparky — Ink on Cream</span>
+        <span class="pl-med">octant glyph grid · blue-noise dither</span>
+      </figcaption>
+    </figure>
+
+    <div class="ctas">
+      <a class="btn btn-primary" href="https://github.com/Joona-t/glyph-grid-studio/releases/latest/download/Glyph-Grid-Studio-macOS.dmg">Download for macOS</a>
+      <a class="btn btn-secondary" href="https://github.com/Joona-t/glyph-grid-studio">★ Star on GitHub</a>
+    </div>
+    <p class="micro">Free &amp; open source · universal · macOS 11+</p>
+  </header>
+
+  <section class="wrap showcase">
+    <div class="sec-head">
+      <div class="sec-eyebrow" data-show-eyebrow>From the studio</div>
+      <h2 class="sec-title">A portrait, rendered in glyphs</h2>
+      <div class="sec-rule"></div>
+    </div>
+    <figure class="placard show-frame">
+      <div class="mat">
+        <img class="frame-img" id="kanekiImg"
+             src="assets/kaneki-poster.png"
+             data-gif="assets/kaneki.gif" data-still="assets/kaneki-poster.png"
+             alt="Ken Kaneki rendered as an ink-on-cream grid of typeset Unicode glyphs by Glyph Grid Studio.">
+      </div>
+      <figcaption class="plate">
+        <span class="pl-no">PL. II</span>
+        <span class="pl-name">Portrait — Ink on Cream</span>
+        <span class="pl-med">octant grid · inverted signal · breathing loop</span>
+      </figcaption>
+    </figure>
+  </section>
+
+  <section class="wrap">
+    <div class="sec-head">
+      <div class="sec-eyebrow">Catalogue of Capabilities</div>
+      <h2 class="sec-title">Six specimens from the studio</h2>
+      <div class="sec-rule"></div>
+    </div>
+    <div class="specimens">
+      <article class="card"><div class="spec-no">No. 01</div><h3 class="spec-title">11 palettes</h3><p class="spec-desc">OKLab color, interpolated in OKLCH for perceptually even gradients.</p></article>
+      <article class="card"><div class="spec-no">No. 02</div><h3 class="spec-title">9 dithers</h3><p class="spec-desc">STBN blue noise, Floyd–Steinberg, Atkinson — tunable grain per render.</p></article>
+      <article class="card"><div class="spec-no">No. 03</div><h3 class="spec-title">7 glyph sets</h3><p class="spec-desc">ASCII, blocks, octants, sextants and braille — pick your alphabet.</p></article>
+      <article class="card"><div class="spec-no">No. 04</div><h3 class="spec-title">8 effects</h3><p class="spec-desc">Bloom, halation, scanlines and a Lottes CRT-beam post chain.</p></article>
+      <article class="card"><div class="spec-no">No. 05</div><h3 class="spec-title">Export</h3><p class="spec-desc">GIF, MP4, PNG, SVG and reusable preset JSON straight out.</p></article>
+      <article class="card"><div class="spec-no">No. 06</div><h3 class="spec-title">CLI + MCP</h3><p class="spec-desc">Agent-native — drive the whole studio from Claude or the shell.</p></article>
+    </div>
+  </section>
+
+  <section class="wrap firstlaunch">
+    <div class="sec-head">
+      <div class="sec-eyebrow" data-gk-eyebrow>Conservator's Note</div>
+      <h2 class="sec-title">First launch on macOS</h2>
+      <div class="sec-rule"></div>
+    </div>
+    <div class="panel" style="margin-top:34px;">
+      <h3>Why the first open gets blocked</h3>
+      <p class="lead">Free &amp; open source, but not signed with a paid Apple cert — so macOS blocks the very first open. Any one of these clears it for good:</p>
+      <ul class="gk-steps">
+        <li><span class="gk-num">1</span><span>Right-click the app &rarr; <strong>Open</strong> &rarr; <strong>Open</strong>.</span></li>
+        <li><span class="gk-num">2</span><span>Or <strong>System Settings &rarr; Privacy &amp; Security</strong> &rarr; <strong>Open Anyway</strong>.</span></li>
+        <li><span class="gk-num">3</span><span>Or clear the quarantine flag from a terminal:</span></li>
+      </ul>
+      <div class="terminal">
+        <div class="term-bar">
+          <span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span>
+          <span class="term-label">zsh — clear quarantine</span>
+          <button class="term-copy" id="copyBtn" type="button" aria-label="Copy the command">Copy</button>
+        </div>
+        <div class="term-body"><span class="tprompt">$ </span><span class="tcmd" id="cmd">xattr -dr com.apple.quarantine "/Applications/Glyph Grid Studio.app"</span></div>
+      </div>
+      <div class="reqs">
+        <span>macOS 11 (Big Sur)+</span>
+        <span>Universal — Intel + Apple Silicon</span>
+        <span>~16 MB</span>
+        <span>No account</span>
+        <span>No telemetry</span>
+      </div>
+    </div>
+  </section>
+
+  <footer class="wrap">
+    <div class="foot-grid">
+      <p class="foot-built">Built with p5.js · Tauri 2 · Rust<br>MIT licensed.</p>
+      <div class="foot-links">
+        <a href="https://github.com/Joona-t/glyph-grid-studio">GitHub</a>
+        <a href="https://github.com/Joona-t/glyph-grid-studio/releases">Releases</a>
+        <a href="https://github.com/Joona-t/glyph-grid-studio/blob/main/LICENSE">License</a>
+      </div>
+    </div>
+    <div class="foot-spark">
+      <span class="mascot"><img src="assets/sparky.png" alt="Sparky waving"></span>
+      <p><strong>A LoveSpark project</strong> — free tools for neurodivergent makers.</p>
+    </div>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  var root = document.documentElement;
+  var img = document.getElementById('heroImg');
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)');
+  var KICK = { cream:'The Glyph Collection · Cream Stock', candy:'Ink & Pixels, Made Playful' };
+  var PLATE = { cream:'Sparky — Ink on Cream', candy:'Sparky — Candy Glyphs' };
+  var GKEYE = { cream:"Conservator's Note", candy:'Quick Heads-Up' };
+  var SHOW = { cream:'From the studio', candy:'Made with the studio ♡' };
+
+  function setHero(theme){
+    if(!img) return;
+    var key = reduce.matches ? (theme + '-still') : theme;
+    var src = img.getAttribute('data-' + key) || img.getAttribute('data-' + theme + '-still');
+    if(src) img.src = src;
+  }
+  function applyTheme(theme, persist){
+    if(theme !== 'candy') theme = 'cream';
+    root.dataset.theme = theme;
+    document.querySelectorAll('.tg').forEach(function(b){
+      b.setAttribute('aria-pressed', b.dataset.set === theme ? 'true' : 'false');
+    });
+    var k = document.querySelector('[data-kicker]'); if(k) k.textContent = KICK[theme];
+    var p = document.querySelector('[data-plate-name]'); if(p) p.textContent = PLATE[theme];
+    var g = document.querySelector('[data-gk-eyebrow]'); if(g) g.textContent = GKEYE[theme];
+    var s = document.querySelector('[data-show-eyebrow]'); if(s) s.textContent = SHOW[theme];
+    setHero(theme);
+    if(persist){ try{ localStorage.setItem('ggs-theme', theme); }catch(e){} }
+  }
+
+  // initial theme (saved → else cream)
+  var saved = 'cream';
+  try{ saved = localStorage.getItem('ggs-theme') || 'cream'; }catch(e){}
+  applyTheme(saved, false);
+
+  document.querySelectorAll('.tg').forEach(function(b){
+    b.addEventListener('click', function(){ applyTheme(b.dataset.set, true); });
+  });
+
+  // poster-first: stream the animated hero + showcase in after load (skip if reduced-motion)
+  var kan = document.getElementById('kanekiImg');
+  function setKaneki(){ if(!kan) return; kan.src = reduce.matches ? kan.getAttribute('data-still') : kan.getAttribute('data-gif'); }
+  window.addEventListener('load', function(){
+    if(!reduce.matches){ setHero(root.dataset.theme || 'cream'); setKaneki(); }
+  });
+  reduce.addEventListener && reduce.addEventListener('change', function(){ setHero(root.dataset.theme || 'cream'); setKaneki(); });
+
+  // copy-to-clipboard for the quarantine command
+  var copyBtn = document.getElementById('copyBtn'), cmd = document.getElementById('cmd');
+  if(copyBtn && cmd){
+    copyBtn.addEventListener('click', function(){
+      var text = cmd.textContent.trim();
+      var done = function(){ copyBtn.textContent = 'Copied!'; copyBtn.classList.add('ok'); setTimeout(function(){ copyBtn.textContent='Copy'; copyBtn.classList.remove('ok'); }, 1800); };
+      if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(text).then(done).catch(done); }
+      else { try{ var t=document.createElement('textarea'); t.value=text; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); done(); }catch(e){} }
+    });
+  }
+})();
+</script>
+</body>
+</html>

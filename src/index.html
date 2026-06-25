@@ -388,6 +388,13 @@
      ================================================================= */
   let sourceImg = null;       /* source image — fed by drag-drop / Pick image */
   let sparkyImg = null;       /* optional mascot used by the sparkyPortrait scene */
+
+  /* Source-presence hook for the studio panel (a separate module).  Without
+     this, clicking Export GIF/MP4 on the empty canvas starts a recording
+     whose frames are never captured — draw() early-returns in the empty
+     state (see the "Drop an image to start" branch), so the recorder spins
+     forever and the app appears frozen.  BUG-010 (v0.1.8). */
+  window.__glyphHasSource = function () { return !!(sourceImg && sourceImg.width); };
   function preload() {
     /* No bundled source image — the studio launches blank with a
        "Drop an image to start" placeholder. The user supplies one via
@@ -4027,7 +4034,7 @@
      For testing the same phase configs on a different source image without
      overwriting prior runs.
        runStudioPhasesAt([2,3,4,5,6,7,8,9],
-                         '/Users/.../Glyph Grid Studio Test/thor/');
+                         '~/Glyph Grid Studio Test/thor/');
      The batch driver creates parent dirs on save (Rust mkdir -p), so the
      phase sub-folders (02-selection-glyphset/, etc.) appear automatically. */
   window.runStudioPhasesAt = function (phaseNumbers, baseDir) {

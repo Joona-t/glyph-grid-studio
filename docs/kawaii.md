@@ -55,7 +55,7 @@ Postprocess → kawaii
 Run via dev console:
 
 ```js
-runKawaiiVariants('/Users/darkfire/Documents/Glyph Grid Studio Test/kawaii/')
+runKawaiiVariants('~/Documents/Glyph Grid Studio Test/kawaii/')
 ```
 
 | # | Name | Look |

@@ -2,7 +2,25 @@
 
 A real-time character-grid image renderer for macOS. Drop in any image and convert it to a tunable mosaic of typeset Unicode glyphs — ASCII, block elements, octants, sextants, braille — with live OKLab-palette interpolation, spatiotemporal blue-noise dithering, and a Lottes-style CRT-beam postprocess.
 
-> **Status:** in active development (private). First public release pending Apple Developer signing setup + additional test cases.
+[![Download](https://img.shields.io/badge/Download-macOS-E07A4D?style=for-the-badge)](https://github.com/Joona-t/glyph-grid-studio/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-A3B18A.svg)](LICENSE)
+&nbsp;**Free · open source · macOS 11+ (Intel + Apple Silicon)**
+
+🌐 **Website & download:** https://lovespark.love/glyph-grid-studio/
+
+## Download
+
+1. **[Download the latest release](https://github.com/Joona-t/glyph-grid-studio/releases/latest)** (`.dmg`), open it, drag **Glyph Grid Studio** into **Applications**.
+2. **First launch (one time only).** The app is free and open source but isn't signed with a paid Apple Developer certificate, so macOS blocks the first open. To allow it:
+   - **Right-click** (or Control-click) the app → **Open** → **Open** again in the dialog, **or**
+   - **System Settings → Privacy & Security** → scroll down → **"Open Anyway"**, **or** run:
+     ```bash
+     xattr -dr com.apple.quarantine "/Applications/Glyph Grid Studio.app"
+     ```
+
+**Requirements:** macOS 11 (Big Sur) or later. Universal binary — runs natively on both Apple Silicon and Intel Macs.
+
+Prefer to build it yourself? See [Build from source](#build) below.
 
 ## What it does
 

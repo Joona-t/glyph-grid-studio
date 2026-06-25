@@ -4,6 +4,107 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-06-25 — v0.1.8: public-release ship-readiness (fable-audit)
+
+Full audit before flipping the repo public + shipping a free, unsigned,
+direct-download universal macOS build with a landing page. Three parallel
+adversarial auditors → verify → fix. 9 P0 ship-blockers (almost all
+release-mechanics + repo-hygiene), 1 real new code bug, 4 debunked.
+
+### BUG-010 — Export GIF/MP4 before loading an image hangs the recorder forever (P0)
+
+- **Found by:** audit (first-5-min correctness auditor); confirmed by reading source.
+- **Problem:** clicking Export GIF / Export MP4 on the empty canvas (no image
+  loaded) starts a recording that never completes — no save dialog, no error,
+  app appears frozen. A brand-new user can hit this on first launch.
+- **Root cause:** `draw()` early-returns in the empty-state branch
+  (`src/index.html` "Drop an image to start") *before* the `handleRecordFrame()`
+  calls, so `recState.frameIdx` never advances and `finishRecording()` never
+  fires. The export buttons (`src/lib/glyph-studio.js` `exportRun`) had **no
+  source guard** — `glyph-studio.js` can't see index.html's `sourceImg`.
+- **Fix:** exposed `window.__glyphHasSource()` from index.html (reads the
+  module-scoped `sourceImg`); added a `hasSource()` bridge + guard at the top of
+  `exportRun` and `snapshotPNG` that shows `exportFeedback('Load an image
+  before exporting.')` and returns. Distinct from BUG-009 (freeze *after* a
+  successful export) — this is a hang *before* any frames exist.
+- **Prevention rule:** any action that drives the record/draw loop must verify a
+  source is present first; the empty-state early-return is a load-bearing branch.
+
+### BUG-011 — Preset save/load silently drops `invertSignal`, `bgThreshold`, `dispersal` (P1, data-loss)
+
+- **Found by:** audit; confirmed against `snapshotConfig` whitelist.
+- **Problem:** these three are live Tweakpane inputs, but the preset whitelist in
+  `snapshotConfig` (`src/lib/glyph-studio.js`) omitted them — so Save current →
+  reload silently lost the user's invert / bg-threshold / dispersal tweaks.
+- **Fix:** added `invertSignal`, `bgThreshold`, `dispersal`, `scene` to the
+  whitelist.
+- **Prevention rule:** the whitelist is a maintenance hazard — every new
+  top-level CONFIG section that gets a panel binding must be added here
+  (future: switch to a denylist of runtime-only keys).
+
+### BUG-012 — Drag-dropping a non-image file fails silently (P2)
+
+- **Problem:** dropping a `.txt`/`.pdf` from Finder decoded to nothing with only
+  a `console.warn` (invisible in release — devtools off). User saw no feedback.
+- **Fix:** the decode-error and read-error callbacks in `setupImageDrop` now
+  surface `exportFeedback('Not a readable image: …' / 'Could not read dropped
+  file.')`.
+
+### ITER — repo hygiene for public (P0/P1)
+
+- Moved 14 internal planning docs (OPTIMIZATION-*, AGENT-INTEGRATION,
+  CARMACK-KARPATHY, POSTPROCESS-GPU, WEBGL-RENDERER-DESIGN, TEST-PLAN,
+  PUBLIC-LAUNCH-PLAN, PRE-PUBLIC-CHECKLIST, plan/research) → gitignored
+  `docs/internal/` (kept local, out of the public repo).
+- Untracked `scripts/loop_orchestrator/` (internal autonomous-optimization
+  harness, full of home paths — no user value, gitignored).
+- `git rm` `tests/sources/ghost-I.gif` (12 MB clone bloat, comment-only ref) +
+  `tests/sources/thor.png` (personal anime source); repointed the gate's batch
+  test to the public-safe `cream-paper.png` fixture.
+- Sanitized the `darkfire` home-dir username out of public source/docs
+  (`docs/kawaii.md`, the one placeholder comment in `src/index.html`).
+  (Historical entries in *this* append-only changelog are left as-written.)
+- Hardened the gate's A1 test: greps `/Users/[^/]+/` (any home path) instead of
+  the literal `/Users/darkfire/`. Updated A5 to assert the real public file set.
+
+### ITER — release mechanics (P0)
+
+- Broken chain fixed: `tauri.conf.json` now emits `["app","dmg"]` (was `"app"`
+  only — nothing produced a downloadable single file); added
+  `bundle.macOS.minimumSystemVersion = "11.0"` (Info.plist had a misleading
+  10.13). Built a **universal** binary (Intel + Apple Silicon) — `arm64`-only
+  before, which can't launch on Intel Macs.
+- Version synced to **0.1.8** across package.json / Cargo.toml / tauri.conf.json;
+  cask bumped 0.1.0 → 0.1.8 with the real DMG sha256 and a stable asset name
+  (`Glyph-Grid-Studio-macOS.dmg`) so `releases/latest/download/…` resolves.
+- README rewritten: "(private)/Apple-signing-pending" status → public free
+  unsigned download + Gatekeeper first-launch instructions + requirements.
+- Added `RELEASING.md` documenting the unsigned-universal-direct-download ship
+  workflow (the reusable answer to "design a workflow to get it ship ready").
+
+### ITER — download website (LoveSpark design system)
+
+- Built `docs/` landing page served via GitHub Pages at
+  `lovespark.love/glyph-grid-studio/`. First draft was a DinoRip-style dark
+  retro-mono clone; owner asked for the LoveSpark cream-paper / candy themes
+  instead, so it was redesigned per `~/.claude/docs/lovespark-design-system.md`:
+  OpenDyslexic (self-hosted), glass-sticker cards, film-grain, gloss, Sparky
+  bubble mascot (rule #3) rendered *through the studio itself* as the hero
+  (cream = dark ink-glyphs on aged paper via inverted signal; candy = real pink
+  glyphs via preserve mode).
+- Ships BOTH themes via a cream⇄candy toggle in the nav (persisted to
+  localStorage; default cream — the app's signature). Each theme keeps its own
+  bg gradient, accent (sage / pink), hero render, hero-frame treatment (debossed
+  mat placard / glossy washi-tape polaroid), and heading style (solid /
+  gradient-text). Poster-first hero loading + reduced-motion poster fallback +
+  copy-to-clipboard on the Gatekeeper command.
+- Design explored via a 4-variant multi-agent workflow (2 cream + 2 candy) with
+  an adversarial design-critic panel; the two top-scored layouts were merged
+  into the unified themed page. Verified live (desktop + mobile, both themes) via
+  preview — zero console errors.
+
+---
+
 ## 2026-06-10 — v0.1.7: GUI export freeze (P0)
 
 ### BUG-009 — App permanently freezes after every GUI export; Clear image appears broken

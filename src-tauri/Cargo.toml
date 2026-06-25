@@ -1,6 +1,6 @@
 [package]
 name = "glyph-grid-studio"
-version = "0.1.7"
+version = "0.1.8"
 description = "Real-time character-grid image renderer (GUI + CLI + MCP)"
 authors = ["Joona Tyrninoksa"]
 license = "MIT"
