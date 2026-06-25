@@ -50,7 +50,7 @@ The selected glyph is typeset into the cell, in a chosen palette and color mode.
 | Glyph sets (7) | ASCII, asciiDense, blockElements, braille, sextant, octant, ramp-only |
 | Postprocess (8) | vignette, bloom, halation, scanlines, chromaticAberration, phosphorDecay, depthFog, **CRT-beam** (Lottes / Blur Busters 2024) |
 | Animation | breathing-cell EMA, per-frame gain pulse, per-cell jitter — runtime-tunable |
-| Export | PNG snapshot · animated GIF89a · preset JSON · share URL |
+| Export | PNG snapshot · animated GIF89a · MP4 (H.264) · preset JSON · share URL |
 
 ## Algorithmic notes
 
