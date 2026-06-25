@@ -4,6 +4,25 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-06-25 — Site: Basalt Monolith third theme
+
+### ITER — add `basalt` as a 3rd site theme (Cream · Candy · Basalt)
+
+- **What:** owner chose the "Basalt Monolith" design (from the 20-variant esoteric
+  button forge) as a full theme. Added `:root[data-theme="basalt"]` to `docs/index.html`
+  — dark ash-grey basalt ground, ember-gold accent, light stone text; inherits the
+  cream theme's serious **Cinzel + EB Garamond** serif (it's "not candy"), so headline
+  is inscriptional + solid. Added a Basalt toggle button + wired the JS theme maps
+  (KICK/PLATE/GKEYE/SHOW), hero `data-basalt` (the ankh relic on dark), and 3-way
+  theme validation. Per-theme a11y fix: basalt `--ls-accent-deep` is a *light* ember
+  so small caption/label text clears contrast on the dark ground, and the gk-num step
+  digit flips to dark on the gold circle.
+- **Why:** the basalt aesthetic reads serious/esoteric and showcases taste — a third
+  voice alongside the warm cream gallery and the playful candy. Verified all three
+  themes switch cleanly with zero console errors.
+- **Companion:** the same Basalt Monolith design now styles the lovespark.love homepage
+  nav buttons (separate repo). Born from the `/forge-mockups` in-house design skill.
+
 ## 2026-06-25 — v0.1.8: public-release ship-readiness (fable-audit)
 
 Full audit before flipping the repo public + shipping a free, unsigned,

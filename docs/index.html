@@ -65,6 +65,27 @@
     --ls-headline-mode:gradient;
   }
 
+  /* ===== BASALT MONOLITH (dark, stoic, ember-gold; inherits the Cinzel serif) ===== */
+  :root[data-theme="basalt"]{
+    --ls-bg-mid:#16171a;
+    --ls-bg-gradient:radial-gradient(140% 120% at 50% -10%, #24262b 0%, #181a1e 55%, #0f1012 100%);
+    --ls-cotton:#23252a;
+    --ls-glass:linear-gradient(180deg,#23252a,#191b1f); --ls-glass-solid:#1f2125; --ls-glass-strong:#282b30; --ls-glass-border:#3a3e44;
+    --ls-pink-deep:#f4c46a;
+    --ls-text:#c9cdd3; --ls-text-muted:#9aa0a8; --ls-text-strong:#e9edf2; --ls-heading:#e6d6ad; --ls-text-inv:#16171a;
+    --ls-focus:#f4c46a; --ls-btn-tx:#16171a;
+    --ls-glow:0 6px 18px rgba(0,0,0,.5); --ls-glow-strong:0 14px 34px rgba(0,0,0,.6);
+    --ls-halo-btn:0 4px 12px rgba(0,0,0,.55); --ls-radius:5px; --ls-radius-sm:3px;
+    --ls-grad-btn:linear-gradient(180deg,#d9a23b,#a8761f);
+    --ls-grad-text:none;
+    --ls-code-bg:#0c0d0f; --ls-code-tx:#e7dcc2; --ls-grain:.5;
+    --ls-accent:#d9a23b; --ls-accent-deep:#e6c277;     /* ember gold (light enough for small text on dark) */
+    --ls-mascot-bubble:linear-gradient(135deg,#2a2d33,#191b1f);
+    --ls-headline-mode:underline;
+  }
+  :root[data-theme="basalt"] .gk-num{ color:#16171a; }   /* dark digit on the gold step circle */
+  :root[data-theme="basalt"] .frame-img{ box-shadow:0 2px 12px rgba(0,0,0,.5), 0 0 0 1px rgba(217,162,59,.18); }
+
   *{box-sizing:border-box;}
   html{ background-image:var(--ls-bg-gradient); background-attachment:fixed; background-color:var(--ls-bg-mid); }
   body{ margin:0; font-family:var(--font-body); color:var(--ls-text); line-height:1.6; -webkit-font-smoothing:antialiased; position:relative; min-height:100vh; }
@@ -236,6 +257,7 @@
       <div class="theme-toggle" role="group" aria-label="Color theme">
         <button class="tg" data-set="cream" aria-pressed="true">Cream</button>
         <button class="tg" data-set="candy" aria-pressed="false">Candy</button>
+        <button class="tg" data-set="basalt" aria-pressed="false">Basalt</button>
       </div>
       <div class="nav-links">
         <a href="https://github.com/Joona-t/glyph-grid-studio">GitHub</a>
@@ -257,6 +279,7 @@
              src="assets/hero-ankh.png"
              data-cream="assets/hero-ankh.png" data-cream-still="assets/hero-ankh.png"
              data-candy="assets/hero-candy.gif" data-candy-still="assets/hero-candy-poster.png"
+             data-basalt="assets/hero-ankh.png" data-basalt-still="assets/hero-ankh.png"
              alt="Glyph Grid Studio's ankh brand mark rendered as a grid of typeset Unicode glyphs (cream theme); Sparky the mascot in candy theme.">
       </div>
       <figcaption class="plate">
@@ -363,10 +386,10 @@
   var root = document.documentElement;
   var img = document.getElementById('heroImg');
   var reduce = window.matchMedia('(prefers-reduced-motion: reduce)');
-  var KICK = { cream:'The Glyph Collection · Cream Stock', candy:'Ink & Pixels, Made Playful' };
-  var PLATE = { cream:'Ankh — Ink on Cream', candy:'Sparky — Candy Glyphs' };
-  var GKEYE = { cream:"Conservator's Note", candy:'Quick Heads-Up' };
-  var SHOW = { cream:'From the studio', candy:'Made with the studio ♡' };
+  var KICK = { cream:'The Glyph Collection · Cream Stock', candy:'Ink & Pixels, Made Playful', basalt:'The Glyph Collection · Carved in Basalt' };
+  var PLATE = { cream:'Ankh — Ink on Cream', candy:'Sparky — Candy Glyphs', basalt:'Ankh — Stone & Ember' };
+  var GKEYE = { cream:"Conservator's Note", candy:'Quick Heads-Up', basalt:"Conservator's Note" };
+  var SHOW = { cream:'From the studio', candy:'Made with the studio ♡', basalt:'From the studio' };
 
   function setHero(theme){
     if(!img) return;
@@ -375,7 +398,7 @@
     if(src) img.src = src;
   }
   function applyTheme(theme, persist){
-    if(theme !== 'candy') theme = 'cream';
+    if(theme !== 'candy' && theme !== 'basalt') theme = 'cream';
     root.dataset.theme = theme;
     document.querySelectorAll('.tg').forEach(function(b){
       b.setAttribute('aria-pressed', b.dataset.set === theme ? 'true' : 'false');
