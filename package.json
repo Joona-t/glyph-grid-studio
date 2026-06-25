@@ -2,6 +2,17 @@
   "name": "glyph-grid-studio",
   "version": "0.1.8",
   "private": true,
+  "description": "A real-time character-grid image renderer for macOS — convert any image into a tunable mosaic of typeset Unicode glyphs.",
+  "license": "MIT",
+  "author": "Joona Tyrninoksa",
+  "homepage": "https://lovespark.love/glyph-grid-studio/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Joona-t/glyph-grid-studio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Joona-t/glyph-grid-studio/issues"
+  },
   "scripts": {
     "dev": "echo 'static — nothing to dev'",
     "build": "echo 'static — nothing to build'",
