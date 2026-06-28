@@ -1509,3 +1509,23 @@ pane refresh, and recorder-compatible CONFIG fields.
 
 **Verification** — `npm run build`, `node --check src/lib/glyph-studio.js`,
 and `ls-check .` all pass.
+
+### ITER-104 — Landing site labelled as Alpha / still in testing
+
+**Date** — 2026-06-28
+
+**Context** — The public landing page (`docs/index.html`, served at
+https://lovespark.love/glyph-grid-studio/) made no mention that the app is a
+pre-1.0 alpha, so download visitors had no expectation-setting that it is still
+under active testing.
+
+**Fix** — Added a theme-aware `.alpha-badge` pill ("Alpha · still in testing")
+in the hero between the kicker and headline, appended "Alpha — still in testing,
+expect rough edges" to the under-CTA `.micro` line, and tagged the `<title>` as
+"(Alpha)". Badge styling uses existing theme vars so it reads correctly across
+cream / candy / basalt; the pulsing status dot respects `prefers-reduced-motion`.
+
+**Verification** — Previewed all three themes via the local docs server:
+badge + micro note render with good contrast in cream (brown-on-cream), candy
+(magenta `#b3185c` on near-white), and basalt (light-on-dark, gold dot). DOM
+inspect confirmed the micro and badge text.

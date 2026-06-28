@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Glyph Grid Studio — render any image into living glyphs</title>
+<title>Glyph Grid Studio (Alpha) — render any image into living glyphs</title>
 <meta name="description" content="A free, open-source macOS app that renders any image into a tunable grid of typeset Unicode glyphs — ASCII, blocks, octants, braille — with live palettes, blue-noise dithering, CRT-beam effects and GIF / MP4 / SVG export.">
 <link rel="icon" type="image/png" href="assets/icon-ankh.png">
 <meta property="og:type" content="website">
@@ -119,6 +119,10 @@
   /* ===== HERO ===== */
   .hero{ padding:40px 0 24px; text-align:center; }
   .kicker{ font-family:var(--mono); font-size:.66rem; letter-spacing:.34em; text-transform:uppercase; color:var(--ls-accent-deep); display:inline-block; margin-bottom:22px; padding-bottom:8px; border-bottom:1.5px solid var(--ls-glass-border); }
+  .alpha-badge{ display:inline-flex; align-items:center; gap:8px; font-family:var(--mono); font-size:.6rem; letter-spacing:.2em; text-transform:uppercase; color:var(--ls-accent-deep); background:var(--ls-glass-strong); border:1.5px solid var(--ls-glass-border); border-radius:999px; padding:6px 13px; margin:0 auto 20px; box-shadow:var(--ls-glow); }
+  .alpha-badge::before{ content:""; width:7px; height:7px; border-radius:50%; background:var(--ls-accent); box-shadow:0 0 0 3px rgba(0,0,0,.06); animation:alphaPulse 2.4s ease-in-out infinite; }
+  @keyframes alphaPulse{ 0%,100%{ opacity:1; } 50%{ opacity:.4; } }
+  @media (prefers-reduced-motion: reduce){ .alpha-badge::before{ animation:none; } }
   h1.headline{ font-family:var(--font-display); font-size:clamp(2.1rem,5.6vw,3.6rem); line-height:1.2; font-weight:700; color:var(--ls-heading); margin:0 auto 18px; max-width:15ch; letter-spacing:-.5px; }
   :root:not([data-theme="candy"]) h1.headline{ letter-spacing:.5px; line-height:1.16; }  /* Cinzel: looser tracking, caps need no tight leading */
   h1.headline em{ font-style:normal; position:relative; white-space:nowrap; color:var(--ls-accent-deep); }
@@ -270,6 +274,7 @@
     <span class="spark sp1" aria-hidden="true">✦</span>
     <span class="spark s2 sp2" aria-hidden="true">✦</span>
     <span class="kicker" data-kicker>The Glyph Collection · Cream Stock</span>
+    <div><span class="alpha-badge">Alpha · still in testing</span></div>
     <h1 class="headline">Render any image into <em>living</em> glyphs.</h1>
     <p class="sub">Drop in a photo, dial in palettes, dithering and CRT-beam effects, and pull a clean character-grid render out in seconds. Animated. Exportable. Yours.</p>
 
@@ -293,7 +298,7 @@
       <a class="btn btn-primary" href="https://github.com/Joona-t/glyph-grid-studio/releases/latest/download/Glyph-Grid-Studio-macOS.dmg">Download for macOS</a>
       <a class="btn btn-secondary" href="https://github.com/Joona-t/glyph-grid-studio">★ Star on GitHub</a>
     </div>
-    <p class="micro">Free &amp; open source · universal · macOS 11+</p>
+    <p class="micro">Free &amp; open source · universal · macOS 11+ · Alpha — still in testing, expect rough edges</p>
   </header>
 
   <section class="wrap showcase">
