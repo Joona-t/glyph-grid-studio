@@ -80,11 +80,11 @@ release-mechanics + repo-hygiene), 1 real new code bug, 4 debunked.
 - `git rm` `tests/sources/ghost-I.gif` (12 MB clone bloat, comment-only ref) +
   `tests/sources/thor.png` (personal anime source); repointed the gate's batch
   test to the public-safe `cream-paper.png` fixture.
-- Sanitized the `darkfire` home-dir username out of public source/docs
+- Sanitized the home-dir username out of public source/docs
   (`docs/kawaii.md`, the one placeholder comment in `src/index.html`).
   (Historical entries in *this* append-only changelog are left as-written.)
 - Hardened the gate's A1 test: greps `/Users/[^/]+/` (any home path) instead of
-  the literal `/Users/darkfire/`. Updated A5 to assert the real public file set.
+  the literal `/Users/<user>/`. Updated A5 to assert the real public file set.
 
 ### ITER — release mechanics (P0)
 
@@ -235,7 +235,7 @@ release-mechanics + repo-hygiene), 1 real new code bug, 4 debunked.
 ### ITER-036 — Animate Still feature completed (was WIP failing gate A1)
 
 - **Problem:** the draft "Animate Still" folder hardcoded
-  `/Users/darkfire/Downloads/hermes2.jpeg` in its load button — a
+  `~/Downloads/hermes2.jpeg` in its load button — a
   personal path that tripped gate A1 and was useless on any other
   machine.
 - **Fix:** button is now generic **"Pick image + animate…"** — native
@@ -712,7 +712,7 @@ name — no driver-script rescue needed.
       `targetMaxBytes` from manifest; falls back to 15 MB whenever
       `capWidth == 720` so existing driver scripts get Twitter-fit
       guarantees without changes.
-- **Verification — smoke test on `/Users/darkfire/Downloads/ghost-I.gif`
+- **Verification — smoke test on `~/Downloads/ghost-I.gif`
   (the known-bad source from ITER-025):**
     ```
     twitter-fit: cap=720 size=18.54MB > target 15.00MB — entering shrink ladder
@@ -1495,7 +1495,7 @@ manually as `f655800`. Future loop runs MUST use `--max-cycles`.
 
 **Problem** — Glyph Grid Studio had the raw ingredients for animated glyph art
 (temporal dither, breathing, dispersal, GIF/MP4 export), but no first-class
-workflow for turning a static portrait such as `/Users/darkfire/Downloads/hermes2.jpeg`
+workflow for turning a static portrait such as `~/Downloads/hermes2.jpeg`
 into an animated ASCII/glyph loop.
 
 **Root cause** — The studio UI exposed each animation control separately.
