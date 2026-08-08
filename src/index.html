@@ -607,23 +607,36 @@
            stale — drop it so the unsharp mask runs against the new
            source frame. */
         const _curFrame = (typeof window.__sourceFrameIdx === 'number') ? window.__sourceFrameIdx : -1;
-        if (this.__sourceProcessed && this.__sourceProcessedFrame !== _curFrame) {
-          this.__sourceProcessed = null;
-        }
-        if (!this.__sourceProcessed) {
-          const W0 = sourceImg.width, H0 = sourceImg.height;
-          const buf = createGraphics(W0, H0);
+        const _processedKey = __sourceRevision + '|' + _curFrame + '|' + W + 'x' + H;
+        const _needsSourceProcess = !this.__sourceProcessed
+          || this.__sourceProcessedKey !== _processedKey;
+        if (_needsSourceProcess) {
+          /* Preprocess at the bounded render working size, never at arbitrary
+             source/GIF logical dimensions.  Drawing the source with a cover
+             transform preserves its aspect and the old centered-crop output. */
+          const W0 = W, H0 = H;
+          const sourceScale = Math.max(W0 / sourceImg.width, H0 / sourceImg.height);
+          const sourceDrawW = sourceImg.width * sourceScale;
+          const sourceDrawH = sourceImg.height * sourceScale;
+          const sourceDx = (W0 - sourceDrawW) / 2;
+          const sourceDy = (H0 - sourceDrawH) / 2;
+          const buf = (this.__sourceProcessed
+            && this.__sourceProcessed.width === W0
+            && this.__sourceProcessed.height === H0)
+            ? this.__sourceProcessed : createGraphics(W0, H0);
           buf.pixelDensity(1);
-          buf.image(sourceImg, 0, 0);
+          buf.clear();
+          buf.image(sourceImg, sourceDx, sourceDy, sourceDrawW, sourceDrawH);
           buf.loadPixels();
           const px = buf.pixels;
+          const scratch = ensureSourceScratch(W0, H0);
           /* Step A — copy luminance into a flat array for a 3×3 box blur,
              cheaper than 2D Gaussian and good enough for unsharp mask. */
-          const lum = new Float32Array(W0 * H0);
+          const lum = scratch.lum;
           for (let i = 0, j = 0; j < lum.length; i += 4, j++) {
             lum[j] = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
           }
-          const blur = new Float32Array(W0 * H0);
+          const blur = scratch.blur;
           for (let y = 1; y < H0 - 1; y++) {
             for (let x = 1; x < W0 - 1; x++) {
               const idx = y * W0 + x;
@@ -648,7 +661,7 @@
              still recede the face plane. */
           const sharpenFace  = 1.85;
           const gainFace     = 1.12;
-          const faceY1 = Math.round(H0 * 0.45);
+          const faceY1 = Math.max(0, Math.min(H0, Math.round(sourceDy + sourceDrawH * 0.45)));
           for (let y = 0; y < H0; y++) {
             const inFace = y < faceY1;
             const gain    = inFace ? gainGlobal * gainFace : gainGlobal;
@@ -667,11 +680,11 @@
           /* Second sharpen pass over the face zone using a tighter 5-tap
              cross kernel — captures higher-frequency detail (eye lashes,
              lip outline, nostril) that the 3×3 blur smoothed past. */
-          const lum2 = new Float32Array(W0 * H0);
+          const lum2 = scratch.lum2;
           for (let i = 0, j = 0; j < lum2.length; i += 4, j++) {
             lum2[j] = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
           }
-          const blur2 = new Float32Array(W0 * H0);
+          const blur2 = scratch.blur2;
           for (let y = 1; y < H0 - 1; y++) {
             for (let x = 1; x < W0 - 1; x++) {
               const idx = y * W0 + x;
@@ -702,27 +715,27 @@
                 tweezer base:    (0.32, 0.70)
                 hand centre:     (0.22, 0.80) — palm/finger cluster
           */
-          const tipX  = W0 * 0.59, tipY  = H0 * 0.42;
-          const baseX = W0 * 0.32, baseY = H0 * 0.70;
-          const handX = W0 * 0.22, handY = H0 * 0.80;
+          const tipX  = sourceDx + sourceDrawW * 0.59, tipY  = sourceDy + sourceDrawH * 0.42;
+          const baseX = sourceDx + sourceDrawW * 0.32, baseY = sourceDy + sourceDrawH * 0.70;
+          const handX = sourceDx + sourceDrawW * 0.22, handY = sourceDy + sourceDrawH * 0.80;
           const dx_axis = baseX - tipX, dy_axis = baseY - tipY;
           const axisLen = Math.sqrt(dx_axis * dx_axis + dy_axis * dy_axis);
           const ux = dx_axis / axisLen, uy = dy_axis / axisLen;
-          const bandHalf = W0 * 0.18;
-          const bandFlat = W0 * 0.04;
-          const chipRadius = W0 * 0.07;
+          const bandHalf = sourceDrawW * 0.18;
+          const bandFlat = sourceDrawW * 0.04;
+          const chipRadius = sourceDrawW * 0.07;
           /* Hand zone: elliptical (taller than wide), softer falloff so
              knuckle / fingernail / finger creases get amplified gradually
              across the whole hand without a visible perimeter. */
-          const handRx = W0 * 0.20;       /* x-axis of mask ellipse — fully fades here */
-          const handRy = H0 * 0.34;       /* y-axis of mask ellipse */
+          const handRx = sourceDrawW * 0.20;       /* x-axis of mask ellipse — fully fades here */
+          const handRy = sourceDrawH * 0.34;       /* y-axis of mask ellipse */
           const handFlatR = 0.40;         /* normalized radius staying at full weight */
 
-          const lumChip = new Float32Array(W0 * H0);
+          const lumChip = scratch.lumChip;
           for (let i = 0, j = 0; j < lumChip.length; i += 4, j++) {
             lumChip[j] = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
           }
-          const blurChip = new Float32Array(W0 * H0);
+          const blurChip = scratch.blurChip;
           for (let y = 1; y < H0 - 1; y++) {
             for (let x = 1; x < W0 - 1; x++) {
               const idx = y * W0 + x;
@@ -746,7 +759,7 @@
               let axisW = 0, chipW = 0;
               const dx_tip = x - tipX, dy_tip = y - tipY;
               const t = dx_tip * ux + dy_tip * uy;
-              if (t >= -W0 * 0.06 && t <= axisLen + W0 * 0.04) {
+              if (t >= -sourceDrawW * 0.06 && t <= axisLen + sourceDrawW * 0.04) {
                 const projX = tipX + t * ux, projY = tipY + t * uy;
                 const perp = Math.hypot(x - projX, y - projY);
                 if (perp < bandHalf) {
@@ -787,20 +800,11 @@
           buf.updatePixels();
           this.__sourceProcessed = buf;
           this.__sourceProcessedFrame = _curFrame;
+          this.__sourceProcessedKey = _processedKey;
         }
         const srcImg = this.__sourceProcessed;
-        const imgAspect = srcImg.width / srcImg.height;
-        const canvasAspect = W / H;
-        let dw, dh, dx, dy;
-        if (imgAspect > canvasAspect) {
-          dh = H; dw = H * imgAspect;
-          dx = (W - dw) / 2; dy = 0;
-        } else {
-          dw = W; dh = W / imgAspect;
-          dx = 0; dy = (H - dh) / 2;
-        }
         g.imageMode(g.CORNER);
-        g.image(srcImg, dx, dy, dw, dh);
+        g.image(srcImg, 0, 0, W, H);
       } else {
         g.noStroke(); g.fill(40, 60, 70);
         g.rect(W * 0.4, H * 0.3, W * 0.2, H * 0.4);
@@ -906,6 +910,145 @@
   let depthImg = null;              /* current scene's depth p5.Graphics (R channel = depth) */
   let currentCellDepth = -1;        /* sentinel; v2 draw loops set this per-cell to feed depth fog */
   const statusEl = () => document.getElementById('status');
+
+  /* v0.1.9 resource envelope.  These guards run as soon as decoded image
+     metadata is available, before the renderer allocates preprocessing
+     buffers.  Native loaders can additionally pass compressed size metadata
+     to validateSourceMetadata() before committing a source. */
+  const SOURCE_LIMITS = Object.freeze({
+    maxFileBytes: 64 * 1024 * 1024,
+    maxDimension: 16384,
+    maxFrames: 480,
+    maxDecodedPixels: 100 * 1000 * 1000,
+  });
+  let __sourceRevision = 0;
+  let __sourceImportGeneration = 0;
+  let __renderGeneration = 0;
+  let __lastScheduledFps = null;
+  let __renderResumeTimer = 0;
+  let __renderRaf = 0;
+  let __sourceSignalCache = null;
+  const __sourceCacheStats = { luminanceHits: 0, luminanceMisses: 0, cellHits: 0, cellMisses: 0 };
+  let __sourcePreprocessScratch = null;
+
+  function sourceMetadata(img, extra) {
+    const width = Number(img && img.width) || 0;
+    const height = Number(img && img.height) || 0;
+    let frames = 1;
+    try {
+      if (img && typeof img.numFrames === 'function') frames = Math.max(1, Number(img.numFrames()) || 1);
+      else if (img && img.gifProperties && img.gifProperties.numFrames) frames = Math.max(1, Number(img.gifProperties.numFrames) || 1);
+    } catch (_) {}
+    return {
+      width,
+      height,
+      frames,
+      sizeBytes: Number(extra && extra.sizeBytes) || 0,
+      decodedPixels: width * height * frames,
+    };
+  }
+
+  function validateSourceMetadata(img, extra) {
+    const meta = sourceMetadata(img, extra);
+    let reason = '';
+    if (!meta.width || !meta.height) reason = 'image has invalid dimensions';
+    else if (meta.sizeBytes > SOURCE_LIMITS.maxFileBytes) {
+      reason = 'compressed file is larger than ' + Math.round(SOURCE_LIMITS.maxFileBytes / 1048576) + ' MB';
+    } else if (meta.width > SOURCE_LIMITS.maxDimension || meta.height > SOURCE_LIMITS.maxDimension) {
+      reason = 'logical dimensions exceed ' + SOURCE_LIMITS.maxDimension + ' px';
+    } else if (meta.frames > SOURCE_LIMITS.maxFrames) {
+      reason = 'animation has ' + meta.frames + ' frames (limit ' + SOURCE_LIMITS.maxFrames + ')';
+    } else if (!Number.isSafeInteger(meta.decodedPixels) || meta.decodedPixels > SOURCE_LIMITS.maxDecodedPixels) {
+      reason = 'decoded animation would exceed the ' + SOURCE_LIMITS.maxDecodedPixels.toLocaleString() + '-pixel safety limit';
+    }
+    return { ok: !reason, reason, meta };
+  }
+
+  function clearSourceDerivedCaches() {
+    __sourceSignalCache = null;
+    if (window.SCENES) {
+      for (const name in window.SCENES) {
+        delete window.SCENES[name].__sourceProcessed;
+        delete window.SCENES[name].__sourceProcessedFrame;
+        delete window.SCENES[name].__sourceProcessedKey;
+        delete window.SCENES[name].__sourceDepth;
+      }
+    }
+  }
+
+  function syncAnimationFrameRate() {
+    const fps = Math.max(1, Math.min(120, Number(CONFIG.animation && CONFIG.animation.fps) || 30));
+    if (fps === __lastScheduledFps) return;
+    __lastScheduledFps = fps;
+    try { frameRate(fps); } catch (_) {}
+  }
+
+  function cancelScheduledConfigRender() {
+    if (__renderResumeTimer) {
+      clearTimeout(__renderResumeTimer);
+      __renderResumeTimer = 0;
+    }
+    if (__renderRaf) {
+      try { cancelAnimationFrame(__renderRaf); } catch (_) {}
+      __renderRaf = 0;
+    }
+  }
+
+  function armStructuralRender() {
+    if (__renderResumeTimer) clearTimeout(__renderResumeTimer);
+    __renderResumeTimer = setTimeout(function () {
+      __renderResumeTimer = 0;
+      if (recState) return; // capture owns loop/noLoop while active
+      syncAnimationFrameRate();
+      try { loop(); redraw(); } catch (_) {}
+    }, 100);
+  }
+
+  function scheduleConfigRender(key) {
+    const generation = ++__renderGeneration;
+    syncAnimationFrameRate();
+    if (recState) return generation; // never disturb deterministic capture cadence
+    const structural = !key || key === 'unknown'
+      || /grid|font|renderer|glyph|source|canvas|scene|prefilter|sampling/i.test(String(key));
+    if (structural) {
+      if (__renderRaf) {
+        try { cancelAnimationFrame(__renderRaf); } catch (_) {}
+        __renderRaf = 0;
+      }
+      try { noLoop(); } catch (_) {}
+      armStructuralRender();
+    } else if (__renderResumeTimer) {
+      /* A structural scrub already paused the loop. Keep one trailing
+         render, but move it after the latest (possibly cheap) mutation. */
+      armStructuralRender();
+    } else if (!__renderRaf) {
+      __renderRaf = requestAnimationFrame(function () {
+        __renderRaf = 0;
+        if (recState) return;
+        try { loop(); redraw(); } catch (_) {}
+      });
+    }
+    return generation;
+  }
+
+  function ensureSourceScratch(w, h) {
+    const key = w + 'x' + h;
+    if (!__sourcePreprocessScratch || __sourcePreprocessScratch.key !== key) {
+      const n = w * h;
+      __sourcePreprocessScratch = {
+        key,
+        lum: new Float32Array(n), blur: new Float32Array(n),
+        lum2: new Float32Array(n), blur2: new Float32Array(n),
+        lumChip: new Float32Array(n), blurChip: new Float32Array(n),
+      };
+    }
+    /* Blur borders were zero in the old freshly-allocated arrays.  Clear
+       only the three destination planes so reuse remains output-equivalent. */
+    __sourcePreprocessScratch.blur.fill(0);
+    __sourcePreprocessScratch.blur2.fill(0);
+    __sourcePreprocessScratch.blurChip.fill(0);
+    return __sourcePreprocessScratch;
+  }
 
   /* ---- per-frame scratch buffers, sized once in setup() ---- */
   let lumBuf = null;      /* Float32Array, linear luminance over src */
@@ -1088,19 +1231,79 @@
       crtState = null;
     }
 
-    /* Clear scene cache so preprocess re-runs at the new dims. */
-    if (window.SCENES) {
-      for (const name in window.SCENES) {
-        delete window.SCENES[name].__sourceProcessed;
-        delete window.SCENES[name].__sourceDepth;
-      }
-    }
+    /* Clear source-derived caches so preprocess/signal stages re-run at
+       the new bounded working dimensions. */
+    clearSourceDerivedCaches();
 
     console.log('canvas resized to ' + cw + '×' + ch
       + ' (image aspect ' + aspect.toFixed(3) + ')');
   }
 
+  function beginSourceImport(label) {
+    const generation = ++__sourceImportGeneration;
+    ++__renderGeneration;
+    window.__glyphLastImportError = null;
+    statusEl().textContent = 'Loading ' + (label || 'image') + '…';
+    return generation;
+  }
+
+  function acceptSourceImage(img, options) {
+    options = options || {};
+    const taggedGeneration = Number(options.generation) || 0;
+    if (taggedGeneration && taggedGeneration !== __sourceImportGeneration) {
+      return false; // a newer source selection superseded this decode
+    }
+    if (!taggedGeneration) ++__sourceImportGeneration;
+
+    if (!img) {
+      sourceImg = null;
+      ++__sourceRevision;
+      clearSourceDerivedCaches();
+      statusEl().textContent = 'Source cleared';
+      try { loop(); redraw(); } catch (_) {}
+      return true;
+    }
+
+    const checked = validateSourceMetadata(img, options);
+    if (!checked.ok) {
+      window.__glyphLastImportError = checked;
+      statusEl().textContent = 'Image rejected: ' + checked.reason;
+      console.warn('glyph-grid: source rejected', checked.reason, checked.meta);
+      return false;
+    }
+
+    sourceImg = img;
+    ++__sourceRevision;
+    window.__glyphLastImportError = null;
+    clearSourceDerivedCaches();
+    try { fitCanvasToImage(img); } catch (e) { console.warn(e); }
+
+    /* Preserve variable-delay animation timing and tune capture to exactly
+       one source loop.  Frame count was already guarded above. */
+    try {
+      if (img.gifProperties && img.numFrames && img.numFrames() > 1) {
+        const props = img.gifProperties;
+        let totalMs = 0;
+        for (let i = 0; i < props.numFrames; i++) totalMs += (props.frames[i].delay || 100);
+        if (totalMs > 0) {
+          CONFIG.animation.duration = totalMs / 1000;
+          CONFIG.animation.loop = true;
+          console.log('animated source: ' + props.numFrames + ' frames, '
+            + (totalMs / 1000).toFixed(2) + 's loop — duration auto-set');
+        }
+      }
+    } catch (e) { console.warn('animated-source auto-tune failed:', e); }
+
+    statusEl().textContent = 'Loaded ' + checked.meta.width + '×' + checked.meta.height
+      + (checked.meta.frames > 1 ? ' · ' + checked.meta.frames + ' frames' : '');
+    try { loop(); redraw(); } catch (_) {}
+    return true;
+  }
+
   function draw() {
+    /* CONFIG.animation.fps is live-mutated by Tweakpane and batch jobs.
+       Keep p5's actual timer cadence in sync with the animation math. */
+    syncAnimationFrameRate();
     if (recState && recState.done) { noLoop(); return; }
     if (!CONFIG.animation.loop && !recState && frameCount > 1) { noLoop(); return; }
 
@@ -1407,6 +1610,7 @@
      Studio-side wraps this in addInput onChange handlers. */
   window.__markChange = function (key) {
     __pfLastChange = { key, t: performance.now() };
+    scheduleConfigRender(key);
   };
   window.__perfReport = function () {
     if (!__pfRing.length) { console.log('no frames recorded'); return; }
@@ -1694,13 +1898,41 @@
       for (let i = 0; i < n; i++) cellSignalEma[i] = oldEma[i];
     }
 
-    /* Step 1+2: linearize source to per-pixel luminance (Rec.709 on linear sRGB, CR-1). */
+    /* Step 1+2: linearize source to per-pixel luminance (Rec.709 on
+       linear sRGB, CR-1).  A still studio source produces the same full
+       canvas pixels until its source/canvas/palette revision changes, so
+       retain one bounded luminance plane instead of recomputing it at the
+       preview cadence.  Animated frames deliberately bypass this cache. */
     const _t_lum0 = performance.now();
-    linearizeToLuminance(pixels, lumBuf, srcW, srcH);
+    const _staticSource = CONFIG.scene === 'studio'
+      && sourceImg && window.__sourceFrameIdx === -1;
+    const _lumKey = _staticSource
+      ? (__sourceRevision + '|' + srcW + 'x' + srcH + '|' + CONFIG.palette)
+      : null;
+    if (_staticSource && __sourceSignalCache
+        && __sourceSignalCache.lumKey === _lumKey
+        && __sourceSignalCache.lum.length === lumBuf.length) {
+      lumBuf.set(__sourceSignalCache.lum);
+      __sourceCacheStats.luminanceHits++;
+    } else {
+      linearizeToLuminance(pixels, lumBuf, srcW, srcH);
+      __sourceCacheStats.luminanceMisses++;
+      if (_staticSource) {
+        __sourceSignalCache = { lumKey: _lumKey, lum: lumBuf.slice(), cellKey: null, cells: null };
+      }
+    }
     if (__pfFrame) __pfFrame.stages._lum = performance.now() - _t_lum0;
 
+    const _prefilterKey = GlyphGrid.compat.gatePrefilter(CONFIG)
+      ? JSON.stringify(CONFIG.prefilter || null) : 'none';
+    const _cellKey = _lumKey && (_lumKey + '|' + cols + 'x' + rows + '|' + _prefilterKey);
+    const _hasCachedCells = !!(_cellKey && __sourceSignalCache
+      && __sourceSignalCache.cellKey === _cellKey
+      && __sourceSignalCache.cells
+      && __sourceSignalCache.cells.length === cellSignal.length);
+
     /* Optional prefilter (XDoG) — writes over lumBuf in place. */
-    if (GlyphGrid.compat.gatePrefilter(CONFIG) && GlyphGrid.xdog) {
+    if (!_hasCachedCells && GlyphGrid.compat.gatePrefilter(CONFIG) && GlyphGrid.xdog) {
       const pre = CONFIG.prefilter;
       const mode = pre.mode || pre;
       if (typeof mode === 'string' && mode.indexOf('xdog') === 0) {
@@ -1711,9 +1943,21 @@
       }
     }
 
-    /* Step 3: per-cell brightness via mean-in-cell. */
+    /* Step 3: per-cell brightness via mean-in-cell.  Cache the raw signal
+       before threshold/invert/EMA; those downstream controls can change
+       without touching full-canvas source work. */
     const _t_ds0 = performance.now();
-    downsampleToCells(lumBuf, srcW, srcH, cellSignal, cols, rows, cellPxW, cellPxH);
+    if (_hasCachedCells) {
+      cellSignal.set(__sourceSignalCache.cells);
+      __sourceCacheStats.cellHits++;
+    } else {
+      downsampleToCells(lumBuf, srcW, srcH, cellSignal, cols, rows, cellPxW, cellPxH);
+      __sourceCacheStats.cellMisses++;
+      if (_cellKey && __sourceSignalCache && __sourceSignalCache.lumKey === _lumKey) {
+        __sourceSignalCache.cellKey = _cellKey;
+        __sourceSignalCache.cells = cellSignal.slice();
+      }
+    }
     if (__pfFrame) __pfFrame.stages._downsample = performance.now() - _t_ds0;
 
     /* Step 3a: bgThreshold + invertSignal — both operate on raw source
@@ -3163,18 +3407,21 @@
      interaction on a slow machine). ---- */
   const _atlasCache = {};       // setId → atlas (post-buildAtlas)
   const _atlasInflight = {};    // setId → in-progress promise (avoids double-fetch)
-  function loadAtlasAsync(setId) {
+  function loadAtlasAsync(setId, opts) {
+    opts = opts || {};
+    const requestedGeneration = __renderGeneration;
+    function commitIfCurrent(atlas) {
+      if (!opts.warmOnly && requestedGeneration === __renderGeneration
+          && CONFIG.glyphSet === setId) glyphAtlas = atlas;
+      return atlas;
+    }
     /* Cache hit — instant. */
     if (_atlasCache[setId]) {
-      glyphAtlas = _atlasCache[setId];
-      return Promise.resolve(glyphAtlas);
+      return Promise.resolve(commitIfCurrent(_atlasCache[setId]));
     }
     /* In-flight — wait on the existing fetch. */
     if (_atlasInflight[setId]) {
-      return _atlasInflight[setId].then(function (a) {
-        glyphAtlas = a;
-        return a;
-      });
+      return _atlasInflight[setId].then(commitIfCurrent);
     }
     const url = './glyph-sets/' + setId + '.json';
     const p = fetch(url).then(function (r) {
@@ -3183,7 +3430,6 @@
     }).then(function (j) {
       const atlas = GlyphGrid.shapeIndex.buildAtlas(j);
       _atlasCache[setId] = atlas;
-      glyphAtlas = atlas;
       delete _atlasInflight[setId];
       return atlas;
     }).catch(function (e) {
@@ -3191,13 +3437,13 @@
       if (console && console.warn) console.warn('glyph-grid: atlas load failed for "' + setId + '": ' + e.message);
     });
     _atlasInflight[setId] = p;
-    return p;
+    return p.then(commitIfCurrent);
   }
   /* Pre-warm — kick off parallel fetches for all known atlases. */
   function prewarmAllAtlases() {
     const sets = ['ascii','asciiDense','blockElements','braille','sextant','octant'];
     sets.forEach(function (s) {
-      if (!_atlasCache[s] && !_atlasInflight[s]) loadAtlasAsync(s);
+      if (!_atlasCache[s] && !_atlasInflight[s]) loadAtlasAsync(s, { warmOnly: true });
     });
   }
 
@@ -3344,45 +3590,132 @@
      because toBlob captures the canvas AT THE TIME of the encode (after
      the queued microtasks settle). For a 24-frame loop this is
      imperceptible — frames are still in temporal order. */
+  let __recordJobSequence = 0;
+  const MAX_CAPTURE_FRAMES = 600;
+  const MAX_CAPTURE_PIXELS = 100 * 1000 * 1000;
+
+  function validateCaptureBudget(requestedTotal, captureWidth, captureHeight) {
+    const total = Math.max(1, Math.round(Number(requestedTotal) || 1));
+    const pixels = Math.max(0, Number(captureWidth) || 0)
+      * Math.max(0, Number(captureHeight) || 0) * total;
+    let code = null;
+    let message = '';
+    if (total > MAX_CAPTURE_FRAMES) {
+      code = 'capture-frame-limit';
+      message = 'Export frame limit exceeded (' + total + ' > ' + MAX_CAPTURE_FRAMES + ')';
+    } else if (!Number.isSafeInteger(pixels) || pixels > MAX_CAPTURE_PIXELS) {
+      code = 'capture-pixel-limit';
+      message = 'Export pixel budget exceeded; lower duration, FPS, or output size';
+    }
+    return { ok: !code, code, message, total, pixels };
+  }
+
+  function blobToBase64(blob) {
+    return new Promise(function (resolve, reject) {
+      const reader = new FileReader();
+      reader.onload = function () { resolve(String(reader.result).split(',')[1] || ''); };
+      reader.onerror = function () { reject(reader.error || new Error('FileReader failed')); };
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function lazyFallbackZip(state) {
+    if (state._zipPromise) return state._zipPromise;
+    state._zipPromise = Promise.resolve().then(function () {
+      if (state.zip) return state.zip.generateAsync({ type: 'blob' });
+      if (!state.framesB64 || !state.framesB64.length) {
+        throw new Error('Fallback ZIP unavailable: recording did not retain frames');
+      }
+      const zip = new JSZip();
+      for (let i = 0; i < state.framesB64.length; i++) {
+        const name = `frame_${String(i + 1).padStart(4, '0')}.png`;
+        zip.file(name, state.framesB64[i], { base64: true });
+      }
+      return zip.generateAsync({ type: 'blob' });
+    });
+    return state._zipPromise;
+  }
+
+  function recordingHelpers(state) {
+    return Object.freeze({
+      jobId: state.jobId,
+      total: state.total,
+      framesB64: state.framesB64,
+      getFrames: function () { return state.framesB64 || []; },
+      getFallbackZip: function () { return lazyFallbackZip(state); },
+    });
+  }
+
+  function failRecording(state, error) {
+    if (recState !== state) return;
+    state.cancelled = true;
+    state._capturing = false;
+    recState = null;
+    clearTimeout(window.__statusHoldTimer);
+    window.__statusHold = true;
+    statusEl().textContent = 'Recording stopped: ' + (error && error.message ? error.message : String(error));
+    window.__statusHoldTimer = setTimeout(() => { window.__statusHold = false; }, 5000);
+    try { loop(); } catch (_) {}
+    if (typeof state.onError === 'function') state.onError(error);
+  }
+
   function handleRecordFrame() {
-    if (recState._capturing) return;  // previous capture still in flight; skip
-    recState._capturing = true;
-    const idx = recState.frameIdx;
+    const state = recState;
+    if (!state || state.cancelled || state._capturing) return;
+    state._capturing = true; // one-frame backpressure: never build a capture backlog
+    const idx = state.frameIdx;
     const name = `frame_${String(idx + 1).padStart(4, '0')}.png`;
     statusEl().textContent =
-      `RECORDING ${idx + 1}/${recState.total} (${CONFIG.scene} @ ${CONFIG.palette})`;
+      `RECORDING ${idx + 1}/${state.total} (${CONFIG.scene} @ ${CONFIG.palette})`;
+    /* Freeze presentation until this frame has been encoded/consumed. This
+       is producer backpressure (queue depth one) and also prevents toBlob
+       from observing a later redraw of the same logical animation frame. */
+    try { noLoop(); } catch (_) {}
     drawingContext.canvas.toBlob(function (blob) {
+      if (recState !== state || state.cancelled) return;
       if (!blob) {
-        recState._capturing = false;
-        if (console && console.warn) console.warn('handleRecordFrame: toBlob returned null');
+        failRecording(state, new Error('canvas PNG capture returned no data'));
         return;
       }
-      const reader = new FileReader();
-      reader.onload = function () {
-        const dataUrl = reader.result;
-        const base64 = dataUrl.split(',')[1];
-        recState.zip.file(name, base64, { base64: true });
-        if (recState.framesB64) recState.framesB64.push(base64);
-        recState.frameIdx++;
-        recState._capturing = false;
-        if (recState.frameIdx >= recState.total && !recState.done) {
-          recState.done = true;
-          finishRecording();
+      if (state.zip) state.zip.file(name, blob);
+      const needsBase64 = !!(state.framesB64 || state.onFrame);
+      const encoded = needsBase64 ? blobToBase64(blob) : Promise.resolve(null);
+      encoded.then(function (base64) {
+        if (recState !== state || state.cancelled) return null;
+        if (state.framesB64) state.framesB64.push(base64);
+        if (state.onFrame) {
+          return state.onFrame({
+            jobId: state.jobId, index: idx, name, blob, b64: base64,
+            total: state.total,
+          });
         }
-      };
-      reader.onerror = function () {
-        recState._capturing = false;
-        if (console && console.warn) console.warn('handleRecordFrame: FileReader error', reader.error);
-      };
-      reader.readAsDataURL(blob);
+        return null;
+      }).then(function () {
+        if (recState !== state || state.cancelled) return;
+        state.frameIdx++;
+        state._capturing = false;
+        if (typeof state.onProgress === 'function') {
+          state.onProgress(state.frameIdx, state.total, state.jobId);
+        }
+        if (state.frameIdx >= state.total && !state.done) {
+          state.done = true;
+          finishRecording(state);
+        } else {
+          try { loop(); } catch (_) {}
+        }
+      }).catch(function (error) {
+        failRecording(state, error);
+      });
     }, 'image/png');
   }
 
-  function finishRecording() {
-    statusEl().textContent = `RECORDING DONE — building ZIP…`;
-    recState.zip.generateAsync({ type: 'blob' }).then((blob) => {
-      const total = recState.total;
-      const onFinish = (typeof recState.onFinish === 'function') ? recState.onFinish : null;
+  function finishRecording(state) {
+    if (!state || recState !== state || state.cancelled) return;
+    const total = state.total;
+    const onFinish = (typeof state.onFinish === 'function') ? state.onFinish : null;
+    const helpers = recordingHelpers(state);
+    function complete(blob) {
+      if (recState !== state || state.cancelled) return;
       /* BUG-009: recState used to survive past this point forever, so
          draw()'s `recState.done → noLoop()` froze the studio after every
          GUI export — dead canvas, dead status bar, and "Clear image"
@@ -3395,7 +3728,7 @@
          returns.  __statusHold keeps the encode/save feedback readable
          while frames render underneath; exportFeedback releases it. */
       if (onFinish) {
-        onFinish(blob);
+        onFinish(blob, helpers);
         recState = null;
         clearTimeout(window.__statusHoldTimer);
         window.__statusHold = true;
@@ -3422,7 +3755,19 @@
       statusEl().textContent =
         `RECORDED ${total} frames → ZIP downloaded. Unzip + run export-gif.sh`;
       window.__statusHoldTimer = setTimeout(() => { window.__statusHold = false; }, 4000);
-    });
+    }
+
+    if (state.zip) {
+      statusEl().textContent = `RECORDING DONE — building fallback ZIP…`;
+      lazyFallbackZip(state).then(complete).catch(function (error) { failRecording(state, error); });
+    } else if (onFinish) {
+      /* Normal native path: no JSZip object was created and no ZIP blob is
+         materialized.  The second argument can construct a fallback lazily
+         only when explicitly requested and retained frames are available. */
+      complete(null);
+    } else {
+      lazyFallbackZip(state).then(complete).catch(function (error) { failRecording(state, error); });
+    }
   }
 
   /* =================================================================
@@ -3433,18 +3778,52 @@
       const opts = (typeof totalOrOpts === 'object' && totalOrOpts !== null)
         ? totalOrOpts
         : { total: totalOrOpts };
+      const requestedTotal = opts.total || Math.round(CONFIG.animation.duration * CONFIG.animation.fps);
+      const budget = validateCaptureBudget(requestedTotal, width, height);
+      const total = budget.total;
+      if (!budget.ok) {
+        statusEl().textContent = budget.message;
+        const error = new Error(budget.message);
+        error.code = budget.code;
+        error.capture = budget;
+        throw error;
+      }
+      const collectFrames = !!opts.collectFrames;
+      const onFrame = (typeof opts.onFrame === 'function') ? opts.onFrame : null;
+      const collectZip = opts.collectZip === true
+        || (opts.collectZip !== false && !collectFrames && !onFrame);
+      /* A pending settings redraw must never fire between noLoop() and the
+         asynchronous toBlob callback. Capture becomes the sole loop owner. */
+      cancelScheduledConfigRender();
       recState = {
-        zip: new JSZip(),
-        framesB64: opts.collectFrames ? [] : null,
+        jobId: opts.jobId || (++__recordJobSequence),
+        zip: collectZip ? new JSZip() : null,
+        framesB64: collectFrames ? [] : null,
         frameIdx: 0,
-        total: opts.total || Math.round(CONFIG.animation.duration * CONFIG.animation.fps),
+        total,
         done: false,
+        cancelled: false,
+        onFrame,
+        onProgress: opts.onProgress,
+        onError: opts.onError,
         onFinish: opts.onFinish || onFinishOverride,
       };
       /* Re-engage the p5 draw loop in case a previous recording's
          finishRecording → noLoop() is still in effect.  Without this,
          batch-mode runBatchExport stalls after the first job. */
       try { loop(); } catch (e) {}
+      return recState.jobId;
+    },
+    cancelRecord(jobId, reason) {
+      const state = recState;
+      if (!state) return false;
+      if (jobId !== undefined && jobId !== null && jobId !== state.jobId) return false;
+      state.cancelled = true;
+      state._capturing = false;
+      recState = null;
+      statusEl().textContent = 'Recording cancelled' + (reason ? ': ' + reason : '');
+      try { loop(); } catch (_) {}
+      return true;
     },
     getConfig: () => JSON.parse(JSON.stringify(CONFIG)),
     setConfig: (overrides) => {
@@ -3459,8 +3838,16 @@
           CONFIG[k] = v;
         }
       }
+      scheduleConfigRender(Object.keys(overrides).join(','));
     },
     getRecState: () => recState,
+    getSourceLimits: () => Object.assign({}, SOURCE_LIMITS),
+    validateRecord: (total, w, h) => validateCaptureBudget(total, w || width, h || height),
+    validateSource: (img, extra) => validateSourceMetadata(img, extra),
+    beginSourceImport: (label) => beginSourceImport(label),
+    commitSource: (img, options) => acceptSourceImage(img, options),
+    getSourceCacheStats: () => Object.assign({}, __sourceCacheStats),
+    getRenderGeneration: () => __renderGeneration,
     getSkillVersion: () => (window.GlyphGrid && GlyphGrid.compat ? GlyphGrid.compat.SKILL_VERSION : '1.x'),
 
     /* ── captureGridSnapshot (v0.1.6, SOTA feature 2) ──────────────────
@@ -3718,6 +4105,45 @@
         const effFps = 1000 / delayMs;
         const savedFps = CONFIG.animation.fps;
         CONFIG.animation.fps = effFps;
+        const requestedFrames = job.frames || 24;
+        let captureFailureHandled = false;
+
+        function advanceCaptureFailure(error, budget, phase) {
+          if (captureFailureHandled) return;
+          captureFailureHandled = true;
+          const message = error && error.message ? error.message : String(error);
+          const detail = {
+            name: job.name,
+            phase: phase || 'capture-preflight',
+            code: (error && error.code) || (budget && budget.code) || 'capture-start-failed',
+            err: message,
+            requestedFrames: budget ? budget.total : requestedFrames,
+            capturePixels: budget ? budget.pixels : null,
+          };
+          console.warn('batch: capture rejected', detail);
+          errors.push(detail);
+          CONFIG.animation.fps = savedFps;
+          syncAnimationFrameRate();
+          try {
+            Promise.resolve(tauri('cli_log', {
+              msg: 'batch: capture rejected ' + JSON.stringify(detail),
+            })).catch(()=>{});
+          } catch (_) {}
+          idx++;
+          setTimeout(next, 50);
+        }
+
+        /* Fail before the settle timer when dimensions/frame count already
+           exceed the same envelope enforced by beginRecord/Rust.  This is
+           especially important in headless mode: an uncaught timer error
+           otherwise leaves exit_with_status waiting forever. */
+        const captureBudget = self.validateRecord(requestedFrames, width, height);
+        if (!captureBudget.ok) {
+          const preflightError = new Error(captureBudget.message);
+          preflightError.code = captureBudget.code;
+          advanceCaptureFailure(preflightError, captureBudget, 'capture-preflight');
+          return;
+        }
 
         /* Reset the perf ring so the snapshot in onFinish captures only
            this job's frames (perfMode only). */
@@ -3737,10 +4163,14 @@
           if (perfMode && typeof window.__markChange === 'function') {
             try { window.__markChange('job:' + job.name); } catch (_) {}
           }
-          self.beginRecord({
-            total: job.frames || 24,
-            collectFrames: true,
-            onFinish() {
+          try {
+            self.beginRecord({
+              total: requestedFrames,
+              collectFrames: true,
+              onError(error) {
+                advanceCaptureFailure(error, error && error.capture, 'capture');
+              },
+              onFinish() {
               const rs = self.getRecState();
               const frames = (rs && rs.framesB64) || [];
               if (!frames.length) {
@@ -3808,8 +4238,11 @@
                 idx++;
                 setTimeout(next, 50);
               });
-            }
-          });
+              }
+            });
+          } catch (error) {
+            advanceCaptureFailure(error, error && error.capture, 'capture-start');
+          }
         }, settle);
       }  // _runJob
       }  // next
@@ -4190,32 +4623,8 @@
     sceneCacheKeys: ['__sourceProcessed'],
     imageRef: {
       name: 'sourceImg',
-      set: function (img) {
-        sourceImg = img;
-        /* Auto-fit canvas to the new image's aspect ratio so portrait /
-           square / 4:3 / etc. inputs don't get cropped by the 2:1 default.
-           Disabled via CONFIG.studio.fitCanvasToImage = false. */
-        try { fitCanvasToImage(img); } catch (e) { console.warn(e); }
-        /* Animated source — auto-tune animation params so recording
-           captures exactly one source loop (instead of N loops or partial
-           loops driven by the default 6 s duration). */
-        try {
-          if (img && img.gifProperties && img.numFrames && img.numFrames() > 1) {
-            const props = img.gifProperties;
-            let totalMs = 0;
-            for (let i = 0; i < props.numFrames; i++) totalMs += (props.frames[i].delay || 100);
-            if (totalMs > 0) {
-              CONFIG.animation.duration = totalMs / 1000;
-              CONFIG.animation.loop = true;
-              console.log('animated source: ' + props.numFrames + ' frames, ' + (totalMs / 1000).toFixed(2) + 's loop — duration auto-set');
-            }
-          }
-        } catch (e) { console.warn('animated-source auto-tune failed:', e); }
-        /* Image just landed — make sure the draw loop is alive even if a
-           previous setting (or the empty-state placeholder branch) had it
-           paused.  No-op if already looping. */
-        try { loop(); } catch (e) {}
-      },
+      begin: beginSourceImport,
+      set: function (img, options) { return acceptSourceImage(img, options); },
     },
   });
 
@@ -4234,14 +4643,28 @@
      so the caller can immediately apply config and begin recording. */
   let __cliCurrentSource = null;
   async function _cliLoadSource(inPath) {
-    const dataUrl = await window.__TAURI__.core.invoke('read_image_file',
-                                                      { path: inPath });
+    const importGeneration = beginSourceImport(inPath);
+    const loaded = await window.__TAURI__.core.invoke('read_image_file', { path: inPath });
+    /* v0.1.9 native reads return metadata with the data URL.  Accept the
+       legacy string response so older binaries/headless fixtures remain
+       compatible during rollout. */
+    const dataUrl = (loaded && typeof loaded === 'object')
+      ? (loaded.dataUrl || loaded.data_url) : loaded;
+    if (!dataUrl) throw new Error('read_image_file returned no image data');
+    const sourceBytes = loaded && typeof loaded === 'object'
+      ? (loaded.sizeBytes || loaded.size_bytes || 0) : 0;
+    if (sourceBytes > SOURCE_LIMITS.maxFileBytes) {
+      throw new Error('source exceeds the ' + Math.round(SOURCE_LIMITS.maxFileBytes / 1048576) + ' MB limit');
+    }
     await new Promise(function (resolve, reject) {
       window.loadImage(dataUrl, function (img) {
-        sourceImg = img;
-        try { fitCanvasToImage(img); } catch (e) { console.warn(e); }
-        try { loop(); } catch (e) {}
-        resolve();
+        const accepted = acceptSourceImage(img, {
+          generation: importGeneration,
+          sizeBytes: sourceBytes,
+        });
+        if (accepted) resolve();
+        else reject(new Error((window.__glyphLastImportError && window.__glyphLastImportError.reason)
+          || 'source load was superseded'));
       }, function (err) {
         reject(err);
       });

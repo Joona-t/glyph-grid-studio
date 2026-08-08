@@ -1,6 +1,6 @@
 cask "glyph-grid-studio" do
-  version "0.1.8"
-  sha256 "e86bbca32011b06d6d91f5e553fb5c2944608c14a9388593087f6b9492ba2f61"
+  version "0.1.9"
+  sha256 "8936b4b5e2054ea5889f43dbf4689f7d596d18ae218e3eacd333e561aaa756ad"
 
   url "https://github.com/Joona-t/glyph-grid-studio/releases/download/v#{version}/Glyph-Grid-Studio-macOS.dmg"
   name "Glyph Grid Studio"

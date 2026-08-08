@@ -4,6 +4,105 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+## 2026-08-08 — v0.1.9: bounded imports, staged exports, responsive controls
+
+This release follows a source-level performance audit prompted by freezes and
+high GPU/CPU use while importing GIFs, scrubbing settings, previewing, and
+exporting. The audit separated code-proven retention/work from runtime
+hypotheses; v0.1.9 addresses the highest-confidence causes first.
+
+### BUG-013 — Native export duplicated every frame and sent one oversized IPC request (P0)
+
+- **Verified cause:** native GIF/MP4 capture always constructed a JSZip archive,
+  retained a second base64 frame array, materialized the ZIP, and then sent the
+  complete base64 sequence to Rust in one invoke. Rust retained further
+  full-sequence representations during encoding.
+- **Fix:** the native GUI now chooses its destination before capture, opens a
+  job-correlated staged export, and sends one awaited PNG frame per IPC call.
+  Capture has queue-depth-one backpressure: the next frame is not accepted until
+  Rust has validated and staged the current frame. Rust stores decoded PNG bytes,
+  not browser-side base64 strings; successful native exports create no JSZip and
+  retain no JavaScript frame array. Browser export still uses ZIP, and the legacy
+  one-shot commands remain for CLI/backward compatibility.
+- **Bounds:** 600 export frames, 100 million cumulative decoded pixels, and
+  256 MiB of staged compressed PNG data. Frames must arrive in order with
+  consistent, valid PNG dimensions.
+- **Lifecycle:** GUI exports have job IDs, phase/count progress, a visible Cancel
+  export action, cancellation checks throughout decode/encode/mux/write, and
+  atomic temp-file replacement so cancelled/failed writes do not leave a partial
+  destination.
+
+### BUG-014 — Animated source preprocessing scaled with original GIF dimensions (P0)
+
+- **Verified cause:** the studio scene repeatedly allocated six
+  `Float32Array(width × height)` planes and ran its enhancement passes at the
+  source frame's original dimensions, even though the result was immediately
+  fitted to the bounded render canvas.
+- **Fix:** preprocessing now runs at render working resolution with the same
+  centered-cover geometry. The p5 graphics surface and all six scratch planes
+  are reused by dimension. Source imports are generation-tagged so a late decode
+  cannot replace a newer selection.
+- **Bounds:** native/browser imports reject files above 64 MiB; decoded metadata
+  is limited to 16,384 px per axis, 480 frames, and 100 million cumulative source
+  pixels before renderer preprocessing commits.
+
+### BUG-015 — Settings scrubs scheduled redundant full renders (P1)
+
+- **Verified cause:** Tweakpane mutations updated live configuration directly;
+  structural changes were not coalesced, async atlas loads could commit stale
+  results, and still-source luminance/downsample work reran at preview cadence.
+- **Fix:** lightweight changes coalesce to one animation frame; structural
+  changes use a 100 ms trailing render; render generations reject stale atlas
+  commits; p5's actual frame rate follows the FPS setting. Unchanged studio
+  stills reuse bounded luminance and raw cell-signal caches with explicit
+  source/grid/prefilter invalidation.
+
+### Remaining measured-risk backlog
+
+The following are deliberately **not** claimed fixed without further runtime
+work and fixtures:
+
+1. p5 still decodes animated GIFs before frame-count/logical-dimension metadata
+   is available. The 64 MiB pre-decode file guard reduces exposure, but a native
+   bounded GIF decoder with disposal/timing fixtures remains planned.
+2. Staged GUI capture removes the oversized one-shot IPC and browser duplication,
+   but each PNG still crosses IPC as base64. A binary channel should replace that
+   representation after Tauri/WebKit transfer behavior is benchmarked.
+3. gifski adaptive export still retains the decoded RGBA sequence so retries can
+   reuse it. A bounded live collector plus temp-frame spool is planned; MP4 now
+   preprocesses one RGB frame at a time but still retains compressed samples and
+   the final in-memory container.
+4. Working-resolution sharpening intentionally changes processing order. Visual
+   PNG/GIF fixtures and SSIM review are required before calling it pixel-identical.
+5. Full GPU/FBO postprocessing remains later work. Scheduler, memory, IPC, and
+   measurement fixes take precedence over widening the optional WebGL path.
+
+### Release gates added
+
+- Rust unit tests cover PNG validation, frame/pixel/border limits, staged ordering
+  and completeness, cancellation, and atomic output cleanup.
+- JavaScript regression tests cover native ZIP bypass, staged per-frame capture,
+  legacy fallback, and lazy browser ZIP behavior.
+- The existing universal-build CLI/MCP/GIF/MP4 gate remains mandatory. Runtime
+  timings and memory figures are recorded only when collected from the release
+  build; projected improvements are not reported as measurements.
+
+### v0.1.9 release validation (2026-08-08)
+
+- The exact signed universal release app passed **24/24** automated checks:
+  frontend contracts, CLI rendering/batch/catalog, real GIF and MP4 output,
+  hard/feasible GIF size targets, MCP protocol, and CLI/MCP parity.
+- A live macOS GUI smoke test imported the public `cream-paper.png` fixture,
+  changed grid/animation settings, verified save-dialog cancellation settles
+  without starting capture, and completed a six-frame staged GIF export with a
+  visible saved result. The output validated as GIF89a at 1024×682.
+- The 16,626,612-byte universal DMG passed `hdiutil verify`; its mounted app
+  passed strict deep code-signature verification and contains both `x86_64` and
+  `arm64` slices. The release is ad-hoc signed (not Apple-notarized), matching
+  the documented direct-download distribution model.
+- These checks validate behavior and artifact integrity, not process RSS, GPU
+  occupancy, or thermal performance; those remain unmeasured telemetry.
+
 ## 2026-06-25 — Site: Basalt Monolith third theme
 
 ### ITER — add `basalt` as a 3rd site theme (Cream · Candy · Basalt)
