@@ -192,6 +192,73 @@
     }
   }
 
+  /* Source-load arbitration + lightweight guards (v0.1.9).
+     p5 image decoding is asynchronous, so a slow first selection used to be
+     able to overwrite a newer image after its callback finally ran. Every
+     user-initiated source load now owns a monotonically increasing token and
+     only the latest token may commit. The native commands may return either
+     the legacy data-URL string or a metadata-bearing object. */
+  var _sourceLoadGeneration = 0;
+  var MAX_SOURCE_BYTES = 64 * 1024 * 1024;
+  var WARN_SOURCE_BYTES = 24 * 1024 * 1024;
+  var SUPPORTED_IMAGE_MIME = /^image\/(png|jpe?g|webp|gif|bmp|tiff?|avif)$/i;
+
+  function beginSourceLoad() { return ++_sourceLoadGeneration; }
+  function isCurrentSourceLoad(token) { return token === _sourceLoadGeneration; }
+  function invalidateSourceLoads() { _sourceLoadGeneration++; }
+  function sourcePayload(value) {
+    if (typeof value === 'string') return { dataUrl: value };
+    value = value || {};
+    return {
+      dataUrl: value.dataUrl || value.data_url || '',
+      sizeBytes: value.sizeBytes || value.size_bytes || value.bytes || 0,
+      mimeType: value.mimeType || value.mime_type || '',
+      width: value.width || 0,
+      height: value.height || 0,
+      frameCount: value.frameCount || value.frame_count || 0,
+    };
+  }
+  function formatSourceSize(bytes) {
+    if (!bytes) return '';
+    return bytes < 1024 * 1024
+      ? Math.ceil(bytes / 1024) + ' KB'
+      : (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  }
+  function validateSourceMeta(meta, name) {
+    var label = name || 'image';
+    if (meta.mimeType && !SUPPORTED_IMAGE_MIME.test(meta.mimeType)) {
+      exportFeedback('Unsupported image type for ' + label + ': ' + meta.mimeType, true);
+      return false;
+    }
+    if (meta.sizeBytes > MAX_SOURCE_BYTES) {
+      exportFeedback(label + ' is ' + formatSourceSize(meta.sizeBytes) +
+        '; the interactive limit is ' + formatSourceSize(MAX_SOURCE_BYTES) + '.', true);
+      return false;
+    }
+    if (meta.sizeBytes > WARN_SOURCE_BYTES) {
+      exportFeedback('Loading large image ' + label + ' (' +
+        formatSourceSize(meta.sizeBytes) + ') — animated sources may take longer.');
+    }
+    return true;
+  }
+  function validateBrowserFile(file) {
+    if (!file) return false;
+    return validateSourceMeta({ sizeBytes: file.size || 0, mimeType: file.type || '' }, file.name);
+  }
+  function discardStaleImage(img) {
+    try { if (img && typeof img.remove === 'function') img.remove(); } catch (e) {}
+  }
+  function loadImageLatest(source, token, onSuccess, onError) {
+    if (!window.loadImage || !isCurrentSourceLoad(token)) return;
+    window.loadImage(source, function (img) {
+      if (!isCurrentSourceLoad(token)) { discardStaleImage(img); return; }
+      onSuccess(img);
+    }, function (err) {
+      if (!isCurrentSourceLoad(token)) return;
+      if (onError) onError(err);
+    });
+  }
+
   function setupImageDrop(imageRef, sceneCacheKeys, onSwap, config) {
     if (!imageRef) return;
     var overlay = document.createElement('div');
@@ -219,11 +286,16 @@
       overlay.style.borderColor = 'transparent';
       overlay.style.pointerEvents = 'none';
       var file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-      if (!file || !/^image\//.test(file.type)) return;
+      if (!file || !validateBrowserFile(file)) return;
+      var token = beginSourceLoad();
       var url = URL.createObjectURL(file);
-      window.loadImage(url, function (img) {
+      loadImageLatest(url, token, function (img) {
+        if (imageRef.set(img, { sizeBytes: file.size || 0 }) === false) {
+          discardStaleImage(img);
+          URL.revokeObjectURL(url);
+          return;
+        }
         applyFastLoadDefaults(config);
-        imageRef.set(img);
         if (sceneCacheKeys && window.SCENES) {
           for (var i = 0; i < sceneCacheKeys.length; i++) {
             for (var name in window.SCENES) {
@@ -235,6 +307,7 @@
         URL.revokeObjectURL(url);
       }, function () {
         console.warn('glyph-studio: failed to decode dropped image');
+        exportFeedback('Could not decode ' + file.name + '.', true);
         URL.revokeObjectURL(url);
       });
     }
@@ -263,11 +336,18 @@
         console.warn('glyph-studio: Tauri core unavailable, cannot read file');
         return;
       }
+      var token = beginSourceLoad();
       window.__TAURI__.core.invoke('read_image_file', { path: absPath })
-        .then(function (dataUrl) {
-          window.loadImage(dataUrl, function (img) {
+        .then(function (result) {
+          if (!isCurrentSourceLoad(token)) return;
+          var meta = sourcePayload(result);
+          if (!validateSourceMeta(meta, basename(absPath)) || !meta.dataUrl) return;
+          loadImageLatest(meta.dataUrl, token, function (img) {
+            if (imageRef.set(img, { sizeBytes: meta.sizeBytes || 0 }) === false) {
+              discardStaleImage(img);
+              return;
+            }
             applyFastLoadDefaults(config);
-            imageRef.set(img);
             clearSceneCaches();
             if (onSwap) onSwap(img);
             try {
@@ -284,6 +364,7 @@
           });
         })
         .catch(function (e) {
+          if (!isCurrentSourceLoad(token)) return;
           console.warn('glyph-studio: read_image_file failed:', e);
           try { exportFeedback('Could not read dropped file.', true); } catch (e2) {}
         });
@@ -349,130 +430,348 @@
     } catch (e) {}
   }
 
-  /* Native (Tauri) path: collect frame base64 strings during the recording
-     loop, then hand them to the Rust gif muxer.  Browser path: keep the old
-     ZIP behaviour as a fallback so the studio works outside Tauri.
-     `delayMs` defaults to the per-frame duration implied by CONFIG.animation. */
-  function recordGIF(testHook, total, onProgress, onDone, delayMs, capWidth, border, targetMaxBytes) {
-    if (!testHook) return;
-    var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
-
-    testHook.beginRecord({
-      total: total || 24,
-      collectFrames: inTauri,
-      onFinish: function (blob) {
-        if (onDone) onDone(blob);
-        if (inTauri) {
-          var rs = testHook.getRecState();
-          var frames = rs && rs.framesB64 ? rs.framesB64 : [];
-          if (!frames.length) {
-            console.warn('glyph-studio: no frames collected, falling back to ZIP');
-            exportFeedback('No frames collected — saved raw frames as ZIP instead', true);
-            saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
-            return;
-          }
-          var fps = (window.__glyphGridTest &&
-                     window.__glyphGridTest.getConfig &&
-                     window.__glyphGridTest.getConfig().animation &&
-                     window.__glyphGridTest.getConfig().animation.fps) || 24;
-          var dly = delayMs || Math.round(1000 / fps);
-          var payloadFrames = frames.map(function (b64) { return { b64: b64 }; });
-          window.__TAURI__.core.invoke('save_gif_real', {
-            frames: payloadFrames,
-            delayMs: dly,
-            capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
-            border: (border && border.enabled) ? border : null,
-            targetMaxBytes: (typeof targetMaxBytes === 'number' && targetMaxBytes > 0) ? targetMaxBytes : null,
-          })
-            .then(function (p) {
-              /* Always settle through exportFeedback — it releases the
-                 BUG-009 status hold even when p is unexpectedly empty. */
-              if (p) console.log('glyph-studio: saved GIF to', p);
-              exportFeedback(p ? 'Saved GIF → ' + p : '');
-            })
-            .catch(function (e) {
-              if (e === 'cancelled') { exportFeedback(''); return; }
-              console.warn('save_gif_real failed:', e, '— falling back to ZIP');
-              exportFeedback('GIF encode failed: ' + e + ' — frames saved as ZIP instead', true);
-              saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
-            });
-        } else {
-          saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
-        }
-      },
-    });
-    if (onProgress) {
-      var lastIdx = 0;
-      var t = setInterval(function () {
-        var rs = testHook.getRecState();
-        if (!rs) { clearInterval(t); return; }
-        if (rs.frameIdx !== lastIdx) { lastIdx = rs.frameIdx; onProgress(lastIdx, total || 24); }
-        if (rs.done) clearInterval(t);
-      }, 200);
+  /* Export-job coordination (v0.1.9). Jobs make capture/encode status
+     explicit and reject late completions from cancelled or superseded work.
+     `cancel_export` and `export-progress` are optional native capabilities;
+     older builds keep working, but cancellation becomes best-effort. */
+  var _exportJobSeq = 0;
+  var _activeExportJob = null;
+  function newExportJob(format, onStatus) {
+    if (_activeExportJob && !_activeExportJob.settled) return null;
+    var job = {
+      id: 'export-' + Date.now().toString(36) + '-' + (++_exportJobSeq),
+      format: format,
+      phase: 'preparing',
+      cancelled: false,
+      settled: false,
+      onStatus: onStatus,
+      unlisten: [],
+      restore: null,
+    };
+    _activeExportJob = job;
+    setExportPhase(job, 'preparing', 0, 0);
+    attachNativeExportProgress(job);
+    return job;
+  }
+  function isActiveExportJob(job) {
+    return !!job && _activeExportJob === job && !job.cancelled && !job.settled;
+  }
+  function setExportPhase(job, phase, completed, total) {
+    if (!job || (_activeExportJob !== job && !job.settled)) return;
+    job.phase = phase;
+    if (job.onStatus) job.onStatus(phase, completed || 0, total || 0, job);
+  }
+  function cleanupExportJob(job) {
+    if (!job) return;
+    job.settled = true;
+    if (job.restore) { try { job.restore(); } catch (e) {} job.restore = null; }
+    for (var i = 0; i < job.unlisten.length; i++) {
+      try { job.unlisten[i](); } catch (e) {}
     }
+    job.unlisten.length = 0;
+    if (_activeExportJob === job) _activeExportJob = null;
+    if (job.onStatus) job.onStatus(job.phase || (job.cancelled ? 'cancelled' : 'done'), 0, 0, job);
+  }
+  function attachNativeExportProgress(job) {
+    var eventApi = window.__TAURI__ && window.__TAURI__.event;
+    if (!(eventApi && eventApi.listen)) return;
+    ['export-progress', 'glyph-export-progress'].forEach(function (eventName) {
+      eventApi.listen(eventName, function (evt) {
+        var p = evt && evt.payload ? evt.payload : {};
+        var id = p.jobId || p.job_id;
+        if (id !== job.id || !isActiveExportJob(job)) return;
+        setExportPhase(job, p.phase || 'encoding', p.completed || 0, p.total || 0);
+      }).then(function (unlisten) {
+        if (isActiveExportJob(job)) job.unlisten.push(unlisten);
+        else try { unlisten(); } catch (e) {}
+      }).catch(function () {});
+    });
+  }
+  function cancelActiveExport(testHook) {
+    var job = _activeExportJob;
+    if (!job || job.settled) return false;
+    var phaseAtCancel = job.phase;
+    job.cancelled = true;
+    setExportPhase(job, 'cancelling', 0, 0);
+    var captureCancelled = false;
+    if (testHook && typeof testHook.cancelRecord === 'function') {
+      try { captureCancelled = testHook.cancelRecord(job.id) === true; } catch (e) {}
+    }
+    function finishCancelled() {
+      if (job.settled) return;
+      job.phase = 'cancelled';
+      exportFeedback('Export cancelled.');
+      cleanupExportJob(job);
+    }
+    function finishWrite() {
+      if (job.settled) return;
+      job.phase = 'finishing current write';
+      exportFeedback('Cancellation arrived too late — finishing current write.');
+      /* Keep the job stale so a late native completion cannot claim a new
+         success in the UI, but release the control for a later export. */
+      cleanupExportJob(job);
+    }
+    if (!_tauriInvoke) {
+      finishCancelled();
+      return true;
+    }
+    _tauriInvoke('cancel_export', { jobId: job.id }).then(function (nativeCancelled) {
+      if (job.settled) return;
+      if (nativeCancelled || captureCancelled || phaseAtCancel === 'choose destination') {
+        finishCancelled();
+      } else if (phaseAtCancel === 'initializing export') {
+        /* begin_export_capture is still in flight. Its completion handler
+           performs a second cancel immediately, then settles this job. */
+        job.phase = 'cancelling initialization';
+        if (job.onStatus) job.onStatus(job.phase, 0, 0, job);
+      } else {
+        finishWrite();
+      }
+    }).catch(function () {
+      /* Older native builds cannot acknowledge cancellation. A stopped JS
+         capture is definitive; an encoder/write may already be committed. */
+      if (captureCancelled || phaseAtCancel === 'choose destination') finishCancelled();
+      else if (phaseAtCancel === 'initializing export') {
+        job.phase = 'cancelling initialization';
+        if (job.onStatus) job.onStatus(job.phase, 0, 0, job);
+      }
+      else finishWrite();
+    });
+    return true;
   }
 
-  /* MP4/H.264 path — for Instagram (Reels / Stories / feed posts) which
-     strips uploaded GIFs.  Mirrors recordGIF: collect frames during
-     playback, hand them to the Rust openh264 + mp4 muxer.  Outside Tauri
-     this falls back to a ZIP of frames, same as the GIF path. */
-  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border) {
-    if (!testHook) return;
-    var inTauri = !!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
+  function getCapturedFrames(testHook, helpers) {
+    if (helpers) {
+      if (typeof helpers.getFrames === 'function') return helpers.getFrames() || [];
+      if (helpers.framesB64) return helpers.framesB64;
+    }
+    var rs = testHook && testHook.getRecState ? testHook.getRecState() : null;
+    return rs && rs.framesB64 ? rs.framesB64 : [];
+  }
+  function lazyFallbackZip(blob, helpers, frames) {
+    if (blob) return Promise.resolve(blob); // compatibility with old recorder
+    if (helpers && typeof helpers.getFallbackZip === 'function') {
+      return Promise.resolve().then(function () { return helpers.getFallbackZip(); });
+    }
+    if (!(window.JSZip && frames && frames.length)) {
+      return Promise.reject(new Error('raw frames are unavailable'));
+    }
+    /* Deliberately instantiate/populate JSZip only after native failure. */
+    var zip = new window.JSZip();
+    for (var i = 0; i < frames.length; i++) {
+      zip.file('frame_' + String(i + 1).padStart(4, '0') + '.png', frames[i], { base64: true });
+    }
+    return zip.generateAsync({ type: 'blob' });
+  }
+  function saveFallbackZip(blob, helpers, frames, format, job, reason) {
+    setExportPhase(job, 'building fallback ZIP', 0, frames.length);
+    return lazyFallbackZip(blob, helpers, frames).then(function (zipBlob) {
+      if (job && !isActiveExportJob(job)) return;
+      saveBlobBrowser(zipBlob, 'glyph-frames_' + stamp() + '.zip');
+      setExportPhase(job, 'fallback ZIP saved', frames.length, frames.length);
+      exportFeedback(format.toUpperCase() + ' encode failed: ' + reason +
+        ' — raw frames saved as ZIP instead', true);
+      if (job) cleanupExportJob(job);
+    }).catch(function (zipError) {
+      if (job && !isActiveExportJob(job)) return;
+      if (job) setExportPhase(job, 'failed', 0, frames.length);
+      exportFeedback(format.toUpperCase() + ' encode failed: ' + reason +
+        '; fallback ZIP failed: ' + zipError, true);
+      if (job) cleanupExportJob(job);
+    });
+  }
+  function monitorCapture(testHook, total, onProgress, job) {
+    var lastIdx = -1;
+    var timer = setInterval(function () {
+      if (job && !isActiveExportJob(job)) { clearInterval(timer); return; }
+      var rs = testHook.getRecState();
+      if (!rs) { clearInterval(timer); return; }
+      if (rs.frameIdx !== lastIdx) {
+        lastIdx = rs.frameIdx;
+        if (onProgress) onProgress(lastIdx, total);
+        if (job) setExportPhase(job, 'capturing', lastIdx, total);
+      }
+      if (rs.done) clearInterval(timer);
+    }, 100);
+  }
+  function nativeCommandUnavailable(error) {
+    return /unknown command|command .* not found|not registered|does not exist/i.test(String(error));
+  }
+  function cancelNativeJob(job) {
+    if (!_tauriInvoke || !job) return;
+    _tauriInvoke('cancel_export', { jobId: job.id }).catch(function () {});
+  }
 
+  /* Native path retains PNG strings only until encode settles and skips ZIP
+     creation. Browser path preserves the historical ZIP download. */
+  function recordGIF(testHook, total, onProgress, onDone, delayMs, capWidth, border, targetMaxBytes, job, destinationPath, staged) {
+    if (!testHook) return;
+    var inTauri = !!_tauriInvoke;
+    var frameTotal = total || 24;
     testHook.beginRecord({
-      total: total || 24,
-      collectFrames: inTauri,
-      onFinish: function (blob) {
+      total: frameTotal,
+      jobId: job && job.id,
+      collectFrames: inTauri && !staged,
+      collectZip: !inTauri,
+      onFrame: staged ? function (frame) {
+        return _tauriInvoke('push_export_frame', {
+          jobId: job.id,
+          index: frame.index,
+          b64: frame.b64,
+        });
+      } : null,
+      onProgress: function (completed, count) {
+        if (onProgress) onProgress(completed, count);
+        if (job) setExportPhase(job, 'capturing', completed, count);
+      },
+      onError: function (error) {
+        if (job && !isActiveExportJob(job)) return;
+        if (job) setExportPhase(job, 'failed', 0, frameTotal);
+        if (staged) cancelNativeJob(job);
+        exportFeedback('GIF capture failed: ' + error, true);
+        if (job) cleanupExportJob(job);
+      },
+      onFinish: function (blob, helpers) {
         if (onDone) onDone(blob);
-        if (inTauri) {
-          var rs = testHook.getRecState();
-          var frames = rs && rs.framesB64 ? rs.framesB64 : [];
-          if (!frames.length) {
-            console.warn('glyph-studio: no frames collected, falling back to ZIP');
-            exportFeedback('No frames collected — saved raw frames as ZIP instead', true);
-            saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
+        if (job && !isActiveExportJob(job)) return;
+        var frames = getCapturedFrames(testHook, helpers);
+        if (!inTauri) {
+          lazyFallbackZip(blob, helpers, frames).then(function (zipBlob) {
+            if (job && !isActiveExportJob(job)) return;
+            saveBlobBrowser(zipBlob, 'glyph-frames_' + stamp() + '.zip');
+            if (job) setExportPhase(job, 'ZIP downloaded', frameTotal, frameTotal);
+            if (job) cleanupExportJob(job);
+          }).catch(function (e) { exportFeedback('ZIP export failed: ' + e, true); if (job) cleanupExportJob(job); });
+          return;
+        }
+        if (!staged && !frames.length) {
+          saveFallbackZip(blob, helpers, frames, 'gif', job, 'no frames were collected');
+          return;
+        }
+        var fps = (window.__glyphGridTest && window.__glyphGridTest.getConfig &&
+          window.__glyphGridTest.getConfig().animation &&
+          window.__glyphGridTest.getConfig().animation.fps) || 24;
+        var dly = delayMs || Math.round(1000 / fps);
+        setExportPhase(job, 'encoding GIF', 0, staged ? frameTotal : frames.length);
+        _tauriInvoke(staged ? 'finish_gif_export' :
+          (destinationPath ? 'save_gif_to_path' : 'save_gif_real'), {
+          jobId: job && job.id,
+          frames: staged ? undefined : frames.map(function (b64) { return { b64: b64 }; }),
+          delayMs: dly,
+          path: destinationPath || undefined,
+          capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
+          border: (border && border.enabled) ? border : null,
+          targetMaxBytes: (typeof targetMaxBytes === 'number' && targetMaxBytes > 0) ? targetMaxBytes : null,
+        }).then(function (path) {
+          if (job && !isActiveExportJob(job)) return;
+          if (path) console.log('glyph-studio: saved GIF to', path);
+          if (job) setExportPhase(job, 'saved', frameTotal, frameTotal);
+          exportFeedback(path ? 'Saved GIF → ' + path : '');
+          if (job) cleanupExportJob(job);
+        }).catch(function (e) {
+          if (job && !isActiveExportJob(job)) return;
+          if (String(e) === 'cancelled') { exportFeedback(''); if (job) cleanupExportJob(job); return; }
+          if (staged) {
+            cancelNativeJob(job);
+            if (job) setExportPhase(job, 'failed', 0, frameTotal);
+            exportFeedback('GIF export failed after staged capture: ' + e +
+              '. No fallback ZIP was retained. For a 15 MB target, shorten the duration or choose smaller output settings, then retry.', true);
+            if (job) cleanupExportJob(job);
             return;
           }
-          var resolvedFps = (typeof fps === 'number' && fps > 0)
-            ? Math.round(fps)
-            : ((window.__glyphGridTest &&
-                window.__glyphGridTest.getConfig &&
-                window.__glyphGridTest.getConfig().animation &&
-                window.__glyphGridTest.getConfig().animation.fps) || 30);
-          var payloadFrames = frames.map(function (b64) { return { b64: b64 }; });
-          window.__TAURI__.core.invoke('save_mp4_real', {
-            frames: payloadFrames,
-            fps: resolvedFps,
-            capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
-            border: (border && border.enabled) ? border : null,
-          })
-            .then(function (p) {
-              /* Always settle through exportFeedback — it releases the
-                 BUG-009 status hold even when p is unexpectedly empty. */
-              if (p) console.log('glyph-studio: saved MP4 to', p);
-              exportFeedback(p ? 'Saved MP4 → ' + p : '');
-            })
-            .catch(function (e) {
-              if (e === 'cancelled') { exportFeedback(''); return; }
-              console.warn('save_mp4_real failed:', e, '— falling back to ZIP');
-              exportFeedback('MP4 encode failed: ' + e + ' — frames saved as ZIP instead', true);
-              saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
-            });
-        } else {
-          saveBlobBrowser(blob, 'glyph-frames_' + stamp() + '.zip');
-        }
+          console.warn('save_gif_real failed:', e, '— lazily building fallback ZIP');
+          var reason = String(e);
+          if (targetMaxBytes > 0) {
+            reason += '. The 15 MB target was not met; shorten the duration or choose smaller output settings';
+          }
+          saveFallbackZip(blob, helpers, frames, 'gif', job, reason);
+        });
       },
     });
-    if (onProgress) {
-      var lastIdx = 0;
-      var t = setInterval(function () {
-        var rs = testHook.getRecState();
-        if (!rs) { clearInterval(t); return; }
-        if (rs.frameIdx !== lastIdx) { lastIdx = rs.frameIdx; onProgress(lastIdx, total || 24); }
-        if (rs.done) clearInterval(t);
-      }, 200);
-    }
+    monitorCapture(testHook, frameTotal, onProgress, job);
+  }
+
+  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border, job, destinationPath, staged) {
+    if (!testHook) return;
+    var inTauri = !!_tauriInvoke;
+    var frameTotal = total || 24;
+    testHook.beginRecord({
+      total: frameTotal,
+      jobId: job && job.id,
+      collectFrames: inTauri && !staged,
+      collectZip: !inTauri,
+      onFrame: staged ? function (frame) {
+        return _tauriInvoke('push_export_frame', {
+          jobId: job.id,
+          index: frame.index,
+          b64: frame.b64,
+        });
+      } : null,
+      onProgress: function (completed, count) {
+        if (onProgress) onProgress(completed, count);
+        if (job) setExportPhase(job, 'capturing', completed, count);
+      },
+      onError: function (error) {
+        if (job && !isActiveExportJob(job)) return;
+        if (job) setExportPhase(job, 'failed', 0, frameTotal);
+        if (staged) cancelNativeJob(job);
+        exportFeedback('MP4 capture failed: ' + error, true);
+        if (job) cleanupExportJob(job);
+      },
+      onFinish: function (blob, helpers) {
+        if (onDone) onDone(blob);
+        if (job && !isActiveExportJob(job)) return;
+        var frames = getCapturedFrames(testHook, helpers);
+        if (!inTauri) {
+          lazyFallbackZip(blob, helpers, frames).then(function (zipBlob) {
+            if (job && !isActiveExportJob(job)) return;
+            saveBlobBrowser(zipBlob, 'glyph-frames_' + stamp() + '.zip');
+            if (job) setExportPhase(job, 'ZIP downloaded', frameTotal, frameTotal);
+            if (job) cleanupExportJob(job);
+          }).catch(function (e) { exportFeedback('ZIP export failed: ' + e, true); if (job) cleanupExportJob(job); });
+          return;
+        }
+        if (!staged && !frames.length) {
+          saveFallbackZip(blob, helpers, frames, 'mp4', job, 'no frames were collected');
+          return;
+        }
+        var resolvedFps = (typeof fps === 'number' && fps > 0)
+          ? Math.round(fps)
+          : ((window.__glyphGridTest && window.__glyphGridTest.getConfig &&
+              window.__glyphGridTest.getConfig().animation &&
+              window.__glyphGridTest.getConfig().animation.fps) || 30);
+        setExportPhase(job, 'encoding MP4', 0, staged ? frameTotal : frames.length);
+        _tauriInvoke(staged ? 'finish_mp4_export' :
+          (destinationPath ? 'save_mp4_to_path' : 'save_mp4_real'), {
+          jobId: job && job.id,
+          frames: staged ? undefined : frames.map(function (b64) { return { b64: b64 }; }),
+          fps: resolvedFps,
+          path: destinationPath || undefined,
+          capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
+          border: (border && border.enabled) ? border : null,
+        }).then(function (path) {
+          if (job && !isActiveExportJob(job)) return;
+          if (path) console.log('glyph-studio: saved MP4 to', path);
+          if (job) setExportPhase(job, 'saved', frameTotal, frameTotal);
+          exportFeedback(path ? 'Saved MP4 → ' + path : '');
+          if (job) cleanupExportJob(job);
+        }).catch(function (e) {
+          if (job && !isActiveExportJob(job)) return;
+          if (String(e) === 'cancelled') { exportFeedback(''); if (job) cleanupExportJob(job); return; }
+          if (staged) {
+            cancelNativeJob(job);
+            if (job) setExportPhase(job, 'failed', 0, frameTotal);
+            exportFeedback('MP4 export failed after staged capture: ' + e +
+              '. No fallback ZIP was retained; please retry.', true);
+            if (job) cleanupExportJob(job);
+            return;
+          }
+          console.warn('save_mp4_real failed:', e, '— lazily building fallback ZIP');
+          saveFallbackZip(blob, helpers, frames, 'mp4', job, e);
+        });
+      },
+    });
+    monitorCapture(testHook, frameTotal, onProgress, job);
   }
   function stamp() { return new Date().toISOString().replace(/[:.]/g, '-'); }
   function saveBlobBrowser(blob, filename) {
@@ -533,22 +832,35 @@
   }
   function pickImageNative(loadIntoP5) {
     if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+      var token = beginSourceLoad();
       /* Use the path-aware variant so we can record the load in
          localStorage's recent-sources list.  Fall back to plain
          `pick_image` if the new command isn't registered (older builds). */
       window.__TAURI__.core.invoke('pick_image_with_path')
         .then(function (result) {
-          if (result && result.dataUrl && window.loadImage) {
-            window.loadImage(result.dataUrl, loadIntoP5);
-            try { addRecentSource(result.path); } catch (e) {}
+          if (!isCurrentSourceLoad(token)) return;
+          var meta = sourcePayload(result);
+          if (meta.dataUrl && validateSourceMeta(meta, basename(result && result.path))) {
+            loadImageLatest(meta.dataUrl, token, function (img) {
+              if (loadIntoP5(img, meta) !== false) {
+                try { addRecentSource(result.path); } catch (e) {}
+              }
+            }, function () {
+              exportFeedback('Could not decode ' + basename(result && result.path) + '.', true);
+            });
           }
         })
         .catch(function (e) {
+          if (!isCurrentSourceLoad(token)) return;
           if (e === 'cancelled') return;
           /* Older build — try the legacy pick_image.  No path tracking. */
           window.__TAURI__.core.invoke('pick_image')
-            .then(function (dataUrl) {
-              if (window.loadImage) window.loadImage(dataUrl, loadIntoP5);
+            .then(function (result) {
+              if (!isCurrentSourceLoad(token)) return;
+              var meta = sourcePayload(result);
+              if (meta.dataUrl && validateSourceMeta(meta, 'selected image')) {
+                loadImageLatest(meta.dataUrl, token, function (img) { loadIntoP5(img, meta); });
+              }
             })
             .catch(function (e2) { if (e2 !== 'cancelled') console.warn('pick_image:', e2); });
         });
@@ -801,6 +1113,74 @@
     var config = opts.config;
     var pane = new Pane({ title: opts.title || 'glyph-studio', container: opts.container });
 
+    /* Structural settings are expensive because they invalidate grid-sized
+       buffers, glyph atlases, or the render substrate. Bind those controls to
+       staging objects and commit the latest group once after a short quiet
+       period. Mapping/color controls remain directly bound and responsive. */
+    var STRUCTURAL_DEBOUNCE_MS = 125;
+    var structuralStates = [];
+    var structuralPending = [];
+    var structuralTimer = null;
+    var nativePaneRefresh = pane.refresh.bind(pane);
+    function scheduleStructuralCommit(state, value) {
+      state.pending = value;
+      if (structuralPending.indexOf(state) < 0) structuralPending.push(state);
+      clearTimeout(structuralTimer);
+      structuralTimer = setTimeout(function () {
+        var pending = structuralPending.slice();
+        structuralPending.length = 0;
+        structuralTimer = null;
+        var scheduledByHost = false;
+        for (var i = 0; i < pending.length; i++) {
+          var item = pending[i];
+          var next = item.toTarget ? item.toTarget(item.pending) : item.pending;
+          item.target[item.key] = next;
+          if (item.onCommit) item.onCommit(next);
+          if (window.__markChange) {
+            scheduledByHost = true;
+            window.__markChange(item.label || item.key);
+          }
+        }
+        if (!scheduledByHost) {
+          try { if (typeof window.loop === 'function') window.loop(); else if (typeof loop === 'function') loop(); } catch (e) {}
+        }
+      }, STRUCTURAL_DEBOUNCE_MS);
+    }
+    function addStructuralInput(folder, target, key, params, options) {
+      options = options || {};
+      var state = {
+        target: target,
+        key: key,
+        label: options.label || key,
+        onCommit: options.onCommit,
+        toTarget: options.toTarget,
+        fromTarget: options.fromTarget,
+        pending: null,
+        staging: {},
+      };
+      state.staging[key] = state.fromTarget ? state.fromTarget(target[key]) : target[key];
+      structuralStates.push(state);
+      var binding = folder.addInput(state.staging, key, params || {});
+      state.binding = binding;
+      binding.on('change', function (e) { scheduleStructuralCommit(state, e.value); });
+      return binding;
+    }
+    function syncStructuralInputs() {
+      for (var i = 0; i < structuralStates.length; i++) {
+        var state = structuralStates[i];
+        state.staging[state.key] = state.fromTarget
+          ? state.fromTarget(state.target[state.key])
+          : state.target[state.key];
+      }
+    }
+    pane.refresh = function () {
+      clearTimeout(structuralTimer);
+      structuralTimer = null;
+      structuralPending.length = 0;
+      syncStructuralInputs();
+      return nativePaneRefresh();
+    };
+
     /* Tooltip helper — sets a native-browser `title` on the binding's
        row element so hover-text appears for confusing settings.  Tweakpane
        3.1 doesn't expose a `description` option; the row element is
@@ -819,6 +1199,9 @@
     if (window.__markChange) {
       try {
         pane.on('change', function (ev) {
+          for (var i = 0; i < structuralStates.length; i++) {
+            if (structuralStates[i].binding === (ev && ev.target)) return;
+          }
           var key = (ev && ev.target && ev.target.key) || 'unknown';
           window.__markChange(key);
         });
@@ -841,9 +1224,14 @@
     /* Native picker — Tauri only. Falls back to a hidden <input type=file>
        when running in plain browser. */
     fImg.addButton({ title: 'Pick image…' }).on('click', function () {
-      var swap = function (img) {
+      var swap = function (img, sourceMeta) {
+        if (opts.imageRef && opts.imageRef.set && opts.imageRef.set(img, {
+          sizeBytes: (sourceMeta && sourceMeta.sizeBytes) || 0,
+        }) === false) {
+          discardStaleImage(img);
+          return false;
+        }
         applyFastLoadDefaults(config);
-        if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(img);
         if (opts.sceneCacheKeys && window.SCENES) {
           for (var i = 0; i < opts.sceneCacheKeys.length; i++) {
             for (var name in window.SCENES) {
@@ -859,14 +1247,22 @@
             window.__glyphMaybeSuggestInvert(img, config);
           }
         } catch (e) {}
+        return true;
       };
       if (pickImageNative(swap)) return;
       var inp = document.createElement('input');
       inp.type = 'file'; inp.accept = 'image/*';
       inp.onchange = function () {
-        if (inp.files && inp.files[0]) {
+        if (inp.files && inp.files[0] && validateBrowserFile(inp.files[0])) {
+          var token = beginSourceLoad();
           var u = URL.createObjectURL(inp.files[0]);
-          window.loadImage(u, function (img) { swap(img); URL.revokeObjectURL(u); });
+          loadImageLatest(u, token, function (img) {
+            swap(img, { sizeBytes: inp.files[0].size || 0 });
+            URL.revokeObjectURL(u);
+          }, function () {
+            exportFeedback('Could not decode ' + inp.files[0].name + '.', true);
+            URL.revokeObjectURL(u);
+          });
         }
       };
       inp.click();
@@ -879,6 +1275,7 @@
     fImg.addButton({ title: 'Clear image' }).on('click', function () {
       var rs = opts.testHook && opts.testHook.getRecState && opts.testHook.getRecState();
       if (rs && !rs.done) return;
+      invalidateSourceLoads();
       if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(null);
       if (opts.sceneCacheKeys && window.SCENES) {
         for (var i = 0; i < opts.sceneCacheKeys.length; i++) {
@@ -900,11 +1297,19 @@
         if (window.__glyphToast) window.__glyphToast('Image picking needs the desktop app.', 5000);
         return;
       }
+      var token = beginSourceLoad();
       window.__TAURI__.core.invoke('pick_image_with_path')
         .then(function (result) {
-          if (!(result && result.dataUrl && window.loadImage)) return;
-          window.loadImage(result.dataUrl, function (img) {
-            if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(img);
+          if (!isCurrentSourceLoad(token)) return;
+          var meta = sourcePayload(result);
+          if (!meta.dataUrl || !validateSourceMeta(meta, basename(result && result.path))) return;
+          loadImageLatest(meta.dataUrl, token, function (img) {
+            if (opts.imageRef && opts.imageRef.set && opts.imageRef.set(img, {
+              sizeBytes: meta.sizeBytes || 0,
+            }) === false) {
+              discardStaleImage(img);
+              return;
+            }
             clearSceneCaches(opts.sceneCacheKeys);
             try { addRecentSource(result.path); } catch (e) {}
             applyStillAnimationPreset(config, 'portrait');
@@ -916,6 +1321,7 @@
           });
         })
         .catch(function (e) {
+          if (!isCurrentSourceLoad(token)) return;
           if (e !== 'cancelled') console.warn('glyph-studio: pick+animate failed:', e);
         });
     });
@@ -959,12 +1365,20 @@
       var _recentBinding = null;
       function onRecentChange(e) {
         if (!e.value) return;
+        var token = beginSourceLoad();
         window.__TAURI__.core.invoke('read_image_file', { path: e.value })
-          .then(function (dataUrl) {
-            if (!window.loadImage) return;
-            window.loadImage(dataUrl, function (img) {
+          .then(function (result) {
+            if (!isCurrentSourceLoad(token)) return;
+            var meta = sourcePayload(result);
+            if (!meta.dataUrl || !validateSourceMeta(meta, basename(e.value))) return;
+            loadImageLatest(meta.dataUrl, token, function (img) {
+              if (opts.imageRef && opts.imageRef.set && opts.imageRef.set(img, {
+                sizeBytes: meta.sizeBytes || 0,
+              }) === false) {
+                discardStaleImage(img);
+                return;
+              }
               applyFastLoadDefaults(config);
-              if (opts.imageRef && opts.imageRef.set) opts.imageRef.set(img);
               if (opts.sceneCacheKeys && window.SCENES) {
                 for (var i = 0; i < opts.sceneCacheKeys.length; i++) {
                   for (var name in window.SCENES) {
@@ -982,6 +1396,7 @@
             });
           })
           .catch(function (err) {
+            if (!isCurrentSourceLoad(token)) return;
             console.warn('Recent sources: load failed for', e.value, err);
           });
         recentBox.sel = '';
@@ -1006,12 +1421,22 @@
 
     var fGrid = pane.addFolder({ title: 'Grid' });
     if (!config.grid) config.grid = { cols: 240, rows: 120 };
-    tip(fGrid.addInput(config.grid, 'cols', { min: 60, max: 400, step: 5 }),
+    tip(addStructuralInput(fGrid, config.grid, 'cols', { min: 60, max: 400, step: 5 }),
         'Glyph columns. More = finer detail, smaller cells, slower render. cols × rows = total cell count.');
-    tip(fGrid.addInput(config.grid, 'rows', { min: 40, max: 300, step: 5 }),
+    tip(addStructuralInput(fGrid, config.grid, 'rows', { min: 40, max: 300, step: 5 }),
         'Glyph rows. Pair with cols. Default 240×120 ≈ 28,800 cells.');
     if (!config.font) config.font = { family: 'monospace', size: 8 };
-    tip(fGrid.addInput(config.font, 'size', { min: 3, max: 14, step: 1 }),
+    tip(addStructuralInput(fGrid, config.font, 'size', { min: 3, max: 14, step: 1 }, {
+      onCommit: function () {
+        if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
+          window.GlyphGrid.fonts.load({
+            sizePx: config.font.size,
+            glyphSet: config.glyphSet || 'ascii',
+            trustRequested: !!config.glyphSet,
+          });
+        }
+      },
+    }),
         'Glyph pixel size. Tune until characters bleed into neighbours and the grid pattern dissolves.');
     /* Sutskever Stage 1 — render substrate. cpu = proven canvas-2D
        sprite path. webgl = instanced-quad GPU path (opt-in; v1 covers
@@ -1019,7 +1444,7 @@
        on GL failure). Bound to config so the panel's onChange fires
        __markChange('renderer') → switch-latency captured by the bench. */
     if (config.renderer === undefined) config.renderer = 'cpu';
-    tip(fGrid.addInput(config, 'renderer', { options: { cpu: 'cpu', webgl: 'webgl' } }),
+    tip(addStructuralInput(fGrid, config, 'renderer', { options: { cpu: 'cpu', webgl: 'webgl' } }),
         'Render substrate. webgl uses one instanced GPU draw for the whole grid (massive dense-grid win); v1 is gated to the monochrome no-postproc path and auto-falls back to cpu if WebGL is unavailable.');
 
     var fMap = pane.addFolder({ title: 'Mapping' });
@@ -1038,9 +1463,18 @@
     if (config.bgThreshold === undefined) config.bgThreshold = 0;
     tip(fMap.addInput(config, 'bgThreshold', { min: 0, max: 1, step: 0.05, label: 'bg threshold' }),
         'Source pixels brighter than this are forced to palette bg (cream). Carves negative space. 0 = off.');
-    tip(fMap.addInput(config, 'samplingStrategy', {
+    tip(addStructuralInput(fMap, config, 'samplingStrategy', {
       options: { average: 'average', nearest: 'nearest', 'edge-weighted': 'edge-weighted' },
     }), 'How each cell reads source pixels. `average` for photos, `nearest` for sprite art, `edge-weighted` preserves thin lines.');
+
+    if (!config.prefilter) config.prefilter = { mode: 'none' };
+    var fPreprocess = pane.addFolder({ title: 'Source preprocessing', expanded: false });
+    tip(addStructuralInput(fPreprocess, config.prefilter, 'mode', {
+      options: { none: 'none', 'XDoG edges': 'xdog' },
+    }, {
+      label: 'prefilter',
+      onCommit: function () { clearSceneCaches(opts.sceneCacheKeys); },
+    }), 'Source-wide preprocessing is expensive. Changes wait 125 ms so dragging other structural controls does not queue redundant full-image work.');
 
     /* Dither folder — Stage 2B exposes the new STBN mode alongside the
        existing modes. STBN gives smoother substrate breathing than the
@@ -1082,7 +1516,7 @@
     }), 'How palette maps to cells. `monochrome` = single ink with alpha. `gradient` = OKLab interp across all stops.');
 
     var fSel = pane.addFolder({ title: 'Selection (advanced)', expanded: false });
-    tip(fSel.addInput(config, 'selectionMode', {
+    tip(addStructuralInput(fSel, config, 'selectionMode', {
       options: {
         brightness: 'brightness', shape: 'shape',
         'shape-edge-aware': 'shape-edge-aware', 'edge-directional': 'edge-directional',
@@ -1095,37 +1529,27 @@
         'How directionally consistent a neighbourhood must be before its cells become flow strokes. Lower = more hatching, higher = strokes only on clean edges.');
     tip(fSel.addInput(config.flow, 'smoothing', { min: 0, max: 6, step: 1, label: 'flow smoothing' }),
         'Structure-tensor smoothing passes. More = longer, calmer strokes that bridge texture noise.');
-    var glyphSetVal = { v: config.glyphSet || 'null' };
-    var _gsBinding = fSel.addInput(glyphSetVal, 'v', {
+    var _gsBinding = addStructuralInput(fSel, config, 'glyphSet', {
       label: 'glyphSet',
       options: {
         none: 'null', ascii: 'ascii', asciiDense: 'asciiDense',
         blockElements: 'blockElements', braille: 'braille',
         sextant: 'sextant', octant: 'octant',
       },
+    }, {
+      fromTarget: function (value) { return value || 'null'; },
+      toTarget: function (value) { return value === 'null' ? null : value; },
+      onCommit: function () {
+        if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
+          window.GlyphGrid.fonts.load({
+            sizePx: config.font.size,
+            glyphSet: config.glyphSet || 'ascii',
+            trustRequested: !!config.glyphSet,
+          });
+        }
+      },
     });
     tip(_gsBinding, 'Atlas used by shape modes. `octant` (Unicode 16) gives the densest texture; `ascii` is widely compatible.');
-    _gsBinding.on('change', function (e) {
-      config.glyphSet = e.value === 'null' ? null : e.value;
-      /* Stage 2A trustRequested: the renderer reads config.glyphSet
-         live + uses the bundled fonts via the always-loaded cssStack;
-         no async font reload needed on switch. The previous version
-         called clearCache + load() which awaited 3 waitForFace promises
-         (3s + 1.5s + 1.5s timeouts) and made the UI freeze for 1–6s
-         on every glyphSet switch. That was the wrong path — the fonts
-         are physically the same WOFF2 files for every glyphSet; only
-         the requestedSet metadata changes. Re-issue load() WITHOUT
-         clearing the cache so subsequent calls hit the descriptor cache
-         (or do a fast availability re-probe + return). The renderer's
-         next frame picks up config.glyphSet automatically. */
-      if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
-        window.GlyphGrid.fonts.load({
-          sizePx: config.font.size,
-          glyphSet: config.glyphSet || 'ascii',
-          trustRequested: !!config.glyphSet,
-        });
-      }
-    });
 
     if (config.studio && config.studio.breathing) {
       var fBr = pane.addFolder({ title: 'Breathing' });
@@ -1349,6 +1773,23 @@
     });
 
     var fExp = pane.addFolder({ title: 'Export' });
+    var exportJobUi = { phase: 'idle', progress: '—' };
+    fExp.addMonitor(exportJobUi, 'phase', { label: 'status', interval: 100 });
+    fExp.addMonitor(exportJobUi, 'progress', { label: 'progress', interval: 100 });
+    var btnCancelExport = fExp.addButton({ title: 'Cancel export' });
+    btnCancelExport.disabled = true;
+    function updateExportJobUi(phase, completed, total, job) {
+      exportJobUi.phase = phase || 'idle';
+      exportJobUi.progress = total > 0
+        ? completed + ' / ' + total + ' (' + Math.round(completed / total * 100) + '%)'
+        : '—';
+      btnCancelExport.disabled = !job || job.settled || phase === 'saved' ||
+        phase === 'cancelled' || phase === 'failed' || phase === 'ZIP downloaded' ||
+        phase === 'fallback ZIP saved';
+    }
+    btnCancelExport.on('click', function () {
+      cancelActiveExport(opts.testHook);
+    });
     fExp.addButton({ title: 'Snapshot PNG' }).on('click', function () {
       snapshotPNG(document.querySelector('canvas'));
     });
@@ -1562,48 +2003,178 @@
        `capOverride > 0` means "force this exact capWidth, ignore dropdown".
        `targetMaxBytes` (ITER-026): when > 0, the Rust encoder retries
        smaller caps (600→540→480→420→360) until output ≤ N. Used by the
-       Twitter-fit button to GUARANTEE < 15 MB even on dense content. */
+       Twitter-fit button to target 15 MB; Rust returns an error when even
+       the smallest configured attempt cannot meet that target. */
     function exportRun(format, capOverride, targetMaxBytes) {
       /* BUG-010 (v0.1.8): block GIF/MP4 export before any image is loaded.
          draw() early-returns in the empty state, so the recorder would
          capture zero frames and never finish — the app appears frozen. */
       if (!hasSource()) { exportFeedback('Load an image before exporting.', true); return; }
       var p = exportPlan();
+      if (!opts.testHook || typeof opts.testHook.beginRecord !== 'function') {
+        exportFeedback('Recorder is unavailable; reload the application and try again.', true);
+        return;
+      }
+      var canvas = document.querySelector('canvas');
+      var budgetBorder = resolveBorder();
+      var borderSpan = budgetBorder ? 2 * budgetBorder.width : 0;
+      var capturePixels = p.frames *
+        (((canvas && canvas.width) || 1024) + borderSpan) *
+        (((canvas && canvas.height) || 504) + borderSpan);
+      if (p.frames > 600 || capturePixels > 100 * 1000 * 1000) {
+        exportFeedback('Export plan is too large (' + p.frames + ' frames, ' +
+          Math.round(capturePixels / 1000000) + ' megapixels). Shorten the duration, lower FPS, or reduce the border.', true);
+        return;
+      }
+      var job = newExportJob(format, updateExportJobUi);
+      if (!job) {
+        exportFeedback('Another export is running. Cancel it before starting a new one.', true);
+        return;
+      }
       var capW = (capOverride !== null && capOverride !== undefined)
         ? capOverride
         : (sizeOpts.capWidth || 0);
-      var savedFps = config.animation.fps;
-      config.animation.fps = p.effFps;
-      var border = resolveBorder();
-      var onProgress = function (i, total) { console.log('  ', i, '/', total); };
-      var onDone = function () {
-        config.animation.fps = savedFps;
-        try { pane.refresh(); } catch (e) {}
-        console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
-      };
-      if (format === 'mp4') {
-        var encFps = Math.round(p.effFps);
-        console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2));
-        recordMP4(opts.testHook, p.frames, onProgress, onDone, encFps, capW > 0 ? capW : null, border);
+      var border = budgetBorder;
+      function startCapture(destinationPath, staged) {
+        if (!isActiveExportJob(job)) return;
+        var savedFps = config.animation.fps;
+        config.animation.fps = p.effFps;
+        var restored = false;
+        function restoreFps() {
+          if (restored) return;
+          restored = true;
+          config.animation.fps = savedFps;
+          try { pane.refresh(); } catch (e) {}
+        }
+        job.restore = restoreFps;
+        var onProgress = function () {};
+        var onDone = function () {
+          restoreFps();
+          job.restore = null;
+          console.log('glyph-studio: recording finished, fps restored to ' + savedFps);
+        };
+        try {
+          if (format === 'mp4') {
+            var encFps = Math.round(p.effFps);
+            console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2));
+            recordMP4(opts.testHook, p.frames, onProgress, onDone, encFps,
+              capW > 0 ? capW : null, border, job, destinationPath, staged);
+          } else {
+            var fitNote = (targetMaxBytes > 0)
+              ? ' (twitter-fit ' + (targetMaxBytes / 1024 / 1024).toFixed(0) + ' MB target; auto-shrinks if needed)'
+              : '';
+            console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + fitNote + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2) + ' for clean loop');
+            recordGIF(opts.testHook, p.frames, onProgress, onDone, p.delayMs,
+              capW > 0 ? capW : null, border, targetMaxBytes, job, destinationPath, staged);
+          }
+        } catch (e) {
+          if (staged) cancelNativeJob(job);
+          setExportPhase(job, 'failed', 0, p.frames);
+          exportFeedback('Could not start export: ' + e, true);
+          cleanupExportJob(job);
+        }
+      }
+
+      function prepareCapture(destinationPath) {
+        if (!inTauri || !destinationPath) { startCapture(destinationPath, false); return; }
+        setExportPhase(job, 'initializing export', 0, p.frames);
+        _tauriInvoke('begin_export_capture', {
+          jobId: job.id,
+          total: p.frames,
+        }).then(function () {
+          if (isActiveExportJob(job)) {
+            startCapture(destinationPath, true);
+            return;
+          }
+          /* Cancellation can race a native initialization that was already
+             dispatched. Ensure the just-created staged capture is removed
+             instead of silently leaking it in Rust's job map. */
+          _tauriInvoke('cancel_export', { jobId: job.id }).then(function (nativeCancelled) {
+            if (!job.settled) {
+              job.phase = nativeCancelled ? 'cancelled' : 'finishing current write';
+              exportFeedback(nativeCancelled
+                ? 'Export cancelled.'
+                : 'Cancellation cleanup could not be confirmed — finishing current write.');
+              cleanupExportJob(job);
+            }
+          }).catch(function () {
+            if (!job.settled) {
+              job.phase = 'finishing current write';
+              exportFeedback('Cancellation cleanup could not be confirmed.');
+              cleanupExportJob(job);
+            }
+          });
+        }).catch(function (e) {
+          if (!isActiveExportJob(job)) {
+            if (!job.settled) {
+              job.phase = 'cancelled';
+              cleanupExportJob(job);
+            }
+            return;
+          }
+          if (nativeCommandUnavailable(e)) {
+            console.warn('staged export unavailable; using bounded legacy IPC:', e);
+            startCapture(destinationPath, false);
+            return;
+          }
+          setExportPhase(job, 'failed', 0, p.frames);
+          exportFeedback('Could not initialize export: ' + e, true);
+          cleanupExportJob(job);
+        });
+      }
+
+      if (inTauri) {
+        /* Choose the destination before capture so cancelling the dialog costs
+           no frame rendering or encoder work. Older native builds do not have
+           this command; in that case save_*_real remains the compatibility
+           path and opens its dialog after capture. */
+        setExportPhase(job, 'choose destination', 0, 0);
+        _tauriInvoke('choose_export_path', {
+          format: format,
+          suggestedName: 'glyph-loop.' + format,
+        }).then(function (path) {
+          if (!isActiveExportJob(job)) return;
+          if (!path) {
+            setExportPhase(job, 'cancelled', 0, 0);
+            job.cancelled = true;
+            cleanupExportJob(job);
+            exportFeedback('');
+            return;
+          }
+          prepareCapture(path);
+        }).catch(function (e) {
+          if (!isActiveExportJob(job)) return;
+          if (String(e) === 'cancelled') {
+            setExportPhase(job, 'cancelled', 0, 0);
+            job.cancelled = true;
+            cleanupExportJob(job);
+            exportFeedback('');
+            return;
+          }
+          if (nativeCommandUnavailable(e)) {
+            console.warn('choose_export_path unavailable; using legacy save flow:', e);
+            startCapture(null, false);
+            return;
+          }
+          setExportPhase(job, 'failed', 0, p.frames);
+          exportFeedback('Could not choose export destination: ' + e, true);
+          cleanupExportJob(job);
+        });
       } else {
-        var fitNote = (targetMaxBytes > 0)
-          ? ' (twitter-fit ' + (targetMaxBytes / 1024 / 1024).toFixed(0) + ' MB cap; auto-shrinks if needed)'
-          : '';
-        console.log('glyph-studio: recording', p.frames, 'frames at', p.delayMs, 'ms/frame =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + fitNote + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2) + ' for clean loop');
-        recordGIF(opts.testHook, p.frames, onProgress, onDone, p.delayMs, capW > 0 ? capW : null, border, targetMaxBytes);
+        startCapture(null, false);
       }
     }
 
     fExp.addButton({ title: inTauri ? 'Export GIF' : 'Export GIF (ZIP fallback)' }).on('click', function () {
       exportRun('gif', null);
     });
-    /* Export GIF (Twitter-fit) — caps to 720px regardless of dropdown.
+    /* Export GIF (Twitter-fit) — starts at 720px regardless of dropdown.
        Solves the recurring "my GIF is over 15 MB" pain (default density +
        90+ frames at full canvas reliably blows past Twitter's GIF ceiling).
        At 720 wide the kaneki/toji-class loops land 8–13 MB.  See
        BUGS_AND_ITERATIONS.md ITER-017 for context. */
     var btnGifTw = fExp.addButton({ title: 'Export GIF (Twitter-fit)' });
-    tip(btnGifTw, 'GUARANTEES output < 15 MB. Starts at 720 px and auto-shrinks (600 → 540 → 480 → 420 → 360) until it fits. Dense cream-paper renders that overshoot at 720 land between 600–480 px (visually identical at phone widths). ITER-026.');
+    tip(btnGifTw, 'Targets 15 MB. Starts at 720 px and auto-shrinks (600 → 540 → 480 → 420 → 360). If even the smallest result remains over target, export fails and prompts you to shorten the loop or choose smaller settings. ITER-026.');
     btnGifTw.on('click', function () { exportRun('gif', 720, 15 * 1024 * 1024); });
 
     /* Export MP4 — for Instagram (Reels / Stories / feed posts strip

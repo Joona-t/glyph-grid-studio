@@ -97,6 +97,14 @@ else
   fail "A7 version sync" "cargo=$V_CARGO tauri=$V_TAURI npm=$V_NPM"
 fi
 
+# A8 (v0.1.9): parse the inline app and exercise the staged native-export,
+# lazy-ZIP, cancellation, resource-limit, and scheduling contracts.
+if npm test >/dev/null 2>&1; then
+  pass "A8 frontend performance/export regression tests"
+else
+  fail "A8 frontend performance/export regression tests" "npm test failed"
+fi
+
 # ---------- Phase B: CLI ----------
 section "Phase B — CLI surface"
 
@@ -225,8 +233,9 @@ else
   fail "B10 PERF_JOB NDJSON emitted" "no PERF_JOB line in batch stderr"
 fi
 
-# B11: twitter-fit adaptive shrink ladder engages when targetMaxBytes is
-# tiny, and the output is genuinely smaller than the 720px cap would give.
+# B11: an impossible twitter-fit target must fail closed instead of returning
+# an oversized file while claiming success. B12 then proves the same ladder
+# succeeds for a feasible hard target.
 B11_MANIFEST="$SCRATCH/b11-manifest.json"
 cat > "$B11_MANIFEST" <<EOF
 {
@@ -239,18 +248,43 @@ cat > "$B11_MANIFEST" <<EOF
 }
 EOF
 B11_STDERR="$SCRATCH/b11-stderr.txt"
-bin_t batch --manifest "$B11_MANIFEST" 2>"$B11_STDERR" >/dev/null
-B11_W=$(python3 -c "
-import struct,sys
-try:
-    d=open('$SCRATCH/b11.gif','rb').read(10)
-    print(struct.unpack('<H', d[6:8])[0])
-except Exception: print(0)")
-if grep -q "twitter-fit:" "$B11_STDERR" && grep -q "shrink ladder" "$B11_STDERR" \
-   && [[ -f "$SCRATCH/b11.gif" && "$B11_W" -le 600 && "$B11_W" -gt 0 ]]; then
-  pass "B11 twitter-fit ladder engages (output ${B11_W}px <= 600)"
+if bin_t batch --manifest "$B11_MANIFEST" 2>"$B11_STDERR" >/dev/null; then
+  B11_EXIT=0
 else
-  fail "B11 twitter-fit ladder" "width=$B11_W ladder_lines=$(grep -c 'twitter-fit:' "$B11_STDERR" 2>/dev/null || echo 0)"
+  B11_EXIT=$?
+fi
+if [[ "$B11_EXIT" -ne 0 && ! -f "$SCRATCH/b11.gif" ]] \
+   && grep -q "shrink ladder" "$B11_STDERR" \
+   && grep -q "cannot meet target size" "$B11_STDERR"; then
+  pass "B11 impossible twitter-fit target fails closed"
+else
+  fail "B11 impossible twitter-fit target fails closed" "exit=$B11_EXIT output=$([[ -f $SCRATCH/b11.gif ]] && echo yes || echo no)"
+fi
+
+B12_MANIFEST="$SCRATCH/b12-manifest.json"
+cat > "$B12_MANIFEST" <<EOF
+{
+  "in": "$REPO_ABS/tests/sources/cream-paper.png",
+  "frames": 4,
+  "jobs": [
+    {"name": "b12-fit", "out": "$REPO_ABS/$SCRATCH/b12.gif", "format": "gif",
+     "capWidth": 720, "targetMaxBytes": 700000, "config": {}}
+  ]
+}
+EOF
+B12_STDERR="$SCRATCH/b12-stderr.txt"
+if bin_t batch --manifest "$B12_MANIFEST" 2>"$B12_STDERR" >/dev/null \
+   && [[ -f "$SCRATCH/b12.gif" ]]; then
+  B12_SIZE=$(stat -f%z "$SCRATCH/b12.gif")
+  B12_W=$(python3 -c "import struct;d=open('$SCRATCH/b12.gif','rb').read(10);print(struct.unpack('<H',d[6:8])[0])")
+  if [[ "$B12_SIZE" -le 700000 && "$B12_W" -le 480 ]] \
+     && grep -q "shrink ladder" "$B12_STDERR"; then
+    pass "B12 feasible twitter-fit target succeeds (${B12_W}px, $((B12_SIZE/1024)) KB)"
+  else
+    fail "B12 feasible twitter-fit target succeeds" "width=$B12_W size=$B12_SIZE"
+  fi
+else
+  fail "B12 feasible twitter-fit target succeeds" "command failed or no output"
 fi
 
 # ---------- Phase C: MCP ----------

@@ -1,6 +1,6 @@
 {
   "name": "glyph-grid-studio",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "description": "A real-time character-grid image renderer for macOS — convert any image into a tunable mosaic of typeset Unicode glyphs.",
   "license": "MIT",
@@ -16,6 +16,7 @@
   "scripts": {
     "dev": "echo 'static — nothing to dev'",
     "build": "echo 'static — nothing to build'",
+    "test": "node tests/frontend-contracts.test.js && node tests/glyph-studio-export.test.js",
     "tauri": "tauri"
   }
 }
