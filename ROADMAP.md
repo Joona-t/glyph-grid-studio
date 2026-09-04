@@ -38,11 +38,18 @@ explicitly approved transfer.
 - [ ] Stop must freeze performance-session logs; bound events and long tasks.
 - [ ] Separate render-work throughput from achieved FPS and presentation latency.
 - [ ] Add regression tests for those reproduced logging defects.
+- [ ] Release stale source ownership on clear/replacement.
+- [ ] Await and freeze the selected font/atlas before recording frame zero.
+- [ ] Preserve paused time/position when FPS or duration changes.
+- [ ] Minimize/redact default error logs and disclose exported telemetry fields.
 - [ ] Repair ad-hoc signing and verify the final packaged application.
-- [ ] Run Rust tests and the CLI/MCP release gate against the exact candidate.
+- [x] Run the existing CLI/MCP gate on this candidate: 25 top-level checks passed.
+- [ ] Run Rust tests and rerun the release gate after fixes change the candidate.
 - [ ] Manually exercise image import, rapid setting changes, pause/seek, export,
       cancellation, and reopening the application on the candidate build.
 - [ ] Collect matched latency/frame-time and memory workloads with raw evidence.
+- [ ] Replace the legacy runner's unconditional release-ready badge with exact
+      candidate identity and separate automated/manual/signing approval gates.
 - [ ] Record exact source revision, environment, installer checksum, results,
       and limitations together. No unsupported speedup claims.
 - [ ] Align cask version/checksum with the accepted installer.

@@ -1655,3 +1655,25 @@ Decision: HOLD RELEASE. The candidate installer is not approved for download.
 See COMBINED_RELEASE_AUDIT.md for source hashes, rejected installer checksum,
 precise findings, and validation scope. See ROADMAP.md for the portable Mac Mini
 handoff and ordered remaining gates. Release automation is planned, not yet built.
+
+### 0.1.10 audit follow-up (still NOT RELEASED)
+
+The candidate subsequently passed the full existing CLI/MCP automated gate:
+25 top-level checks, including ten MCP subchecks. Independent source review found
+additional gaps in stale image ownership, asset readiness/freeze during capture,
+paused FPS/time remapping, default error-log privacy, and telemetry disclosure.
+The legacy test runner's v0.1.0/READY badge is not a release approval and needs
+correction; its generated local report is excluded from this checkpoint.
+
+One current-candidate six-frame synthetic export took 4.43 s wall time and
+reported 396,918,784 bytes maximum native-process RSS on an M1 Pro/16 GB/macOS
+26.5.1 host. Separate four-frame GIF and MP4 gate jobs reported mean render-work
+costs of 13.47 ms and 14.82 ms; these have different inputs and include warmup
+draws. They are NOT before/after speedup or achieved-FPS evidence. Exact values,
+collection scope, and caveats are in AUDIT_METRICS_0.1.10.json.
+
+The source/privacy reviewer found no credential/private-home-path match in the
+added source scanned. Private artwork, home-path-bearing raw logs, installed
+apps, and databases are not included in the source checkpoint. Public release
+remains held until the reproduced defects, signing, and remaining validation
+are resolved. No source code was changed during this audit follow-up.

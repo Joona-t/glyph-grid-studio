@@ -1,0 +1,82 @@
+{
+  "schema": "glyph-grid-release-audit/v1",
+  "candidate": "0.1.10",
+  "source_checkpoint": "94473c8",
+  "collected_local_date": "2026-09-05",
+  "timezone": "Europe/Helsinki",
+  "release_decision": "hold",
+  "environment": {
+    "chip": "Apple M1 Pro",
+    "cpu_cores": 8,
+    "ram_gib": 16,
+    "macos": "26.5.1",
+    "controlled_idle_host": false
+  },
+  "artifact": {
+    "name": "Glyph Grid Studio_0.1.10_universal.dmg",
+    "bytes": 16564752,
+    "sha256": "510a9fade9bb4718f3638d00a68631664deab5f6581f0313c5d693f3d7aabc98",
+    "architectures": ["x86_64", "arm64"],
+    "app_signature": "failed: code object is not signed at all",
+    "published": false
+  },
+  "automated_gate": {
+    "command": "BIN=<candidate-binary> TEST_IMG=<synthetic-fixture> bash tests/run-all.sh",
+    "top_level_passed": 25,
+    "top_level_failed": 0,
+    "mcp_subchecks_passed": 10,
+    "mcp_subchecks_note": "included through one top-level aggregate; not 35 independent top-level checks",
+    "manual_gui": "not run",
+    "rust_unit_tests": "not run"
+  },
+  "code_derived_scratch": {
+    "baseline": "public 0.1.9 working-resolution preprocessing",
+    "before_bytes_per_working_pixel": 24,
+    "after_bytes_per_working_pixel": 8,
+    "reduction_fraction": 0.6666666666666666,
+    "scope": "six float32 planes to two; not total process memory or measured speedup"
+  },
+  "single_export_sample": {
+    "command": "/usr/bin/time -l <candidate-binary> render --in <synthetic-fixture> --out <temporary-gif> --frames 6",
+    "fixture": "1024x1024 RGB PNG, deterministic LCG seed 1337",
+    "wall_seconds": 4.43,
+    "user_cpu_seconds": 1.55,
+    "system_cpu_seconds": 0.26,
+    "maximum_resident_set_bytes": 396918784,
+    "peak_memory_footprint_bytes": 331990336,
+    "memory_scope": "native process time(1) statistics, not total WebKit process tree",
+    "samples": 1
+  },
+  "perf_job_samples": [
+    {
+      "fixture": "tests/sources/cream-paper.png",
+      "format": "gif",
+      "captured_frames": 4,
+      "observed_draws": 19,
+      "mean_render_work_ms": 13.473684210526267,
+      "p50_render_work_ms": 13.000000000000455,
+      "p95_render_work_ms": 17,
+      "reported_encode_export_ms": 440,
+      "internal_config_switch_ms": 16
+    },
+    {
+      "fixture": "tests/sources/synthetic-noise.png",
+      "format": "mp4",
+      "captured_frames": 4,
+      "observed_draws": 11,
+      "mean_render_work_ms": 14.818181818181818,
+      "p50_render_work_ms": 15,
+      "p95_render_work_ms": 16,
+      "reported_encode_export_ms": 128,
+      "internal_config_switch_ms": 15
+    }
+  ],
+  "limitations": [
+    "No matched before/after benchmark",
+    "PERF_JOB draw ring includes non-capture draws and nested stages",
+    "Internal config-to-render timing is not input-to-screen presentation latency",
+    "Session summary fps field is misleading and must not be used as achieved FPS",
+    "No measured steady-state achieved FPS, end-to-end UI latency or energy",
+    "Installer remains rejected pending source, logging, capture, signing and validation fixes"
+  ]
+}
