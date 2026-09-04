@@ -1628,3 +1628,30 @@ cream / candy / basalt; the pulsing status dot respects `prefers-reduced-motion`
 badge + micro note render with good contrast in cream (brown-on-cream), candy
 (magenta `#b3185c` on near-white), and basalt (light-on-dark, gold dot). DOM
 inspect confirmed the micro and badge text.
+
+## 2026-09-05 - 0.1.10 combined candidate checkpoint (NOT RELEASED)
+
+Problem: local preview/logging work started from a source checkout older than
+public 0.1.9. Replacing public source would have lost bounded import and staged
+export safeguards. A new candidate version is required; public 0.1.9 is not replaced.
+
+Integration: based the candidate on current public source and resolved overlapping
+preprocessing, scheduler, glyph-control, and test-runner edits. Kept working-size
+preprocessing and import/export limits; reduced its six reusable float32 planes
+to two shared sequential-pass planes. Preserved structural debounce, static
+signal caching, deterministic integer preview/seek, font/atlas loading fixes,
+sprite-cache bounds, and opt-in performance-session export.
+
+Evidence: frontend contracts (14 invariants), export tests, and new combined
+preview regressions passed. Scratch capacity is code-derived 24 -> 8 bytes per
+working pixel (66.7% for those planes, NOT measured total memory or FPS). The
+361-tick test covers two exact 180-frame preview cycles. Universal native build
+completed, but the generated app FAILED signature verification. A synthetic
+logger audit also reproduced post-Stop unbounded events and an FPS field that
+actually reports reciprocal render-work cost. No matched before/after latency,
+achieved FPS, process RSS, or energy result is available for this combined build.
+
+Decision: HOLD RELEASE. The candidate installer is not approved for download.
+See COMBINED_RELEASE_AUDIT.md for source hashes, rejected installer checksum,
+precise findings, and validation scope. See ROADMAP.md for the portable Mac Mini
+handoff and ordered remaining gates. Release automation is planned, not yet built.

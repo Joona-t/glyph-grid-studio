@@ -105,6 +105,15 @@ else
   fail "A8 frontend performance/export regression tests" "npm test failed"
 fi
 
+# A9: opt-in, exportable GUI session logger is wired through JS + Tauri.
+if grep -q "__perfSessionStart" src/index.html \
+   && grep -q "Export session JSON" src/lib/glyph-studio.js \
+   && grep -q "save_perf_log" src-tauri/src/lib.rs; then
+  pass "A9 performance session logger + JSON export are wired"
+else
+  fail "A9 performance session logger + JSON export" "missing JS, UI, or Tauri command"
+fi
+
 # ---------- Phase B: CLI ----------
 section "Phase B — CLI surface"
 

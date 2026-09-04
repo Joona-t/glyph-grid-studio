@@ -137,6 +137,7 @@
       }
     }
     deepMerge(config, preset);
+    if (window.__requestRender) window.__requestRender();
   }
   function exportJSON(snap, filename) {
     var blob = new Blob([JSON.stringify(snap, null, 2)], { type: 'application/json' });
@@ -1530,7 +1531,7 @@
     tip(fSel.addInput(config.flow, 'smoothing', { min: 0, max: 6, step: 1, label: 'flow smoothing' }),
         'Structure-tensor smoothing passes. More = longer, calmer strokes that bridge texture noise.');
     var _gsBinding = addStructuralInput(fSel, config, 'glyphSet', {
-      label: 'glyphSet',
+      label: 'shape glyph set',
       options: {
         none: 'null', ascii: 'ascii', asciiDense: 'asciiDense',
         blockElements: 'blockElements', braille: 'braille',
@@ -1646,7 +1647,28 @@
        during pane.refresh, costing 6 frames of source motion). */
     fAnim.addInput(config.animation, 'duration', { min: 0.5, max: 60, step: 0.1 });
     fAnim.addInput(config.animation, 'fps', { min: 12, max: 60, step: 6 });
-    fAnim.addInput(config.animation, 'loop');
+    tip(fAnim.addInput(config.animation, 'loop', { label: 'play preview' }),
+        'Pause at the current time to compare settings. Changes still repaint; exports render the full loop.');
+    if (window.__seekPreview) {
+      var seek = {};
+      Object.defineProperty(seek, 'position', {
+        enumerable: true,
+        get: function () {
+          var state = window.__previewState();
+          return state.total > 1 ? state.frame * 100 / (state.total - 1) : 0;
+        },
+        set: function (value) { window.__seekPreview(value / 100); },
+      });
+      tip(fAnim.addInput(seek, 'position', { label: 'seek %', min: 0, max: 100, step: 1 }),
+          'Inspect a frame without exporting. 100% is the last frame before the loop wraps. Scrubbing pauses playback and resets temporal history; full exports keep their history.')
+        .on('change', function () { pane.refresh(); });
+      function seekBoundary(fraction) {
+        window.__seekPreview(fraction);
+        pane.refresh();
+      }
+      fAnim.addButton({ title: 'Inspect first frame' }).on('click', function () { seekBoundary(0); });
+      fAnim.addButton({ title: 'Inspect last frame' }).on('click', function () { seekBoundary(1); });
+    }
     /* Temporal glyph stability (v0.1.6) — per-cell Schmitt trigger on
        the ramp index. Damps character shimmer in animated renders while
        keeping the continuous alpha breathing. */
@@ -1662,7 +1684,7 @@
        ring buffer. */
     if (window.__perfReport) {
       var fPerf = pane.addFolder({ title: 'Perf', expanded: false });
-      var perfState = { total: 0, fps: 0, scene: 0, lum: 0, downsample: 0, ema: 0, dither: 0, grid: 0, select: 0, draw: 0, postproc: 0, lastSwitch: '—' };
+      var perfState = { total: 0, fps: 0, scene: 0, lum: 0, downsample: 0, ema: 0, dither: 0, grid: 0, select: 0, draw: 0, postproc: 0, lastSwitch: '—', log: 'off', logFrames: 0, slowFrames: 0 };
       fPerf.addMonitor(perfState, 'total', { label: 'total ms' });
       fPerf.addMonitor(perfState, 'fps', { label: 'fps' });
       fPerf.addMonitor(perfState, 'scene', { label: 'scene ms' });
@@ -1675,11 +1697,37 @@
       fPerf.addMonitor(perfState, 'draw', { label: '  draw ms' });
       fPerf.addMonitor(perfState, 'postproc', { label: 'postproc ms' });
       fPerf.addMonitor(perfState, 'lastSwitch', { label: 'last switch' });
+      fPerf.addMonitor(perfState, 'log', { label: 'session log' });
+      fPerf.addMonitor(perfState, 'logFrames', { label: 'logged frames' });
+      fPerf.addMonitor(perfState, 'slowFrames', { label: 'slow frames' });
       fPerf.addButton({ title: 'Report (console)' }).on('click', function () { window.__perfReport(); });
       fPerf.addButton({ title: 'Clear' }).on('click', function () { window.__perfClear(); });
+      fPerf.addButton({ title: 'Start session log' }).on('click', function () {
+        if (window.__perfSessionStart) window.__perfSessionStart();
+      });
+      fPerf.addButton({ title: 'Stop session log' }).on('click', function () {
+        if (window.__perfSessionStop) window.__perfSessionStop();
+      });
+      fPerf.addButton({ title: 'Export session JSON…' }).on('click', function () {
+        if (!window.__perfSessionExport) return;
+        window.__perfSessionExport().then(function (p) {
+          try { showToast('Performance log saved: ' + p, 3500); } catch (_) {}
+        }).catch(function (e) {
+          if (String(e).indexOf('cancelled') < 0) console.warn('performance log export failed:', e);
+        });
+      });
+      fPerf.addButton({ title: 'Clear session log' }).on('click', function () {
+        if (window.__perfSessionClear) window.__perfSessionClear();
+      });
 
       // Update perf state every 500ms with rolling-30-frame averages
       setInterval(function () {
+        var session = window.__perfSessionStatus && window.__perfSessionStatus();
+        if (session) {
+          perfState.log = session.active ? 'recording' : (session.frames ? 'stopped' : 'off');
+          perfState.logFrames = session.frames || 0;
+          perfState.slowFrames = session.slow_frames || 0;
+        }
         var ring = window.__perfRing && window.__perfRing();
         if (!ring || !ring.length) return;
         var sum = { total: 0, scene: 0, _lum: 0, _downsample: 0, _ema: 0, _dither: 0, grid: 0, _select: 0, _draw: 0, postprocess: 0 };

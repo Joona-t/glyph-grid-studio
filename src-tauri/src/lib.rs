@@ -2119,6 +2119,26 @@ async fn save_preset_json(app: tauri::AppHandle, json: String) -> Result<String,
     }
 }
 
+/// Save an opt-in studio performance session as portable JSON. The log is
+/// collected in memory only while the user explicitly records it.
+#[tauri::command]
+async fn save_perf_log(app: tauri::AppHandle, json: String) -> Result<String, String> {
+    let path: Option<PathBuf> = app
+        .dialog()
+        .file()
+        .add_filter("Performance JSON", &["json"])
+        .set_file_name("glyph-grid-performance.json")
+        .blocking_save_file()
+        .map(|fp| fp.into_path().ok())
+        .flatten();
+    if let Some(p) = path {
+        fs::write(&p, json.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(p.display().to_string())
+    } else {
+        Err("cancelled".into())
+    }
+}
+
 /// Load preset JSON via dialog.
 #[tauri::command]
 async fn load_preset_json(app: tauri::AppHandle) -> Result<String, String> {
@@ -2229,6 +2249,7 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             kv_load_all,
             kv_save,
             save_preset_json,
+            save_perf_log,
             load_preset_json,
             get_cli_render_job,
             exit_with_status,

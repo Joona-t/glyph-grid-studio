@@ -103,6 +103,19 @@
   <script src="lib/glyph-studio.js"></script>
 
   <script>
+  /* Forward otherwise-invisible production WebView startup errors to stderr
+     so headless CLI/batch failures are diagnosable instead of hanging. */
+  window.addEventListener('error', function (ev) {
+    const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+    if (!invoke) return;
+    const where = ev && ev.filename ? ' @ ' + ev.filename + ':' + ev.lineno + ':' + ev.colno : '';
+    invoke('cli_log', { msg: 'JS_ERROR ' + ((ev && ev.message) || 'unknown') + where }).catch(function () {});
+  });
+  window.addEventListener('unhandledrejection', function (ev) {
+    const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+    if (!invoke) return;
+    invoke('cli_log', { msg: 'JS_REJECTION ' + String(ev && ev.reason) }).catch(function () {});
+  });
   /* =================================================================
      glyph-grid v2 — single-file p5.js renderer.
 
@@ -680,11 +693,11 @@
           /* Second sharpen pass over the face zone using a tighter 5-tap
              cross kernel — captures higher-frequency detail (eye lashes,
              lip outline, nostril) that the 3×3 blur smoothed past. */
-          const lum2 = scratch.lum2;
+          const lum2 = lum;
           for (let i = 0, j = 0; j < lum2.length; i += 4, j++) {
             lum2[j] = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
           }
-          const blur2 = scratch.blur2;
+          const blur2 = blur;
           for (let y = 1; y < H0 - 1; y++) {
             for (let x = 1; x < W0 - 1; x++) {
               const idx = y * W0 + x;
@@ -731,11 +744,11 @@
           const handRy = sourceDrawH * 0.34;       /* y-axis of mask ellipse */
           const handFlatR = 0.40;         /* normalized radius staying at full weight */
 
-          const lumChip = scratch.lumChip;
+          const lumChip = lum;
           for (let i = 0, j = 0; j < lumChip.length; i += 4, j++) {
             lumChip[j] = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
           }
-          const blurChip = scratch.blurChip;
+          const blurChip = blur;
           for (let y = 1; y < H0 - 1; y++) {
             for (let x = 1; x < W0 - 1; x++) {
               const idx = y * W0 + x;
@@ -798,6 +811,7 @@
             }
           }
           buf.updatePixels();
+          this.__sourceOwner = sourceImg;
           this.__sourceProcessed = buf;
           this.__sourceProcessedFrame = _curFrame;
           this.__sourceProcessedKey = _processedKey;
@@ -994,13 +1008,22 @@
     }
   }
 
+  // One scheduler owns both debounced structural changes and paused redraws.
+  // Async fonts/atlases must never bypass capture ownership or wake a paused loop.
+  function renderConfiguredPreview() {
+    if (recState) return;
+    syncActiveFont();
+    syncAnimationFrameRate();
+    if (CONFIG.animation.loop) { if (!isLooping()) loop(); }
+    else { noLoop(); redraw(); }
+  }
+
   function armStructuralRender() {
     if (__renderResumeTimer) clearTimeout(__renderResumeTimer);
     __renderResumeTimer = setTimeout(function () {
       __renderResumeTimer = 0;
       if (recState) return; // capture owns loop/noLoop while active
-      syncAnimationFrameRate();
-      try { loop(); redraw(); } catch (_) {}
+      renderConfiguredPreview();
     }, 100);
   }
 
@@ -1025,7 +1048,7 @@
       __renderRaf = requestAnimationFrame(function () {
         __renderRaf = 0;
         if (recState) return;
-        try { loop(); redraw(); } catch (_) {}
+        renderConfiguredPreview();
       });
     }
     return generation;
@@ -1038,15 +1061,11 @@
       __sourcePreprocessScratch = {
         key,
         lum: new Float32Array(n), blur: new Float32Array(n),
-        lum2: new Float32Array(n), blur2: new Float32Array(n),
-        lumChip: new Float32Array(n), blurChip: new Float32Array(n),
       };
     }
-    /* Blur borders were zero in the old freshly-allocated arrays.  Clear
-       only the three destination planes so reuse remains output-equivalent. */
+    /* All three sequential passes share two planes. Each pass rewrites the
+       interior; zero borders preserve the previous six-plane calculation. */
     __sourcePreprocessScratch.blur.fill(0);
-    __sourcePreprocessScratch.blur2.fill(0);
-    __sourcePreprocessScratch.blurChip.fill(0);
     return __sourcePreprocessScratch;
   }
 
@@ -1088,16 +1107,18 @@
     frameRate(CONFIG.animation.fps);
     background(bgColor(CONFIG));
 
+    if (document.fonts && document.fonts.addEventListener) {
+      document.fonts.addEventListener('loadingdone', function () {
+        clearSpriteCache();
+        window.__requestRender();
+      });
+    }
+
     /* v2 font preload — non-blocking; v1 draw paths don't depend on it.
        Stage 2A: trust the user's explicit glyphSet choice; skip cascade fallback
        so octants/sextants/braille actually paint when the WOFF2 is slow to decode. */
     if (window.GlyphGrid && GlyphGrid.fonts && GlyphGrid.compat.isV2(CONFIG)) {
-      const requested = CONFIG.glyphSet || 'ascii';
-      GlyphGrid.fonts.load({
-        sizePx: CONFIG.font.size,
-        glyphSet: requested,
-        trustRequested: requested !== 'ascii',
-      }).then(function (d) { fontDescriptor = d; });
+      syncActiveFont();
     }
 
     /* F6 — pre-warm shape-vector atlases in parallel. Eliminates the
@@ -1260,7 +1281,7 @@
       ++__sourceRevision;
       clearSourceDerivedCaches();
       statusEl().textContent = 'Source cleared';
-      try { loop(); redraw(); } catch (_) {}
+      window.__requestRender();
       return true;
     }
 
@@ -1296,20 +1317,74 @@
 
     statusEl().textContent = 'Loaded ' + checked.meta.width + '×' + checked.meta.height
       + (checked.meta.frames > 1 ? ' · ' + checked.meta.frames + ' frames' : '');
-    try { loop(); redraw(); } catch (_) {}
+    window.__requestRender();
     return true;
   }
+  // Coalesce settings changes and repaint even when animation is paused.
+  let _previewTime = 0;
+  let _previewFrame = 0;
+  let _previewHasFrame = false;
+  window.__previewState = function () {
+    const total = Math.max(1, Math.round(CONFIG.animation.duration * CONFIG.animation.fps));
+    return { frame: Math.min(total - 1, Math.round(_previewTime * CONFIG.animation.fps)),
+      total: total, time: _previewTime, playing: !!CONFIG.animation.loop };
+  };
+  window.__seekPreview = function (fraction) {
+    if (recState || !Number.isFinite(fraction)) return false;
+    const total = Math.max(1, Math.round(CONFIG.animation.duration * CONFIG.animation.fps));
+    const frame = Math.round(Math.max(0, Math.min(1, fraction)) * (total - 1));
+    CONFIG.animation.loop = false;
+    _previewTime = frame / CONFIG.animation.fps;
+    _previewFrame = frame;
+    _previewHasFrame = true;
+    window.__requestRender();
+    return true;
+  };
+  let _fontLoadKey = '';
+  let _fontLoadGeneration = 0;
+  function syncActiveFont() {
+    if (!(window.GlyphGrid && GlyphGrid.fonts)) return;
+    const requested = CONFIG.glyphSet || 'ascii';
+    const key = requested + '|' + CONFIG.font.size;
+    if (key === _fontLoadKey) return;
+    _fontLoadKey = key;
+    const generation = ++_fontLoadGeneration;
+    GlyphGrid.fonts.load({ sizePx: CONFIG.font.size, glyphSet: requested,
+      trustRequested: !!CONFIG.glyphSet }).then(function (descriptor) {
+      if (generation !== _fontLoadGeneration || requested !== (CONFIG.glyphSet || 'ascii')) return;
+      const changed = !fontDescriptor || fontDescriptor.cssStack !== descriptor.cssStack;
+      fontDescriptor = descriptor;
+      if (changed) clearSpriteCache();
+      window.__requestRender();
+    }).catch(function (e) {
+      if (generation === _fontLoadGeneration) _fontLoadKey = '';
+      console.warn('glyph-grid: font load failed', e);
+    });
+  }
+  window.__requestRender = function () { return scheduleConfigRender('preview'); };
 
   function draw() {
     /* CONFIG.animation.fps is live-mutated by Tweakpane and batch jobs.
        Keep p5's actual timer cadence in sync with the animation math. */
     syncAnimationFrameRate();
     if (recState && recState.done) { noLoop(); return; }
-    if (!CONFIG.animation.loop && !recState && frameCount > 1) { noLoop(); return; }
-
-    const t = recState
-      ? (recState.frameIdx / CONFIG.animation.fps)
-      : ((frameCount - 1) / CONFIG.animation.fps) % CONFIG.animation.duration;
+    if (!recState) {
+      const total = Math.max(1, Math.round(CONFIG.animation.duration * CONFIG.animation.fps));
+      _previewFrame = Math.max(0, Math.min(total - 1, _previewFrame));
+      if (CONFIG.animation.loop) {
+        if (_previewHasFrame) _previewFrame = (_previewFrame + 1) % total;
+      } else {
+        noLoop();
+        // A paused still has no evolving temporal history. Repeated redraws
+        // reconstruct it from the same inputs, including after a preset swap.
+        cellSignalEma = null;
+        _stabIdx = _stabPend = _stabPendN = null;
+        crtState = null;
+      }
+      _previewTime = _previewFrame / CONFIG.animation.fps;
+      _previewHasFrame = true;
+    }
+    const t = recState ? recState.frameIdx / CONFIG.animation.fps : _previewTime;
 
     /* Empty-state placeholder — no source image loaded yet.  Show a clear
        "drop or pick" message instead of running the scene against null. */
@@ -1378,7 +1453,7 @@
       const rt = window.GlyphGrid.runtime;
       const ctx = rt.makeContext({
         t: t,
-        frameIdx: recState ? recState.frameIdx : (frameCount - 1),
+        frameIdx: recState ? recState.frameIdx : _previewFrame,
         seed: CONFIG.seed,
         config: CONFIG,
       });
@@ -1413,8 +1488,14 @@
     const isV2 = window.GlyphGrid && GlyphGrid.compat.isV2(CONFIG);
     const advanced = isV2 && usesAdvancedPipeline(CONFIG);
 
-    if (advanced) {
-      drawGlyphGridV2(src, t, recState ? recState.frameIdx : (frameCount - 1));
+    /* The interactive Studio is itself an explicit v2 surface. Keep it on
+       the optimized v2 renderer even when every optional stage is inert
+       (notably dither:none). Falling back to drawGlyphGrid() here made the
+       simplest Studio configuration 5x slower than temporal dithering.
+       Non-Studio v2 pieces retain the historical byte-identical fallback. */
+    const studioV2 = isV2 && CONFIG.studio && CONFIG.studio.enabled;
+    if (advanced || studioV2) {
+      drawGlyphGridV2(src, t, recState ? recState.frameIdx : _previewFrame);
     } else {
       drawGlyphGrid(src); /* byte-identical v1 path */
     }
@@ -1488,6 +1569,152 @@
   let __pfLastT = 0;
   let __pfLastChange = null;       // {key, t} — last config change that hasn't been observed yet
   let __pfLastLatency = null;      // last measured switch latency (for status bar)
+  let __pfSession = null;          // opt-in, exportable whole-session performance log
+  const __pfSessionMaxFrames = 10000;
+  let __pfLongTaskObserver = null;
+
+  function __pfCloneConfig() {
+    try { return JSON.parse(JSON.stringify(CONFIG)); }
+    catch (_) { return null; }
+  }
+
+  function __pfSessionEvent(type, detail) {
+    if (!__pfSession) return;
+    __pfSession.events.push({
+      at_ms: performance.now() - __pfSession.started_perf_ms,
+      type: type,
+      detail: detail || null,
+    });
+  }
+
+  function __pfSessionSummary(session) {
+    const frames = session.frames || [];
+    const totals = frames.map(function (f) { return f.total; })
+      .filter(function (v) { return typeof v === 'number' && isFinite(v); })
+      .sort(function (a, b) { return a - b; });
+    const stageSums = {};
+    for (const frame of frames) {
+      for (const key in frame.stages) {
+        stageSums[key] = (stageSums[key] || 0) + frame.stages[key];
+      }
+    }
+    const n = totals.length;
+    const avg = n ? totals.reduce(function (a, b) { return a + b; }, 0) / n : 0;
+    const percentile = function (p) {
+      if (!n) return 0;
+      return totals[Math.min(n - 1, Math.floor(n * p))];
+    };
+    const stages = {};
+    for (const key in stageSums) stages[key] = stageSums[key] / Math.max(1, frames.length);
+    const slowThreshold = Math.max(33.34, avg * 1.5);
+    return {
+      frames: frames.length,
+      dropped_frames: session.dropped_frames,
+      duration_ms: Math.max(0, session.stopped_perf_ms - session.started_perf_ms),
+      avg_frame_ms: avg,
+      fps: avg > 0 ? 1000 / avg : 0,
+      p50_frame_ms: percentile(0.50),
+      p95_frame_ms: percentile(0.95),
+      p99_frame_ms: percentile(0.99),
+      max_frame_ms: n ? totals[n - 1] : 0,
+      slow_frame_threshold_ms: slowThreshold,
+      slow_frames: totals.filter(function (v) { return v > slowThreshold; }).length,
+      long_tasks: session.long_tasks.length,
+      avg_stage_ms: stages,
+    };
+  }
+
+  window.__perfSessionStart = function () {
+    if (__pfSession && !__pfSession.ended_at) return __pfSession;
+    const now = performance.now();
+    __pfSession = {
+      schema: 'glyph-grid-perf-session/v1',
+      started_at: new Date().toISOString(),
+      started_perf_ms: now,
+      stopped_perf_ms: now,
+      frames: [],
+      events: [],
+      long_tasks: [],
+      dropped_frames: 0,
+      source: sourceImg ? { width: sourceImg.width, height: sourceImg.height } : null,
+      canvas: { width: width || 0, height: height || 0 },
+      initial_config: __pfCloneConfig(),
+      environment: {
+        user_agent: navigator.userAgent,
+        hardware_concurrency: navigator.hardwareConcurrency || null,
+        device_memory_gb: navigator.deviceMemory || null,
+        pixel_ratio: window.devicePixelRatio || 1,
+      },
+    };
+    if (typeof PerformanceObserver !== 'undefined'
+        && PerformanceObserver.supportedEntryTypes
+        && PerformanceObserver.supportedEntryTypes.indexOf('longtask') >= 0) {
+      try {
+        __pfLongTaskObserver = new PerformanceObserver(function (list) {
+          if (!__pfSession) return;
+          const entries = list.getEntries();
+          for (const entry of entries) {
+            __pfSession.long_tasks.push({
+              at_ms: entry.startTime - __pfSession.started_perf_ms,
+              duration_ms: entry.duration,
+              name: entry.name || 'longtask',
+            });
+          }
+        });
+        __pfLongTaskObserver.observe({ entryTypes: ['longtask'] });
+      } catch (_) { __pfLongTaskObserver = null; }
+    }
+    __pfSessionEvent('start', null);
+    return __pfSession;
+  };
+
+  window.__perfSessionStop = function () {
+    if (!__pfSession) return null;
+    if (__pfSession.ended_at) return __pfSession;
+    __pfSessionEvent('stop', null);
+    __pfSession.stopped_perf_ms = performance.now();
+    __pfSession.ended_at = new Date().toISOString();
+    __pfSession.final_config = __pfCloneConfig();
+    if (__pfLongTaskObserver) {
+      try { __pfLongTaskObserver.disconnect(); } catch (_) {}
+      __pfLongTaskObserver = null;
+    }
+    return __pfSession;
+  };
+
+  window.__perfSessionStatus = function () {
+    if (!__pfSession) return { active: false, frames: 0, slow_frames: 0 };
+    if (!__pfSession.ended_at) __pfSession.stopped_perf_ms = performance.now();
+    const summary = __pfSessionSummary(__pfSession);
+    return { active: !__pfSession.ended_at, frames: summary.frames, slow_frames: summary.slow_frames };
+  };
+
+  window.__perfSessionExport = function () {
+    if (!__pfSession) return Promise.reject(new Error('no performance session recorded'));
+    window.__perfSessionStop();
+    const payload = Object.assign({}, __pfSession, { summary: __pfSessionSummary(__pfSession) });
+    delete payload.started_perf_ms;
+    delete payload.stopped_perf_ms;
+    const json = JSON.stringify(payload, null, 2);
+    const invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+    if (invoke) return invoke('save_perf_log', { json: json });
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'glyph-grid-performance.json';
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    return Promise.resolve(a.download);
+  };
+
+  window.__perfSessionClear = function () {
+    if (__pfLongTaskObserver) {
+      try { __pfLongTaskObserver.disconnect(); } catch (_) {}
+      __pfLongTaskObserver = null;
+    }
+    __pfSession = null;
+  };
 
   /* ── Temporal glyph stability (v0.1.6, SOTA feature 1) ──────────────
      The classic video-stylization flicker problem: temporal dither +
@@ -1585,6 +1812,18 @@
     __pfFrame.total = total;
     __pfRing.push(__pfFrame);
     if (__pfRing.length > __pfMaxRing) __pfRing.shift();
+    if (__pfSession && !__pfSession.ended_at) {
+      __pfSession.stopped_perf_ms = performance.now();
+      if (__pfSession.frames.length < __pfSessionMaxFrames) {
+        __pfSession.frames.push({
+          at_ms: __pfSession.stopped_perf_ms - __pfSession.started_perf_ms,
+          total: total,
+          stages: Object.assign({}, __pfFrame.stages),
+        });
+      } else {
+        __pfSession.dropped_frames++;
+      }
+    }
     /* Switch-latency: if a change is pending, this frame is the first one
        that reflects it (config was already mutated when draw started). */
     if (__pfLastChange) {
@@ -1611,6 +1850,7 @@
   window.__markChange = function (key) {
     __pfLastChange = { key, t: performance.now() };
     scheduleConfigRender(key);
+    __pfSessionEvent('config-change', { key: key || 'unknown' });
   };
   window.__perfReport = function () {
     if (!__pfRing.length) { console.log('no frames recorded'); return; }
@@ -2003,7 +2243,7 @@
     const _gainSwing = _rmStill ? 0 : ((typeof _br.gainSwing === 'number') ? _br.gainSwing : 0.30);
     const _jitterAmt = _rmStill ? 0 : ((typeof _br.jitter === 'number') ? _br.jitter : 0.05);
     const _pulseHz = (typeof _br.pulseHz === 'number') ? _br.pulseHz : 0.7;
-    const _frameIdx = recState ? recState.frameIdx : (frameCount - 1);
+    const _frameIdx = recState ? recState.frameIdx : _previewFrame;
     const _loopPhase = (_frameIdx / CONFIG.animation.fps) / CONFIG.animation.duration * Math.PI * 2;
     const _breatheGain = 1.0 + _gainSwing * Math.sin(_loopPhase * _pulseHz);
     const _seed = (CONFIG.seed | 0) ^ ((_frameIdx + 1) * 2654435761) >>> 0;
@@ -2030,9 +2270,8 @@
 
     /* Step 4: dither (brightness mode only — CR-6). */
     const mode = GlyphGrid.compat.resolveSelectionMode(CONFIG);
-    let levels = 16;
-    if (CONFIG.glyphSet && glyphAtlas) levels = glyphAtlas.size;
-    else if (mode === 'brightness') levels = RAMPS[CONFIG.ramp].length;
+    // Brightness indexes the ramp, never the independently selected shape atlas.
+    const levels = mode === 'brightness' ? RAMPS[CONFIG.ramp].length : 16;
 
     let cellIndex = null;
     if (GlyphGrid.compat.gateDither(CONFIG) && mode === 'brightness') {
@@ -2075,6 +2314,7 @@
         if (cached) {
           glyphAtlas = cached;  /* pointer swap, ~0 cost */
         } else {
+          glyphAtlas = null;
           loadAtlasAsync(CONFIG.glyphSet);
           /* fallback while waiting for the fetch */
           drawBrightnessGrid(cellIndex, cellSignal, cols, rows, cellW, cellH);
@@ -2263,12 +2503,41 @@
      28,800 × ~4.5μs (fillText) ≈ 130ms to 28,800 × ~0.5μs (drawImage)
      ≈ 15ms — about 8× faster.  Rebuilt only when (atlas, fontSize,
      fontFamily, fillColor) change. */
+  const _spriteCache = new Map();
+  let _spriteCacheBytes = 0;
+  const SPRITE_CACHE_LIMIT = 8 * 1024 * 1024;
+  function cachedSprite(key) {
+    const item = _spriteCache.get(key);
+    if (!item) return null;
+    _spriteCache.delete(key); _spriteCache.set(key, item);
+    return item;
+  }
+  function rememberSprite(key, sprite, mask) {
+    const bytes = sprite.canvas.width * sprite.canvas.height * 4;
+    // Unusually large imported font settings retain only this atlas, rather
+    // than rebuilding it each frame. Normal UI settings fit the 8 MiB budget.
+    const budget = Math.max(SPRITE_CACHE_LIMIT, bytes);
+    while (_spriteCache.size && (_spriteCacheBytes + bytes > budget || _spriteCache.size >= 12)) {
+      const oldest = _spriteCache.keys().next().value;
+      _spriteCacheBytes -= _spriteCache.get(oldest).bytes;
+      _spriteCache.delete(oldest);
+    }
+    _spriteCache.set(key, { sprite: sprite, mask: mask, bytes: bytes });
+    _spriteCacheBytes += bytes;
+    return sprite;
+  }
+  function clearSpriteCache() {
+    _spriteCache.clear(); _spriteCacheBytes = 0;
+    _spriteAtlas = _rampSprite = _glyphDuotoneSprite = _glyphGradientSprite = null;
+    _rampDuotoneSprite = _rampGradientSprite = null;
+  }
   let _spriteAtlas = null;
   let _spriteAtlasKey = null;
   function _ensureSpriteAtlas(glyphAtlasArg, fontFamily, fontSizePx, fillColor) {
     if (!glyphAtlasArg) return null;
     const key = (glyphAtlasArg.name || '?') + '|' + fontFamily + '|' + fontSizePx + '|' + fillColor + '|' + glyphAtlasArg.size;
-    if (_spriteAtlasKey === key && _spriteAtlas) return _spriteAtlas;
+    const hit = cachedSprite(key);
+    if (hit) { return hit.sprite; }
     const N = glyphAtlasArg.size;
     /* Tile size: enough to hold the glyph centred. fontSize px gives 1× width;
        block / sextant / octant glyphs can extend slightly beyond, so 1.1×. */
@@ -2287,9 +2556,9 @@
       if (!g) continue;
       ctx.fillText(g.s, i * tileW + tileW * 0.5, tileH * 0.5);
     }
-    _spriteAtlas = { canvas: canvas, tileW: tileW, tileH: tileH, halfW: tileW * 0.5, halfH: tileH * 0.5 };
+    const sprite = { canvas: canvas, tileW: tileW, tileH: tileH, halfW: tileW * 0.5, halfH: tileH * 0.5 };
     _spriteAtlasKey = key;
-    return _spriteAtlas;
+    return rememberSprite(key, sprite, null);
   }
 
   /* Multi-tint sprite atlas — generalised version of _ensureSpriteAtlas /
@@ -2358,7 +2627,8 @@
   function _ensureRampDuotoneSprite(rampStr, fontFamily, fontSizePx, ink0Hex, ink1Hex) {
     if (!rampStr || rampStr.length === 0) return null;
     const key = 'rampduo:' + rampStr + '|' + fontFamily + '|' + fontSizePx + '|' + ink0Hex + '|' + ink1Hex;
-    if (_rampDuotoneKey === key && _rampDuotoneSprite) return _rampDuotoneSprite;
+    const hit = cachedSprite(key);
+    if (hit) { _rampDuotoneSpaceMask = hit.mask; return hit.sprite; }
     const c0 = _hexToRgb(ink0Hex), c1 = _hexToRgb(ink1Hex);
     const N = rampStr.length;
     const items = new Array(N);
@@ -2371,17 +2641,17 @@
       const b = (c0[2] + (c1[2] - c0[2]) * t) | 0;
       return 'rgb(' + r + ',' + g + ',' + b + ')';
     }, MULTITINT_STEPS);
-    _rampDuotoneSprite = sprite;
     _rampDuotoneKey = key;
     _rampDuotoneSpaceMask = mask;
-    return sprite;
+    return rememberSprite(key, sprite, mask);
   }
 
   let _glyphDuotoneSprite = null, _glyphDuotoneKey = null;
   function _ensureGlyphDuotoneSprite(glyphAtlasArg, fontFamily, fontSizePx, ink0Hex, ink1Hex) {
     if (!glyphAtlasArg) return null;
     const key = 'glyphduo:' + (glyphAtlasArg.name || '?') + '|' + fontFamily + '|' + fontSizePx + '|' + ink0Hex + '|' + ink1Hex + '|' + glyphAtlasArg.size;
-    if (_glyphDuotoneKey === key && _glyphDuotoneSprite) return _glyphDuotoneSprite;
+    const hit = cachedSprite(key);
+    if (hit) { return hit.sprite; }
     const c0 = _hexToRgb(ink0Hex), c1 = _hexToRgb(ink1Hex);
     const N = glyphAtlasArg.size;
     const items = new Array(N);
@@ -2392,9 +2662,8 @@
       const b = (c0[2] + (c1[2] - c0[2]) * t) | 0;
       return 'rgb(' + r + ',' + g + ',' + b + ')';
     }, MULTITINT_STEPS);
-    _glyphDuotoneSprite = sprite;
     _glyphDuotoneKey = key;
-    return sprite;
+    return rememberSprite(key, sprite, null);
   }
 
   /* --- Gradient atlases (ramp + glyph variants) --- */
@@ -2409,7 +2678,8 @@
       stopKey += s[0] + ',' + s[1] + ',' + s[2] + ';';
     }
     const key = 'rampgrad:' + rampStr + '|' + fontFamily + '|' + fontSizePx + '|' + stopKey + '|' + mode + '|' + curveExp;
-    if (_rampGradientKey === key && _rampGradientSprite) return _rampGradientSprite;
+    const hit = cachedSprite(key);
+    if (hit) { _rampGradientSpaceMask = hit.mask; return hit.sprite; }
     const N = rampStr.length;
     const items = new Array(N);
     for (let i = 0; i < N; i++) items[i] = rampStr.charAt(i);
@@ -2421,10 +2691,9 @@
       const rgb = GlyphGrid.paletteMorph.interpAtU(stops, u, mode);
       return 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
     }, MULTITINT_STEPS);
-    _rampGradientSprite = sprite;
     _rampGradientKey = key;
     _rampGradientSpaceMask = mask;
-    return sprite;
+    return rememberSprite(key, sprite, mask);
   }
 
   let _glyphGradientSprite = null, _glyphGradientKey = null;
@@ -2436,7 +2705,8 @@
       stopKey += s[0] + ',' + s[1] + ',' + s[2] + ';';
     }
     const key = 'glyphgrad:' + (glyphAtlasArg.name || '?') + '|' + fontFamily + '|' + fontSizePx + '|' + stopKey + '|' + mode + '|' + curveExp + '|' + glyphAtlasArg.size;
-    if (_glyphGradientKey === key && _glyphGradientSprite) return _glyphGradientSprite;
+    const hit = cachedSprite(key);
+    if (hit) { return hit.sprite; }
     const N = glyphAtlasArg.size;
     const items = new Array(N);
     for (let i = 0; i < N; i++) items[i] = (glyphAtlasArg.glyphs[i] && glyphAtlasArg.glyphs[i].s) || '';
@@ -2446,9 +2716,8 @@
       const rgb = GlyphGrid.paletteMorph.interpAtU(stops, u, mode);
       return 'rgb(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ')';
     }, MULTITINT_STEPS);
-    _glyphGradientSprite = sprite;
     _glyphGradientKey = key;
-    return sprite;
+    return rememberSprite(key, sprite, null);
   }
 
   /* Ramp sprite atlas — sibling of _ensureSpriteAtlas but keyed on a
@@ -2466,7 +2735,8 @@
   function _ensureRampSprite(rampStr, fontFamily, fontSizePx, fillColor) {
     if (!rampStr || rampStr.length === 0) return null;
     const key = 'ramp:' + rampStr + '|' + fontFamily + '|' + fontSizePx + '|' + fillColor;
-    if (_rampSpriteKey === key && _rampSprite) return _rampSprite;
+    const hit = cachedSprite(key);
+    if (hit) { _rampSpriteSpaceMask = hit.mask; return hit.sprite; }
     const N = rampStr.length;
     const tileW = Math.max(2, Math.ceil(fontSizePx * 1.1));
     const tileH = Math.max(2, Math.ceil(fontSizePx * 1.4));
@@ -2484,10 +2754,10 @@
       if (ch === ' ') { mask[i] = 1; continue; }
       ctx.fillText(ch, i * tileW + tileW * 0.5, tileH * 0.5);
     }
-    _rampSprite = { canvas: canvas, tileW: tileW, tileH: tileH, halfW: tileW * 0.5, halfH: tileH * 0.5 };
+    const sprite = { canvas: canvas, tileW: tileW, tileH: tileH, halfW: tileW * 0.5, halfH: tileH * 0.5 };
     _rampSpriteKey = key;
     _rampSpriteSpaceMask = mask;
-    return _rampSprite;
+    return rememberSprite(key, sprite, mask);
   }
 
   /* Gradient color LUT — 256 RGB triples precomputed once per palette/mode/
@@ -2732,7 +3002,7 @@
       const _dispDur = (CONFIG.animation && CONFIG.animation.duration) || 6;
       const _dispT = recState
         ? (recState.frameIdx / CONFIG.animation.fps)
-        : ((frameCount - 1) / CONFIG.animation.fps);
+        : (_previewFrame / CONFIG.animation.fps);
       const _dispNorm = (_dispT % _dispDur) / _dispDur;
       if (_dispNorm >= _dispCfg.startT) {
         const _dispRange = _dispCfg.endT - _dispCfg.startT;
@@ -3430,6 +3700,7 @@
     }).then(function (j) {
       const atlas = GlyphGrid.shapeIndex.buildAtlas(j);
       _atlasCache[setId] = atlas;
+      if (CONFIG.glyphSet === setId) window.__requestRender();
       delete _atlasInflight[setId];
       return atlas;
     }).catch(function (e) {
@@ -3535,11 +3806,12 @@
     const post = CONFIG.postprocess || {};
     const frameIdx = (recState && typeof recState.frameIdx === 'number')
       ? recState.frameIdx
-      : (frameCount - 1);
+      : _previewFrame;
     const reduced = __prefersReducedMotion();
 
     /* Phase A — only when any imgData stage is active. */
     if (_hasImgDataStages(post)) {
+      if (!crtState || crtState.width !== w || crtState.height !== h) crtState = GlyphGrid.crt.makeState(w, h);
       const imgData = ctx.getImageData(0, 0, w, h);
       GlyphGrid.crt.applyChain(imgData, crtState, post, {
         prefersReducedMotion: reduced,
@@ -4008,7 +4280,16 @@
         if (framesB64 && framesB64.length) {
           var idxs = [0, Math.floor(framesB64.length / 2), framesB64.length - 1];
           for (var i = 0; i < idxs.length; i++) {
-            anchors.push(framesB64[idxs[i]] || '');
+            var b64 = framesB64[idxs[i]] || '';
+            /* Never embed full PNG data URLs in PERF_JOB. Three anchors
+               previously made each telemetry line hundreds of KB, turning
+               the logger itself into significant IPC / stderr overhead.
+               Keep only enough metadata to spot unexpectedly large frames. */
+            anchors.push({
+              index: idxs[i],
+              encoded_chars: b64.length,
+              estimated_bytes: Math.floor(b64.length * 0.75),
+            });
           }
         }
         /* Sutskever B2 — interactive switch latency: time from this
@@ -4674,22 +4955,31 @@
     await new Promise(function (r) { setTimeout(r, 300); });
   }
 
+  let __cliHookStarted = false;
   async function tryHeadlessRender() {
+    if (__cliHookStarted) return;
+    __cliHookStarted = true;
     if (!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)) {
       // Not running in Tauri at all (browser preview): nothing to do.
       return;
     }
+    const _cliTrace = function (msg) {
+      window.__TAURI__.core.invoke('cli_log', { msg: 'startup: ' + msg }).catch(function () {});
+    };
+    _cliTrace('headless hook entered');
     let job;
     try {
       job = await window.__TAURI__.core.invoke('get_cli_render_job');
     } catch (e) {
       // Command not registered → not running in Tauri-with-CLI.  Silent.
+      _cliTrace('get_cli_render_job failed: ' + String(e));
       return;
     }
     if (!job) {
       console.log('CLI: GUI mode (no headless job)');
       return;
     }
+    _cliTrace('job received; batch=' + !!job.batch);
     console.log('CLI: render job received', job);
 
     // Pick the initial source — top-level `inPath`, or first job's `in`
@@ -4779,9 +5069,10 @@
 
   // Wait for the p5 setup() + studio init + font load before polling.
   // 1500ms is generous; the actual setup is usually done by ~300ms.
-  window.addEventListener('DOMContentLoaded', function () {
-    setTimeout(tryHeadlessRender, 1500);
-  });
+  // This script is the last node in <body>; all studio setup code above has
+  // already run. Scheduling directly avoids a WKWebView edge case where a
+  // late DOMContentLoaded listener can miss the event and strand CLI jobs.
+  setTimeout(tryHeadlessRender, 1500);
   </script>
 </body>
 </html>

@@ -81,6 +81,9 @@
   const CASCADE_ORDER = ['octant', 'sextant', 'braille', 'blockElements', 'asciiDense', 'ascii'];
 
   const CACHE_KEY = '__glyphGridFontCache';
+  const descriptors = new Map();
+  let facesReady = null;
+  let requestGeneration = 0;
 
   /* Inject @font-face rules into the document head. Safe to call multiple
      times — does nothing on the second call. */
@@ -117,7 +120,7 @@
     }
     const spec = sizePx + 'px "' + family + '"';
     return Promise.race([
-      document.fonts.load(spec).then(function () { /* ok */ }),
+      document.fonts.load(spec, 'M' + SENTINELS.brailleVisible + SENTINELS.sextant + SENTINELS.octant).then(function () { /* ok */ }),
       new Promise(function (resolve) { setTimeout(resolve, timeoutMs); }),
     ]);
   }
@@ -202,10 +205,13 @@
     const requestedSet = options.glyphSet || 'ascii';
     const trust = options.trustRequested === true;
 
-    const cached = (typeof window !== 'undefined') && window[CACHE_KEY];
-    if (cached && cached.requestedSet === requestedSet && cached.trustRequested === trust) {
-      return Promise.resolve(cached);
+    const key = requestedSet + '|' + sizePx + '|' + trust;
+    const generation = ++requestGeneration;
+    function activate(descriptor) {
+      if (generation === requestGeneration && typeof window !== 'undefined') window[CACHE_KEY] = descriptor;
+      return descriptor;
     }
+    if (descriptors.has(key)) return descriptors.get(key).then(activate);
 
     function probeWithRetry(attemptsLeft) {
       const avail = detectAvailability(FONT_FAMILY, sizePx);
@@ -220,9 +226,14 @@
     }
 
     injectFaces();
-    return waitForFace(FONT_FAMILY, sizePx, 3000)
-      .then(function () { return waitForFace(FONT_FAMILY + '-Fallback', sizePx, 1500); })
-      .then(function () { return waitForFace('PxPlusIBMVGA8', sizePx, 1500); })
+    if (!facesReady) facesReady = Promise.all([
+      waitForFace(FONT_FAMILY, sizePx, 3000),
+      waitForFace(FONT_FAMILY + '-Fallback', sizePx, 1500),
+      waitForFace('PxPlusIBMVGA8', sizePx, 1500),
+    ].map(function (face) { return face.catch(function (e) {
+      console.warn('glyph-grid: bundled face unavailable; using available fallback', e);
+    }); }));
+    const pending = facesReady
       .then(function () {
         if (trust) {
           // Skip the cascade entirely — the user has asked for a specific set.
@@ -247,7 +258,7 @@
           cssStack: '"' + FONT_FAMILY + '", "' + FONT_FAMILY + '-Fallback", ' + FALLBACK_FAMILY,
         };
         if (typeof window !== 'undefined') {
-          window[CACHE_KEY] = descriptor;
+          activate(descriptor);
           if (probe.resolved.fallback) {
             const msg = 'glyph-grid: requested set "' + requestedSet + '" unavailable; ' +
                         'cascaded to "' + probe.resolved.id + '" via ' + probe.resolved.chain.join(' → ');
@@ -256,9 +267,15 @@
         }
         return descriptor;
       });
+    descriptors.set(key, pending);
+    pending.catch(function () { if (descriptors.get(key) === pending) descriptors.delete(key); });
+    return pending;
   }
 
   function clearCache() {
+    requestGeneration++;
+    descriptors.clear();
+    facesReady = null;
     if (typeof window !== 'undefined' && window[CACHE_KEY]) delete window[CACHE_KEY];
   }
 
