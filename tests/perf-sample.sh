@@ -26,7 +26,10 @@
 #     ~0.2 s).
 #   * If another WebKit-hosting app spawns an XPC process in the same window,
 #     the diff picks it up too; every sample carries the `command` path and
-#     the per-pid lines let you exclude it by hand.
+#     the per-pid lines let you exclude it by hand.  ITER-049: a single
+#     webview owns exactly one WebContent and one GPU pid, so when more than
+#     one of either is tracked the summary carries `suspect_foreign_xpc:true`
+#     and a warning goes to stderr — the CPU sums are then an over-count.
 
 set -u
 
@@ -169,6 +172,15 @@ for pid, (role, c) in last.items():
     by_role[role] = by_role.get(role, 0.0) + c
     pids[role].append(pid)
 
+# ITER-049: one webview == one WebContent + one GPU pid. More than one of
+# either means a foreign WebKit app (or a respawn) landed in the diff window
+# and the role sums are inflated — flag it rather than report a clean number.
+suspect = len(pids['webcontent']) > 1 or len(pids['gpu']) > 1
+if suspect:
+    print(f"perf-sample: WARNING — {len(pids['webcontent'])} WebContent / {len(pids['gpu'])} GPU pids tracked "
+          f"for one webview; webcontent_cpu_s/gpu_cpu_s may include a foreign process "
+          f"(see the xpc lines in {out})", file=sys.stderr)
+
 summary = {
     'type': 'summary',
     'wall_s': round(t1 - t0, 3),
@@ -179,6 +191,7 @@ summary = {
     'exit': code,
     'samples': n,
     'pids': pids,
+    'suspect_foreign_xpc': suspect,
 }
 print(json.dumps(summary, separators=(",", ":")))
 PY

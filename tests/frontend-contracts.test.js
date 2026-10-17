@@ -30,11 +30,16 @@ const contracts = [
   ['memory probe sums every audited cache (F20)', /GlyphGrid\.memProbe = function[\s\S]{0,6000}totalBytes: total/],
   ['memory probe covers the wave6 atlas map', /wave6\.atlasCacheStats\(\)/],
   /* v0.2 Phase 1 determinism (ITER-046/047) */
-  ['beginRecord primes temporal state before frame 0', /try \{ loop\(\); \} catch \(e\) \{\}\s*\/\*[\s\S]{0,200}\*\/\s*primeTemporalState\(total\);/],
+  /* ITER-049: priming must precede loop() — p5's loop() can draw synchronously. */
+  ['beginRecord primes temporal state before loop() re-arms the draw', /primeTemporalState\(total\);[\s\S]{0,600}try \{ loop\(\); \} catch \(e\) \{\}\s*return recState\.jobId;/],
+  ['perf switch stamp is re-taken after priming', /primeTemporalState\(total\);[\s\S]{0,400}if \(__pfLastChange\) __pfLastChange\.t = performance\.now\(\);/],
+  ['stale prime diagnostics are cleared per job', /function primeTemporalState\(total\) \{\s*__lastPrime = null;/],
+  ['setup() rejects __setupReady on throw', /catch \(e\) \{\s*if \(__setupReadyReject\) __setupReadyReject\(e\);\s*throw e;/],
+  ['headless exits non-zero when setup() throws', /try \{\s*await __setupReady;\s*\} catch \(e\) \{[\s\S]{0,400}exit_with_status', \{ ok: false \}/],
   ['priming resets EMA, CRT state and stability hysteresis', /cellSignalEma\.fill\(0\.5\);\s*crtState = null;[\s\S]{0,80}_stabKey = '';/],
   ['throttled capture draws are no-ops (stray p5 rAF)', /if \(recState && recState\._capturing && !__primeOnly\) return;/],
   ['animated sources are paused so setFrame owns playback (F21)', /if \(typeof img\.pause === 'function'\) img\.pause\(\);/],
-  ['headless start waits on readiness, not the clock', /await __setupReady;\s*await __assetsReady\(\);/],
+  ['headless start waits on readiness, not the clock', /await __setupReady;\s*\} catch \(e\) \{[\s\S]{0,400}\}\s*await __assetsReady\(\);/],
   /* ITER-048 (F17 part 1): reduced motion pins the frame-hashed seed + dither phase for stills */
   ['reduced motion pins frame index for still sources', /const _rmPinned = _rmStill && window\.__sourceFrameIdx === -1;\s*const _frameIdx = _rmPinned \? 0 :/],
   ['reduced motion pins the temporal dither phase', /_persistentDitherOpts\.frameIdx = _rmPinned \? 0 : frameIdx;/],

@@ -22,6 +22,22 @@ for f in "$NEW" "$BASE"; do
   [[ -f "$f" ]] || { echo "psnr-gate: missing file $f" >&2; exit 2; }
 done
 command -v ffmpeg >/dev/null || { echo "psnr-gate: ffmpeg not on PATH" >&2; exit 2; }
+command -v ffprobe >/dev/null || { echo "psnr-gate: ffprobe not on PATH" >&2; exit 2; }
+
+# ITER-049: the frame-count mismatch exit promised above was never
+# implemented — ffmpeg's psnr filter silently compares the shorter stream.
+# Count decoded frames on both sides first.
+nframes() {
+  ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames \
+    -of csv=p=0 "$1" 2>/dev/null | head -1 | tr -d '[:space:],'
+}
+N_NEW=$(nframes "$NEW"); N_BASE=$(nframes "$BASE")
+if [[ -z "$N_NEW" || -z "$N_BASE" ]]; then
+  echo "psnr-gate: ffprobe could not count frames (new=${N_NEW:-?} base=${N_BASE:-?})" >&2; exit 2
+fi
+if [[ "$N_NEW" != "$N_BASE" ]]; then
+  echo "psnr-gate: frame-count mismatch — $NEW has $N_NEW frames, $BASE has $N_BASE" >&2; exit 2
+fi
 
 STATS="$(mktemp "${TMPDIR:-/tmp}/psnr-gate.XXXXXX")"
 LOG="$(mktemp "${TMPDIR:-/tmp}/psnr-gate-log.XXXXXX")"
@@ -38,9 +54,10 @@ fi
 SUMMARY=$(grep -E 'PSNR .*average:' "$LOG" | tail -1)
 [[ -n "$SUMMARY" ]] || { echo "psnr-gate: no PSNR summary in ffmpeg output" >&2; tail -5 "$LOG" >&2; exit 2; }
 
-python3 - "$STATS" "$SUMMARY" "$MIN_DB" "$NEW" "$BASE" <<'PY'
+python3 - "$STATS" "$SUMMARY" "$MIN_DB" "$NEW" "$BASE" "$N_NEW" <<'PY'
 import re, sys
 stats, summary, min_db, new, base = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4], sys.argv[5]
+n_probe = int(sys.argv[6])
 
 def num(s):
     return float('inf') if s == 'inf' else float(s)
@@ -60,13 +77,15 @@ for line in open(stats):
         worst_n, worst_db = int(n.group(1)), v
 
 print(f"psnr-gate: {new} vs {base}")
-print(f"  frames compared : {frames}")
+print(f"  frames compared : {frames}  (ffprobe: {n_probe} in each)")
 print(f"  average         : {avg:.2f} dB  (per-frame min {mn:.2f}, max {mx:.2f})")
 if worst_n is not None:
     print(f"  worst frame     : #{worst_n} @ {worst_db:.2f} dB")
 print(f"  threshold       : >= {min_db:.2f} dB")
 if avg != avg:  # nan
     print("  RESULT: ERROR (could not parse average)"); sys.exit(2)
+if frames != n_probe:
+    print(f"  RESULT: ERROR (psnr compared {frames} frames, ffprobe counted {n_probe})"); sys.exit(2)
 if avg >= min_db:
     print("  RESULT: PASS"); sys.exit(0)
 print(f"  RESULT: FAIL (stats: {stats})"); sys.exit(1)

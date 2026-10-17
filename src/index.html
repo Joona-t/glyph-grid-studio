@@ -924,7 +924,13 @@
      v2 font cascade started there; __assetsReady() (below, with the atlas
      cache) waits for both plus any glyph-set atlas the config needs. */
   let __setupReadyResolve = null;
-  const __setupReady = new Promise(function (r) { __setupReadyResolve = r; });
+  let __setupReadyReject = null;
+  const __setupReady = new Promise(function (res, rej) { __setupReadyResolve = res; __setupReadyReject = rej; });
+  /* ITER-049: setup() rejects the promise when it throws (e.g. a compat
+     validator error) so tryHeadlessRender exits instead of hanging forever.
+     The no-op handler keeps GUI mode free of an unhandled-rejection report;
+     each await still sees the rejection. */
+  __setupReady.catch(function () {});
   let __fontLoadPromise = null;
   let retroResolved = null;         /* retro-merged CONFIG, if modeset */
   let gradientStopsCache = null;    /* { key, stops } — parsed OKLab stops for gradient colorMode */
@@ -1104,6 +1110,17 @@
   };
 
   function setup() {
+    /* ITER-049: a throw still propagates to the console as before, but
+       __setupReady must settle either way. */
+    try {
+      setupBody();
+    } catch (e) {
+      if (__setupReadyReject) __setupReadyReject(e);
+      throw e;
+    }
+  }
+
+  function setupBody() {
     createCanvas(CONFIG.canvas.w, CONFIG.canvas.h);
     pixelDensity(1);
     /* a11y (audit 2026-06-10): the p5 canvas is the app's primary
@@ -4183,6 +4200,7 @@
      Phosphor and stability restart from scratch at frame 0 — deterministic,
      and identical to what a fresh process did before. */
   function primeTemporalState(total) {
+    __lastPrime = null;     /* ITER-049: never report a previous job's prime */
     if (!sourceImg || !sourceImg.width || window.PIPELINE) return;
     const want = CONFIG.grid.cols * CONFIG.grid.rows;
     if (!cellSignalEma || cellSignalEma.length !== want) cellSignalEma = new Float32Array(want);
@@ -4262,13 +4280,21 @@
         onError: opts.onError,
         onFinish: opts.onFinish || onFinishOverride,
       };
+      /* ITER-046: deterministic warm-up, synchronous — the first live draw
+         after this call is frame 0.  ITER-049: it runs BEFORE loop() —
+         p5's loop() is `_loop = true; _draw()`, which can draw synchronously
+         when the previous job's noLoop() is still in effect, and recState is
+         already installed above, so that draw would have been captured as
+         frame 0 from un-primed state. */
+      primeTemporalState(total);
+      /* ITER-049: the perf switch-point stamp (__markChange in startCapture)
+         predates the priming passes; re-stamp it so switch_ms measures the
+         first captured frame alone, not PRIME_FRAMES passes of priming. */
+      if (__pfLastChange) __pfLastChange.t = performance.now();
       /* Re-engage the p5 draw loop in case a previous recording's
          finishRecording → noLoop() is still in effect.  Without this,
          batch-mode runBatchExport stalls after the first job. */
       try { loop(); } catch (e) {}
-      /* ITER-046: deterministic warm-up, synchronous — the first live draw
-         after this call is frame 0. */
-      primeTemporalState(total);
       return recState.jobId;
     },
     cancelRecord(jobId, reason) {
@@ -5212,8 +5238,17 @@
     }
 
     /* ITER-047: readiness instead of the 1500 ms start-up sleep — p5 setup()
-       done (canvas, buffers, loadImage bound) and the font cascade settled. */
-    await __setupReady;
+       done (canvas, buffers, loadImage bound) and the font cascade settled.
+       ITER-049: a setup() throw rejects __setupReady — exit non-zero rather
+       than leave the CLI waiting for a render that can never start. */
+    try {
+      await __setupReady;
+    } catch (e) {
+      console.error('CLI: p5 setup failed:', e);
+      try { await window.__TAURI__.core.invoke('cli_log', { msg: 'setup failed: ' + ((e && e.message) || e) }); } catch (_) {}
+      try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
+      return;
+    }
     await __assetsReady();
 
     try {
