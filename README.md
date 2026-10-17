@@ -95,11 +95,19 @@ glyph-grid-studio catalog | jq
 # "capwidth") and unknown versions fail with exit 2 in ~20 ms, before any render.
 glyph-grid-studio batch --manifest variants.json
 
-# Re-run an interrupted / timed-out batch: jobs whose `out` is already a valid
-# GIF/MP4 with the requested frame count are skipped.
+# Re-run an interrupted / timed-out batch: finished jobs are skipped.  Every
+# batch job that lands writes a sidecar `<out>.ggs.json`
+#   {"version":1,"frames":<requested>,"config_sha256":"…","bytes":…,"finished_at":<unix s>}
+# and --resume skips a job only when its sidecar matches the requested frames,
+# the job's config hash and the output's size (change the config → re-render).
+# Outputs without a sidecar fall back to a validity check: a readable GIF with
+# 1..=requested frames (gifski merges identical frames, so a still source can
+# finish with fewer) or an MP4 with exactly the requested count.
 glyph-grid-studio batch --manifest variants.json --resume
 
-# Check a preset or manifest without rendering (exit 0 valid / 2 invalid)
+# Check a preset or manifest without rendering (exit 0 valid / 2 invalid).
+# A file with a `jobs` key is a manifest and gets every pre-launch check
+# `batch` runs (manifest schema, frames, border, each job config).
 glyph-grid-studio validate variants.json
 
 # Bound the wall time: past --timeout the render is killed (exit 3)
@@ -121,7 +129,7 @@ glyph-grid-studio batch --help
 |---|---|
 | `0` | Success — every output written. |
 | `1` | Render or encode failed (for `batch`: at least one job failed; the others are still written). |
-| `2` | Bad input: usage error, unreadable source / preset / manifest, config that fails the schema. Exits before the app window starts. |
+| `2` | Bad input: usage error, unreadable source / preset / manifest, config that fails the schema. Only ever before the app window starts — an app session that ends without a result is `1`. |
 | `3` | Timed out: `--timeout <seconds>` elapsed, or no render progress for 300 s (a stalled WebView). The render is killed and its `.part` temp files removed. |
 | `130` / `143` | Interrupted by Ctrl-C (SIGINT) / SIGTERM. The render stops within ~0.1 s and its `.part` temp files are removed; finished outputs are never partial (writes are atomic). |
 

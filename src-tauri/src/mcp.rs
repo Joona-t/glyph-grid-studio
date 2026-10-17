@@ -316,6 +316,9 @@ fn error_path(text: &str, batch: bool) -> Option<String> {
         if t.contains("cannot resolve --in") || t.contains("cannot resolve manifest `in`") {
             return Some(if batch { "/in" } else { "/in_path" }.to_string());
         }
+        if t.contains("--postprocess") {
+            return Some("/postprocess".to_string());
+        }
         if t.contains("--preset") {
             return Some("/preset".to_string());
         }
@@ -323,8 +326,50 @@ fn error_path(text: &str, batch: bool) -> Option<String> {
     None
 }
 
+/// ITER-062: `error_path` reads `/config/<ptr>` off the MERGED render
+/// config (preset → config → named params).  Blame what the caller sent:
+/// the named param that wrote `<ptr>`, else `/config<ptr>` when the
+/// `config` argument holds it, else `/preset<ptr>` (the preset file).
+fn render_error_path(p: &RenderParams, path: Option<String>) -> Option<String> {
+    let path = path?;
+    let Some(ptr) = path.strip_prefix("/config") else {
+        return Some(path);
+    };
+    let named: [(&str, bool, &str); 9] = [
+        ("/palette", p.palette.is_some(), "/palette"),
+        ("/colorMode", p.color_mode.is_some(), "/color_mode"),
+        ("/ramp", p.ramp.is_some(), "/ramp"),
+        ("/dither/mode", p.dither.is_some(), "/dither"),
+        ("/selectionMode", p.selection_mode.is_some(), "/selection_mode"),
+        ("/glyphSet", p.glyph_set.is_some(), "/glyph_set"),
+        ("/samplingStrategy", p.sampling_strategy.is_some(), "/sampling_strategy"),
+        ("/grid/cols", p.cols.is_some(), "/cols"),
+        ("/grid/rows", p.rows.is_some(), "/rows"),
+    ];
+    for (at, sent, arg) in named {
+        if sent && (ptr == at || ptr.starts_with(&format!("{}/", at))) {
+            return Some(arg.to_string());
+        }
+    }
+    if !p.postprocess.is_empty() && ptr.starts_with("/postprocess/") && ptr.ends_with("/enabled") {
+        return Some("/postprocess".to_string());
+    }
+    match (&p.config, &p.preset) {
+        (Some(cfg), Some(_)) if cfg.pointer(ptr).is_none() => Some(format!("/preset{}", ptr)),
+        (Some(_), _) => Some(format!("/config{}", ptr)),
+        (None, Some(_)) => Some(format!("/preset{}", ptr)),
+        (None, None) => None,
+    }
+}
+
 /// A child that exited non-zero → the structured error for its exit code.
-fn child_error(what: &str, status: std::process::ExitStatus, stderr: &str, batch: bool) -> CallToolResult {
+fn child_error(
+    what: &str,
+    status: std::process::ExitStatus,
+    stderr: &str,
+    batch: bool,
+    blame: impl Fn(Option<String>) -> Option<String>,
+) -> CallToolResult {
     let code = match status.code() {
         Some(crate::EXIT_USAGE) => "invalid_arguments",
         Some(crate::EXIT_TIMEOUT) => "timeout",
@@ -334,7 +379,7 @@ fn child_error(what: &str, status: std::process::ExitStatus, stderr: &str, batch
     let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail = lines[lines.len().saturating_sub(20)..].join("\n");
     let last = lines.last().copied().unwrap_or("");
-    let path = if code == "invalid_arguments" { error_path(stderr, batch) } else { None };
+    let path = if code == "invalid_arguments" { blame(error_path(stderr, batch)) } else { None };
     CallToolResult::structured_error(serde_json::json!({
         "code": code,
         "path": path,
@@ -450,7 +495,7 @@ impl GlyphGridServer {
         if let Err(e) = probe.build_js_config() {
             return tool_error(
                 "invalid_arguments",
-                error_path(&e, false),
+                render_error_path(&p, error_path(&e, false)),
                 format!("invalid arguments: {}", e),
             );
         }
@@ -530,7 +575,9 @@ impl GlyphGridServer {
                     ),
                 }
             }
-            Ok(ChildEnd::Exited(status, stderr)) => child_error("Render", status, &stderr, false),
+            Ok(ChildEnd::Exited(status, stderr)) => {
+                child_error("Render", status, &stderr, false, |x| render_error_path(&p, x))
+            }
             Ok(ChildEnd::Cancelled) => tool_error("cancelled", None, "Render cancelled (subprocess killed)".into()),
             Err(e) => tool_error("internal", None, format!("Render {}", e)),
         }
@@ -599,7 +646,7 @@ impl GlyphGridServer {
                 } else {
                     // Structured error first; the per-job report (which
                     // outputs do exist after a partial failure) second.
-                    let mut r = child_error("Batch", status, &stderr, true);
+                    let mut r = child_error("Batch", status, &stderr, true, |x| x);
                     r.content.push(Content::text(report.join("\n")));
                     r
                 }
@@ -638,7 +685,38 @@ pub async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_path, parse_batch_progress, parse_frame_progress};
+    use super::{error_path, parse_batch_progress, parse_frame_progress, render_error_path, RenderParams};
+
+    #[test]
+    fn render_errors_blame_what_the_caller_sent() {
+        let params = |v: serde_json::Value| -> RenderParams { serde_json::from_value(v).unwrap() };
+        let at = |p: &RenderParams, ptr: &str| render_error_path(p, Some(format!("/config{}", ptr)));
+        let base = serde_json::json!({"in_path": "/a.png", "out_path": "/a.gif"});
+        // A preset file alone → /preset/<ptr>, not /config/...
+        let mut v = base.clone();
+        v["preset"] = "/p.json".into();
+        assert_eq!(at(&params(v.clone()), "/dither/mode").as_deref(), Some("/preset/dither/mode"));
+        // Named params are blamed by name.
+        v["dither"] = "STBN".into();
+        v["cols"] = 7.into();
+        v["palette"] = "nope".into();
+        let p = params(v);
+        assert_eq!(at(&p, "/dither/mode").as_deref(), Some("/dither"));
+        assert_eq!(at(&p, "/grid/cols").as_deref(), Some("/cols"));
+        assert_eq!(at(&p, "/palette").as_deref(), Some("/palette"));
+        assert_eq!(at(&p, "/dither").as_deref(), Some("/preset/dither"));  // e.g. a typo'd key in the file
+        // `config` holds it → /config; config + preset, not in config → /preset.
+        let mut v = base.clone();
+        v["config"] = serde_json::json!({"seed": 3, "dither": {"mode": "STBN"}});
+        assert_eq!(at(&params(v.clone()), "/dither/mode").as_deref(), Some("/config/dither/mode"));
+        v["preset"] = "/p.json".into();
+        assert_eq!(at(&params(v.clone()), "/ramp").as_deref(), Some("/preset/ramp"));
+        assert_eq!(at(&params(v), "/seed").as_deref(), Some("/config/seed"));
+        // Non-config paths pass through; nothing sent → no guess.
+        let p = params(base);
+        assert_eq!(render_error_path(&p, Some("/in_path".into())).as_deref(), Some("/in_path"));
+        assert_eq!(at(&p, "/palette"), None);
+    }
 
     #[test]
     fn frame_progress_lines_are_parsed() {

@@ -339,6 +339,13 @@ for rid, args, want_code, want_path in [
           "config": {"dither": {"mode": "STBN"}}}, "invalid_arguments", "/config/dither/mode"),
     (13, {"in_path": "/tmp/__nonexistent_test_image__.png",
           "out_path": os.path.join(SCRATCH, "c13b.gif")}, "invalid_arguments", "/in_path"),
+    # ITER-062: blame what the caller sent — the preset file, or the named param.
+    (30, {"in_path": TEST_IMG, "out_path": os.path.join(SCRATCH, "c13d.gif"),
+          "preset": preset12}, "invalid_arguments", "/preset/dither/mode"),
+    (31, {"in_path": TEST_IMG, "out_path": os.path.join(SCRATCH, "c13e.gif"),
+          "dither": "STBN"}, "invalid_arguments", "/dither"),
+    (32, {"in_path": TEST_IMG, "out_path": os.path.join(SCRATCH, "c13f.gif"),
+          "selection_mode": "shapes", "config": {"seed": 3}}, "invalid_arguments", "/selection_mode"),
 ]:
     send(proc, {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
                 "params": {"name": "glyph_grid_render", "arguments": args}})

@@ -225,6 +225,68 @@ for (const k of Object.keys(CONFIG)) {
   if (DESCRIPTIONS[k]) p = Object.assign({ description: DESCRIPTIONS[k] }, p);
   properties[k] = p;
 }
+/* ITER-062: closed blocks.  A typo inside a fixed-shape block
+   (`{"dither":{"moed":"stbn"}}`) used to validate and silently render the
+   default.  These blocks get additionalProperties:false; the accepted keys
+   are the CONFIG defaults PLUS every key the renderer reads or writes on
+   them in source (`CONFIG.dither.levels`, `config.grid.salientROIs`,
+   scanlines `opts.period`, depthFog `fog.color`, ...) — a key the code
+   uses is never a typo.  Top level stays open (warn, x-unknown-key-policy). */
+const RENDER_SRC = [html].concat(fs.readdirSync(path.join(ROOT, 'src', 'lib'))
+  .filter((f) => f.endsWith('.js')).map((f) => read('src/lib/' + f))).join('\n');
+function keysMatching(re, src) {
+  return Array.from((src || RENDER_SRC).matchAll(re), (m) => m[1]);
+}
+/* Keys of flat object literals assigned to `name:` / `name =` anywhere. */
+function literalKeys(name) {
+  const out = [];
+  for (const m of RENDER_SRC.matchAll(new RegExp('\\b' + name + '\\s*[:=]\\s*\\{([^{}]*)\\}', 'g'))) {
+    for (const k of m[1].matchAll(/([A-Za-z_$][\w$]*)\s*:/g)) out.push(k[1]);
+  }
+  return out;
+}
+/* Blocks handed whole to a consumer function: the keys it reads (`opts.<key>`). */
+const CONSUMER = {
+  prefilter: ['glyph-xdog.js', 'xdog'],
+  phosphorDecay: ['glyph-crt.js', 'applyPhosphorDecay'], bloom: ['glyph-crt.js', 'applyBloom'],
+  halation: ['glyph-crt.js', 'applyBloom'], scanlines: ['glyph-crt.js', 'applyScanlines'],
+  chromaticAberration: ['glyph-crt.js', 'applyChromaticAberration'],
+  vignette: ['glyph-crt.js', 'applyVignette'], crtBeam: ['glyph-crt.js', 'applyCrtBeam'],
+  kawaii: ['glyph-crt.js', 'applyKawaii'],
+};
+function consumerKeys(block) {
+  if (!CONSUMER[block]) return [];
+  const [file, fn] = CONSUMER[block];
+  const src = read('src/lib/' + file);
+  const at = src.indexOf('function ' + fn + '(');
+  if (at < 0) fail(file + ' ' + fn + '() not found (consumer of ' + block + ')');
+  return keysMatching(/\bopts\.(\w+)/g, sliceBalanced(src, src.indexOf(')', at)));
+}
+function closeBlock(p, used) {
+  for (const k of new Set(used)) {
+    if (!p.properties[k]) p.properties[k] = { description: 'Read by the renderer; no CONFIG default.' };
+  }
+  p.additionalProperties = false;
+}
+for (const b of ['grid', 'canvas', 'font', 'animation', 'dither', 'prefilter']) {
+  if (!properties[b] || !properties[b].properties) fail('closed block CONFIG.' + b + ' is not an object');
+  closeBlock(properties[b], keysMatching(new RegExp('\\b(?:CONFIG|config)\\.' + b + '\\.(\\w+)', 'g'))
+    .concat(literalKeys(b), consumerKeys(b)));
+}
+const fogAt = html.indexOf('const fog = CONFIG.postprocess.depthFog;');
+if (fogAt < 0) fail('depthFog consumer (`const fog = CONFIG.postprocess.depthFog;`) not found');
+const fogReads = keysMatching(/\bfog\.(\w+)/g, html.slice(fogAt, fogAt + 1500));
+/* glyph-compat.js gates a stage on `_stageActive(p.<stage>, ['<key>', ...])`. */
+const compatKeys = {};
+for (const m of compatSrc.matchAll(/_stageActive\(p\.(\w+), (\[[^\]]*\])\)/g)) {
+  compatKeys[m[1]] = evalLiteral(m[2], 'compat ' + m[1] + ' keys');
+}
+for (const s of STAGES) {
+  closeBlock(properties.postprocess.properties[s],
+    keysMatching(new RegExp('\\bpostprocess\\.' + s + '\\.(\\w+)', 'g'))
+      .concat(literalKeys(s), consumerKeys(s), compatKeys[s] || [], s === 'depthFog' ? fogReads : []));
+}
+
 const missing = Object.keys(CONFIG).filter((k) => !DESCRIPTIONS[k]);
 if (missing.length) fail('CONFIG keys without a description in gen-schema.js: ' + missing.join(', '));
 

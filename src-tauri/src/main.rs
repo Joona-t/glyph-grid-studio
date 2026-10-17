@@ -47,7 +47,7 @@ enum Command {
 
     /// Run the MCP server (Model Context Protocol over stdio JSON-RPC).
     /// Wire this into Claude Desktop / Cursor via their MCP config; tools then
-    /// appear as `glyph_grid_render` and `glyph_grid_catalog`.
+    /// appear as `glyph_grid_render`, `glyph_grid_batch` and `glyph_grid_catalog`.
     Mcp,
 }
 

@@ -31,7 +31,7 @@ Exposes Glyph Grid Studio's rendering pipeline as MCP tools over stdio JSON-RPC.
 }
 ```
 
-Per job: `name`, `out` (absolute), optional `format` (`gif`/`mp4`, else from the extension), `in` (per-job source), `frames` (integer or `"auto"`), `capWidth`, `targetMaxBytes`, `border {width, bgColor?, style?, inkColor?}`, `config`. The manifest is validated against `src/glyph-grid.manifest.schema.json` (unknown keys such as `capwidth` are errors — `path: "/jobs/0"`) and every job config against the preset schema before the app starts; one bad job refuses the whole batch (exit 2). `resume: true` skips jobs whose `out` is already a valid GIF/MP4 with the requested frame count (`batch --resume`). The result has one line per job (`job 0 (spice): /abs/out/spice.gif (1493 KB)`).
+Per job: `name`, `out` (absolute), optional `format` (`gif`/`mp4`, else from the extension), `in` (per-job source), `frames` (integer or `"auto"`), `capWidth`, `targetMaxBytes`, `border {width, bgColor?, style?, inkColor?}`, `config`. The manifest is validated against `src/glyph-grid.manifest.schema.json` (unknown keys such as `capwidth` are errors — `path: "/jobs/0"`) and every job config against the preset schema before the app starts; one bad job refuses the whole batch (exit 2). `resume: true` skips jobs that are already done (`batch --resume`): a job is done when its `<out>.ggs.json` sidecar (written as each output lands) records the same requested frames, config hash and output size; an output without a sidecar falls back to a validity check (GIF with 1..=requested frames — gifski merges identical frames — or MP4 with exactly the requested count). The result has one line per job (`job 0 (spice): /abs/out/spice.gif (1493 KB)`).
 
 **Progress.** Send `_meta: {"progressToken": <token>}` in the `tools/call` params and the server emits `notifications/progress`: `glyph_grid_batch` sends `progress: N, total: M` as each job finishes (`message` carries the job's `batch: N/M name → path` line); `glyph_grid_render` sends one per captured frame (`progress: frame, total: frames`, `message: "capture 12/120"`; it runs the CLI with `--progress`).
 
@@ -44,7 +44,7 @@ Per job: `name`, `out` (absolute), optional `format` (`gif`/`mp4`, else from the
 
 | `code` | When |
 |---|---|
-| `invalid_arguments` | Rejected before or by the CLI (exit 2): schema violation, missing `in_path`, unreadable `preset`, bad manifest. `path` is a JSON pointer into the tool arguments (`/config/dither/mode`, `/jobs/1/config/selectionMode`, `/in_path`) when known. |
+| `invalid_arguments` | Rejected before or by the CLI (exit 2): schema violation, missing `in_path`, unreadable `preset`, bad manifest. `path` is a JSON pointer into the tool arguments (`/config/dither/mode`, `/jobs/1/config/selectionMode`, `/in_path`) when known: a named param that caused it is reported as itself (`/palette`, `/dither`, `/cols`), a violation inside the `preset` file as `/preset/<pointer>` — never `/config/...` for a `config` the caller did not send. |
 | `timeout` | `timeout_s` elapsed, or the render made no progress for 300 s (exit 3). |
 | `render_failed` | The render or encode failed (exit 1). |
 | `no_output` | The CLI exited 0 but `out_path` does not exist. |

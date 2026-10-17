@@ -46,7 +46,7 @@
           "default": 504
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "grid": {
       "description": "Glyph grid dimensions (cells).",
@@ -59,9 +59,12 @@
         "rows": {
           "type": "number",
           "default": 120
+        },
+        "salientROIs": {
+          "description": "Read by the renderer; no CONFIG default."
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "font": {
       "description": "Glyph font family and pixel size.",
@@ -74,9 +77,12 @@
         "size": {
           "type": "number",
           "default": 8
+        },
+        "cells": {
+          "description": "Read by the renderer; no CONFIG default."
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "ramp": {
       "description": "Density ramp used by brightness selection.",
@@ -179,7 +185,7 @@
           "default": true
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "seed": {
       "description": "Deterministic seed for noise, dither phase and jitter.",
@@ -242,9 +248,12 @@
         "asSourcePrefilter": {
           "type": "boolean",
           "default": true
+        },
+        "levels": {
+          "description": "Read by the renderer; no CONFIG default."
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "prefilter": {
       "description": "Source-wide preprocessing.",
@@ -257,9 +266,27 @@
             "xdog"
           ],
           "default": "none"
+        },
+        "sigma": {
+          "description": "Read by the renderer; no CONFIG default."
+        },
+        "k": {
+          "description": "Read by the renderer; no CONFIG default."
+        },
+        "tau": {
+          "description": "Read by the renderer; no CONFIG default."
+        },
+        "phi": {
+          "description": "Read by the renderer; no CONFIG default."
+        },
+        "epsilon": {
+          "description": "Read by the renderer; no CONFIG default."
+        },
+        "invert": {
+          "description": "Read by the renderer; no CONFIG default."
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "postprocess": {
       "description": "Per-stage post effects; each stage has `enabled` plus its params.",
@@ -277,7 +304,7 @@
               "default": 0.55
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "bloom": {
           "type": "object",
@@ -293,9 +320,15 @@
             "strength": {
               "type": "number",
               "default": 0.95
+            },
+            "threshold": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "intensity": {
+              "description": "Read by the renderer; no CONFIG default."
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "halation": {
           "type": "object",
@@ -307,9 +340,18 @@
             "strength": {
               "type": "number",
               "default": 0.7
+            },
+            "threshold": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "intensity": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "radius": {
+              "description": "Read by the renderer; no CONFIG default."
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "scanlines": {
           "type": "object",
@@ -317,9 +359,21 @@
             "enabled": {
               "type": "boolean",
               "default": false
+            },
+            "period": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "intensity": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "phase": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "strength": {
+              "description": "Read by the renderer; no CONFIG default."
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "chromaticAberration": {
           "type": "object",
@@ -327,9 +381,15 @@
             "enabled": {
               "type": "boolean",
               "default": false
+            },
+            "amount": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "offset": {
+              "description": "Read by the renderer; no CONFIG default."
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "phosphorDecay": {
           "type": "object",
@@ -337,9 +397,15 @@
             "enabled": {
               "type": "boolean",
               "default": false
+            },
+            "decayFactor": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "decay": {
+              "description": "Read by the renderer; no CONFIG default."
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "depthFog": {
           "type": "object",
@@ -347,9 +413,24 @@
             "enabled": {
               "type": "boolean",
               "default": false
+            },
+            "strength": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "intensity": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "start": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "end": {
+              "description": "Read by the renderer; no CONFIG default."
+            },
+            "color": {
+              "description": "Read by the renderer; no CONFIG default."
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "crtBeam": {
           "type": "object",
@@ -377,9 +458,12 @@
             "slotStrength": {
               "type": "number",
               "default": 0.2
+            },
+            "beamY": {
+              "description": "Read by the renderer; no CONFIG default."
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         },
         "kawaii": {
           "type": "object",
@@ -421,7 +505,7 @@
               "default": 180
             }
           },
-          "additionalProperties": true
+          "additionalProperties": false
         }
       },
       "additionalProperties": true

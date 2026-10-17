@@ -442,18 +442,135 @@ fn output_frame_count(path: &std::path::Path, format: &str) -> Result<u64, Strin
     Ok(n)
 }
 
-/// `--resume`: Some(reason) when job `out` already holds a valid output of
-/// the requested frame count (`frames: "auto"` → any frame count, since
-/// the count is only resolved inside the WebView).
-fn resume_skip_reason(out: &str, format: &str, frames: &serde_json::Value) -> Option<String> {
+/* ---------- ITER-062: `--resume` sidecars ----------
+ *
+ * A frame count is not proof that a job is done: gifski drops consecutive
+ * pixel-identical frames (a still source can finish as a 1-frame GIF for
+ * `frames: 24` and would be re-rendered forever), and a matching count says
+ * nothing about WHICH config produced the file.  So every batch job that
+ * commits its output also writes `<out>.ggs.json`:
+ *   {"version":1, "frames":<requested, n | "auto">, "config_sha256":"<hex>",
+ *    "bytes":<output size>, "finished_at":<unix seconds>}
+ * `--resume` trusts a sidecar when present (skip iff same frames, same
+ * config hash and the output still has the recorded size) and falls back to
+ * the frame-count check only when there is none. */
+
+const SIDECAR_VERSION: u64 = 1;
+
+/// Batch outputs that get a sidecar when committed: out path → (requested
+/// frames, config hash).  Filled by `run_headless_batch`; empty for GUI
+/// exports and `render`, so those never write one.
+static PENDING_SIDECARS: OnceLock<Mutex<HashMap<PathBuf, (serde_json::Value, String)>>> =
+    OnceLock::new();
+
+fn sidecar_path(out: &std::path::Path) -> PathBuf {
+    let mut s = out.as_os_str().to_owned();
+    s.push(".ggs.json");
+    PathBuf::from(s)
+}
+
+/// Sorted keys at every level, so the hash does not depend on how the
+/// manifest happened to order an object.
+fn canonical_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for k in keys {
+                out.insert(k.clone(), canonical_json(&m[k]));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// SHA-256 of everything in a (JS-shaped) batch job that shapes its output
+/// bytes — source path, format, frames, border, config, capWidth,
+/// targetMaxBytes; not `name` / `outPath`.
+fn job_config_sha256(job: &serde_json::Value, batch_in: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let key = serde_json::json!({
+        "in": job["inPath"].as_str().unwrap_or(batch_in),
+        "format": job["format"],
+        "frames": job["frames"],
+        "border": job["border"],
+        "config": job["config"],
+        "capWidth": job["capWidth"],
+        "targetMaxBytes": job["targetMaxBytes"],
+    });
+    Sha256::digest(canonical_json(&key).to_string().as_bytes())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// Called by `atomic_write_output` once `out` is committed: record the
+/// finished job.  A failed sidecar write only costs a re-render on resume.
+fn write_resume_sidecar(out: &std::path::Path, bytes: u64) {
+    let entry = PENDING_SIDECARS
+        .get()
+        .and_then(|m| m.lock().ok().and_then(|m| m.get(out).cloned()));
+    let Some((frames, sha)) = entry else {
+        return;
+    };
+    let finished_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body = serde_json::json!({
+        "version": SIDECAR_VERSION,
+        "frames": frames,
+        "config_sha256": sha,
+        "bytes": bytes,
+        "finished_at": finished_at,
+    });
+    if let Err(e) = fs::write(sidecar_path(out), format!("{}\n", body)) {
+        eprintln!(
+            "batch: warning: cannot write resume sidecar for {}: {}",
+            out.display(),
+            e
+        );
+    }
+}
+
+/// `--resume`: Some(reason) when job `out` is already done.
+/// With a sidecar: same requested frames + config hash + output size.
+/// Without one (outputs from before ITER-062): a valid file whose frame
+/// count fits the request — `<=` for GIF (gifski merges identical
+/// frames), `==` for MP4, any count for `frames: "auto"`.
+fn resume_skip_reason(
+    out: &str,
+    format: &str,
+    frames: &serde_json::Value,
+    config_sha: &str,
+) -> Option<String> {
     let path = std::path::Path::new(out);
     if !path.is_file() {
         return None;
     }
+    let side = sidecar_path(path);
+    if side.exists() {
+        // Unreadable / foreign sidecar → not trusted → re-render.
+        let doc: serde_json::Value = fs::read_to_string(&side)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())?;
+        let size = fs::metadata(path).ok()?.len();
+        let same = doc["version"].as_u64() == Some(SIDECAR_VERSION)
+            && doc["frames"] == *frames
+            && doc["config_sha256"].as_str() == Some(config_sha)
+            && doc["bytes"].as_u64() == Some(size);
+        return same.then(|| "sidecar: same frames + config".to_string());
+    }
     let n = output_frame_count(path, format).ok()?;
     match frames.as_u64() {
-        Some(want) if n == want => Some(format!("{} frames", n)),
-        None if n >= 1 => Some(format!("{} frames, frames:auto", n)),
+        Some(want) if format == "mp4" && n == want => Some(format!("{} frames, no sidecar", n)),
+        Some(want) if format != "mp4" && n >= 1 && n <= want => {
+            Some(format!("{} of {} frames, no sidecar", n, want))
+        }
+        None if n >= 1 => Some(format!("{} frames, frames:auto, no sidecar", n)),
         _ => None,
     }
 }
@@ -478,17 +595,36 @@ pub fn run_validate(path: PathBuf) -> i32 {
     };
     let mut targets: Vec<(String, serde_json::Value)> = Vec::new();
     let mut manifest_errors = 0usize;
-    match doc.get("jobs").and_then(|j| j.as_array()) {
+    // ITER-062: a `jobs` key of ANY type makes it a manifest — `{"jobs":{}}`
+    // used to be taken for a preset and pass.
+    match doc.get("jobs") {
         Some(jobs) => {
             // F27 (ITER-061): the manifest's own keys first.
             for e in validate_manifest(&doc) {
                 eprintln!("validate: error: manifest {}", e);
                 manifest_errors += 1;
             }
-            for (i, j) in jobs.iter().enumerate() {
+            // ITER-062: the same per-field checks `batch` runs before launch,
+            // so validate rejects exactly what batch rejects.
+            if let Err(e) = manifest_frames(doc.get("frames"), "manifest") {
+                eprintln!("validate: error: {}", e);
+                manifest_errors += 1;
+            }
+            for (i, j) in jobs.as_array().into_iter().flatten().enumerate() {
                 let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let what = format!("job {} ({:?})", i, name);
+                if j.get("out").and_then(|v| v.as_str()).map(|s| !s.is_empty() && s.trim().is_empty()) == Some(true) {
+                    eprintln!("validate: error: {} has no `out` path", what);
+                    manifest_errors += 1;
+                }
+                if let Err(e) = manifest_frames(j.get("frames"), &what)
+                    .and_then(|_| manifest_border(j.get("border"), &what))
+                {
+                    eprintln!("validate: error: {}", e);
+                    manifest_errors += 1;
+                }
                 let cfg = j.get("config").cloned().unwrap_or(serde_json::json!({}));
-                targets.push((format!("job {} ({:?}) config", i, name), cfg));
+                targets.push((format!("{} config", what), cfg));
             }
         }
         None => {
@@ -978,15 +1114,22 @@ pub fn run_headless_batch(
         })
         .collect();
 
-    // F27 (ITER-061): `--resume` drops jobs whose output already exists and
-    // is a valid GIF/MP4 of the requested frame count (ITER-024's
-    // out-of-scope item: a timed-out 64-job run resumes with one flag).
+    // F27 (ITER-061): `--resume` drops jobs whose output is already done
+    // (ITER-024's out-of-scope item: a timed-out 64-job run resumes with
+    // one flag).  ITER-062: "done" = a matching `<out>.ggs.json` sidecar,
+    // else the frame-count fallback — see resume_skip_reason.
     let mut jobs_js = jobs_js;
+    let job_sha = |j: &serde_json::Value| job_config_sha256(j, &in_path);
     if resume {
         let before = jobs_js.len();
         jobs_js.retain(|j| {
             let out = j["outPath"].as_str().unwrap_or("");
-            match resume_skip_reason(out, j["format"].as_str().unwrap_or("gif"), &j["frames"]) {
+            match resume_skip_reason(
+                out,
+                j["format"].as_str().unwrap_or("gif"),
+                &j["frames"],
+                &job_sha(j),
+            ) {
                 Some(why) => {
                     let name = j["name"].as_str().unwrap_or("job");
                     eprintln!("batch: resume: skip {:?} — {} already done ({})", name, out, why);
@@ -999,6 +1142,17 @@ pub fn run_headless_batch(
         if jobs_js.is_empty() {
             eprintln!("batch complete: nothing to do (every output is already done)");
             return 0;
+        }
+    }
+
+    // ITER-062: every job that runs records a sidecar when its output lands.
+    if let Ok(mut pending) = PENDING_SIDECARS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        for j in &jobs_js {
+            let out = PathBuf::from(j["outPath"].as_str().unwrap_or(""));
+            pending.insert(out, (j["frames"].clone(), job_sha(j)));
         }
     }
 
@@ -1020,7 +1174,9 @@ pub fn run_headless_batch(
         manifest_path
     );
 
-    let exit_code = Arc::new(Mutex::new(2));
+    // ITER-062: Tauri returning without exit_with_status is a failed run
+    // (1); 2 strictly means rejected before launch (README table).
+    let exit_code = Arc::new(Mutex::new(EXIT_FAILED));
     let state = CliJobState {
         job: Mutex::new(Some(batch_json)),
         exit_code: exit_code.clone(),
@@ -1063,7 +1219,8 @@ pub fn run_headless_render(job: HeadlessRenderJob) -> i32 {
             return 2;
         }
     };
-    let exit_code = Arc::new(Mutex::new(2)); // 2 = "didn't complete"
+    // ITER-062: "didn't complete" is a failure (1), not a usage error (2).
+    let exit_code = Arc::new(Mutex::new(EXIT_FAILED));
     let state = CliJobState {
         job: Mutex::new(Some(job_json)),
         exit_code: exit_code.clone(),
@@ -1291,6 +1448,7 @@ fn atomic_write_output(
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|e| format!("sync export directory {:?}: {}", parent, e))?;
+        write_resume_sidecar(path, bytes.len() as u64);
         control.emit("write", 1, 1);
         Ok(())
     })();
@@ -3597,5 +3755,54 @@ mod preset_schema_tests {
         // The normalised object deserialises into the encoders' BorderConfig.
         let bc: BorderConfig = serde_json::from_value(b).unwrap();
         assert!(bc.enabled && bc.width == 16);
+    }
+    #[test]
+    fn resume_trusts_a_matching_sidecar_and_falls_back_to_gif_frames_le() {
+        let dir = std::env::temp_dir().join(format!("ggs-resume-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // A real 1-frame GIF: what gifski leaves of 4 identical frames.
+        let gif_path = dir.join("still.gif");
+        {
+            let mut f = fs::File::create(&gif_path).unwrap();
+            let mut enc = gif::Encoder::new(&mut f, 2, 2, &[0, 0, 0, 255, 255, 255]).unwrap();
+            enc.write_frame(&gif::Frame::from_indexed_pixels(2, 2, vec![0u8; 4], None)).unwrap();
+        }
+        let out = gif_path.to_str().unwrap();
+        let four = serde_json::json!(4);
+        // No sidecar: a valid GIF with 1 <= n <= requested is done...
+        assert!(resume_skip_reason(out, "gif", &four, "h").is_some());
+        // ...but never an MP4 count mismatch or a 0-request.
+        assert!(resume_skip_reason(out, "gif", &serde_json::json!(0), "h").is_none());
+
+        let job = serde_json::json!({"inPath": null, "format": "gif", "frames": 4,
+            "border": null, "config": {"palette": "spice", "dither": {"mode": "stbn"}},
+            "capWidth": 0, "targetMaxBytes": null});
+        let sha = job_config_sha256(&job, "/src.png");
+        // Key order never changes the hash.
+        let reordered = serde_json::json!({"config": {"dither": {"mode": "stbn"}, "palette": "spice"},
+            "targetMaxBytes": null, "capWidth": 0, "border": null, "frames": 4, "format": "gif", "inPath": null});
+        assert_eq!(sha, job_config_sha256(&reordered, "/src.png"));
+        assert_ne!(sha, job_config_sha256(&job, "/other.png"));
+
+        PENDING_SIDECARS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(gif_path.clone(), (four.clone(), sha.clone()));
+        let size = fs::metadata(&gif_path).unwrap().len();
+        write_resume_sidecar(&gif_path, size);
+        let side: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(sidecar_path(&gif_path)).unwrap()).unwrap();
+        assert_eq!(side["version"], 1);
+        assert_eq!(side["frames"], 4);
+        assert_eq!(side["config_sha256"], sha.as_str());
+        assert!(resume_skip_reason(out, "gif", &four, &sha).is_some());
+        // With a sidecar it is authoritative: another config, another frame
+        // request or a replaced output all re-render.
+        assert!(resume_skip_reason(out, "gif", &four, "other").is_none());
+        assert!(resume_skip_reason(out, "gif", &serde_json::json!(3), &sha).is_none());
+        fs::write(&gif_path, b"GIF89a-not-the-recorded-file").unwrap();
+        assert!(resume_skip_reason(out, "gif", &four, &sha).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
