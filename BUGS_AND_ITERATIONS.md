@@ -4,6 +4,25 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-084 — 2026-10-18 — video: no short tails inside containers, crop sides bounded together, chunk offsets bounded
+
+**Problem:** three more crate trust paths in `video.rs`. (29, HIGH) `walk_boxes` let a box list end in fewer than 8 all-zero bytes (QuickTime's udta 32-bit zero), but the mp4 crate's container loops read 8 bytes straddling the container end, get size 0, and `skip_box(0)` seeks back and spins forever, with `open_video` holding the slot lock. Repro: a udta ending in `00 00 00 00`, or 4 zero bytes at the end of stbl, on either fixture; the open never returns. (30, LOW) `sps_parse` bounded each crop side under 16 px but not their sum, so `coded_w - cx*(cl+cr)` underflowed: a 1-MB-wide SPS with crop left = right = 7 gave width 4294967284 in release (a debug panic). (31, LOW) `sample_tables_fit` never bounded stco/co64 entries; the crate adds `chunk_offset + sample_offset` unchecked (debug panic on co64 u64::MAX, release wrap to a garbage seek).
+
+**Root cause:** the ITER-081..083 checks bounded the values the crate reads, not every place it combines them (the end-of-list read, a difference of two bounded crops, an offset plus a bounded sum).
+
+**Fix:**
+1. `walk_boxes` refuses any tail under 8 bytes: "box list ends in N stray bytes". Chosen: no exception at all, not even at the very end of the file. The crate cannot parse such a file either way (it loops mid-file, errors on EOF at the end), so it goes to the WebView path.
+2. `sps_parse` also returns `Some(None)` ("SPS crops a macroblock or more off an edge") when `cx*(cl+cr) >= coded_w` or `cy*(ct+cb) >= coded_h`, before the subtraction.
+3. `sample_tables_fit` walks the chunks with stsc: for every stco/co64 entry, `offset <= file_len` and `offset + that chunk's sample-size total <= file_len`, else "chunk K at offset O (+B bytes) is past the end of the file (L)". The work is O(chunks + samples), and the sum cannot overflow (offset <= file_len, the chunk total <= the stsz total <= u32::MAX).
+
+**Tests (cargo 72 → 73):** `zero_tails_wide_crops_and_chunk_offsets_are_refused`: on both fixtures, a udta ending in a 32-bit zero and an stbl ending in 4 zero bytes are refused ("box list ends in 4 stray bytes") and the probe returns None. These run in the item-26 thread with a 20 s `recv_timeout`; with the old tolerance put back, the test fails on that timeout (verified). `sps_nal_cropped(1, 1, [7,7,0,0])` and `[0,0,4,4]` are refused; `(2, 1, [7,7,0,0])` still gives 4x16. The stco is rewritten as a co64: a valid offset still opens, u64::MAX is refused, and a stco entry of file_len − 10 (inside the file, its chunk is not) is refused. The new `stbl_spliced` helper grows stbl, its ancestors and the stco entry. The ITER-080 FNV-1a pins for tiny.mp4 / tiny-bframes.mp4 still pass.
+
+**Measured:** golden render (worm-move.gif, 120 frames, pB, `--mp4-quality archive`) vs golden-p3-iter057.mp4: PSNR inf over 120/120 frames on both runs, real 16.75 s / 25.07 s, user 1.95 s / 2.11 s. Gate: cargo build --release 0 errors (1 pre-existing `Shell::open` deprecation), cargo 73/73, npm test ok, run-all PASS 49 / FAIL 0 (`TEST_TIMEOUT=400`), MCP 34/34, byte-identity 9/9.
+
+**Gotchas:** a QuickTime file whose udta (or any container in the moov) ends in a 32-bit zero now goes to the WebView decoder instead of the Rust one. Before this it hung the Rust one.
+
+---
+
 ### ITER-083 — 2026-10-18 — video: no crate frame_rate(), child boxes of size 0 refused, stsz totals bounded, data box bodies checked
 
 **Problem:** four more crate trust paths in `video.rs`. (25) With no usable stts, `track_fps` fell back to the crate's `frame_rate()`, whose `duration()` does `mdhd.duration * 1_000_000 / mdhd.timescale` unchecked: timescale 0 panics (repro: tiny.mp4 with mdhd.timescale = 0 and stts entry_count = 0), a huge duration overflows. (26) `box_header` took size 0 (and largesize 0) as "to the end of the parent" for child boxes, but the crate honours size 0 at the top level only; inside a container `skip_box(0)` seeks back to the box start and `read_header` loops forever, holding the open slot lock (repro: a size-0 `free` at the end of the moov). (27) `sample_tables_fit` bounded each stsz entry, not the per-chunk running sum `sample_offset` accumulates in a u32. (28) The ITER-082 ilst `data` check compared the total size to 16, so a largesize data box of total 16 (16-byte header, empty body) passed.

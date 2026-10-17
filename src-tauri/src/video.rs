@@ -254,7 +254,12 @@ fn sps_parse(nal: &[u8]) -> Option<Option<SpsSize>> {
         return None;
     }
     // ue() saturates at u32::MAX, so these products cannot overflow u64.
-    if [cx * cl, cx * cr, cy * ct, cy * cb].iter().any(|&c| c >= 16) {
+    // ITER-084: the two sides together too (each under 16 can still sum
+    // past a 16-px coded width and underflow the subtraction).
+    if [cx * cl, cx * cr, cy * ct, cy * cb].iter().any(|&c| c >= 16)
+        || cx * (cl + cr) >= coded_w
+        || cy * (ct + cb) >= coded_h
+    {
         return Some(None);
     }
     let (w, h) = (coded_w - cx * (cl + cr), coded_h - cy * (ct + cb));
@@ -381,9 +386,11 @@ fn walk_boxes(b: &[u8], depth: u32, in_ilst: bool, in_item: bool) -> Result<(), 
     let mut o = 0usize;
     while o < b.len() {
         let rest = &b[o..];
-        // QuickTime lets a udta list end in a 32-bit zero.
-        if rest.len() < 8 && rest.iter().all(|&x| x == 0) {
-            break;
+        // ITER-084: no short tail, not even QuickTime's udta 32-bit zero —
+        // the crate's container loops read 8 bytes straddling the end, get
+        // size 0, and skip_box(0) spins (the crate cannot parse it anyway).
+        if rest.len() < 8 {
+            return Err(format!("box list ends in {} stray bytes", rest.len()));
         }
         let (typ, hdr, size) = box_header(rest, rest.len() as u64, false)?;
         let body = &rest[hdr as usize..size as usize];
@@ -484,6 +491,30 @@ fn sample_tables_fit(track: &mp4::Mp4Track, file_len: u64) -> Result<(), String>
     }
     if !stsc_fits(stbl.stsc.entries.iter().map(|e| (e.first_chunk, e.samples_per_chunk))) {
         return Err("stsc has a zero or decreasing chunk entry (corrupt or crafted sample tables)".into());
+    }
+    // ITER-084: the crate adds chunk_offset + sample_offset unchecked, so
+    // every chunk (offset + its samples' sizes) must lie inside the file.
+    let offsets: Vec<u64> = match (&stbl.stco, &stbl.co64) {
+        (Some(s), _) => s.entries.iter().map(|&o| o as u64).collect(),
+        (None, Some(c)) => c.entries.clone(),
+        (None, None) => Vec::new(),
+    };
+    let count = stsz.sample_count as u64;
+    let size_of = |i: u64| if stsz.sample_size != 0 { stsz.sample_size as u64 } else { stsz.sample_sizes.get(i as usize).map_or(0, |&s| s as u64) };
+    let mut sample = 0u64;
+    let mut entry = 0usize;
+    for (k, &off) in offsets.iter().enumerate() {
+        let chunk = k as u64 + 1;
+        while entry + 1 < stbl.stsc.entries.len() && stbl.stsc.entries[entry + 1].first_chunk as u64 <= chunk {
+            entry += 1;
+        }
+        let per = stbl.stsc.entries.get(entry).map_or(0, |e| e.samples_per_chunk as u64);
+        let end = (sample + per).min(count);
+        let bytes: u64 = (sample..end).map(size_of).sum();
+        sample = end;
+        if off > file_len || off + bytes > file_len {
+            return Err(format!("chunk {} at offset {} (+{} bytes) is past the end of the file ({})", chunk, off, bytes, file_len));
+        }
     }
     Ok(())
 }
@@ -1872,6 +1903,80 @@ mod tests {
         for name in ["tiny.mp4", "tiny-bframes.mp4"] {
             let r = open_reason(&with_extra(name, true, &ilst_meta(&data16), "data16l"));
             assert!(r.contains("box data is smaller than its fixed fields"), "{}: {}", name, r);
+        }
+    }
+
+    /// A copy of `name` with `bytes[range]` (offsets from the stbl start,
+    /// `None` = its end) replaced by `with`: stbl and every enclosing box
+    /// grow, and for a moov before the mdat the one stco entry moves.
+    fn stbl_spliced(name: &str, range: Option<(usize, usize)>, with: &[u8], tag: &str) -> PathBuf {
+        let mut b = std::fs::read(fixture(name)).unwrap();
+        let be = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+        let pos = |b: &[u8], t: &[u8]| b.windows(4).rposition(|w| w == t).unwrap() - 4;
+        let stbl = pos(&b, b"stbl");
+        let (from, to) = range.map_or_else(|| { let e = stbl + be(&b, stbl) as usize; (e, e) }, |(f, t)| (stbl + f, stbl + t));
+        let delta = with.len() as i64 - (to - from) as i64;
+        if pos(&b, b"moov") < pos(&b, b"mdat") {
+            let stco = pos(&b, b"stco");
+            assert_eq!(be(&b, stco + 12), 1, "{}: one chunk", name);
+            let v = (be(&b, stco + 16) as i64 + delta) as u32;
+            b[stco + 16..stco + 20].copy_from_slice(&v.to_be_bytes());
+        }
+        for t in [b"moov", b"trak", b"mdia", b"minf", b"stbl"] {
+            let o = pos(&b, t);
+            let v = (be(&b, o) as i64 + delta) as u32;
+            b[o..o + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        b.splice(from..to, with.iter().copied());
+        let dir = std::env::temp_dir().join(format!("ggs-video-stbl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("{}-{}", tag, name));
+        std::fs::write(&out, b).unwrap();
+        out
+    }
+
+    /// ITER-084 (29-31): a short zero tail inside a container, a crop whose
+    /// two sides together exceed the coded size, chunk offsets past EOF.
+    #[test]
+    fn zero_tails_wide_crops_and_chunk_offsets_are_refused() {
+        // 29: udta ending in a 32-bit zero, and stbl ending in one — the
+        // crate's container loop spun on both.  Timeout thread as in 26.
+        let udta = mp4_box(b"udta", &[&mp4_box(b"free", &[])[..], &[0, 0, 0, 0]].concat());
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            for (p, tag) in [(with_extra(name, true, &udta, "udta0"), "udta"), (stbl_spliced(name, None, &[0, 0, 0, 0], "stbl0"), "stbl")] {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send((open_reason(&p), probe_mp4(&p)));
+                });
+                let (r, probe) = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("open hung on a zero tail");
+                assert!(r.contains("box list ends in 4 stray bytes"), "{} {}: {}", name, tag, r);
+                assert_eq!(probe.unwrap(), None, "the probe hands it to the WebView");
+            }
+        }
+        // 30: 16 px wide, crop left = right = 7 (14 px each, 28 together).
+        let e = sps_size(&sps_nal_cropped(1, 1, [7, 7, 0, 0])).unwrap_err();
+        assert!(e.contains("crops a macroblock or more"), "{}", e);
+        let e = sps_size(&sps_nal_cropped(1, 1, [0, 0, 4, 4])).unwrap_err();
+        assert!(e.contains("crops a macroblock or more"), "{}", e);
+        assert_eq!(sps_size(&sps_nal_cropped(2, 1, [7, 7, 0, 0])).unwrap().cropped, (4, 16));
+        // 31: stco -> co64 (one entry).  A valid offset still decodes, u64::MAX
+        // is refused, and so is an in-file chunk whose samples overrun the end.
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            let b = std::fs::read(fixture(name)).unwrap();
+            let be = |o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+            let stbl = b.windows(4).rposition(|w| w == b"stbl").unwrap() - 4;
+            let stco = b.windows(4).rposition(|w| w == b"stco").unwrap() - 4;
+            let (from, to) = (stco - stbl, stco - stbl + be(stco) as usize);
+            let moov_first = b.windows(4).rposition(|w| w == b"moov") < b.windows(4).rposition(|w| w == b"mdat");
+            let co64 = |off: u64| mp4_box(b"co64", &[&[0, 0, 0, 0, 0, 0, 0, 1][..], &off.to_be_bytes()].concat());
+            let good = be(stco + 16) as u64 + if moov_first { 4 } else { 0 };
+            assert!(VideoDecoder::open(&stbl_spliced(name, Some((from, to)), &co64(good), "co64-ok")).is_ok(), "{}", name);
+            let p = stbl_spliced(name, Some((from, to)), &co64(u64::MAX), "co64-max");
+            assert!(open_reason(&p).contains("chunk 1 at offset 18446744073709551615"), "{}: {}", name, open_reason(&p));
+            let len = b.len() as u32;
+            let p = patched_many(name, &[(b"stco", 16, len - 10)], "stco-eof");
+            let r = open_reason(&p);
+            assert!(r.contains(&format!("chunk 1 at offset {}", len - 10)) && r.contains("past the end of the file"), "{}: {}", name, r);
         }
     }
 }
