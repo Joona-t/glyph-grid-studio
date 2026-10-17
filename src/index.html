@@ -404,6 +404,20 @@
   /* =================================================================
      SCENES (v1 set preserved).
      ================================================================= */
+  /* Pass 2B — XDoG sigma sweep. Mutates CONFIG.prefilter.sigma so
+     the DoG kernel breathes across the loop. The skill's xdog
+     reads CONFIG.prefilter.sigma per draw; we just have to set it
+     here. Range stays in [0.65, 1.05] per references/xdog.md.
+     Hoisted out of the studio scene so draw() can still run it on
+     frames where the memoized source layer skips the scene. */
+  function studioSigmaSweep(t, config) {
+    if (config.prefilter && config.prefilter.mode === 'xdog') {
+      const loopPhase = (t / config.animation.duration) * Math.PI * 2;
+      const sigmaBase = 0.85, sigmaSwing = 0.20;
+      config.prefilter.sigma = sigmaBase + sigmaSwing * Math.sin(loopPhase);
+    }
+  }
+
   const SCENES = {
     caduceusHelix(g, t, config) {
       const W = g.width, H = g.height;
@@ -581,14 +595,7 @@
       const chipY = H * 0.50;
       const minWH = Math.min(W, H);
 
-      /* Pass 2B — XDoG sigma sweep. Mutates CONFIG.prefilter.sigma so
-         the DoG kernel breathes across the loop. The skill's xdog
-         reads CONFIG.prefilter.sigma per draw; we just have to set it
-         here. Range stays in [0.65, 1.05] per references/xdog.md. */
-      if (config.prefilter && config.prefilter.mode === 'xdog') {
-        const sigmaBase = 0.85, sigmaSwing = 0.20;
-        config.prefilter.sigma = sigmaBase + sigmaSwing * Math.sin(loopPhase);
-      }
+      studioSigmaSweep(t, config);
 
       g.background(bgColor(config));
 
@@ -928,6 +935,11 @@
   let __renderResumeTimer = 0;
   let __renderRaf = 0;
   let __sourceSignalCache = null;
+  let __curCellKey = null;          /* drawGlyphGridV2 -> drawShapeGrid selection cache */
+  let __curCellsFresh = false;
+  let __srcLayerKey = null;         /* memoized studio source layer (see draw) */
+  let __srcLayerProcessed = null;
+  let __srcLayerDepth = null;
   const __sourceCacheStats = { luminanceHits: 0, luminanceMisses: 0, cellHits: 0, cellMisses: 0 };
   let __sourcePreprocessScratch = null;
 
@@ -966,6 +978,7 @@
 
   function clearSourceDerivedCaches() {
     __sourceSignalCache = null;
+    __srcLayerKey = null;
     if (window.SCENES) {
       for (const name in window.SCENES) {
         delete window.SCENES[name].__sourceProcessed;
@@ -1217,6 +1230,7 @@
     /* Recreate canvas-pixel-sized buffers. */
     src = createGraphics(cw, ch);
     src.pixelDensity(1);
+    __srcLayerKey = null;
     lumBuf = new Float32Array(cw * ch);
 
     /* Reset crtState — it captures persistent per-pixel buffers at the
@@ -1398,14 +1412,38 @@
        folder (live rolling averages). */
     __pfStart();
 
-    /* 1. Render the source layer (scene). */
-    sceneResult = SCENES[CONFIG.scene](src, t, CONFIG) || null;
-    depthImg = (sceneResult && sceneResult.depth && sceneResult.depth.width > 0)
-      ? sceneResult.depth : null;
+    /* 1. Render the source layer (scene).  A still studio source paints
+       byte-identical pixels every frame (cached preprocess + bg, cached
+       depth), so when its identity key and cached buffers are unchanged
+       we keep last frame's src + src.pixels and skip both the repaint
+       and the full-canvas getImageData readback.  Only the scene's
+       config side effect (xdog sigma sweep) still has to run. */
+    const studio = SCENES.studio;
+    const layerKey = (CONFIG.scene === 'studio' && sourceImg
+        && window.__sourceFrameIdx === -1)
+      ? (__sourceRevision + '|' + src.width + 'x' + src.height + '|'
+         + bgColor(CONFIG) + '|' + !!(CONFIG.depth && CONFIG.depth.enabled))
+      : null;
+    const reuseLayer = layerKey !== null && layerKey === __srcLayerKey
+      && src.pixels && src.pixels.length > 0
+      && studio.__sourceProcessed && studio.__sourceProcessed === __srcLayerProcessed
+      && studio.__sourceDepth === __srcLayerDepth;
+    if (reuseLayer) {
+      studioSigmaSweep(t, CONFIG);
+    } else {
+      sceneResult = SCENES[CONFIG.scene](src, t, CONFIG) || null;
+      depthImg = (sceneResult && sceneResult.depth && sceneResult.depth.width > 0)
+        ? sceneResult.depth : null;
+    }
     __pf('scene');
 
     const t0 = performance.now();
-    src.loadPixels();
+    if (!reuseLayer) {
+      src.loadPixels();
+      __srcLayerKey = layerKey;
+      __srcLayerProcessed = studio.__sourceProcessed || null;
+      __srcLayerDepth = studio.__sourceDepth;
+    }
     background(bgColor(CONFIG));
     __pf('loadPixels');
 
@@ -1670,6 +1708,54 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(CONFIG.font.family);
+
+    /* Monochrome fast path (dither:none / compat:v1 configs land here).
+       Same signal math and the same fill()+text() calls as the loop
+       below, so output is unchanged, but the ink is parsed once per frame
+       (one p5.Color re-alpha'd per cell; fill() copies it into fillStyle
+       immediately) and the default box-average sampler is inlined so no
+       {r,g,b} object is allocated per cell.  A sprite blit was tried and
+       dropped: atlas glyphs rasterise thinner than text() on the opaque
+       canvas (~23.8 dB vs baseline).  v1 never sets currentCellDepth, so
+       depth fog cannot apply here. */
+    const strategy = CONFIG.samplingStrategy;
+    if (CONFIG.colorMode === 'monochrome' && currentCellDepth < 0
+        && palette.inks && palette.inks[0]
+        && strategy !== 'nearest' && strategy !== 'edge-weighted') {
+      const ink = color(palette.inks[0]);
+      for (let row = 0; row < rows; row++) {
+        const y0 = Math.floor(row * cellH);
+        const cy = y0 + cellH / 2;
+        const yEnd = Math.min(srcH, y0 + cellPxH);
+        for (let col = 0; col < cols; col++) {
+          const x0 = Math.floor(col * cellW);
+          const xEnd = Math.min(srcW, x0 + cellPxW);
+          let sumR = 0, sumG = 0, sumB = 0, count = 0;
+          for (let py = y0; py < yEnd; py++) {
+            const rowOff = py * stride;
+            for (let px = x0; px < xEnd; px++) {
+              const i = rowOff + px * 4;
+              sumR += pixels[i]; sumG += pixels[i + 1]; sumB += pixels[i + 2];
+              count++;
+            }
+          }
+          const dr = sumR / count - bgR;
+          const dg = sumG / count - bgG;
+          const db = sumB / count - bgB;
+          const signal = Math.sqrt(dr * dr + dg * dg + db * db) / MAX_RGB_DIST;
+          if (signal < 0.02) continue;
+          const curved = Math.pow(signal, gamma);
+          const idx = Math.min(rampLast, Math.max(0, Math.floor(curved * rampLast + 0.0001)));
+          const ch = ramp.charAt(idx);
+          if (ch === ' ') continue;
+          ink.setAlpha(255 * Math.min(1, curved * 1.1));
+          fill(ink);
+          text(ch, x0 + cellW / 2, cy);
+        }
+      }
+      return;
+    }
+
     for (let row = 0; row < rows; row++) {
       for (let col = 0; col < cols; col++) {
         const x0 = Math.floor(col * cellW);
@@ -1930,6 +2016,8 @@
       && __sourceSignalCache.cellKey === _cellKey
       && __sourceSignalCache.cells
       && __sourceSignalCache.cells.length === cellSignal.length);
+    __curCellKey = _cellKey;
+    __curCellsFresh = !_hasCachedCells;
 
     /* Optional prefilter (XDoG) — writes over lumBuf in place. */
     if (!_hasCachedCells && GlyphGrid.compat.gatePrefilter(CONFIG) && GlyphGrid.xdog) {
@@ -3036,10 +3124,31 @@
     const stride = srcW * 4;
     const glyphs = glyphAtlas.glyphs;
     const _t_sel0 = performance.now();
-    const indices = GlyphGrid.shapeIndex.selectGrid(
-      glyphAtlas, lumBuf, srcW, srcH, cols, rows, cellPxW, cellPxH,
-      { reach: edgeAware ? Math.floor(Math.min(cellPxW, cellPxH) / 2) : Math.floor(Math.min(cellPxW, cellPxH) / 4) }
-    );
+    /* Selection depends only on lumBuf + grid/cell/reach/atlas, so a still
+       studio source (__curCellKey set) reuses the indices from the frame the
+       cell cache was built on.  That frame also ran the prefilter, which
+       later cache-hit frames skip; storing only then (or when no prefilter
+       is active) keeps every frame on the prefiltered selection. */
+    const reach = edgeAware ? Math.floor(Math.min(cellPxW, cellPxH) / 2) : Math.floor(Math.min(cellPxW, cellPxH) / 4);
+    const selCount = cols * rows;
+    const selKey = __curCellKey
+      && (__curCellKey + '|' + cellPxW + 'x' + cellPxH + '|' + reach);
+    const sc = __sourceSignalCache;
+    let indices;
+    if (selKey && sc && sc.cellKey === __curCellKey && sc.selKey === selKey
+        && sc.selAtlas === glyphAtlas && sc.selIdx && sc.selIdx.length === selCount) {
+      indices = sc.selIdx;
+    } else {
+      indices = GlyphGrid.shapeIndex.selectGrid(
+        glyphAtlas, lumBuf, srcW, srcH, cols, rows, cellPxW, cellPxH, { reach: reach }
+      );
+      if (selKey && sc && sc.cellKey === __curCellKey
+          && (__curCellsFresh || !GlyphGrid.compat.gatePrefilter(CONFIG))) {
+        sc.selKey = selKey;
+        sc.selAtlas = glyphAtlas;
+        sc.selIdx = indices.slice(0, selCount);
+      }
+    }
     if (__pfFrame) __pfFrame.stages._select = performance.now() - _t_sel0;
     const _t_draw0 = performance.now();
 
@@ -3253,6 +3362,33 @@
     drawEdgeDirectionalGrid(cols, rows, cellW, cellH, _flowCps);
   }
 
+  /* Edge-directional sprite atlas — pure edge-directional mode only ever
+     draws the box-drawing directional alphabet (─ ╱ │ ╲), so pre-rasterise
+     those once per (font, size, ink) and blit tiles with globalAlpha
+     instead of one fill()+fillText per edge cell.  `_edgeTile` maps
+     cp -> tile index (-1 = not in the atlas; those cells use text()). */
+  const _edgeTile = new Int16Array(0x10000).fill(-1);
+  let _edgeTileCps = [];
+  let _edgeSprite = null, _edgeSpriteKey = null;
+  function _ensureEdgeSprite(fontFamily, fontSizePx, ink) {
+    const key = 'edge:' + fontFamily + '|' + fontSizePx + '|' + ink;
+    if (_edgeSpriteKey === key && _edgeSprite) return _edgeSprite;
+    for (let k = 0; k < _edgeTileCps.length; k++) _edgeTile[_edgeTileCps[k]] = -1;
+    const cps = [];
+    const alpha = GlyphGrid.edge.DEFAULT_ALPHABET;
+    for (let k = 0; k < alpha.length; k++) {
+      const cp = alpha[k];
+      if (cp === 0x20 || cp > 0xffff || _edgeTile[cp] >= 0) continue;
+      _edgeTile[cp] = cps.length;
+      cps.push(cp);
+    }
+    _edgeTileCps = cps;
+    const items = cps.map(function (cp) { return String.fromCharCode(cp); });
+    _edgeSprite = _buildMultiTintAtlas(items, fontFamily, fontSizePx, function () { return ink; }, 1);
+    _edgeSpriteKey = key;
+    return _edgeSprite;
+  }
+
   /* ---- edge-directional drawer (cheap alt). ---- */
   // HOT-PATH: drawEdgeDirectionalGrid — autonomous optimization loop tracks
   // no per-frame allocations / no new branches in this function body.
@@ -3306,6 +3442,52 @@
 
     const halfCellW = cellW * 0.5;
     const halfCellH = cellH * 0.5;
+
+    const fontFam = fontFamilyForActive();
+    /* Sprite blit only for pure edge-directional monochrome: its output
+       is the 4 box-drawing strokes, which are pixel-aligned and blit within
+       ~32 dB of text().  Flow (ramp glyphs mixed in) and duotone/gradient
+       measured 25-30 dB against baseline (atlas glyphs rasterise thinner
+       on the transparent atlas than text() on the opaque canvas), so those
+       stay on text(). */
+    if (colorMode === 'monochrome' && !depthFogActive && !cpsOverride) {
+      const ink = palette.inks && palette.inks[0] ? palette.inks[0] : '#ffffff';
+      const sprite = _ensureEdgeSprite(fontFam, CONFIG.font.size, ink);
+      const ctx = drawingContext;
+      const tileW = sprite.tileW, tileH = sprite.tileH;
+      const halfTW = sprite.halfW, halfTH = sprite.halfH;
+      const spriteCanvas = sprite.canvas;
+      const prevAlpha = ctx.globalAlpha;
+      for (let r = 0; r < rows; r++) {
+        const cy = ((r * cellH) | 0) + halfCellH;
+        const rowI = r * cols;
+        for (let c = 0; c < cols; c++) {
+          const i = rowI + c;
+          const cp = cps[i];
+          if (cp === 0x20) continue;
+          const cx = ((c * cellW) | 0) + halfCellW;
+          const sig = cellSignal[i];
+          const sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          const tile = _edgeTile[cp];
+          if (tile < 0) {
+            const a = sigQ * 280.5;
+            ctx.globalAlpha = prevAlpha;
+            fill(monoR, monoG, monoB, a > 255 ? 255 : a);
+            text(String.fromCodePoint(cp), cx, cy);
+            continue;
+          }
+          const a = sigQ * 1.1;
+          ctx.globalAlpha = a > 1 ? 1 : a;
+          ctx.drawImage(
+            spriteCanvas, tile * tileW, 0, tileW, tileH,
+            cx - halfTW, cy - halfTH, tileW, tileH
+          );
+        }
+      }
+      ctx.globalAlpha = prevAlpha;
+      currentCellDepth = -1;
+      return;
+    }
 
     if (colorMode === 'monochrome' && !depthFogActive) {
       for (let r = 0; r < rows; r++) {
@@ -3541,6 +3723,15 @@
     /* Phase A — only when any imgData stage is active. */
     if (_hasImgDataStages(post)) {
       const imgData = ctx.getImageData(0, 0, w, h);
+      /* Stateful stages need a host-owned state: applyChain's own lazy
+         init only rebinds its local, so a null crtState meant a fresh
+         8 MB buffer per frame and phosphor/beam that never advanced. */
+      const pd = post.phosphorDecay, cb = post.crtBeam;
+      if (((pd && pd.enabled) || (cb && cb.enabled))
+          && (!crtState || crtState.width !== imgData.width
+              || crtState.height !== imgData.height)) {
+        crtState = GlyphGrid.crt.makeState(imgData.width, imgData.height);
+      }
       GlyphGrid.crt.applyChain(imgData, crtState, post, {
         prefersReducedMotion: reduced,
         frameIdx: frameIdx,

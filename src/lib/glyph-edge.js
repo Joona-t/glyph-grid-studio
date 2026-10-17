@@ -51,8 +51,11 @@
        mag  — gradient magnitude (not normalized)
        dir  — atan2(Gy, Gx) in radians ∈ [-π, π] */
   function sobel(signal, cols, rows) {
-    const mag = new Float32Array(cols * rows);
-    const dir = new Float32Array(cols * rows);
+    return _sobelInto(signal, cols, rows,
+      new Float32Array(cols * rows), new Float32Array(cols * rows));
+  }
+
+  function _sobelInto(signal, cols, rows, mag, dir) {
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < cols; x++) {
         let gx = 0, gy = 0;
@@ -92,11 +95,14 @@
      Cells below threshold emit `fallbackCp` (caller passes 0x20 space or
      a brightness-selected codepoint if coupling the two). */
   function emitDirectional(mag, dir, cols, rows, opts) {
+    return _emitInto(mag, dir, new Uint16Array(cols * rows), opts);
+  }
+
+  function _emitInto(mag, dir, out, opts) {
     opts = opts || {};
     const threshold = opts.threshold == null ? 0.15 : opts.threshold;
     const alphabet = opts.alphabet || DEFAULT_ALPHABET;
     const fallbackCp = opts.fallbackCp == null ? 0x20 : opts.fallbackCp;
-    const out = new Uint16Array(cols * rows);
     for (let i = 0; i < out.length; i++) {
       if (mag[i] < threshold) {
         out[i] = fallbackCp;
@@ -107,10 +113,20 @@
     return out;
   }
 
-  /* Convenience: single call from signal -> directional cp grid. */
+  /* Convenience: single call from signal -> directional cp grid.
+     Runs per frame, so mag/dir/out are persistent grow-only buffers like
+     flowField's; the returned array is valid until the next selectGrid
+     call (copy it to keep it).  sobel/emitDirectional still allocate. */
+  let _sgN = 0, _sgMag = null, _sgDir = null, _sgOut = null;
   function selectGrid(signal, cols, rows, opts) {
-    const g = sobel(signal, cols, rows);
-    return emitDirectional(g.mag, g.dir, cols, rows, opts);
+    const n = cols * rows;
+    if (n > _sgN) {
+      _sgMag = new Float32Array(n); _sgDir = new Float32Array(n); _sgOut = new Uint16Array(n);
+      _sgN = n;
+    }
+    const mag = _sgMag.subarray(0, n), dir = _sgDir.subarray(0, n);
+    _sobelInto(signal, cols, rows, mag, dir);
+    return _emitInto(mag, dir, _sgOut.subarray(0, n), opts);
   }
 
   /* ── Edge-tangent flow field (v0.1.6, SOTA feature 3) ────────────────

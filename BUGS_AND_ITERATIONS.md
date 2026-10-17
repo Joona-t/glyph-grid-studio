@@ -4,6 +4,60 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-042 — 2026-10-17 — Render loop: crtState persistence, still-source layer memo, shape selection cache, v1/edge fast paths
+
+- **Problem:** (a) with `crtState` null (any import/resize while postprocess
+  was off, which applyFastLoadDefaults guarantees), enabling phosphorDecay or
+  crtBeam made `applyChain` allocate an 8.4 MB state per frame and throw it
+  away: phosphor never decayed and the beam never moved. (b) A still studio
+  source was repainted into `src` and read back with a full-canvas
+  `src.loadPixels()` (plus a fresh 2.8 MB ImageData) every preview frame,
+  even though the luminance/cell caches discarded the result. (c) Shape modes
+  re-ran `selectGrid` (~16 ms per ITER-013, not re-measured) every frame on an
+  unchanged lumBuf, and from frame 2 on matched against un-prefiltered
+  luminance because cache-hit frames skip the prefilter. (d) dither:none +
+  brightness + no glyphSet falls into the v1 `drawGlyphGrid`, which parsed
+  the ink hex into a p5.Color and allocated a `{r,g,b}` sample per cell.
+  (e) Edge-directional mode drew every edge cell with fill()+fillText, and
+  `glyph-edge.selectGrid` allocated 3 typed arrays per frame.
+- **Root cause:** applyChain's lazy init only rebinds its local parameter;
+  the scene/readback and the selection never had a cache key, although the
+  downstream stages did; ITER-014/016 never touched the v1 or edge drawers.
+- **Fix:** (a) applyPostprocess allocates `crtState` (size-checked) when
+  either stateful stage is on. (b) draw() keys the studio source layer on
+  `revision|WxH|bg|depth` plus the identities of the scene's cached
+  `__sourceProcessed`/`__sourceDepth`, and on a hit skips the scene and
+  `loadPixels` (src.pixels stays valid for every reader). The xdog sigma
+  sweep is hoisted to `studioSigmaSweep` and still runs every frame. Key
+  is cleared with the source caches and on canvas reallocation.
+  (c) drawShapeGrid caches indices in `__sourceSignalCache` under
+  `cellKey|cellPx|reach` + atlas identity; it stores only on the frame the
+  prefilter ran (or when none is active), so every frame uses the
+  prefiltered selection. (d) The v1 monochrome branch now parses the ink
+  once and inlines the box sampler. It keeps fill()+text(), so the output is
+  byte-identical. (e) Pure edge-directional monochrome blits the 4 box-drawing
+  strokes from a sprite atlas (globalAlpha, fractional destination);
+  `selectGrid` uses persistent grow-only buffers (`sobel` and `emitDirectional`
+  still allocate, as public API).
+- **Tried and dropped (measured, not shipped):** sprite blits for v1
+  dither:none (23.8 dB vs baseline, ~10% darker: glyphs rasterised on the
+  transparent atlas come out thinner than text() on the opaque canvas),
+  flow mono (29.7 dB), flow duotone (24.7 dB) and edge gradient (27.9 dB),
+  even with 64 tint steps. Integer-snapped blit positions cost edge mono
+  ~10 dB (23.0 dB), so fractional destinations are used.
+- **Measured:** stills of worm.jpg, 8 frames, new vs HEAD binary
+  (baseline-vs-baseline is inf for every case): edge-directional mono
+  **32.8 dB**; shape/octant **41.0 dB**, a uniform sub-level drift. With the
+  selection cache disabled it is inf, so the cause is EMA warm-up from more
+  pre-capture draws rather than different glyphs (see ITER-041).
+  dither:none, flow mono/duotone, edge gradient and phosphorDecay are
+  **inf** (identical). worm-move.gif 120 frames, preset pB, vs base2.mp4:
+  PSNR **inf / inf**; real **28.86 / 28.47 s**, user 2.63 s (pB is an
+  animated preserve/brightness source, so none of these paths are on it).
+  Per-frame ms gains in the preview were not profiled (UNCERTAIN).
+- **Gate:** cargo build --release clean; npm test both ok; run-all PASS 24
+  FAIL 0, MCP 10/0.
+
 ### ITER-041 — 2026-10-17 — Capture pipeline: pipelined toBlob + staged batch/CLI frames
 
 - **Problem:** (a) `handleRecordFrame` held queue depth one: `noLoop()` →
