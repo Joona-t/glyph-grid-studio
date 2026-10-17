@@ -4,6 +4,29 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-058 — 2026-10-17 — v0.2 Phase 3: MCP `glyph_grid_batch`, `preset` passthrough, async tools with progress + cancel (F22 Tier A + B)
+
+**Problem:** MCP was one cold app launch per render (~5 s spawn + Tauri start-up each, mcp.rs header) with no way to reach the single-session batch driver (`run_headless_batch`, ITER-024: 6.2 s/job in one session vs ~3 s start-up per spawn) — an agent trying three palettes paid three launches. `glyph_grid_render` could take an inline `config` (ITER-057) but not a preset file the GUI exported. The tool fn was sync around `std::process::Command::output()`: it blocked a tokio worker for the whole render, so pings and `notifications/cancelled` went unserviced and a cancelled render ran to completion; rmcp's progress tokens were unused.
+
+**Root cause:** the MCP surface was written for the two-tool v0.1 contract and never caught up with the batch CLI or rmcp's async/progress API.
+
+**Fix:**
+- Tier A: new `glyph_grid_batch` tool whose arguments ARE a `batch --manifest` object (`{in, frames?, perf?, jobs:[{name, out, format?, in?, frames?, capWidth?, targetMaxBytes?, border?, config?}]}`), written to a temp manifest (deleted on return — `TempPreset` drop guard, now generic over preset/manifest) and run as `<exe> batch --manifest <tmp>`; the batch CLI's own up-front validation (exit 2 before Tauri) applies unchanged. Result is one line per job (path + KB). `glyph_grid_render` gains `preset` (absolute path): alone it is forwarded as `--preset`; with `config` the config deep-merges onto the file's contents (`json_deep_merge`, the ITER-057 rule) into one temp preset, since the CLI takes one `--preset`. Layering: preset < config < named params; the in-process schema probe sees the same resolved preset, so a bad preset file fails in 0.0 s.
+- Tier B: both render tools are `async fn` taking `RequestContext<RoleServer>`; the child runs under `tokio::process` via one `run_child` helper with stdin **and stdout null** (stdout is the JSON-RPC channel — `output()` used to capture it implicitly; an inherited stdout would corrupt the stream) and stderr read line by line. `batch: N/M …` lines (the JS driver's per-job `cli_log`) become `notifications/progress {progress: N, total: M, message}` when the request carried `_meta.progressToken`; `ctx.ct.cancelled()` kills the child (`kill_on_drop` as backstop).
+- tokio features `process` + `io-util` added in `src-tauri/Cargo.toml` (Cargo.lock gains `signal-hook-registry` under tokio) — **left uncommitted** (hook-protected), like ITER-056's jsonschema dependency.
+- Tier C (warm worker) not in scope.
+
+**Measured:**
+- MCP 3-job batch (2/2/3 frames, one with an 8 px border): one call, three outputs, progress notifications exactly `[(1,3),(2,3),(3,3)]` on the client token.
+- `ping` answered in **0.00 s** while a 120-frame render was in flight (previously queued behind the render); `notifications/cancelled` killed the render child within 2 s.
+- Output gate unchanged (render CLI path untouched): worm-move 120 f / `pB.json` → md5 `96fc9327…` == `golden-p3-iter057.mp4` (PSNR inf); vs `golden-p3.mp4` **37.62 dB** (the ITER-057 bloom delta).
+- Timing (perf-sample, two runs, **under parallel load**, load avg ~19–22, `suspect_foreign_xpc: true` — the WebContent/GPU sums include other phases' XPC pids and are not comparable): wall 22.41 / 21.58 s, host 3.33 / 2.56 s.
+
+**Gate:** cargo build 0 errors · cargo test **23/23** (+1: `batch: N/M` progress-line parser rejects the summary/queue/error lines) · npm test ok (32 contracts) · run-all **PASS 32 / FAIL 0** (`TEST_TIMEOUT=400`) · byte-identity **7/7** · MCP **17/17** (C2 → 3 tools, C3d batch schema requires `in`+`jobs`, C10 3-job batch, C10b progress, C11 `preset` + `config` render, C12 bad preset file rejected in 0.0 s).
+
+**Gotchas:** (a) A spawned child must never inherit the MCP server's stdout or stdin — `tokio::process::Command` inherits both by default, unlike `std` `output()`. (b) Progress is per finished *job*; `glyph_grid_render` is one job and sends no progress. (c) Concurrent tool calls are no longer serialized — two parallel renders start two app instances (not load-tested); one batch call is the efficient path. (d) Batch reports the files that exist at each job's `out` even on a partial failure (exit ≠ 0) — read the stderr tail in the reply.
+
+
 ### ITER-057 — 2026-10-17 — v0.2 Phase 3: one config merger — json_deep_merge + GlyphStudio.deepMerge, `--set`, `--frames auto`, MCP `config`, per-job frames/border (F24)
 
 **Problem:** Three mergers resolved the same intent three ways. GUI `applyPreset` was recursive; CLI `setConfig` and batch `applyConfig` were one level deep (`Object.assign(CONFIG[k], v)`); and Rust `build_js_config` `config.insert`-replaced whole blocks on top of the preset. So `--postprocess vignette` replaced `vignette: {enabled, strength: 0.55}` with `{enabled: true}` (reader falls back to 0.5), `--cols` alone dropped the preset's `rows`, `--dither` reset the preset's `asSourcePrefilter`, and a preset with `bloom: {enabled: true}` rendered **without bloom** headless (no `strength` → `_hasImgDataStages` false) but **with** bloom when the same file was imported in the GUI. Beyond the 10 bespoke flags nothing was reachable without hand-writing a preset; `--frames` was fixed at 24 regardless of `animation.duration`; batch `frames` was manifest-level only and `border` was GUI-only; MCP had no config passthrough.

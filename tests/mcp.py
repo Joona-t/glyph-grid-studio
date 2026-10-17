@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP protocol tests for Glyph Grid Studio v0.1 (Phase C)."""
+"""MCP protocol tests for Glyph Grid Studio (Phase C)."""
 
 import json
 import os
@@ -88,15 +88,15 @@ else:
     bad("C1 initialize handshake", str(init))
     sys.exit(1)
 
-# --- Test C2: tools/list returns 2 tools ---
+# --- Test C2: tools/list returns 3 tools (F22/ITER-058 added glyph_grid_batch) ---
 send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
 tools_resp = recv(proc, timeout=5)
 tools = tools_resp.get("result", {}).get("tools", []) if tools_resp else []
 tool_names = sorted(t["name"] for t in tools)
-if tool_names == ["glyph_grid_catalog", "glyph_grid_render"]:
-    ok("C2 tools/list returns exactly 2 tools (%s)" % tool_names)
+if tool_names == ["glyph_grid_batch", "glyph_grid_catalog", "glyph_grid_render"]:
+    ok("C2 tools/list returns exactly 3 tools (%s)" % tool_names)
 else:
-    bad("C2 tools/list returns exactly 2 tools", str(tool_names))
+    bad("C2 tools/list returns exactly 3 tools", str(tool_names))
 
 # --- Test C3: schema validation ---
 render_tool = next((t for t in tools if t["name"] == "glyph_grid_render"), None)
@@ -116,6 +116,12 @@ if render_tool and "inputSchema" in render_tool:
         bad("C3b render tool schema property count", "only %d" % len(props))
 else:
     bad("C3 render tool schema present", "missing")
+
+batch_tool = next((t for t in tools if t["name"] == "glyph_grid_batch"), None)
+if batch_tool and set(batch_tool.get("inputSchema", {}).get("required", [])) == {"in", "jobs"}:
+    ok("C3d batch tool schema requires in + jobs (manifest shape)")
+else:
+    bad("C3d batch tool schema", str(batch_tool and batch_tool.get("inputSchema")))
 
 if catalog_tool and "inputSchema" in catalog_tool:
     if not catalog_tool["inputSchema"].get("required"):
@@ -243,6 +249,80 @@ if "invalid arguments" in t9 and "/dither/mode" in t9 and time.time() - t0 < 5 \
     ok("C9 invalid config rejected before spawning (%.1fs)" % (time.time() - t0))
 else:
     bad("C9 invalid config rejected before spawning", t9[:160])
+
+# --- Test C10 (F22/ITER-058): 3-job batch in one session, progress per job ---
+outs10 = [os.path.join(SCRATCH, "c10_%s.gif" % n) for n in ("a", "b", "c")]
+for o in outs10:
+    if os.path.exists(o):
+        os.remove(o)
+send(proc, {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+    "name": "glyph_grid_batch",
+    "_meta": {"progressToken": "c10"},
+    "arguments": {"in": TEST_IMG, "frames": 2, "jobs": [
+        {"name": "a", "out": outs10[0], "config": {"palette": "spice"}},
+        {"name": "b", "out": outs10[1], "config": {"palette": "phosphor"}},
+        {"name": "c", "out": outs10[2], "frames": 3, "border": {"width": 8}},
+    ]},
+}})
+print("    (waiting up to 300s for the 3-job MCP batch…)")
+progress10, r10, deadline = [], None, time.time() + 300
+while time.time() < deadline:
+    msg = recv(proc, timeout=max(1, deadline - time.time()))
+    if msg is None:
+        break
+    if msg.get("method") == "notifications/progress":
+        progress10.append(msg["params"])
+    elif msg.get("id") == 9:
+        r10 = msg
+        break
+t10 = r10.get("result", {}).get("content", [{}])[0].get("text", "") if r10 else ""
+steps10 = [(q.get("progress"), q.get("total")) for q in progress10 if q.get("progressToken") == "c10"]
+if "Batch complete: 3 jobs" in t10 and all(os.path.exists(o) for o in outs10):
+    ok("C10 batch tool renders 3 jobs in one call (%s KB)"
+       % "/".join(str(os.path.getsize(o) // 1024) for o in outs10))
+else:
+    bad("C10 batch tool renders 3 jobs", t10[:200])
+if steps10 == [(1, 3), (2, 3), (3, 3)]:
+    ok("C10b batch progress notifications 1/3, 2/3, 3/3 on the client token")
+else:
+    bad("C10b batch progress notifications", str(progress10)[:200])
+
+# --- Test C11 (F22/ITER-058): `preset` path (+ `config` merged on top) ---
+preset11 = os.path.join(SCRATCH, "c11_preset.json")
+with open(preset11, "w") as f:
+    json.dump({"palette": "phosphor", "dither": {"mode": "stbn"}}, f)
+out11 = os.path.join(SCRATCH, "c11_preset.gif")
+if os.path.exists(out11):
+    os.remove(out11)
+send(proc, {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TEST_IMG, "out_path": out11, "frames": 2,
+                  "preset": preset11, "config": {"seed": 3}},
+}})
+print("    (waiting up to 90s for preset render…)")
+r11 = recv(proc, timeout=90)
+t11 = r11.get("result", {}).get("content", [{}])[0].get("text", "") if r11 else ""
+if "Rendered" in t11 and os.path.exists(out11):
+    ok("C11 render with a `preset` file + `config` (%d KB)" % (os.path.getsize(out11) // 1024))
+else:
+    bad("C11 render with a `preset` file", t11[:160])
+
+# --- Test C12: a bad `preset` file is validated in-process (it is actually read) ---
+preset12 = os.path.join(SCRATCH, "c12_bad_preset.json")
+with open(preset12, "w") as f:
+    json.dump({"dither": {"mode": "STBN"}}, f)
+t0 = time.time()
+send(proc, {"jsonrpc": "2.0", "id": 11, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TEST_IMG, "out_path": os.path.join(SCRATCH, "c12.gif"),
+                  "preset": preset12},
+}})
+r12 = recv(proc, timeout=10)
+t12 = r12.get("result", {}).get("content", [{}])[0].get("text", "") if r12 else ""
+if "invalid arguments" in t12 and "/dither/mode" in t12 and time.time() - t0 < 5:
+    ok("C12 invalid preset file rejected before spawning (%.1fs)" % (time.time() - t0))
+else:
+    bad("C12 invalid preset file rejected", t12[:160])
 
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")
