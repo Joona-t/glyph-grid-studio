@@ -108,8 +108,9 @@ struct RenderArgs {
 
     /// MP4 rate control: `upload` (default; ~5 Mbps bitrate target, a few MB
     /// per loop) or `archive` (fixed QP 26, near-lossless, ~30-60 Mbps).
-    /// Ignored for GIF output.
-    #[arg(long, value_name = "QUALITY", value_parser = ["upload", "archive"])]
+    /// Ignored for GIF output.  Case-insensitive, same parser as the
+    /// manifest `mp4Quality` and the MCP tool (ITER-070).
+    #[arg(long, value_name = "QUALITY", value_parser = app_lib::parse_mp4_quality_arg)]
     mp4_quality: Option<String>,
 }
 

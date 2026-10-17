@@ -4,6 +4,46 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-070 — 2026-10-17 — Audit fixes: private `--jobs` sub-manifests, bounded GIF stream queue, feeder panic release, out-path dedupe, GUI MP4 quality
+
+**Problem:** A review of ITER-050..055 found seven defects.
+1. **Security:** `run_batch_children` wrote sub-manifests to the predictable `temp_dir()/ggs-batch-<pid>-<i>.json` with `fs::write`. Another local user could pre-plant a symlink there (a TOCTOU / symlink clobber) or swap the manifest before the child read it.
+2. A streaming GIF job without a byte target sent frames over an unbounded channel, and their bytes counted against neither byte cap. If the encoder ran slower than the capture, memory grew without bound.
+3. In `encode_gif_gifski_frames`, the code that sets `stop` and calls `notify_all` ran inline at the end of the feeder. A feeder panic unwound past it and left decode workers parked on the condvar forever.
+4. `duplicate_out_path` compared raw strings, so `a.gif` and `./a.gif` slipped past the guard and raced across `--jobs` children.
+5. `--jobs` children could outlive the parent: a panic or early return skipped both the waits and the temp-file cleanup.
+6. The GUI never sent `mp4Quality`, so after ITER-050 every GUI MP4 was silently encoded in upload mode with no way to pick archive.
+7. `render --mp4-quality` used a clap value list that was case-sensitive. The manifest and MCP accept `Archive`, the CLI did not.
+
+**Root cause:** The ITER-055 fan-out was written for the happy path, and the ITER-053 stream accounting assumed "retains nothing" meant "holds nothing". The ITER-050 frontend and CLI wiring each grew their own copy of the validation.
+
+**Fix:**
+1. `BatchChildren::new` creates `temp_dir()/ggs-batch-<pid>-<16 hex>` with `DirBuilder::mode(0o700)` (plain `create`, which fails on any existing entry, symlinks included). The 16-hex suffix comes from hashing pid, attempt and clock through a per-process `RandomState`, with 8 retries on `AlreadyExists`. `write_private_file` opens each part `create_new(true)` with mode 0o600. No `tempfile` crate is in Cargo.lock and Cargo.toml is off-limits, so this is std only.
+2. `GifStream` gains `queued: Arc<AtomicU64>` and `queue_caps` (the compressed and raw export caps). For a non-retaining stream, `try_stage_export_frame` calls `stream_queue_admit`. It sends when `queued + len <= cap` and reserves the bytes. Otherwise it hands the frame back and `stage_export_frame` sleeps 2 ms outside the captures lock and retries. That is backpressure, not rejection, so a slow encoder throttles the capture instead of failing it. A frame larger than the cap on its own, or a stopped encoder (state not RUNNING or thread finished), errors out instead of waiting forever. A cancel drops the capture, so the retry fails as an unknown capture. The feeder subtracts each frame's bytes once gifski has it, and a failed send gives its reservation back.
+3. The release logic moved into the `ReleaseGifWorkers` Drop guard, built at the top of the feeder. It runs on unwind as well as on the normal path, and the normal path keeps its order: collector, then release, then rx.
+4. `normalize_out_path` applies `std::path::absolute`, then lexical `.`/`..` folding, then canonicalises the parent when that directory exists.
+5. The `BatchChildren` guard owns every child. Reaped children are set to `None` so a reused pid is never signalled. On drop the guard kills and reaps any child still running, then `remove_dir_all`s the private directory. This branch has no ITER-060 signal handler, so only the guard was added. A terminal Ctrl-C already reaches the whole process group.
+6. `glyph-studio.js` adds an `mp4 quality` select to the export panel (`upload` by default, or `archive`). `recordMP4` passes the value to `finish_mp4_export`, `save_mp4_to_path` and `save_mp4_real`.
+7. `--mp4-quality` now uses `value_parser = app_lib::parse_mp4_quality_arg`, a wrapper over `Mp4Quality::parse`. The CLI, the manifest and MCP now accept the same spellings, and a typo is still refused before any render runs.
+
+**Tests:**
+- New cargo tests (26 → 29):
+  - `streamed_gif_queue_is_byte_bounded_and_drains` sets the queue cap to one frame, so every push waits on the feeder. The test asserts the queue never exceeds the cap, the GIF is byte-identical to the staged encode, and the counter drains to 0. It also checks the admission table directly.
+  - `duplicate_out_path_normalises_relative_spellings`.
+  - `batch_children_dir_is_private_and_removed_on_drop` checks the 0700 directory and 0600 file modes, that `create_new` refuses an existing file, and that a live `sleep 30` child is dead and the directory gone after drop.
+- `parse_mp4_quality_arg` cases were added to the existing parse test.
+- New frontend test `mp4QualitySelectReachesFinish`: the select defaults to upload, and the `finish_mp4_export` args carry `upload` and `archive`.
+- run-all **B28** (from the ITER-050 B13 patch, renamed to avoid an id clash) checks that upload is smaller than archive, that both have a 1/fps timescale, and that a typo is refused. Like G8, it stays uncommitted in `tests/run-all.sh` because the hook deny-lists that file.
+
+**Measured:**
+- cargo test 29/29. npm test: both files ok. run-all PASS 27 / FAIL 0, including byte-identity 7/7, G8 batch-jobs 5/5 and B28 (upload 423 KB vs archive 950 KB, timescale 1/33). MCP 10/10.
+- Output gate: worm-move 120 frames, pB preset, `--mp4-quality ARCHIVE` (uppercase on purpose): `psnr-gate.sh` against golden.mp4 gives **inf dB** over 120/120 frames.
+- Timing: real 11.85 s and 12.30 s, user 1.74-1.75 s.
+
+**Gotchas:**
+- The queue wait polls every 2 ms instead of using a condvar. Waits only happen when gifski is behind, and polling keeps the captures lock out of the feeder.
+- `normalize_out_path` is lexical on purpose, because the output usually does not exist yet. A `..` through a symlinked directory can therefore still miss a collision. When it errs the other way, the batch just runs serially.
+
 ### ITER-055 — 2026-10-17 — v0.2 Phase 3: `batch --jobs N` fans a manifest out over child processes (F4)
 
 **Problem:** `batch` renders every job, one after another, in one app + WebContent + GPU triple. F4 predicted ~3× wall at N=4 on a 20-job bench. That prediction assumed the v0.1 numbers: 2.7 s CPU against 18-56 s wall per render, with each webview throttled and mostly idle.

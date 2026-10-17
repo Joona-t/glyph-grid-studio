@@ -726,7 +726,7 @@
     monitorCapture(testHook, frameTotal, onProgress, job);
   }
 
-  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border, job, destinationPath, staged) {
+  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border, job, destinationPath, staged, mp4Quality) {
     if (!testHook) return;
     var inTauri = !!_tauriInvoke;
     var frameTotal = total || 24;
@@ -778,6 +778,8 @@
           path: destinationPath || undefined,
           capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
           border: (border && border.enabled) ? border : null,
+          // ITER-070: the panel's rate-control pick; Rust defaults to upload.
+          mp4Quality: mp4Quality === 'archive' ? 'archive' : 'upload',
         }).then(function (path) {
           if (job && !isActiveExportJob(job)) return;
           if (path) console.log('glyph-studio: saved MP4 to', path);
@@ -1998,6 +2000,14 @@
       label: 'output size',
       options: { 'full (no cap)': 0, '720px (Twitter)': 720, '480px (small)': 480 },
     }), 'Cap output width before encoding. Smaller = smaller file, no quality loss for mobile viewing.');
+    /* ITER-070: MP4 rate control (ITER-050).  `upload` = ~5 Mbps bitrate
+       target (a few MB per loop); `archive` = fixed QP, near-lossless,
+       ~30-60 Mbps.  Same two values as the CLI --mp4-quality flag. */
+    sizeOpts.mp4Quality = 'upload';
+    tip(fExp.addInput(sizeOpts, 'mp4Quality', {
+      label: 'mp4 quality',
+      options: { 'upload (small)': 'upload', 'archive (near-lossless)': 'archive' },
+    }), 'MP4 only. Upload keeps files small for social posts; archive keeps near-lossless detail at a much larger size.');
 
     /* Bordered export — palette-aware matte added to the encoded frame.
        Frames out at (w + 2*borderWidth) × (h + 2*borderWidth), rounded to
@@ -2121,7 +2131,7 @@
             var encFps = Math.round(p.effFps);
             console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2));
             recordMP4(opts.testHook, p.frames, onProgress, onDone, encFps,
-              capW > 0 ? capW : null, border, job, destinationPath, staged);
+              capW > 0 ? capW : null, border, job, destinationPath, staged, sizeOpts.mp4Quality);
           } else {
             var fitNote = (targetMaxBytes > 0)
               ? ' (twitter-fit ' + (targetMaxBytes / 1024 / 1024).toFixed(0) + ' MB target; auto-shrinks if needed)'

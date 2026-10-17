@@ -9,6 +9,7 @@ function loadStudio(invokeImpl) {
   const clicked = [];
   const buttons = new Map();
   const monitors = new Map();
+  const inputs = new Map();
   function element(tag) {
     return {
       tagName: tag,
@@ -45,7 +46,7 @@ function loadStudio(invokeImpl) {
   };
   function Folder() { this.children = []; this.handlers = {}; }
   Folder.prototype.addFolder = function () { const child = new Folder(); this.children.push(child); return child; };
-  Folder.prototype.addInput = function (_obj, key) { const api = new Binding(key); this.children.push(api); return api; };
+  Folder.prototype.addInput = function (_obj, key) { const api = new Binding(key); this.children.push(api); inputs.set(key, _obj); return api; };
   Folder.prototype.addMonitor = function (_obj, key) {
     const api = new Binding(key);
     this.children.push(api);
@@ -120,6 +121,7 @@ function loadStudio(invokeImpl) {
     clicked,
     buttons,
     monitors,
+    inputs,
     window,
     zipConstructs: () => zipConstructs,
   };
@@ -443,6 +445,57 @@ async function stagedFramesPushRawBytesWithBase64Fallback(rawAvailable) {
   }
 }
 
+// ITER-070: the export panel's mp4Quality select (default upload) must
+// reach the staged MP4 finish call; before it the GUI always sent nothing
+// and Rust silently encoded every GUI MP4 in upload mode.
+async function mp4QualitySelectReachesFinish() {
+  for (const pick of [null, 'archive', 'upload']) {
+    const calls = [];
+    const env = loadStudio((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'kv_load_all') return Promise.resolve('{}');
+      if (cmd === 'choose_export_path') return Promise.resolve('/tmp/q.mp4');
+      if (cmd === 'begin_export_capture') return Promise.resolve();
+      if (cmd === 'push_export_frame_raw' || cmd === 'push_export_frame') return Promise.resolve();
+      if (cmd === 'finish_mp4_export') return Promise.resolve('/tmp/q.mp4');
+      return Promise.reject(new Error('unexpected command ' + cmd));
+    });
+    let recState = null;
+    const hook = {
+      beginRecord(options) {
+        recState = { frameIdx: 0, done: false };
+        Promise.resolve().then(() => {
+          recState.done = true;
+          options.onFinish(null, { getFrames: () => [] });
+          recState = null;
+        });
+      },
+      cancelRecord() { recState = null; return true; },
+      getRecState() { return recState; },
+      getConfig() { return { animation: { fps: 25 } }; },
+    };
+    env.window.__glyphGridTest = hook;
+    env.studio.init({
+      config: {
+        studio: { enabled: true }, animation: { fps: 25, duration: 0.08, loop: true },
+        grid: { cols: 80, rows: 40 }, font: { family: 'monospace', size: 8 },
+        ramp: 'gradient', brightnessGamma: 1, samplingStrategy: 'average',
+        colorMode: 'monochrome', palette: 'cream-paper', selectionMode: 'brightness', glyphSet: null,
+      },
+      testHook: hook,
+    });
+    const opts = env.inputs.get('mp4Quality');
+    assert(opts, 'export panel must expose an mp4Quality select');
+    assert.strictEqual(opts.mp4Quality, 'upload', 'mp4Quality defaults to upload');
+    if (pick) opts.mp4Quality = pick;
+    env.buttons.get('Export MP4').fire('click');
+    for (let i = 0; i < 6; i++) await settle();
+    const finish = calls.filter((call) => call.cmd === 'finish_mp4_export');
+    assert.strictEqual(finish.length, 1, 'staged MP4 export must call finish_mp4_export once');
+    assert.strictEqual(finish[0].args.mp4Quality, pick || 'upload');
+  }
+}
+
 function twitterFitCopyDoesNotPromiseSuccess() {
   const source = fs.readFileSync(require.resolve('../src/lib/glyph-studio.js'), 'utf8');
   assert(!/GUARANTEES output|GUARANTEE < 15 MB/.test(source));
@@ -459,6 +512,7 @@ function twitterFitCopyDoesNotPromiseSuccess() {
   await cancelledSaveDialogSettlesVisiblePhase();
   await stagedFramesPushRawBytesWithBase64Fallback(true);
   await stagedFramesPushRawBytesWithBase64Fallback(false);
+  await mp4QualitySelectReachesFinish();
   twitterFitCopyDoesNotPromiseSuccess();
   console.log('glyph-studio export tests: ok');
 })().catch((error) => {

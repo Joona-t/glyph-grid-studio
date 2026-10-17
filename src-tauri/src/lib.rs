@@ -439,13 +439,38 @@ fn batch_fan_out_count(requested: usize, n_jobs: usize, cores: Option<usize>) ->
 
 /// First `out` path two jobs share.  Serially the later job overwrites the
 /// earlier one; across children the two writes would race, so fan-out is
-/// refused for such manifests.
+/// refused for such manifests.  ITER-070: compared after `normalize_out_path`
+/// so `a.gif`, `./a.gif` and `sub/../a.gif` count as the same file.
 fn duplicate_out_path(jobs: &[serde_json::Value]) -> Option<String> {
     let mut seen = std::collections::HashSet::new();
     jobs.iter()
         .filter_map(|j| j.get("out").and_then(|v| v.as_str()))
-        .find(|o| !seen.insert(o.to_string()))
+        .find(|o| !seen.insert(normalize_out_path(o)))
         .map(|o| o.to_string())
+}
+
+/// Absolute, lexically normalised form of an output path: `.` dropped, `..`
+/// pops the previous component.  Lexical on purpose — the file usually does
+/// not exist yet, so `canonicalize` can't be used.  The parent directory is
+/// canonicalised when it exists, so a symlinked directory and its target
+/// also collide.
+fn normalize_out_path(out: &str) -> PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(out).unwrap_or_else(|_| PathBuf::from(out));
+    let mut norm = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                norm.pop();
+            }
+            other => norm.push(other.as_os_str()),
+        }
+    }
+    match (norm.parent().and_then(|p| p.canonicalize().ok()), norm.file_name()) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => norm,
+    }
 }
 
 /// Round-robin split of the manifest into `n` sub-manifests (top-level keys
@@ -507,14 +532,23 @@ fn run_batch_children(
         }
     };
     let parts = split_batch_manifest(manifest, in_path, jobs, n);
+    // ITER-070: sub-manifests live in a private 0700 directory created for
+    // this run (fresh name, mkdir fails rather than following anything that
+    // already exists) and are opened create_new 0600 — never a predictable
+    // path in the shared temp dir.  The guard removes the directory and
+    // kills any child still running on every exit path, panics included.
+    let mut guard = match BatchChildren::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("batch: --jobs: cannot create private sub-manifest dir: {}", e);
+            return 2;
+        }
+    };
     let mut paths = Vec::with_capacity(n);
     for (i, part) in parts.iter().enumerate() {
-        let p = std::env::temp_dir().join(format!("ggs-batch-{}-{}.json", std::process::id(), i));
-        if let Err(e) = fs::write(&p, part.to_string()) {
+        let p = guard.dir.join(format!("part-{}.json", i));
+        if let Err(e) = write_private_file(&p, part.to_string().as_bytes()) {
             eprintln!("batch: --jobs: cannot write sub-manifest {:?}: {}", p, e);
-            for p in &paths {
-                let _ = fs::remove_file(p);
-            }
             return 2;
         }
         paths.push(p);
@@ -522,7 +556,7 @@ fn run_batch_children(
     eprintln!("batch: {} jobs across {} processes", jobs.len(), n);
 
     let mut worst = 0;
-    let mut running = Vec::with_capacity(n);
+    let mut relays = Vec::with_capacity(n);
     for (i, p) in paths.iter().enumerate() {
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("batch").arg("--manifest").arg(p);
@@ -532,6 +566,7 @@ fn run_batch_children(
         match cmd.stderr(std::process::Stdio::piped()).spawn() {
             Ok(mut child) => {
                 let stderr = child.stderr.take().expect("piped stderr");
+                guard.children.push(Some(child));
                 let relay = std::thread::spawn(move || {
                     let mut r = std::io::BufReader::new(stderr);
                     let mut line = Vec::new();
@@ -546,7 +581,7 @@ fn run_batch_children(
                         line.clear();
                     }
                 });
-                running.push((child, relay));
+                relays.push(relay);
             }
             Err(e) => {
                 eprintln!("batch: --jobs: cannot spawn child {}: {}", i + 1, e);
@@ -554,18 +589,89 @@ fn run_batch_children(
             }
         }
     }
-    for (mut child, relay) in running {
-        let code = match child.wait() {
-            Ok(s) => s.code().unwrap_or(1),
-            Err(_) => 1,
+    for k in 0..guard.children.len() {
+        let code = match guard.children[k].as_mut().map(|c| c.wait()) {
+            Some(Ok(s)) => s.code().unwrap_or(1),
+            _ => 1,
         };
-        let _ = relay.join();
+        // Reaped: the guard must not signal a pid that may be reused.
+        guard.children[k] = None;
         worst = worst.max(code);
     }
-    for p in &paths {
-        let _ = fs::remove_file(p);
+    for relay in relays {
+        let _ = relay.join();
     }
     worst
+}
+
+/// ITER-070: owns the `--jobs` children and their private sub-manifest
+/// directory.  Drop kills (and reaps) every child not yet waited for and
+/// removes the directory, so neither outlives the parent's batch call.  (No
+/// signal handler exists on this branch: a terminal Ctrl-C already reaches
+/// the whole foreground process group, children included.)
+struct BatchChildren {
+    dir: PathBuf,
+    children: Vec<Option<std::process::Child>>,
+}
+
+impl BatchChildren {
+    fn new() -> std::io::Result<Self> {
+        use std::hash::{BuildHasher, Hasher};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+        let mut last = None;
+        for attempt in 0..8u32 {
+            // RandomState is seeded from the OS RNG per process; hashing the
+            // pid, attempt and clock through it gives an unguessable suffix.
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u32(std::process::id());
+            h.write_u32(attempt);
+            h.write_u128(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            );
+            let dir = std::env::temp_dir()
+                .join(format!("ggs-batch-{}-{:016x}", std::process::id(), h.finish()));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&dir) {
+                Ok(()) => {
+                    return Ok(BatchChildren {
+                        dir,
+                        children: Vec::new(),
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| std::io::Error::other("no free temp dir name")))
+    }
+}
+
+impl Drop for BatchChildren {
+    fn drop(&mut self) {
+        for child in self.children.iter_mut().flatten() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Write `bytes` to a file that must not exist yet, mode 0600 (ITER-070).
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)?.write_all(bytes)
 }
 
 /// Public entry point invoked by main.rs for `render` subcommand.  Returns
@@ -736,15 +842,22 @@ struct StreamedGif {
     retained: Vec<PngFrame>,
 }
 
-/// A per-job streaming GIF encoder (ITER-053).  Frames go over an UNBOUNDED
-/// channel so the IPC/capture chain never waits on gifski (index.html
-/// pauses the draw loop at 3 in-flight pushes); only the encoder's own
-/// decode step feels gifski's bounded queue.
+/// A per-job streaming GIF encoder (ITER-053).  Frames go over an unbounded
+/// channel so the IPC/capture chain rarely waits on gifski (index.html
+/// pauses the draw loop at 3 in-flight pushes).  ITER-070: for a job that
+/// retains nothing, the bytes sitting in that channel are counted in
+/// `queued` (the feeder subtracts each frame once gifski has it) and
+/// `stage_export_frame` waits while a push would take the queue past the
+/// same byte caps a retaining job is held to — a slow encoder throttles the
+/// capture instead of growing memory without bound.
 struct GifStream {
     config: GifStreamConfig,
     tx: Option<std::sync::mpsc::Sender<PngFrame>>,
     state: Arc<AtomicU8>,
     handle: Option<std::thread::JoinHandle<Result<StreamedGif, String>>>,
+    queued: Arc<AtomicU64>,
+    /// (compressed, raw) queue caps; the export byte caps outside tests.
+    queue_caps: (u64, u64),
 }
 
 impl GifStreamConfig {
@@ -755,7 +868,38 @@ impl GifStreamConfig {
     }
 }
 
+/// What `stage_export_frame` does with a frame for a non-retaining stream
+/// (ITER-070): send it, wait for the encoder to drain, or fail.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamAdmit {
+    Send,
+    Wait,
+}
+
+/// `queued` bytes are in the channel; can `len` more go in under `cap`?
+/// A frame that alone exceeds the cap can never fit, and a stopped encoder
+/// never drains, so both fail instead of waiting forever.
+fn stream_queue_admit(queued: u64, len: u64, cap: u64, running: bool) -> Result<StreamAdmit, String> {
+    match queued.checked_add(len) {
+        Some(total) if total <= cap => Ok(StreamAdmit::Send),
+        _ if queued == 0 => Err(format!(
+            "frame of {} bytes exceeds the streaming queue limit {} bytes",
+            len, cap
+        )),
+        _ if !running => Err(
+            "streaming GIF encoder stopped; finish or cancel the export for the cause".to_string(),
+        ),
+        _ => Ok(StreamAdmit::Wait),
+    }
+}
+
 impl GifStream {
+    /// Encoder thread alive and the job neither cancelled nor committing.
+    fn is_running(&self) -> bool {
+        self.state.load(Ordering::Acquire) == JOB_RUNNING
+            && self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     /// Close the frame channel and wait for the encoder to finish the GIF.
     fn finish(mut self) -> Result<StreamedGif, String> {
         drop(self.tx.take());
@@ -798,6 +942,7 @@ fn run_gif_stream(
     total: usize,
     part_path: PathBuf,
     control: ExportControl,
+    queued: Arc<AtomicU64>,
 ) -> Result<StreamedGif, String> {
     let retain = config.retains_frames();
     let border = config.border.as_ref();
@@ -843,6 +988,11 @@ fn run_gif_stream(
                     }
                     if retain {
                         retained.push(frame);
+                    } else {
+                        // ITER-070: gifski has it; free its queue budget.
+                        let len = frame.bytes.len() as u64;
+                        drop(frame);
+                        queued.fetch_sub(len, Ordering::AcqRel);
                     }
                     idx += 1;
                 };
@@ -1243,15 +1393,19 @@ fn begin_export_capture(
         };
         let (tx, rx) = std::sync::mpsc::channel::<PngFrame>();
         let thread_config = config.clone();
+        let queued = Arc::new(AtomicU64::new(0));
+        let thread_queued = queued.clone();
         let handle = std::thread::Builder::new()
             .name("gif-stream".into())
-            .spawn(move || run_gif_stream(rx, thread_config, total, part_path, control))
+            .spawn(move || run_gif_stream(rx, thread_config, total, part_path, control, thread_queued))
             .map_err(|e| format!("spawn GIF stream encoder: {}", e))?;
         capture.stream = Some(GifStream {
             config,
             tx: Some(tx),
             state,
             handle: Some(handle),
+            queued,
+            queue_caps: (MAX_TOTAL_COMPRESSED_FRAME_BYTES, MAX_TOTAL_RAW_FRAME_BYTES),
         });
     }
     captures.insert(job_id, capture);
@@ -1366,8 +1520,30 @@ fn check_frame_pixels(width: u32, height: u32, index: usize) -> Result<u64, Stri
 
 /// Validate one frame against the job's staged capture (order, declared
 /// total, consistent dimensions, retained-byte budgets) and retain it.  Shared
-/// by the base64 and raw-body push commands.
+/// by the base64 and raw-body push commands.  ITER-070: a non-retaining
+/// stream whose queue is full hands the frame back; wait (outside the
+/// captures lock, so the encoder, other jobs and cancel_export proceed) and
+/// retry.  A cancel drops the capture, so the retry fails as unknown.
 fn stage_export_frame(job_id: &str, index: usize, frame: PngFrame) -> Result<(), String> {
+    let mut frame = frame;
+    loop {
+        match try_stage_export_frame(job_id, index, frame)? {
+            None => return Ok(()),
+            Some(back) => {
+                frame = back;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// One attempt of `stage_export_frame`: `Ok(None)` = staged, `Ok(Some)` =
+/// the stream queue is full, try again later with the returned frame.
+fn try_stage_export_frame(
+    job_id: &str,
+    index: usize,
+    frame: PngFrame,
+) -> Result<Option<PngFrame>, String> {
     let dimensions = frame.dimensions(index)?;
     let mut captures = EXPORT_CAPTURES
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1403,7 +1579,8 @@ fn stage_export_frame(job_id: &str, index: usize, frame: PngFrame) -> Result<(),
     // RGBA (ITER-052) against the raw-byte cap — what is held, not what a
     // decode would produce.  ITER-053: a streaming job without a byte target
     // retains nothing (each frame is dropped once gifski has it), so its
-    // frames count against neither.
+    // frames count against neither running total — ITER-070 bounds what is
+    // still queued for the encoder instead, below.
     let retained = capture
         .stream
         .as_ref()
@@ -1431,22 +1608,44 @@ fn stage_export_frame(job_id: &str, index: usize, frame: PngFrame) -> Result<(),
             ));
         }
     }
+    let mut reserved = 0;
+    if let Some(stream) = capture.stream.as_ref().filter(|_| !retained) {
+        let cap = if frame.rgba.is_some() { stream.queue_caps.1 } else { stream.queue_caps.0 };
+        let frame_len = frame.bytes.len() as u64;
+        // Serialised by the captures lock; the feeder only ever subtracts.
+        let queued = stream.queued.load(Ordering::Acquire);
+        match stream_queue_admit(queued, frame_len, cap, stream.is_running())? {
+            StreamAdmit::Send => {
+                stream.queued.fetch_add(frame_len, Ordering::AcqRel);
+                reserved = frame_len;
+            }
+            StreamAdmit::Wait => return Ok(Some(frame)),
+        }
+    }
     match &capture.stream {
         // The encoder keeps retained frames itself, for the ladder.
-        Some(stream) => stream
-            .tx
-            .as_ref()
-            .ok_or_else(|| "GIF stream is closed".to_string())?
-            .send(frame)
-            .map_err(|_| {
-                "streaming GIF encoder stopped; finish or cancel the export for the cause".to_string()
-            })?,
+        Some(stream) => {
+            let sent = stream
+                .tx
+                .as_ref()
+                .ok_or_else(|| "GIF stream is closed".to_string())
+                .and_then(|tx| {
+                    tx.send(frame).map_err(|_| {
+                        "streaming GIF encoder stopped; finish or cancel the export for the cause"
+                            .to_string()
+                    })
+                });
+            if let Err(error) = sent {
+                stream.queued.fetch_sub(reserved, Ordering::AcqRel);
+                return Err(error);
+            }
+        }
         None => capture.frames.push(frame),
     }
     capture.total_bytes = next_bytes;
     capture.total_raw_bytes = next_raw_bytes;
     capture.received += 1;
-    Ok(())
+    Ok(None)
 }
 
 fn take_export_capture(job_id: &str) -> Result<StagedExport, String> {
@@ -1896,6 +2095,9 @@ fn encode_gif_gifski_frames(
         // its own thread and the writer runs on this one.
         let (stop_ref, fed_ref) = (&stop, &fed);
         let feeder = s.spawn(move || -> Result<(), String> {
+            // ITER-070: release parked workers even if this thread panics —
+            // the guard's Drop runs on unwind, an inline block would not.
+            let release = ReleaseGifWorkers { stop: stop_ref, fed: fed_ref };
             let mut pending: std::collections::BTreeMap<
                 usize,
                 Result<imgref::ImgVec<rgb::RGBA8>, String>,
@@ -1921,14 +2123,7 @@ fn encode_gif_gifski_frames(
                 Ok(())
             })();
             drop(collector); // signals the writer to finalise
-            // Release any worker parked on the window or blocked on send.
-            // Set the flag under the mutex so a worker can't check it, miss
-            // this notify, and park forever (lost wakeup).
-            {
-                let _g = fed_ref.0.lock().unwrap_or_else(|e| e.into_inner());
-                stop_ref.store(true, Ordering::Relaxed);
-            }
-            fed_ref.1.notify_all();
+            drop(release);
             drop(rx);
             result
         });
@@ -1951,6 +2146,25 @@ fn encode_gif_gifski_frames(
 
     control.check_cancelled()?;
     Ok(output)
+}
+
+/// Releases every decode worker parked on the window (or about to park) in
+/// `encode_gif_gifski_frames`.  The flag is set under the mutex so a worker
+/// can't check it, miss this notify, and park forever (lost wakeup).  A
+/// Drop guard (ITER-070) so a feeder panic still runs it.
+struct ReleaseGifWorkers<'a> {
+    stop: &'a AtomicBool,
+    fed: &'a (Mutex<usize>, std::sync::Condvar),
+}
+
+impl Drop for ReleaseGifWorkers<'_> {
+    fn drop(&mut self) {
+        {
+            let _g = self.fed.0.lock().unwrap_or_else(|e| e.into_inner());
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        self.fed.1.notify_all();
+    }
 }
 
 /// Adaptive Twitter-fit wrapper.  ITER-025 surfaced that the GUI's
@@ -2248,6 +2462,16 @@ impl Mp4Quality {
             )),
         }
     }
+}
+
+/// ITER-070: clap value parser for `render --mp4-quality`, so the CLI
+/// accepts exactly the spellings the manifest and MCP accept (any case,
+/// surrounding whitespace) and hands the canonical name on.
+pub fn parse_mp4_quality_arg(value: &str) -> Result<String, String> {
+    Ok(match Mp4Quality::parse(Some(value))? {
+        Mp4Quality::Upload => "upload".to_string(),
+        Mp4Quality::Archive => "archive".to_string(),
+    })
 }
 
 /// Upload-mode target bitrate: 5 Mbps up to 1080p, scaled by pixel count
@@ -3523,6 +3747,104 @@ mod export_guard_tests {
     }
 
     #[test]
+    fn streamed_gif_queue_is_byte_bounded_and_drains() {
+        // ITER-070: a non-retaining stream's queued bytes are capped.  With
+        // the cap at one frame, every push past the first waits for the
+        // feeder; the GIF must still be byte-identical and the counter must
+        // drain to zero.  Admission rules checked directly too.
+        assert_eq!(stream_queue_admit(0, 10, 10, true), Ok(StreamAdmit::Send));
+        assert_eq!(stream_queue_admit(5, 6, 10, true), Ok(StreamAdmit::Wait));
+        assert!(stream_queue_admit(5, 6, 10, false).unwrap_err().contains("stopped"));
+        assert!(stream_queue_admit(0, 11, 10, true).unwrap_err().contains("queue limit"));
+        assert!(stream_queue_admit(u64::MAX, 1, 10, true).is_ok());
+
+        let _guard = STATE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let dir = stream_test_dir("gif-stream-queue");
+        let frames = gif_test_frames();
+        let expected =
+            encode_gif_gifski_adaptive(&frames, 40, None, None, None, &test_control(JOB_RUNNING))
+                .unwrap();
+        let cap = frames.iter().map(|f| f.bytes.len() as u64).max().unwrap();
+        let job_id = "rust-gif-stream-queue";
+        let path = dir.join("queued.gif");
+        let config = GifStreamConfig {
+            path: path.display().to_string(),
+            delay_ms: 40,
+            cap_width: None,
+            border: None,
+            target_max_bytes: None,
+        };
+        begin_export_capture(job_id.to_string(), frames.len(), Some(config.clone())).unwrap();
+        let queued = {
+            let mut captures = EXPORT_CAPTURES.get().unwrap().lock().unwrap();
+            let stream = captures.get_mut(job_id).unwrap().stream.as_mut().unwrap();
+            stream.queue_caps = (cap, cap);
+            stream.queued.clone()
+        };
+        for (index, frame) in frames.into_iter().enumerate() {
+            stage_export_frame(job_id, index, frame).unwrap();
+            assert!(queued.load(Ordering::Acquire) <= cap, "queue over cap at frame {index}");
+        }
+        let stream = take_export_capture(job_id).ok().unwrap().stream.unwrap();
+        let control = ExportControl {
+            state: stream.state.clone(),
+            app: None,
+            job_id: None,
+        };
+        finish_gif_stream(stream, config, &control).unwrap();
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_out_path_normalises_relative_spellings() {
+        // ITER-070: `a.gif` and `./a.gif` (and `x/../a.gif`) are one file.
+        let jobs: Vec<serde_json::Value> = ["a.gif", "./a.gif"]
+            .iter()
+            .map(|o| serde_json::json!({ "out": o }))
+            .collect();
+        assert_eq!(duplicate_out_path(&jobs).as_deref(), Some("./a.gif"));
+        let jobs: Vec<serde_json::Value> = ["out/b.gif", "out/x/../b.gif", "out/c.gif"]
+            .iter()
+            .map(|o| serde_json::json!({ "out": o }))
+            .collect();
+        assert_eq!(duplicate_out_path(&jobs).as_deref(), Some("out/x/../b.gif"));
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("d.gif").display().to_string();
+        let jobs = vec![serde_json::json!({ "out": "d.gif" }), serde_json::json!({ "out": abs })];
+        assert!(duplicate_out_path(&jobs).is_some());
+    }
+
+    #[test]
+    fn batch_children_dir_is_private_and_removed_on_drop() {
+        // ITER-070: fresh 0700 dir, 0600 create_new files, gone after Drop
+        // (with any still-running child killed and reaped).
+        use std::os::unix::fs::PermissionsExt;
+        let mut guard = BatchChildren::new().unwrap();
+        let dir = guard.dir.clone();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        let file = dir.join("part-0.json");
+        write_private_file(&file, b"{}").unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(write_private_file(&file, b"{}").is_err(), "create_new must refuse an existing file");
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        guard.children.push(Some(child));
+        drop(guard);
+        assert!(!dir.exists());
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "child {pid} must be killed by the guard");
+    }
+
+    #[test]
     fn streamed_gif_overshoot_and_cancel_leave_no_part_files() {
         let _guard = STATE_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -3860,6 +4182,10 @@ mod export_guard_tests {
         assert_eq!(Mp4Quality::parse(Some("")).unwrap(), Mp4Quality::Upload);
         assert_eq!(Mp4Quality::parse(Some("Archive")).unwrap(), Mp4Quality::Archive);
         assert!(Mp4Quality::parse(Some("lossless")).is_err());
+        // ITER-070: the CLI flag shares the parser (case-insensitive).
+        assert_eq!(parse_mp4_quality_arg("ARCHIVE").unwrap(), "archive");
+        assert_eq!(parse_mp4_quality_arg(" Upload ").unwrap(), "upload");
+        assert!(parse_mp4_quality_arg("lossless").is_err());
         assert_eq!(mp4_upload_bitrate(1024, 682), 5_000_000);
         assert_eq!(mp4_upload_bitrate(3840, 2160), 20_000_000);
     }
