@@ -123,6 +123,13 @@ struct BatchArgs {
     /// Show the rendering window during the headless batch (debug aid).
     #[arg(long)]
     show_window: bool,
+
+    /// Render the manifest across N child processes (each its own webview),
+    /// jobs split round-robin. Capped at the job count and at CPU cores - 2.
+    /// Default 1 renders every job in one session. One render already keeps
+    /// ~3 cores busy, so past ~cores/4 the children contend (ITER-055).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    jobs: usize,
 }
 
 fn main() {
@@ -176,7 +183,7 @@ fn main() {
             std::process::exit(code);
         }
         Some(Command::Batch(args)) => {
-            let code = app_lib::run_headless_batch(args.manifest, args.show_window);
+            let code = app_lib::run_headless_batch(args.manifest, args.show_window, args.jobs);
             std::process::exit(code);
         }
         Some(Command::Catalog) => {

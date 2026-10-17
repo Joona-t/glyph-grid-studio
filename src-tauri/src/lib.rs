@@ -216,7 +216,9 @@ fn exit_with_status(_app: tauri::AppHandle, state: tauri::State<CliJobState>, ok
 /// side via `CliJobState`.  The JS hook (`tryHeadlessRender`) detects the
 /// `batch: true` discriminator and runs `runBatchExport` with all jobs in
 /// a single Tauri session — no per-variant Tauri restarts.  See ITER-024.
-pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
+/// `jobs > 1` fans the manifest out over that many child processes instead
+/// (ITER-055); 1 is the single-session behaviour above.
+pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool, jobs: usize) -> i32 {
     let raw = match fs::read_to_string(&manifest_path) {
         Ok(s) => s,
         Err(e) => {
@@ -308,6 +310,26 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
             let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("?");
             eprintln!("batch: job {} ({:?}): {}", i, name, e);
             return 2;
+        }
+    }
+
+    // ITER-055 (F4): `--jobs N` forks N CLI children, each its own
+    // app + WebContent + GPU triple, over a round-robin split of the
+    // already-validated manifest.  Wall is bound by each off-screen
+    // webview's throttled rAF, not by CPU, so independent processes scale.
+    let workers = batch_fan_out_count(
+        jobs,
+        jobs_arr.len(),
+        std::thread::available_parallelism().ok().map(|p| p.get()),
+    );
+    if workers > 1 {
+        if let Some(dup) = duplicate_out_path(&jobs_arr) {
+            eprintln!(
+                "batch: --jobs {} ignored: two jobs write {:?}; running serially so the last one wins as before",
+                jobs, dup
+            );
+        } else {
+            return run_batch_children(&manifest, &in_path, &jobs_arr, workers, show_window);
         }
     }
 
@@ -405,6 +427,145 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
     run_tauri(state, !show_window);
     let code = *exit_code.lock().unwrap();
     code
+}
+
+/// ITER-055: how many child processes `batch --jobs N` forks.  Capped by the
+/// job count and by `cores - 2` (BUG-009's headroom: each child also runs
+/// gifski/MP4 workers, and the host stays usable).  1 = run in-process.
+fn batch_fan_out_count(requested: usize, n_jobs: usize, cores: Option<usize>) -> usize {
+    let cap = cores.map(|c| c.saturating_sub(2)).unwrap_or(1).max(1);
+    requested.min(n_jobs).min(cap).max(1)
+}
+
+/// First `out` path two jobs share.  Serially the later job overwrites the
+/// earlier one; across children the two writes would race, so fan-out is
+/// refused for such manifests.
+fn duplicate_out_path(jobs: &[serde_json::Value]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    jobs.iter()
+        .filter_map(|j| j.get("out").and_then(|v| v.as_str()))
+        .find(|o| !seen.insert(o.to_string()))
+        .map(|o| o.to_string())
+}
+
+/// Round-robin split of the manifest into `n` sub-manifests (top-level keys
+/// kept, `in` canonical).  Serially a job without its own `in` renders
+/// whatever source the previous job left loaded (runBatchExport only swaps
+/// when `inPath` is set), so each job is pinned to that effective source
+/// here — a child must not fall back to the manifest `in` where the serial
+/// batch would not.
+fn split_batch_manifest(
+    manifest: &serde_json::Value,
+    in_path: &str,
+    jobs: &[serde_json::Value],
+    n: usize,
+) -> Vec<serde_json::Value> {
+    let mut current_src = in_path.to_string();
+    let mut parts: Vec<Vec<serde_json::Value>> = vec![Vec::new(); n];
+    for (i, j) in jobs.iter().enumerate() {
+        let mut j = j.clone();
+        match j.get("in").and_then(|v| v.as_str()) {
+            Some(s) => current_src = s.to_string(),
+            None => {
+                if let Some(obj) = j.as_object_mut() {
+                    obj.insert("in".into(), serde_json::Value::String(current_src.clone()));
+                }
+            }
+        }
+        parts[i % n].push(j);
+    }
+    parts
+        .into_iter()
+        .map(|p| {
+            let mut m = manifest.clone();
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("in".into(), serde_json::Value::String(in_path.to_string()));
+                obj.insert("jobs".into(), serde_json::Value::Array(p));
+            }
+            m
+        })
+        .collect()
+}
+
+/// ITER-055: run the split manifest as `n` concurrent `batch` children of
+/// this binary.  Each child's stderr is relayed line by line (PERF_JOB lines
+/// verbatim so NDJSON consumers need no change; everything else tagged
+/// `batch[i/n]`).  Exit = the worst child's code (a signal counts as 1).
+fn run_batch_children(
+    manifest: &serde_json::Value,
+    in_path: &str,
+    jobs: &[serde_json::Value],
+    n: usize,
+    show_window: bool,
+) -> i32 {
+    use std::io::BufRead;
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("batch: --jobs: cannot locate own binary: {}", e);
+            return 2;
+        }
+    };
+    let parts = split_batch_manifest(manifest, in_path, jobs, n);
+    let mut paths = Vec::with_capacity(n);
+    for (i, part) in parts.iter().enumerate() {
+        let p = std::env::temp_dir().join(format!("ggs-batch-{}-{}.json", std::process::id(), i));
+        if let Err(e) = fs::write(&p, part.to_string()) {
+            eprintln!("batch: --jobs: cannot write sub-manifest {:?}: {}", p, e);
+            for p in &paths {
+                let _ = fs::remove_file(p);
+            }
+            return 2;
+        }
+        paths.push(p);
+    }
+    eprintln!("batch: {} jobs across {} processes", jobs.len(), n);
+
+    let mut worst = 0;
+    let mut running = Vec::with_capacity(n);
+    for (i, p) in paths.iter().enumerate() {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("batch").arg("--manifest").arg(p);
+        if show_window {
+            cmd.arg("--show-window");
+        }
+        match cmd.stderr(std::process::Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                let stderr = child.stderr.take().expect("piped stderr");
+                let relay = std::thread::spawn(move || {
+                    let mut r = std::io::BufReader::new(stderr);
+                    let mut line = Vec::new();
+                    while matches!(r.read_until(b'\n', &mut line), Ok(k) if k > 0) {
+                        let text = String::from_utf8_lossy(&line);
+                        let text = text.trim_end_matches('\n');
+                        if text.contains("PERF_JOB") {
+                            eprintln!("{}", text);
+                        } else {
+                            eprintln!("batch[{}/{}]: {}", i + 1, n, text);
+                        }
+                        line.clear();
+                    }
+                });
+                running.push((child, relay));
+            }
+            Err(e) => {
+                eprintln!("batch: --jobs: cannot spawn child {}: {}", i + 1, e);
+                worst = 2;
+            }
+        }
+    }
+    for (mut child, relay) in running {
+        let code = match child.wait() {
+            Ok(s) => s.code().unwrap_or(1),
+            Err(_) => 1,
+        };
+        let _ = relay.join();
+        worst = worst.max(code);
+    }
+    for p in &paths {
+        let _ = fs::remove_file(p);
+    }
+    worst
 }
 
 /// Public entry point invoked by main.rs for `render` subcommand.  Returns
@@ -3636,8 +3797,61 @@ mod export_guard_tests {
             .to_string(),
         )
         .unwrap();
-        assert_eq!(run_headless_batch(manifest, false), 2);
+        assert_eq!(run_headless_batch(manifest, false, 1), 2);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ITER-055: `--jobs` clamps to the job count and cores-2, never below 1,
+    /// and the split keeps every job once, round-robin, each pinned to the
+    /// source the serial batch would have rendered it with.
+    #[test]
+    fn batch_fan_out_clamps_and_split_pins_effective_sources() {
+        assert_eq!(batch_fan_out_count(1, 20, Some(8)), 1);
+        assert_eq!(batch_fan_out_count(4, 20, Some(8)), 4);
+        assert_eq!(batch_fan_out_count(16, 20, Some(8)), 6);
+        assert_eq!(batch_fan_out_count(4, 3, Some(8)), 3);
+        assert_eq!(batch_fan_out_count(4, 20, Some(2)), 1);
+        assert_eq!(batch_fan_out_count(0, 20, None), 1);
+
+        let jobs: Vec<serde_json::Value> = vec![
+            serde_json::json!({"name": "a", "out": "a.gif"}),
+            serde_json::json!({"name": "b", "out": "b.gif", "in": "/x.png"}),
+            serde_json::json!({"name": "c", "out": "c.gif"}),
+            serde_json::json!({"name": "d", "out": "d.gif", "in": "/y.png"}),
+            serde_json::json!({"name": "e", "out": "e.gif"}),
+        ];
+        let manifest =
+            serde_json::json!({"in": "rel.png", "frames": 7, "perf": true, "jobs": jobs});
+        let parts = split_batch_manifest(&manifest, "/m.png", &jobs, 2);
+        let names = |p: &serde_json::Value| -> Vec<(String, String)> {
+            p["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|j| {
+                    (
+                        j["name"].as_str().unwrap().into(),
+                        j["in"].as_str().unwrap().into(),
+                    )
+                })
+                .collect()
+        };
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            names(&parts[0]),
+            vec![s("a", "/m.png"), s("c", "/x.png"), s("e", "/y.png")]
+        );
+        assert_eq!(names(&parts[1]), vec![s("b", "/x.png"), s("d", "/y.png")]);
+        for p in &parts {
+            assert_eq!(p["in"], "/m.png");
+            assert_eq!(p["frames"], 7);
+            assert_eq!(p["perf"], true);
+        }
+
+        assert_eq!(duplicate_out_path(&jobs), None);
+        let mut dup = jobs.clone();
+        dup.push(serde_json::json!({"name": "f", "out": "c.gif"}));
+        assert_eq!(duplicate_out_path(&dup).as_deref(), Some("c.gif"));
     }
 
     #[test]

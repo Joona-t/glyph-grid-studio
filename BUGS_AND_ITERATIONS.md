@@ -4,6 +4,36 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-055 — 2026-10-17 — v0.2 Phase 3: `batch --jobs N` fans a manifest out over child processes (F4)
+
+**Problem:** `batch` renders every job, one after another, in one app + WebContent + GPU triple. F4 predicted ~3× wall at N=4 on a 20-job bench. That prediction assumed the v0.1 numbers: 2.7 s CPU against 18-56 s wall per render, with each webview throttled and mostly idle.
+
+**Root cause:** `run_headless_batch` hands the whole manifest to a single `run_tauri`, and `runBatchExport` advances jobs serially. WebKit's XPC processes belong to one app instance, so only separate processes give each job its own webview.
+
+**Fix:**
+- `BatchArgs` gains `--jobs N` (default 1 = today's single session, byte for byte the same code path). `run_headless_batch(manifest, show_window, jobs)` validates the manifest exactly as before. `batch_fan_out_count` then clamps N to min(N, job count, `available_parallelism` − 2), never below 1. When N > 1, `run_batch_children` writes N round-robin sub-manifests to `temp_dir()/ggs-batch-<pid>-<i>.json` (every top-level key is kept and `in` is canonical), spawns `current_exe() batch --manifest <part>` for each (`--show-window` is passed through), relays each child's stderr line by line, waits for all of them, removes the temp files, and exits with the worst child code (a signal counts as 1). PERF_JOB lines pass through verbatim, so NDJSON consumers need no change. Every other line is tagged `batch[i/N]: `.
+- Order dependence found while wiring it: `runBatchExport` only swaps the source when a job has `inPath`, so serially a job WITHOUT `in` renders whatever the previous job loaded, not the manifest `in`. `split_batch_manifest` pins each such job to that effective source, so a child cannot fall back to the manifest `in` where the serial batch would not. Manifests where two jobs share an `out` (serially, last one wins; across children they would race) log a warning and run serially.
+- `tests/perf-sample.sh` tracks the host's child pids as `app` (`pgrep -P`), so app CPU includes the children. `suspect_foreign_xpc` now allows one WebContent/GPU pair per child host. On timeout it also TERMs the children.
+- Tests: `batch_fan_out_clamps_and_split_pins_effective_sources` (clamp table, round-robin order, inherited-source pinning, duplicate-out detection). New run-all **G8** (`tests/batch-jobs-identity.sh`) renders a 5-job manifest serially and with `--jobs 4`: still and animated sources, GIF and MP4, phosphorDecay, and two jobs that inherit the previous job's source. It requires every output file to be md5-identical with the requested frame count. The `tests/run-all.sh` hunk that wires in G8 is **not in this commit**. The pre-commit hook deny-lists that file for agent commits, so the hunk stays in the worktree for a supervised `GLYPHLOOP_BYPASS=1` commit.
+
+**Measured** (Ghost manifest: 20 jobs × 77 frames, GIF, capWidth 720, 15 MB twitter-fit target; outputs redirected to scratch; `tests/perf-sample.sh`; interleaved. The machine was **heavily loaded** by other worktrees' builds and gates, with load average 20-75 on 8 cores, so absolute walls are noisy. Runs flagged `suspect_foreign_xpc` caught another worktree's webviews.):
+
+| run | N | wall s | app CPU s | WebContent s | GPU s | 1-min load at start |
+|---|---|---|---|---|---|---|
+| r1 | 4 | 138.0 | 138.5 | 330.7 | 259.4 | 75.8 |
+| r1 | 1 | 115.1 | 152.9 | 81.7 | 101.1 | 68.5 |
+| r2 | 4 | 147.8 | 141.7 | 292.6 | 333.3 | 28.5 |
+| r2 | 1 | 123.4 | 150.3 | 116.1 (suspect) | 128.8 | 46.3 |
+| r3 | **2** | **91.8** | 162.7 | 132.8 (suspect) | 124.7 | 20.0 |
+| r3 | 1 | 110.2 | 145.1 | 83.2 | 91.5 | 24.1 |
+
+- **N=4 is ~20 % slower than serial** (138/148 vs 115/123 s). **N=2 is ~17 % faster** (91.8 vs 110.2 s). F4's 3× does not hold any more. Since ITER-046..054 removed the sleeps, the PNG round trip and the post-capture gifski pass, a headless render is CPU-bound: the serial batch already keeps ~3 cores busy (≈ 336 CPU-s in 115 s). Four children ask for ~12 cores on an 8-core machine. WebContent+GPU CPU then triples (≈ 183 → 590-625 s) and gifski falls behind the captures: the post-capture encode tails summed 11.9 s over 20 jobs serially and **261 s** at N=4.
+- Output: all 20 GIFs are md5-identical across N=1 (×3), N=4 (×2) and N=2 (×1).
+
+**Gate:** cargo build 0 errors (1 pre-existing `Shell::open` deprecation warning) · cargo test 26/26 (was 25) · npm test ok (28 contracts + export tests) · run-all **PASS 26 / FAIL 0** (with the held G8 hunk applied), MCP 10/10, G1-G7 byte-identity green · psnr-gate (archive, worm-move pB 120 f) **inf** vs golden.mp4.
+
+**Gotchas:** (a) Use `--jobs 2` on 8 cores. The `cores − 2` cap from the brief lets N reach 6, which oversubscribes. A tighter cap (≈ cores/4) or a per-child gifski thread budget is the follow-up if fan-out should scale further. (b) A parent killed by a signal that hits only its pid (not its process group) leaves its children running to completion, and their temp sub-manifests stay behind. `timeout` and Ctrl-C signal the whole group. perf-sample's own timeout now TERMs the children. (c) While other worktrees run their gates, their `pkill -f "glyph-grid-studio batch"` also matches this binary and any shell or perf-sample whose command line contains that string. It killed one bench run here, leaving `.part` files from the 4 children. The benches ran a copy of the binary named `ggsbench`. The children still exec through `current_exe()`, and the copy's path does not contain the pattern either.
+
 ### ITER-053 — 2026-10-17 — v0.2 Phase 2: headless GIF encode streams during capture (F12)
 
 **Problem:** A headless GIF ran capture first and gifski after it. The 120-frame gate job (worm-move, pB, 760×1024) spent ~6.4 s in gifski after the last frame, about a third of wall time, while the cores sat mostly idle during the rAF-throttled capture. The staged raw RGBA set (373 MB) also stayed alive until the encode finished.

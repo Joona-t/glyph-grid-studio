@@ -74,6 +74,15 @@ declare -a KNOWN_XPC=()
 
 discover_xpc() {
   local p cmd role
+  # ITER-055: `batch --jobs N` forks N child hosts; each is one more app pid
+  # (and brings its own WebContent + GPU pair).
+  for p in $(pgrep -P "$APP" 2>/dev/null); do
+    local seen=0
+    for k in "${KNOWN_XPC[@]:-}"; do [[ "$k" == "$p" ]] && seen=1; done
+    [[ $seen -eq 1 ]] && continue
+    KNOWN_XPC+=("$p")
+    TRACK+=("$p app")
+  done
   for p in $(pgrep -f "$XPC_RE" 2>/dev/null); do
     [[ "$before" == *" $p "* ]] && continue
     local seen=0
@@ -122,6 +131,7 @@ while kill -0 "$APP" 2>/dev/null; do
   fi
   if (( TIMEOUT > 0 && SECONDS > TIMEOUT )); then
     echo "perf-sample: timeout after ${TIMEOUT}s — killing pid $APP" >&2
+    pkill -TERM -P "$APP" 2>/dev/null   # ITER-055: --jobs children
     kill -TERM "$APP" 2>/dev/null; sleep 1; kill -KILL "$APP" 2>/dev/null
     EXIT_CODE=124
     break
@@ -175,10 +185,12 @@ for pid, (role, c) in last.items():
 # ITER-049: one webview == one WebContent + one GPU pid. More than one of
 # either means a foreign WebKit app (or a respawn) landed in the diff window
 # and the role sums are inflated — flag it rather than report a clean number.
-suspect = len(pids['webcontent']) > 1 or len(pids['gpu']) > 1
+# ITER-055: a `batch --jobs N` parent hosts no webview; each child host does.
+hosts = max(1, len(pids['app']) - (1 if len(pids['app']) > 1 else 0))
+suspect = len(pids['webcontent']) > hosts or len(pids['gpu']) > hosts
 if suspect:
     print(f"perf-sample: WARNING — {len(pids['webcontent'])} WebContent / {len(pids['gpu'])} GPU pids tracked "
-          f"for one webview; webcontent_cpu_s/gpu_cpu_s may include a foreign process "
+          f"for {hosts} webview(s); webcontent_cpu_s/gpu_cpu_s may include a foreign process "
           f"(see the xpc lines in {out})", file=sys.stderr)
 
 summary = {
