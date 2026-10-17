@@ -75,6 +75,7 @@
 
   <!-- glyph-grid skill libs (v2). All IIFEs that attach to window.GlyphGrid. -->
   <script src="lib/glyph-compat.js"></script>
+  <script src="lib/glyph-text-export.js"></script>
   <script src="lib/glyph-fonts.js"></script>
   <script src="lib/glyph-record.js"></script>
   <script src="lib/glyph-dither.js"></script>
@@ -4399,8 +4400,14 @@
        (getImageData on the raw path), cap_toBlob_async = PNG callback. */
     const _pfCapFrame = __pfFrame;
     const _tCap0 = performance.now();
+    /* ITER-074: text-family exports take a copy of the GlyphFrame IR here,
+       synchronously, for the same reason getImageData runs here — the next
+       draw overwrites it.  irOnly skips the pixel readback entirely. */
+    const irSnap = state.captureIr ? GlyphGrid.textExport.snapFromIr(glyphFrame) : null;
     let blobReady;
-    if (state.rawFrames) {
+    if (state.irOnly) {
+      blobReady = Promise.resolve(null);
+    } else if (state.rawFrames) {
       try {
         const cv = drawingContext.canvas;
         blobReady = Promise.resolve(drawingContext.getImageData(0, 0, cv.width, cv.height));
@@ -4440,7 +4447,8 @@
         if (state.onFrame && state.rawFrames) {
           return state.onFrame({
             jobId: state.jobId, index: idx, name, blob: null, b64: null,
-            rgba: blob.data, width: blob.width, height: blob.height,
+            rgba: blob ? blob.data : null, width: blob ? blob.width : 0,
+            height: blob ? blob.height : 0, ir: irSnap,
             total: state.total,
           });
         }
@@ -4591,6 +4599,34 @@
   }
   let __lastPrime = null;
 
+  /* ITER-074: the bundled Cascadia subset (ASCII, blocks, braille,
+     sextants, octants) as base64, for the HTML export's inline @font-face.
+     Fetched once from the app bundle; null when unreachable (file:// preview)
+     — the HTML then falls back to the viewer's monospace. */
+  let __inlineFontPromise = null;
+  function loadInlineFontBase64() {
+    if (!__inlineFontPromise) {
+      __inlineFontPromise = fetch('fonts/cascadia-mono-subset.woff2')
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+        .then(function (buf) { return bytesToBase64(new Uint8Array(buf)); })
+        .catch(function (e) { console.warn('inline font unavailable:', e); return null; });
+    }
+    return __inlineFontPromise;
+  }
+
+  /* ITER-074: output format from an output path's extension (Rust passes an
+     explicit format; this covers direct runBatchExport callers). */
+  function formatFromPath(path) {
+    const m = /\.([a-z0-9]+)$/i.exec(path || '');
+    const ext = m ? m[1].toLowerCase() : '';
+    if (ext === 'mp4') return 'mp4';
+    if (ext === 'txt') return 'txt';
+    if (ext === 'ans' || ext === 'ansi') return 'ansi';
+    if (ext === 'cast') return 'cast';
+    if (ext === 'html' || ext === 'htm') return 'html';
+    return 'gif';
+  }
+
   /* =================================================================
      Test hooks. getConfig now returns a deep clone (EC-4).
      ================================================================= */
@@ -4616,6 +4652,8 @@
       /* ITER-052: raw RGBA frames only for a pure streaming consumer — the
          ZIP and retained-base64 paths still need PNG files. */
       const rawFrames = opts.rawFrames === true && !!onFrame && !collectZip && !collectFrames;
+      /* ITER-074: IR snapshots per frame (frame.ir); irOnly = no pixels. */
+      const captureIr = opts.captureIr === true && rawFrames;
       /* A pending settings redraw must never fire between noLoop() and the
          asynchronous toBlob callback. Capture becomes the sole loop owner. */
       cancelScheduledConfigRender();
@@ -4630,6 +4668,8 @@
         cancelled: false,
         onFrame,
         rawFrames,
+        captureIr,
+        irOnly: captureIr && opts.irOnly === true,
         onProgress: opts.onProgress,
         onError: opts.onError,
         onFinish: opts.onFinish || onFinishOverride,
@@ -4730,6 +4770,15 @@
     /* ITER-073: the live GlyphFrame IR (read-only by convention — Phase 5
        exporters copy what they need) and the active FrameSource. */
     getGlyphFrame: () => glyphFrame,
+    /* ITER-074: a self-contained copy of the last painted IR in the
+       GlyphGrid.textExport snapshot shape, or null (same guard as
+       captureGridSnapshot). */
+    captureTextSnapshot() {
+      const f = glyphFrame;
+      if (!sourceImg || !f.seq || f.cols !== CONFIG.grid.cols || f.rows !== CONFIG.grid.rows) return null;
+      return GlyphGrid.textExport.snapFromIr(f);
+    },
+    getInlineFontBase64: () => loadInlineFontBase64(),
     getFrameSource: () => (__frameSource
       ? { kind: __frameSource.kind, durationMs: __frameSource.durationMs,
           index: __frameSource.index, revision: __frameSource.revision }
@@ -4920,6 +4969,78 @@
            exceed the same envelope enforced by beginRecord/Rust.  This is
            especially important in headless mode: an uncaught timer error
            otherwise leaves exit_with_status waiting forever. */
+        /* ITER-074: txt | ansi | cast | html — the grid as text, built from
+           per-frame GlyphFrame IR copies; no pixels, no encoder staging. */
+        const textFmt = String(job.format || formatFromPath(job.path)).toLowerCase();
+        if (GlyphGrid.textExport.FORMATS.indexOf(textFmt) >= 0) {
+          runTextJob(textFmt);
+          return;
+        }
+
+        function runTextJob(tfmt) {
+          const TEXT = GlyphGrid.textExport;
+          /* txt / ansi are one still (frame 0); cast / html animate. */
+          const want = TEXT.STILL_FORMATS.indexOf(tfmt) >= 0 ? 1 : requestedFrames;
+          const budget = self.validateRecord(want, width, height);
+          if (!budget.ok) {
+            const preflightError = new Error(budget.message);
+            preflightError.code = budget.code;
+            advanceCaptureFailure(preflightError, budget, 'capture-preflight');
+            return;
+          }
+          /* CR-8: octant/sextant sets under ansi/cast warn on stderr. */
+          GlyphGrid.compat.validate(CONFIG, { format: tfmt }).forEach(function (is) {
+            if (is.code !== 'CR-8') return;
+            console.warn('compat:', is.code, is.message);
+            Promise.resolve(tauri('cli_log', {
+              msg: 'compat: ' + is.level + ' ' + is.code + ' (' + job.name + '): ' + is.message,
+            })).catch(()=>{});
+          });
+          const snaps = [];
+          function textFailed(e) {
+            console.warn('batch: save failed', job.name, e);
+            tauri('cli_log', { msg: 'batch: save failed ' + job.name + ' fmt=' + tfmt + ' err=' + String(e) }).catch(()=>{});
+            errors.push({ name: job.name, err: String(e) });
+            CONFIG.animation.fps = savedFps;
+            idx++;
+            setTimeout(next, 50);
+          }
+          __assetsReady().then(function () {
+            try {
+              self.beginRecord({
+                total: budget.total,
+                jobId: 'text-' + Date.now() + '-' + idx,
+                collectFrames: false,
+                collectZip: false,
+                rawFrames: true,
+                captureIr: true,
+                irOnly: true,
+                onFrame(frame) { snaps[frame.index] = frame.ir; },
+                onError(error) { advanceCaptureFailure(error, error && error.capture, 'capture'); },
+                onFinish() {
+                  (tfmt === 'html' ? loadInlineFontBase64() : Promise.resolve(null)).then(function (fontBase64) {
+                    if (!snaps.length || snaps.some(function (f) { return !f || !f.cols; })) {
+                      throw new Error('no grid frame was painted');
+                    }
+                    const body = TEXT.build(tfmt, snaps, { fps: effFps, fontBase64: fontBase64, title: job.name });
+                    return tauri('save_text_export', {
+                      path: job.path, bytesB64: bytesToBase64(new TextEncoder().encode(body)),
+                    });
+                  }).then(function (p) {
+                    console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p, 'format:' + tfmt);
+                    tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p + ' format:' + tfmt }).catch(()=>{});
+                    CONFIG.animation.fps = savedFps;
+                    idx++;
+                    setTimeout(next, 50);
+                  }).catch(textFailed);
+                },
+              });
+            } catch (error) {
+              advanceCaptureFailure(error, error && error.capture, 'capture-start');
+            }
+          });
+        }
+
         const captureBudget = self.validateRecord(requestedFrames, width, height);
         if (!captureBudget.ok) {
           const preflightError = new Error(captureBudget.message);

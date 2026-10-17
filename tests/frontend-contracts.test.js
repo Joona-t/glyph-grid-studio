@@ -68,6 +68,11 @@ const contracts = [
   /* ITER-053 (F12): headless GIF streams into gifski during capture; finish repeats the same settings */
   ['headless GIF passes its encode settings to begin_export_capture', /tauri\('begin_export_capture', \{ jobId: jobId, total: frameTotal, gifStream: gifStream, label: job\.name \}\)/],
   ['finish_gif_export args are the streamed settings', /:\s*Object\.assign\(\{ jobId: jobId \}, gifStream\);/],
+  /* ITER-074: text exports copy the GlyphFrame IR synchronously at capture
+     time (the next draw overwrites it) and skip the pixel readback. */
+  ['text exports snapshot the IR at capture time', /state\.captureIr \? GlyphGrid\.textExport\.snapFromIr\(glyphFrame\)/],
+  ['irOnly capture skips the pixel readback', /if \(state\.irOnly\) \{\s*blobReady = Promise\.resolve\(null\);/],
+  ['text-export module is loaded before the app script', /<script src="lib\/glyph-text-export\.js"><\/script>/],
 ];
 
 for (const [name, pattern] of contracts) {
@@ -624,3 +629,6 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   assert.strictEqual(ctx.make(one, 3).kind, 'still', 'single-frame GIF is a still');
   console.log('FrameSource adapter: ok');
 }
+
+/* ITER-074: the terminal-export unit tests ride along with `npm test`. */
+require('./glyph-text-export.test.js');

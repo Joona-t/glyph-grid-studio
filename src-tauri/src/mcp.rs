@@ -39,7 +39,7 @@ use tokio::process::Command;
 pub struct RenderParams {
     /// Absolute path to the source image (PNG / JPG / WebP / GIF / BMP / TIFF).
     pub in_path: String,
-    /// Absolute path to write the output GIF.
+    /// Absolute path to write the output file (GIF / MP4 / text, per `format`).
     pub out_path: String,
     /// Frames in the output animation. Default 24.
     #[serde(default)]
@@ -74,8 +74,11 @@ pub struct RenderParams {
     /// Grid rows.
     #[serde(default)]
     pub rows: Option<u32>,
-    /// Output format: `gif` (default) or `mp4`.  When omitted, inferred
-    /// from `out_path`'s extension.
+    /// Output format: `gif` (default), `mp4`, or the grid as text: `txt`,
+    /// `ansi` (24-bit colour escapes), `cast` (asciinema v2), `html`
+    /// (single file, font inlined).  txt/ansi are one still frame and their
+    /// body is also returned inline (up to 64 KB) so a text-only model can
+    /// read the result.  When omitted, inferred from `out_path`'s extension.
     #[serde(default)]
     pub format: Option<String>,
     /// Any partial CONFIG object (see src/glyph-grid.schema.json — the same
@@ -394,6 +397,23 @@ fn child_error(
     }))
 }
 
+/// Inline bodies stop here: a 240x120 TXT is ~29 KB, ANSI larger.
+const INLINE_TEXT_MAX: u64 = 64 * 1024;
+
+/// The output file's text for `txt` / `ansi` renders up to
+/// `INLINE_TEXT_MAX` bytes, else None (binary formats, cast/html, or too
+/// big — the path is still returned).
+fn inline_text_body(format: &str, out_path: &str) -> Option<String> {
+    if format != "txt" && format != "ansi" {
+        return None;
+    }
+    let meta = std::fs::metadata(out_path).ok()?;
+    if meta.len() > INLINE_TEXT_MAX {
+        return None;
+    }
+    std::fs::read_to_string(out_path).ok()
+}
+
 /* ---------- Server handler ---------- */
 
 #[derive(Debug, Clone)]
@@ -403,7 +423,8 @@ pub struct GlyphGridServer;
 impl GlyphGridServer {
     #[tool(
         description = "Render an image to an animated character-grid GIF (ASCII / Unicode glyphs). \
-                       Returns the absolute path of the written file (GIF or MP4, per `format`) on success."
+                       Returns the absolute path of the written file (GIF, MP4, or TXT/ANSI/CAST/HTML text, per \
+                       `format`) on success; for txt/ansi the text itself (up to 64 KB) follows the path."
     )]
     async fn glyph_grid_render(
         &self,
@@ -503,6 +524,10 @@ impl GlyphGridServer {
         if let Some(Err(e)) = p.mp4_quality.as_deref().map(crate::parse_mp4_quality_arg) {
             return tool_error("invalid_arguments", Some("/mp4_quality".into()), e);
         }
+        // ITER-074: same parser as `render --format`.
+        if let Some(Err(e)) = p.format.as_deref().map(crate::parse_format_arg) {
+            return tool_error("invalid_arguments", Some("/format".into()), e);
+        }
         if let Err(e) = probe.build_js_config() {
             return tool_error(
                 "invalid_arguments",
@@ -576,11 +601,19 @@ impl GlyphGridServer {
             Ok(ChildEnd::Exited(status, _)) if status.success() => {
                 // Verify the output file exists and report size.
                 match std::fs::metadata(&p.out_path) {
-                    Ok(meta) => CallToolResult::success(vec![Content::text(format!(
-                        "Rendered {} ({} KB)",
-                        p.out_path,
-                        meta.len() / 1024
-                    ))]),
+                    Ok(meta) => {
+                        let mut content = vec![Content::text(format!(
+                            "Rendered {} ({} KB)",
+                            p.out_path,
+                            meta.len() / 1024
+                        ))];
+                        // ITER-074 (R2): txt/ansi come back as text too, so
+                        // a model without vision can judge the render.
+                        if let Some(body) = inline_text_body(&probe.resolved_format(), &p.out_path) {
+                            content.push(Content::text(body));
+                        }
+                        CallToolResult::success(content)
+                    }
                     // F25: exit 0 without the file is a failure, not a success.
                     Err(_) => tool_error(
                         "no_output",

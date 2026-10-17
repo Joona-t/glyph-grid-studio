@@ -2001,6 +2001,99 @@
     var btnTxt = fExp.addButton({ title: 'Export TXT (plain text)' });
     tip(btnTxt, 'The grid as actual text — paste into a terminal, README, or anywhere monospace lives. Works in every selection mode.');
     btnTxt.on('click', function () { exportGridAs('txt'); });
+    /* ── Terminal-native export (ITER-074, research R2) ──────────────
+       ANSI = the live frame as 24-bit colour escapes (`cat` it).  .cast and
+       HTML record the export plan's frames (Animation › duration x fps) as
+       GlyphFrame IR copies — no pixels — and build an asciinema v2 file or a
+       single-file HTML player (bundled font inlined, reduced-motion aware).
+       Same writers as the CLI `--format ansi|cast|html`. */
+    function saveTextExport(kind, body, base) {
+      var ext = kind === 'ansi' ? 'ans' : kind;
+      var name = base + '.' + ext;
+      if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+        var b64 = bytesToBase64(new TextEncoder().encode(body));
+        return window.__TAURI__.core.invoke('save_blob', {
+          bytesB64: b64, suggestedName: name, extension: ext,
+        }).then(function (path) {
+          if (path) exportFeedback('Saved ' + kind.toUpperCase() + ' → ' + path);
+        }).catch(function (e) {
+          if (e !== 'cancelled') exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
+        });
+      }
+      saveBlobBrowser(new Blob([body], { type: kind === 'html' ? 'text/html' : 'text/plain' }), name);
+      return Promise.resolve();
+    }
+    function textCompatNote(kind) {
+      var issues = (window.GlyphGrid && GlyphGrid.compat)
+        ? GlyphGrid.compat.validate(config, { format: kind }) : [];
+      for (var i = 0; i < issues.length; i++) {
+        if (issues[i].code === 'CR-8') return ' — ' + issues[i].message;
+      }
+      return '';
+    }
+    function exportTextFormat(kind) {
+      var hook = opts.testHook;
+      var TEXT = window.GlyphGrid && GlyphGrid.textExport;
+      if (!hook || !TEXT || !hook.captureTextSnapshot) {
+        exportFeedback('Text export is unavailable; reload the application and try again.', true);
+        return;
+      }
+      if (!hasSource()) { exportFeedback('Load an image before exporting.', true); return; }
+      var base = 'glyph-grid_' + config.palette + '_' + config.grid.cols + 'x' + config.grid.rows;
+      var note = textCompatNote(kind);
+      if (kind === 'ansi') {
+        var snap = hook.captureTextSnapshot();
+        if (!snap) { exportFeedback('ANSI export needs a rendered frame.', true); return; }
+        saveTextExport(kind, TEXT.build('ansi', [snap]), base).then(function () {
+          if (note) exportFeedback('Saved ANSI' + note, true);
+        });
+        return;
+      }
+      if (hook.getRecState && hook.getRecState()) {
+        exportFeedback('Another export is running. Cancel it before starting a new one.', true);
+        return;
+      }
+      var p = exportPlan();
+      if (p.frames > 600) {
+        exportFeedback('Export plan is too large (' + p.frames + ' frames). Shorten the duration or lower FPS.', true);
+        return;
+      }
+      var snaps = [];
+      var savedFps = config.animation.fps;
+      config.animation.fps = p.effFps;    // same clean-loop rule as GIF export
+      function restore() { config.animation.fps = savedFps; try { pane.refresh(); } catch (e) {} }
+      try {
+        hook.beginRecord({
+          total: p.frames,
+          collectFrames: false, collectZip: false,
+          rawFrames: true, captureIr: true, irOnly: true,
+          onFrame: function (frame) { snaps[frame.index] = frame.ir; },
+          onError: function (error) { restore(); exportFeedback(kind.toUpperCase() + ' capture failed: ' + error, true); },
+          onFinish: function () {
+            restore();
+            (kind === 'html' && hook.getInlineFontBase64 ? hook.getInlineFontBase64() : Promise.resolve(null))
+              .then(function (fontBase64) {
+                var body = TEXT.build(kind, snaps, { fps: p.effFps, fontBase64: fontBase64, title: base });
+                return saveTextExport(kind, body, base);
+              }).then(function () {
+                if (note) exportFeedback('Saved ' + kind.toUpperCase() + note, true);
+              }).catch(function (e) { exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true); });
+          },
+        });
+      } catch (e) {
+        restore();
+        exportFeedback('Could not start ' + kind.toUpperCase() + ' export: ' + e, true);
+      }
+    }
+    var btnAnsi = fExp.addButton({ title: 'Export ANSI (terminal)' });
+    tip(btnAnsi, 'The current frame as 24-bit colour terminal text — `cat` it in any truecolor terminal. Octant/sextant sets need a terminal font that has them.');
+    btnAnsi.on('click', function () { exportTextFormat('ansi'); });
+    var btnCast = fExp.addButton({ title: 'Export .cast (asciinema)' });
+    tip(btnCast, 'The animation as an asciinema v2 recording — plays in any terminal (`asciinema play`) or on asciinema.org. Uses the export duration and fps.');
+    btnCast.on('click', function () { exportTextFormat('cast'); });
+    var btnHtml = fExp.addButton({ title: 'Export HTML (single file)' });
+    tip(btnHtml, 'A self-contained web page: every cell is a real character, the font is inlined, Play/Step controls; no autoplay under reduced motion.');
+    btnHtml.on('click', function () { exportTextFormat('html'); });
     /* Compute the frame count + per-frame delay we'll actually pass to
        the GIF encoder.  The GIF format stores delays in centiseconds
        (10 ms units), so e.g. 30 fps wants 33.33 ms but the encoder

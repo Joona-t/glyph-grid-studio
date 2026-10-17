@@ -121,9 +121,12 @@ struct RenderArgs {
     #[arg(long)]
     show_window: bool,
 
-    /// Output format: `gif` (default) or `mp4`.  When omitted, the format
-    /// is inferred from the output path extension (`.mp4` → mp4).
-    #[arg(long, value_name = "FORMAT")]
+    /// Output format: `gif` (default), `mp4`, or the grid as text — `txt`,
+    /// `ansi` (24-bit colour, `cat` it), `cast` (asciinema v2) or `html`
+    /// (single file, font inlined).  txt/ansi are one still frame; cast/html
+    /// animate `--frames`.  When omitted, inferred from the output path
+    /// extension (.mp4 .txt .ans/.ansi .cast .html; anything else → gif).
+    #[arg(long, value_name = "FORMAT", value_parser = app_lib::parse_format_arg)]
     format: Option<String>,
 
     /// Resolve preset + flags, validate, print the job JSON (merged config)
@@ -169,7 +172,7 @@ fn parse_frames(s: &str) -> Result<FramesArg, String> {
 struct BatchArgs {
     /// Path to a JSON manifest (schema: src/glyph-grid.manifest.schema.json;
     /// unknown keys are errors, optional `"version": 1`). Shape:
-    /// `{"in":"<source>","frames":<N|"auto">,"jobs":[{"name":"...","out":"...","format":"gif|mp4",
+    /// `{"in":"<source>","frames":<N|"auto">,"jobs":[{"name":"...","out":"...","format":"gif|mp4|txt|ansi|cast|html",
     /// "frames":<N|"auto">,"border":{"width":32,"bgColor":"auto"},"mp4Quality":"upload|archive","config":{...}}, ...]}`
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,

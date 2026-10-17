@@ -88,7 +88,7 @@ glyph-grid-studio catalog | jq
 # Batch: render N variants of one or more sources in a SINGLE app session
 # (~10x faster than per-variant render calls — startup + decode paid once).
 # Manifest shape: {"version": 1, "in": "<default source>", "frames": N|"auto", "perf": false,
-#   "jobs": [{"name", "out", "format": "gif|mp4", "in": "<per-job source>", "frames": N|"auto",
+#   "jobs": [{"name", "out", "format": "gif|mp4|txt|ansi|cast|html", "in": "<per-job source>", "frames": N|"auto",
 #             "capWidth": 720, "targetMaxBytes": 15728640, "border": {"width": 16},
 #             "mp4Quality": "upload|archive", "config": {...}}]}
 # capWidth 720 auto-targets Twitter's 15 MB cap (adaptive shrink ladder).
@@ -118,6 +118,22 @@ glyph-grid-studio render --in a.png --out a.gif --timeout 120
 # captured frame and encode step:
 #   {"type":"progress","job":"cli","phase":"capture","frame":12,"total":120}
 glyph-grid-studio render --in a.png --out a.gif --progress
+
+# The grid as text (ITER-074): --format txt|ansi|cast|html, or just the
+# extension (.txt .ans/.ansi .cast .html).  Every selection mode — the
+# writers read the per-cell GlyphFrame the drawers fill, not pixels.
+#   txt   rows x cols characters, one still frame (an LLM can read it)
+#   ansi  the same frame with 24-bit colour escapes — `cat portrait.ans`
+#   cast  asciinema v2 of --frames frames — `asciinema play portrait.cast`
+#   html  one self-contained page: real characters, the bundled font
+#         inlined, Play/Step controls, no autoplay under reduced motion
+# Octant/sextant glyph sets under ansi/cast print a CR-8 warning: most
+# terminal fonts lack those codepoints (html inlines a font that has them).
+# Rough sizes at 240x120: txt 29 KB, ansi 30-300 KB (colour runs are
+# merged), cast/html grow with how much changes per frame (a colourful
+# 24-frame loop: cast ~8 MB, html ~3 MB).
+glyph-grid-studio render --in portrait.jpg --out portrait.txt
+glyph-grid-studio render --in worm.gif --out worm.cast --frames 48 --glyph-set blockElements
 
 # Help
 glyph-grid-studio render --help

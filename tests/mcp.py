@@ -448,6 +448,38 @@ if res.get("isError") is True and isinstance(body, dict) and body.get("code") ==
 else:
     bad("C16 batch manifest typo", str(res)[:240])
 
+# --- Test C17 (ITER-074): format "txt" writes text AND returns it inline ---
+out17 = os.path.join(SCRATCH, "c17_mcp.txt")
+if os.path.exists(out17):
+    os.remove(out17)
+send(proc, {"jsonrpc": "2.0", "id": 19, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TEST_IMG, "out_path": out17, "format": "txt", "cols": 80, "rows": 40},
+}})
+print("    (waiting up to 90s for MCP txt render…)")
+r17 = recv(proc, timeout=90)
+c17 = (r17 or {}).get("result", {}).get("content", []) or []
+body17 = c17[1].get("text", "") if len(c17) > 1 else ""
+rows17 = body17.split("\n")[:-1]
+if "Rendered" in (c17[0].get("text", "") if c17 else "") and os.path.exists(out17) \
+        and len(rows17) == 40 and all(len(r) == 80 for r in rows17) \
+        and body17 == open(out17, encoding="utf-8").read():
+    ok("C17 format txt: file written + 40x80 text returned inline (%d B)" % len(body17.encode()))
+else:
+    bad("C17 format txt inline", str(r17)[:240])
+
+# C17b: an unknown format is refused in-process with its argument path.
+send(proc, {"jsonrpc": "2.0", "id": 20, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TEST_IMG, "out_path": os.path.join(SCRATCH, "c17b.txt"), "format": "webm"},
+}})
+res, body = tool_result(recv(proc, timeout=10))
+if res.get("isError") is True and isinstance(body, dict) and body.get("code") == "invalid_arguments" \
+        and body.get("path") == "/format" and not os.path.exists(os.path.join(SCRATCH, "c17b.txt")):
+    ok("C17b unknown format → invalid_arguments at /format")
+else:
+    bad("C17b unknown format", str(res)[:200])
+
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")
 sys.exit(0 if FAIL == 0 else 1)

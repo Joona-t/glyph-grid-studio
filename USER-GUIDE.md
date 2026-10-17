@@ -418,6 +418,22 @@ Records `frames` frames, encodes via gifski (Rust), pops save dialog. Quantizati
 #### `Export MP4`
 Records `frames` frames, encodes via openh264 + mp4 (Rust), pops save dialog. H.264 Constrained Baseline yuv420p — IG-compatible. Smaller than GIF (~3× smaller for kaneki: 13 MB GIF → 4.3 MB MP4).
 
+#### `Export SVG (vector)` / `Export TXT (plain text)`
+The current frame as vector text (SVG) or plain text, in every selection mode.
+
+#### `Export ANSI (terminal)`
+The current frame as 24-bit colour terminal text (`.ans`). Open a terminal and `cat` the file. Runs of the same colour share one escape, so a monochrome frame stays small.
+
+#### `Export .cast (asciinema)`
+Records `frames` frames (same duration × fps as Export GIF) as an asciinema v2 recording. Play it with `asciinema play file.cast`, or upload it to asciinema.org. Only the rows that change between frames are redrawn.
+
+#### `Export HTML (single file)`
+Records `frames` frames into one self-contained web page: every cell is a real character, the bundled font is inlined (no tofu on other machines), and Play / Step buttons drive the animation. With *reduce motion* switched on in your OS it does not autoplay.
+
+> **Octant and sextant glyph sets** need a font that has Unicode 16 octants / Unicode 13 sextants. HTML brings its own; a terminal usually does not, so ANSI and .cast exports of those sets show a warning (code CR-8) and will look like boxes in most terminals. Use `blockElements` or `ascii` for terminal output.
+
+The CLI and MCP do the same with `--format txt|ansi|cast|html` (or the output extension). TXT and ANSI are always one still frame.
+
 > **Under the hood**
 > Both buttons override `CONFIG.animation.fps = effFps` for the recording duration, restore on completion. Frame collection is identical (base64-encoded PNGs sent over IPC). The Rust encoders differ:
 > - **GIF**: gifski 1.34, quality 100, fast=false, repeat=Infinite. Frames decoded via `image::load_from_memory`, converted to `imgref::ImgVec<rgb::RGBA8>`, encoded with shared global palette.

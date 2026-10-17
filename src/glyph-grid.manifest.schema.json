@@ -24,8 +24,8 @@
         "additionalProperties": false,
         "properties": {
           "name": { "type": "string" },
-          "out": { "description": "Output path (.gif or .mp4).", "type": "string", "minLength": 1 },
-          "format": { "enum": ["gif", "mp4"] },
+          "out": { "description": "Output path (.gif, .mp4, .txt, .ans/.ansi, .cast or .html; the extension picks the format when `format` is absent).", "type": "string", "minLength": 1 },
+          "format": { "description": "gif | mp4 (pixels) or txt | ansi | cast | html (the grid as text, ITER-074; txt/ansi are one still frame).", "enum": ["gif", "mp4", "txt", "ansi", "cast", "html"] },
           "in": { "description": "Per-job source override.", "type": "string", "minLength": 1 },
           "frames": { "$ref": "#/$defs/frames" },
           "capWidth": { "description": "Downscale the output to at most this width (720 = Twitter-fit, 15 MB default target).", "type": "integer", "minimum": 0 },

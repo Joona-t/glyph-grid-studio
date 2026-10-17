@@ -50,7 +50,8 @@ pub struct HeadlessRenderJob {
     pub show_window: bool,
     pub preset_path: Option<PathBuf>,
     pub config_overrides: ConfigOverrides,
-    /// Output format. `"gif"` (default) → gifski; `"mp4"` → openh264 + mp4.
+    /// Output format. `"gif"` (default) → gifski; `"mp4"` → openh264 + mp4;
+    /// `"txt" | "ansi" | "cast" | "html"` → the grid as text (ITER-074).
     /// When None, derived from `out_path`'s extension.
     pub format: Option<String>,
     /// F25 (ITER-059): overall wall-clock budget in seconds (`--timeout`);
@@ -69,16 +70,44 @@ impl HeadlessRenderJob {
         if let Some(f) = &self.format {
             return f.to_lowercase();
         }
-        match self
-            .out_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase())
-            .as_deref()
-        {
-            Some("mp4") => "mp4".into(),
-            _ => "gif".into(),
-        }
+        format_from_path(&self.out_path.to_string_lossy()).into()
+    }
+}
+
+/// Every output format `render --format`, manifest `format` and the MCP
+/// `format` param accept.  gif/mp4 are pixels; the rest are the grid as
+/// text, built from the GlyphFrame IR (ITER-074).
+pub const OUTPUT_FORMATS: [&str; 6] = ["gif", "mp4", "txt", "ansi", "cast", "html"];
+/// The text family: written through `save_text_export`, no encoder.
+pub const TEXT_FORMATS: [&str; 4] = ["txt", "ansi", "cast", "html"];
+
+/// Format implied by an output path's extension (unknown → gif, as before).
+pub fn format_from_path(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("mp4") => "mp4",
+        Some("txt") => "txt",
+        Some("ans") | Some("ansi") => "ansi",
+        Some("cast") => "cast",
+        Some("html") | Some("htm") => "html",
+        _ => "gif",
+    }
+}
+
+/// clap / MCP parser for `--format`: any case, canonical name out.
+pub fn parse_format_arg(value: &str) -> Result<String, String> {
+    let v = value.trim().to_ascii_lowercase();
+    if OUTPUT_FORMATS.contains(&v.as_str()) {
+        Ok(v)
+    } else {
+        Err(format!(
+            "unknown output format {:?} (expected one of: {})",
+            value,
+            OUTPUT_FORMATS.join(", ")
+        ))
     }
 }
 
@@ -1177,13 +1206,7 @@ pub fn run_headless_batch(
                 .get("format")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    if out_path.to_lowercase().ends_with(".mp4") {
-                        "mp4".into()
-                    } else {
-                        "gif".into()
-                    }
-                });
+                .unwrap_or_else(|| format_from_path(&out_path).into());
             let mut config = j.get("config").cloned().unwrap_or(serde_json::json!({}));
             strip_preset_meta(&mut config);
             let cap_width = j.get("capWidth").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1699,6 +1722,7 @@ pub fn catalog_json() -> String {
         "glyph_sets": glyph_sets,
         "sampling_strategies": p["samplingStrategy"]["enum"],
         "postprocess_stages": schema_postprocess_stages(),
+        "formats": OUTPUT_FORMATS,
         "schema_version": schema_version(),
     })
     .to_string()
@@ -4079,6 +4103,31 @@ async fn finish_mp4_export(
 
 /// Save an arbitrary blob (e.g. an already-assembled GIF or ZIP) to a path
 /// chosen via native save dialog.  Kept for back-compat with the ZIP path.
+/// ITER-074: write a text-family export (txt / ansi / cast / html) to an
+/// absolute path with no dialog — the headless `render` / `batch` path.
+/// Same temp-file + fsync + rename commit as the encoders, so a batch
+/// output gets its `--resume` sidecar and a crash never leaves a torn file.
+#[tauri::command]
+async fn save_text_export(
+    app: tauri::AppHandle,
+    path: String,
+    bytes_b64: String,
+) -> Result<String, String> {
+    touch_liveness();
+    let bytes = general_purpose::STANDARD
+        .decode(&bytes_b64)
+        .map_err(|e| format!("text export payload: {}", e))?;
+    let p = PathBuf::from(&path);
+    let (control, registration) = register_export(app, None);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _registration = registration;
+        atomic_write_output(&p, &bytes, &control)?;
+        Ok::<String, String>(p.display().to_string())
+    })
+    .await
+    .map_err(|e| format!("text export worker failed: {}", e))?
+}
+
 #[tauri::command]
 async fn save_blob(
     app: tauri::AppHandle,
@@ -4485,6 +4534,7 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             finish_mp4_export,
             cancel_export,
             save_blob,
+            save_text_export,
             cli_log,
             pick_image,
             pick_image_with_path,
@@ -5675,5 +5725,41 @@ mod integration_tests {
         assert_eq!(h("mp4", None), h("mp4", Some("upload")));
         assert_eq!(h("mp4", Some("archive")), h("mp4", Some("ARCHIVE")));
         assert_eq!(h("gif", None), h("gif", Some("archive")));
+    }
+
+    /// ITER-074: the four text formats are known to the extension
+    /// inference, the CLI/MCP parser, the catalog and the manifest schema;
+    /// gif/mp4 inference is unchanged.
+    #[test]
+    fn text_formats_are_known_everywhere() {
+        for (path, want) in [
+            ("/o/a.gif", "gif"), ("/o/a.MP4", "mp4"), ("/o/a.txt", "txt"), ("/o/a.ans", "ansi"),
+            ("/o/a.ansi", "ansi"), ("/o/a.cast", "cast"), ("/o/a.HTML", "html"), ("/o/a.htm", "html"),
+            ("/o/a.webm", "gif"), ("/o/noext", "gif"),
+        ] {
+            assert_eq!(format_from_path(path), want, "{}", path);
+        }
+        assert_eq!(parse_format_arg(" CAST ").as_deref(), Ok("cast"));
+        assert!(parse_format_arg("webm").unwrap_err().contains("txt, ansi, cast, html"));
+        let job = |out: &str, format: Option<&str>| HeadlessRenderJob {
+            in_path: PathBuf::from("/i.png"),
+            out_path: PathBuf::from(out),
+            frames: Some(4),
+            show_window: false,
+            preset_path: None,
+            config_overrides: ConfigOverrides::default(),
+            format: format.map(String::from),
+            timeout_secs: None,
+            mp4_quality: None,
+        };
+        assert_eq!(job("/o/a.txt", None).resolved_format(), "txt");
+        assert_eq!(job("/o/a.gif", Some("html")).resolved_format(), "html");
+        assert_eq!(job("/o/a.gif", None).resolved_format(), "gif");
+        let cat: serde_json::Value = serde_json::from_str(&catalog_json()).unwrap();
+        assert_eq!(cat["formats"], serde_json::json!(OUTPUT_FORMATS));
+        for f in TEXT_FORMATS {
+            let m = serde_json::json!({"in": "/a.png", "jobs": [{"out": "/a.x", "format": f}]});
+            assert!(validate_manifest(&m).is_empty(), "{}: {:?}", f, validate_manifest(&m));
+        }
     }
 }
