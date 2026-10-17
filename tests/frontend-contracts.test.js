@@ -48,6 +48,11 @@ const contracts = [
   ['idle park requires a settled EMA', /frameIsTimeDependent\(\) \|\| !\(__emaMaxDelta < IDLE_EMA_EPS\)/],
   ['a parked redraw that turns dynamic re-arms the loop', /__idleParked = false;\s*setTimeout\(function \(\) \{\s*if \(!recState && !__renderResumeTimer\) \{ try \{ loop\(\); \}/],
   ['EMA formula is unchanged by the idle probe', /cellSignalEma\[i\] = \(1 - _emaA\) \* cellSignalEma\[i\] \+ _emaA \* cellSignal\[i\];/],
+  /* ITER-063 (F19): vendored deps + single font readiness promise */
+  ['p5 is loaded from the vendored copy', /<script src="vendor\/p5-1\.11\.2\/p5\.min\.js"><\/script>/],
+  ['Tweakpane is loaded from the vendored copy', /<script src="vendor\/tweakpane-3\.1\.10\/tweakpane\.min\.js"><\/script>/],
+  ['JSZip is loaded from the vendored copy', /<script src="vendor\/jszip-3\.10\.1\/jszip\.min\.js"><\/script>/],
+  ['fflate is loaded from the vendored copy', /<script src="vendor\/fflate-0\.8\.2\/index\.js"><\/script>/],
 ];
 
 for (const [name, pattern] of contracts) {
@@ -59,6 +64,7 @@ const banned = [
   ['headless start-up sleep', /setTimeout\(tryHeadlessRender,\s*\d+\)/],
   ['post-load / post-config settle sleeps', /await new Promise\(function \(r\) \{ setTimeout\(r, (300|200|1500)\); \}\);/],
   ['batch settle timer', /opts\.settleMs/],
+  ['remote <script>/<link> (offline boot, ITER-063)', /<(script|link)\b[^>]*\b(src|href)=["']?(https?:)?\/\//i],
 ];
 for (const [name, pattern] of banned) {
   assert(!pattern.test(html), `frontend contract violated: ${name} is back`);
@@ -119,4 +125,27 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   assert.strictEqual(make({ CONFIG: { studio: { breathing: {} }, dither: { mode: 'temporal' } },
     ctx: { __prefersReducedMotion: () => true } }), false, 'reduced motion still source must be static');
   assert.strictEqual(make({ CONFIG: { dither: { mode: 'bayer8' } } }), false, 'ordered dither is static');
+}
+
+/* ITER-063: vendored files must match the pinned CDN hashes, ship a licence,
+   and the font loader must wait on all faces in parallel. */
+{
+  const crypto = require('crypto');
+  const path = require('path');
+  const vendorDir = path.join(__dirname, '..', 'src', 'vendor');
+  const sums = fs.readFileSync(path.join(vendorDir, 'SHA256SUMS'), 'utf8').trim().split('\n');
+  assert.strictEqual(sums.length, 4, 'SHA256SUMS must pin exactly the four vendored files');
+  for (const line of sums) {
+    const [hash, rel] = line.split(/\s+/);
+    const got = crypto.createHash('sha256').update(fs.readFileSync(path.join(vendorDir, rel))).digest('hex');
+    assert.strictEqual(got, hash, `vendored file drifted from its pinned hash: ${rel}`);
+    const dir = path.join(vendorDir, path.dirname(rel));
+    assert(fs.readdirSync(dir).some((f) => /^LICENSE/i.test(f)), `missing LICENSE in ${dir}`);
+    assert(html.includes(`<script src="vendor/${rel}"></script>`), `index.html does not load vendor/${rel}`);
+  }
+  const fontsJs = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'glyph-fonts.js'), 'utf8');
+  assert(/return Promise\.all\(\[\s*waitForFace\(FONT_FAMILY, sizePx, 3000\),\s*waitForFace\(FONT_FAMILY \+ '-Fallback'/.test(fontsJs),
+    'font faces must load behind one parallel readiness promise');
+  assert(!/waitForFace\([^)]*\)\s*\.then\(function \(\) \{ return waitForFace/.test(fontsJs),
+    'sequential font wait chain is back');
 }

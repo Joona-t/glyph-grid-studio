@@ -72,7 +72,7 @@ Goal: CLI/MCP/batch expose everything the GUI can do, validate inputs, report er
 Goal: the GUI is cheap when idle, starts offline, imports big GIFs without copying them four times; the GL path becomes gate-verifiable.
 
 - [x] **Static-frame detector** (F17 part 2, S): `frameIsTimeDependent()` after paint; `noLoop()` when false and EMA converged; unknown ⇒ dynamic; config changes already re-arm. — ITER-062
-- [ ] **Vendor the 4 CDN scripts** (F19, M): p5, Tweakpane, JSZip, fflate into `src/vendor/` pinned, with licences; collapse the 3-stage font wait. App and CLI boot offline.
+- [x] **Vendor the 4 CDN scripts** (F19, M): p5, Tweakpane, JSZip, fflate into `src/vendor/` pinned, with licences; collapse the 3-stage font wait. App and CLI boot offline. — ITER-063 (CSP still open: tauri.conf.json is hook-protected)
 - [ ] **Import via asset protocol** (F18 steps 1+2, S+M): `read_image_file` returns metadata only, `loadImage(convertFileSrc(path))`; Rust `probe_image_file` rejects over-limit GIFs before p5 allocates (closes BUGS backlog #1). Spike: confirm `asset://` doesn't taint the canvas.
 - [ ] **p5 GIF autoplay off** (F21, S) so `setFrame()` can't race wall-clock advance.
 - [ ] **GL path, step 0 → 1** (F6): instrument `wave6.draw`/`drawImage`/`toBlob` split at 240×120 and 400×300; then move per-cell placement + gamma into the vertex shader (per-instance `signal`/`cellIndex` bytes). Make the shader output-equivalent to the sprite path (F7) and gate it with the PSNR script. Steps 2–3 (GL as presented surface, FBO postprocess) only if step 0 shows ≥5 ms on the fill loop at default.

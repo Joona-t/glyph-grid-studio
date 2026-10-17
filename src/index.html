@@ -64,12 +64,14 @@
 <body aria-label="glyph-grid render canvas">
   <div id="status" role="status" aria-live="polite"></div>
 
-  <!-- p5.js core (unchanged from v1). -->
-  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
+  <!-- p5.js core (unchanged from v1).  ITER-063: all four third-party libs are
+       vendored, pinned and sha256-checked in vendor/ (see vendor/README.md) —
+       the app and the headless CLI never touch the network to boot. -->
+  <script src="vendor/p5-1.11.2/p5.min.js"></script>
   <!-- JSZip stays as the legacy-fallback recorder; new streaming recorder
        prefers File System Access API, then fflate. -->
-  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+  <script src="vendor/jszip-3.10.1/jszip.min.js"></script>
+  <script src="vendor/fflate-0.8.2/index.js"></script>
 
   <!-- glyph-grid skill libs (v2). All IIFEs that attach to window.GlyphGrid. -->
   <script src="lib/glyph-compat.js"></script>
@@ -99,7 +101,7 @@
        output.audio-synth. -->
   <script src="lib/glyph-wave6.js"></script>
   <!-- Tweakpane v3 (UMD) — used by lib/glyph-studio.js when CONFIG.studio.enabled = true. -->
-  <script src="https://cdn.jsdelivr.net/npm/tweakpane@3.1.10/dist/tweakpane.min.js"></script>
+  <script src="vendor/tweakpane-3.1.10/tweakpane.min.js"></script>
   <script src="lib/glyph-studio.js"></script>
 
   <script>

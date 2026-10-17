@@ -4,6 +4,28 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-063 — 2026-10-17 — v0.2 Phase 4: vendored front-end deps (offline boot) + one parallel font readiness promise (F19)
+
+**Problem:** `src/index.html` loaded p5 1.11.2, JSZip 3.10.1, fflate 0.8.2 and Tweakpane 3.1.10 as parser-blocking `<script src="https://cdn.jsdelivr.net/...">` tags (1,332,182 B). The headless `render`/`batch` CLI loads the same page, so on a cold WebKit cache (first launch, fresh machine, CI, offline install) neither the GUI nor the CLI could boot, and every launch depended on a third-party CDN serving the right bytes. Separately, `GlyphGrid.fonts.load` waited for its three local faces in sequence (3000 + 1500 + 1500 ms caps, 6 s worst case on a stalled decode).
+
+**Root cause:** the CDN tags date from the initial commit (`git log -S jsdelivr`); nothing pinned the bytes. The font chain was written as `.then(waitForFace…)` links although the faces are independent.
+
+**Fix:**
+- `src/vendor/{p5-1.11.2,jszip-3.10.1,fflate-0.8.2,tweakpane-3.1.10}/` hold the exact files, each with its LICENSE; `src/vendor/SHA256SUMS` pins them; `src/vendor/README.md` lists upstream URL, license, provenance and the upgrade procedure. The four script tags now use relative `vendor/…` paths (same order, same parse-blocking semantics, so load order is unchanged).
+- `src/lib/glyph-fonts.js`: `Promise.all([waitForFace(primary, 3000), waitForFace(fallback, 1500), waitForFace(cp437, 1500)])` — one readiness promise, which is what setup()'s `__fontLoadPromise` (ITER-047) and `__assetsReady()` already await.
+- `tests/frontend-contracts.test.js`: 4 tag contracts; a banned pattern for any remote `<script>`/`<link>` (verified to fire on the previous `index.html`); a block that re-hashes every vendored file against `SHA256SUMS`, requires a LICENSE per directory and the matching tag, and pins the parallel font wait / bans the sequential chain.
+
+**Provenance / integrity:** the download command was refused by this session's permission policy, so no new network fetch happened. The bytes are the jsdelivr responses for the exact four URLs, taken from the app's own WebKit cache (`~/Library/Caches/art.lovespark.glyph-grid-studio/WebKit/NetworkCache`, two partitions, identical) and cross-checked against an independent on-disk copy (an earlier review's `vendor/` dir; JSZip also against a `node_modules` copy): sha256 p5 `2ee031e7…`, JSZip `acc7e414…`, fflate `c3b34f2e…`, Tweakpane `32693d7d…` — all three sources agree, and the sizes equal the research's byte-exact CDN fetch (1,055,288 / 97,630 / 32,665 / 146,599 B). The file banners say `p5.js v1.11.2`, `JSZip v3.10.1`, `Tweakpane 3.1.10`. LICENSE files: JSZip `LICENSE.markdown` and fflate MIT `LICENSE` are package copies (fflate's from a local 0.7.4 install — same MIT text and holder); p5's is the canonical FSF LGPL-2.1 text; Tweakpane's is the MIT text with the holder from its banner. `curl -sL <url> | shasum -a 256` against SHA256SUMS is the one-line re-check once network is allowed.
+
+**Measured:**
+- Offline boot evidence: `grep` finds 0 remote `<script>`/`<link>` tags in `src/index.html`. Serving the repo on 127.0.0.1 and loading `src/index.html`: 30 resource loads, **0 to any other host**; `p5.VERSION 1.11.2`, `Tweakpane.VERSION 3.1.10`, `JSZip.version 3.10.1`, `fflate.zipSync` present, studio pane built. A true network-blocked CLI run was not done (blocking hosts needs a system-level change; WebKit's networking runs in an XPC service outside any per-process sandbox).
+- Output unchanged: worm-move 120 frames vs golden **inf dB**, MP4 md5 `163e203c…` (= golden). Bundle +1.33 MB of JS (`du -sh src/vendor` 1.4 M with licences).
+- Timing (perf-sample, under heavy parallel load — `suspect_foreign_xpc:true` on every run, so the WebContent/GPU sums include other phases' webviews): wall 18.61 / 29.37 / 28.88 s, host CPU 3.16 / 2.24 / 2.39 s. No steady-state speed change expected (warm launches already read the CDN files from WebKit's immutable cache).
+
+**Gate:** cargo build 0 errors · cargo test 15/15 · npm test ok (35 invariants + behavioural + vendor blocks) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity 7/7 · psnr-gate inf.
+
+**Gotchas:** (a) A non-null CSP (research F19 A) is still open: it lives in `src-tauri/tauri.conf.json`, which is hook-protected in this phase — the vendoring is what makes a strict `script-src 'self'` possible later. (b) Upgrading a library means replacing the file, renaming its directory, updating `SHA256SUMS`, the tag and `vendor/README.md` together — the contract test fails otherwise. (c) The font caps now overlap: a stalled primary face still bounds the wait at 3000 ms, but the fallback/CP437 caps no longer add to it.
+
 ### ITER-062 — 2026-10-17 — v0.2 Phase 4: static-frame detector parks the render loop on still configs (F17 part 2)
 
 **Problem:** With a still source and a time-independent config (breathing 0, dither none/ordered/error-diffusion, no dispersal, no CRT pixel stages, no XDoG sigma sweep) — or any still source under prefers-reduced-motion since ITER-048 — the draw loop kept re-rendering the identical frame at 30 fps forever. The only idle exits in `draw()` were `recState.done` and `!CONFIG.animation.loop`.
