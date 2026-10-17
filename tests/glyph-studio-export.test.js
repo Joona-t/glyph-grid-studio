@@ -450,7 +450,30 @@ function twitterFitCopyDoesNotPromiseSuccess() {
   assert(source.includes('The 15 MB target was not met'));
 }
 
+/* R7 (ITER-056): exported presets carry $schema + version; applying one
+   strips that metadata and surfaces unknown keys instead of silently
+   writing them into CONFIG. */
+function presetSchemaStampAndUnknownKeys() {
+  const { studio } = loadStudio(() => Promise.resolve());
+  const config = { palette: 'cream-paper', postprocess: { vignette: { enabled: true, strength: 0.55 } } };
+  const snap = studio.snapshotConfig(config);
+  assert.strictEqual(snap.$schema, studio.presetSchemaId);
+  assert.strictEqual(snap.version, studio.presetSchemaVersion);
+  assert(/\/schema\/preset\/v\d+\.json$/.test(snap.$schema));
+  const schema = JSON.parse(fs.readFileSync(require.resolve('../src/glyph-grid.schema.json'), 'utf8'));
+  assert.strictEqual(schema.$id, studio.presetSchemaId, 'regenerate src/glyph-grid.schema.json');
+
+  studio.applyPreset(config, { $schema: snap.$schema, version: 1, palette: 'spice',
+    postprocess: { vignette: { enabled: false } }, palete: 'typo' });
+  assert.strictEqual(config.palette, 'spice');
+  assert.strictEqual(config.postprocess.vignette.strength, 0.55, 'nested params survive');
+  assert.strictEqual(config.postprocess.vignette.enabled, false);
+  assert(!('$schema' in config) && !('version' in config), 'preset metadata is not CONFIG');
+  assert.strictEqual(config.palete, 'typo', 'unknown keys still apply (warn policy)');
+}
+
 (async function run() {
+  presetSchemaStampAndUnknownKeys();
   await nativeSuccessSkipsZip();
   await nativeFailureBuildsFallbackOnce();
   await stagedUiFlowStreamsWithoutRetainingFrames();

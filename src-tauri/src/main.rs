@@ -33,6 +33,15 @@ enum Command {
     /// Print the catalog of available palettes / ramps / dithers / glyph sets / postprocess stages.
     Catalog,
 
+    /// Validate a preset (partial CONFIG) or a batch manifest against the
+    /// generated preset schema (src/glyph-grid.schema.json).  Errors carry
+    /// the JSON path of the bad value.  Exit 0 = valid, 2 = invalid.
+    Validate {
+        /// Preset or manifest JSON file.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+
     /// Run the MCP server (Model Context Protocol over stdio JSON-RPC).
     /// Wire this into Claude Desktop / Cursor via their MCP config; tools then
     /// appear as `glyph_grid_render` and `glyph_grid_catalog`.
@@ -105,6 +114,11 @@ struct RenderArgs {
     /// is inferred from the output path extension (`.mp4` → mp4).
     #[arg(long, value_name = "FORMAT")]
     format: Option<String>,
+
+    /// Resolve preset + flags, validate, print the job JSON (merged config)
+    /// to stdout and exit — no window, no render.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -161,6 +175,18 @@ fn main() {
                 },
                 format: args.format,
             };
+            if args.dry_run {
+                match app_lib::headless_render_json(&job) {
+                    Ok(v) => {
+                        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("render: {}", e);
+                        std::process::exit(2);
+                    }
+                }
+            }
             let code = app_lib::run_headless_render(job);
             // Tauri's `app.exit(code)` triggers `tauri::run()` to return without
             // process-exiting (despite docs implying otherwise). Always exit
@@ -174,6 +200,9 @@ fn main() {
         }
         Some(Command::Catalog) => {
             println!("{}", app_lib::catalog_json());
+        }
+        Some(Command::Validate { path }) => {
+            std::process::exit(app_lib::run_validate(path));
         }
         Some(Command::Mcp) => {
             // MCP server is async; spin up a tokio runtime ad-hoc for it.

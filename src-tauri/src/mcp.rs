@@ -79,6 +79,33 @@ impl GlyphGridServer {
         &self,
         Parameters(p): Parameters<RenderParams>,
     ) -> String {
+        // R7 (ITER-056): validate the arguments against the preset schema
+        // in-process, before paying ~5 s of Tauri start-up for a render the
+        // CLI would reject anyway.  Same resolver as `render`.
+        let probe = crate::HeadlessRenderJob {
+            in_path: std::path::PathBuf::from(&p.in_path),
+            out_path: std::path::PathBuf::from(&p.out_path),
+            frames: p.frames.unwrap_or(24),
+            show_window: false,
+            preset_path: None,
+            config_overrides: crate::ConfigOverrides {
+                palette: p.palette.clone(),
+                color_mode: p.color_mode.clone(),
+                ramp: p.ramp.clone(),
+                dither_mode: p.dither.clone(),
+                selection_mode: p.selection_mode.clone(),
+                glyph_set: p.glyph_set.clone(),
+                sampling_strategy: p.sampling_strategy.clone(),
+                postprocess: p.postprocess.clone(),
+                cols: p.cols,
+                rows: p.rows,
+            },
+            format: p.format.clone(),
+        };
+        if let Err(e) = probe.build_js_config() {
+            return format!("Render failed: exit 2 | invalid arguments: {}", e);
+        }
+
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(e) => return format!("error: cannot locate own binary: {}", e),

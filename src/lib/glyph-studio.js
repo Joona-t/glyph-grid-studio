@@ -51,6 +51,13 @@
    * ---------------------------------------------------------------- */
   var PRESET_PREFIX = 'glyph-studio:';
   function presetKey(n) { return PRESET_PREFIX + n; }
+  /* R7 (ITER-056): preset format version + the $id of the generated
+     src/glyph-grid.schema.json.  scripts/gen-schema.js reads both from
+     here, so bump PRESET_SCHEMA_VERSION when a preset key changes meaning
+     and regenerate the schema (run-all A9 fails until you do). */
+  var PRESET_SCHEMA_VERSION = 1;
+  var PRESET_SCHEMA_ID = 'https://github.com/Joona-t/glyph-grid-studio/schema/preset/v' +
+    PRESET_SCHEMA_VERSION + '.json';
 
   /* Rust-backed persistence mirror (BUG-006, audit 2026-06-10).
      WKWebView does NOT persist localStorage for Tauri's custom-scheme
@@ -120,7 +127,9 @@
       /* BUG-011 (v0.1.8): these are live panel inputs but were missing
          from the preset whitelist, so save → reload silently dropped them. */
       'invertSignal', 'bgThreshold', 'dispersal', 'scene'];
-    var out = {};
+    /* R7: stamp the schema so editors autocomplete and `validate` knows
+       which preset format it is reading. */
+    var out = { $schema: PRESET_SCHEMA_ID, version: PRESET_SCHEMA_VERSION };
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
       if (config[k] !== undefined) out[k] = JSON.parse(JSON.stringify(config[k]));
@@ -136,7 +145,24 @@
         } else { t[k] = s[k]; }
       }
     }
-    deepMerge(config, preset);
+    if (!preset || typeof preset !== 'object') return;
+    /* R7 (ITER-056): $schema / version are preset metadata, not CONFIG.
+       Unknown top-level keys are applied as before (schema policy
+       x-unknown-key-policy: warn — share URLs from other builds must keep
+       loading) but surfaced, so a typo'd key is no longer silent. */
+    var body = {}, unknown = [];
+    for (var k in preset) {
+      if (k === '$schema' || k === 'version') continue;
+      if (!(k in config)) unknown.push(k);
+      body[k] = preset[k];
+    }
+    deepMerge(config, body);
+    var notes = [];
+    if (unknown.length) notes.push('unknown key' + (unknown.length > 1 ? 's ' : ' ') + unknown.join(', '));
+    if (typeof preset.version === 'number' && preset.version > PRESET_SCHEMA_VERSION) {
+      notes.push('made by a newer preset format (v' + preset.version + ')');
+    }
+    if (notes.length) exportFeedback('Preset: ' + notes.join('; ') + ' — applied as-is.', true);
   }
   function exportJSON(snap, filename) {
     var blob = new Blob([JSON.stringify(snap, null, 2)], { type: 'application/json' });
@@ -1550,7 +1576,7 @@
           bayer8: 'bayer8',
           blueNoise: 'blueNoise',
           temporal: 'temporal',
-          stbn: 'stbn (smooth temporal blue noise)',
+          'stbn (smooth temporal blue noise)': 'stbn',
           floydSteinberg: 'floydSteinberg',
           atkinson: 'atkinson',
           jarvisJudiceNinke: 'jarvisJudiceNinke',
@@ -1582,7 +1608,7 @@
       options: {
         brightness: 'brightness', shape: 'shape',
         'shape-edge-aware': 'shape-edge-aware', 'edge-directional': 'edge-directional',
-        flow: 'flow (ETF)',
+        'flow (ETF)': 'flow',
       },
     }), 'How glyphs are picked per cell. `brightness` = fast ramp lookup. `shape-edge-aware` = best aesthetic, ~4× slower. `flow` = strokes follow the image contours (structure-tensor ETF).');
     /* Flow (ETF) tuning — v0.1.6. */
@@ -2292,6 +2318,8 @@
     init: init,
     snapshotConfig: snapshotConfig,
     applyPreset: applyPreset,
+    presetSchemaId: PRESET_SCHEMA_ID,
+    presetSchemaVersion: PRESET_SCHEMA_VERSION,
     listPresets: listPresets,
     savePreset: savePreset,
     loadPreset: loadPreset,
