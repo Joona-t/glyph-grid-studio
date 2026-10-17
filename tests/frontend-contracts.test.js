@@ -43,6 +43,11 @@ const contracts = [
   /* ITER-048 (F17 part 1): reduced motion pins the frame-hashed seed + dither phase for stills */
   ['reduced motion pins frame index for still sources', /const _rmPinned = _rmStill && window\.__sourceFrameIdx === -1;\s*const _frameIdx = _rmPinned \? 0 :/],
   ['reduced motion pins the temporal dither phase', /_persistentDitherOpts\.frameIdx = _rmPinned \? 0 : frameIdx;/],
+  /* ITER-062 (F17 part 2): static-frame detector */
+  ['idle check runs after the live frame is painted, never while recording', /if \(recState\) \{\s*handleRecordFrame\(\);\s*\} else \{\s*idleCheck\(\);\s*\}/],
+  ['idle park requires a settled EMA', /frameIsTimeDependent\(\) \|\| !\(__emaMaxDelta < IDLE_EMA_EPS\)/],
+  ['a parked redraw that turns dynamic re-arms the loop', /__idleParked = false;\s*setTimeout\(function \(\) \{\s*if \(!recState && !__renderResumeTimer\) \{ try \{ loop\(\); \}/],
+  ['EMA formula is unchanged by the idle probe', /cellSignalEma\[i\] = \(1 - _emaA\) \* cellSignalEma\[i\] \+ _emaA \* cellSignal\[i\];/],
 ];
 
 for (const [name, pattern] of contracts) {
@@ -60,3 +65,58 @@ for (const [name, pattern] of banned) {
 }
 
 console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${contracts.length} invariants)`);
+
+/* ITER-062: behavioural check of frameIsTimeDependent() against stubbed state.
+   Unknown/dynamic must win; only a fully still config may report false. */
+{
+  const m = html.match(/const IDLE_STATIC_DITHER = [^\n]*\n[\s\S]*?\n  function frameIsTimeDependent\(\) \{[\s\S]*?\n  \}\n/);
+  assert(m, 'frameIsTimeDependent() not found');
+  const src = m[0].replace(/^\s*let __\w+ = [^\n]*\n/gm, '');
+  const make = (over) => {
+    const still = {
+      scene: 'studio', glyphSet: null, prefilter: null, dispersal: { enabled: false },
+      studio: { breathing: { gainSwing: 0, jitter: 0 } }, dither: { mode: 'none' },
+      postprocess: {}, animation: { loop: true },
+    };
+    const ctx = Object.assign({
+      CONFIG: Object.assign(still, over && over.CONFIG),
+      recState: null, __primeOnly: false, __fontLoadPromise: null, fontDescriptor: null,
+      sourceImg: { width: 10 }, _atlasInflight: {}, _atlasCache: {},
+      window: { PIPELINE: null, __sourceFrameIdx: -1 },
+      __prefersReducedMotion: () => false,
+      usesAdvancedPipeline: () => true,
+      _hasImgDataStages: () => false,
+    }, over && over.ctx);
+    ctx.GlyphGrid = { compat: { isV2: () => true, gateDither: (c) => c.dither.mode !== 'none',
+      gatePostprocess: () => true } };
+    ctx.window.GlyphGrid = ctx.GlyphGrid;
+    vm.createContext(ctx);
+    vm.runInContext(src + '\nthis.__f = frameIsTimeDependent;', ctx);
+    return ctx.__f();
+  };
+  assert.strictEqual(make(), false, 'fully still config must be static');
+  const dynamic = [
+    ['default breathing', { CONFIG: { studio: { breathing: {} } } }],
+    ['temporal dither', { CONFIG: { dither: { mode: 'temporal' } } }],
+    ['stbn dither', { CONFIG: { dither: { mode: 'stbn' } } }],
+    ['dispersal', { CONFIG: { dispersal: { enabled: true, startT: 0.2, endT: 0.9 } } }],
+    ['xdog sigma sweep', { CONFIG: { prefilter: { mode: 'xdog' } } }],
+    ['generative scene', { CONFIG: { scene: 'flowField' } }],
+    ['animated source', { ctx: { window: { PIPELINE: null, __sourceFrameIdx: 3 } } }],
+    ['pipeline', { ctx: { window: { PIPELINE: {}, __sourceFrameIdx: -1 } } }],
+    ['recording', { ctx: { recState: { frameIdx: 0 } } }],
+    ['priming', { ctx: { __primeOnly: true } }],
+    ['no source', { ctx: { sourceImg: null } }],
+    ['font pending', { ctx: { __fontLoadPromise: {}, fontDescriptor: null } }],
+    ['atlas in flight', { ctx: { _atlasInflight: { octant: {} } } }],
+    ['atlas missing', { CONFIG: { glyphSet: 'octant' } }],
+    ['CRT pixel stage', { ctx: { _hasImgDataStages: () => true } }],
+  ];
+  for (const [name, over] of dynamic) {
+    assert.strictEqual(make(over), true, `frameIsTimeDependent must be true for: ${name}`);
+  }
+  /* Reduced motion stills breathing + temporal dither for a still source. */
+  assert.strictEqual(make({ CONFIG: { studio: { breathing: {} }, dither: { mode: 'temporal' } },
+    ctx: { __prefersReducedMotion: () => true } }), false, 'reduced motion still source must be static');
+  assert.strictEqual(make({ CONFIG: { dither: { mode: 'bayer8' } } }), false, 'ordered dither is static');
+}

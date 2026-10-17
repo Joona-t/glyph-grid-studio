@@ -1367,6 +1367,76 @@
     return true;
   }
 
+  /* ITER-062 (F17 part 2): static-frame detector.  A still source with a
+     time-independent config (no breathing, no frame-hashed dither, no
+     dispersal, no CRT pixel stages, no sigma sweep) paints the same frame
+     forever, yet the loop kept re-rendering it at 30 fps.  After each
+     painted live frame, idleCheck() parks the loop (noLoop) once the frame
+     is provably static AND the cross-frame state has settled: the per-cell
+     EMA step is below IDLE_EMA_EPS and the stability debounce has had
+     enough frames.  Anything unknown counts as time-dependent.  Every
+     config path already re-arms with loop()/redraw() (scheduleConfigRender,
+     acceptSourceImage, the studio preset buttons, beginRecord); a parked
+     redraw() that turns out dynamic re-arms the loop itself.  Never engages
+     while recording, priming or under window.PIPELINE. */
+  const IDLE_EMA_EPS = 1e-4;
+  const IDLE_SETTLE_FRAMES = 8;
+  const IDLE_STATIC_DITHER = ['none', 'bayer4', 'bayer8', 'floydSteinberg', 'atkinson', 'jarvisJudiceNinke'];
+  let __emaMaxDelta = 0;      // largest per-cell EMA step of the last v2 frame (0 on v1)
+  let __idleStreak = 0;       // consecutive static + settled frames
+  let __idleParked = false;   // true while the detector holds the loop stopped
+  function frameIsTimeDependent() {
+    if (recState || window.PIPELINE || __primeOnly) return true;
+    if (!sourceImg || !sourceImg.width) return true;
+    if (window.__sourceFrameIdx !== -1) return true;              // animated source
+    if (CONFIG.scene !== 'studio') return true;                    // generative scenes animate on t
+    if (__fontLoadPromise && !fontDescriptor) return true;         // face swap still pending
+    for (const _id in _atlasInflight) return true;                 // atlas commit pending
+    if (CONFIG.glyphSet && !_atlasCache[CONFIG.glyphSet]) return true;
+    if (CONFIG.prefilter && CONFIG.prefilter.mode === 'xdog') return true;  // studioSigmaSweep
+    const rm = __prefersReducedMotion();
+    const disp = CONFIG.dispersal || {};
+    if (!rm && disp.enabled && disp.endT > disp.startT) return true;
+    if (!(window.GlyphGrid && GlyphGrid.compat)) return true;
+    if (!GlyphGrid.compat.isV2(CONFIG)) return false;              // v1 path: no t, no frame state
+    if (usesAdvancedPipeline(CONFIG)) {
+      const br = (CONFIG.studio && CONFIG.studio.breathing) || {};
+      const swing = (typeof br.gainSwing === 'number') ? br.gainSwing : 0.30;
+      const jit = (typeof br.jitter === 'number') ? br.jitter : 0.05;
+      if (!rm && (swing > 0 || jit > 0)) return true;
+      if (!rm && GlyphGrid.compat.gateDither(CONFIG)
+          && IDLE_STATIC_DITHER.indexOf(CONFIG.dither.mode) < 0) return true;
+    }
+    if (GlyphGrid.compat.gatePostprocess(CONFIG) && _hasImgDataStages(CONFIG.postprocess)) return true;
+    return false;
+  }
+  function idleCheck() {
+    if (__idleParked && isLooping()) { __idleParked = false; __idleStreak = 0; } // re-armed elsewhere
+    if (frameIsTimeDependent() || !(__emaMaxDelta < IDLE_EMA_EPS)) {
+      __idleStreak = 0;
+      if (__idleParked) {
+        /* A bare redraw() painted a frame that still has to evolve.  Re-arm
+           outside this draw: p5's loop() draws synchronously. */
+        __idleParked = false;
+        setTimeout(function () {
+          if (!recState && !__renderResumeTimer) { try { loop(); } catch (_) {} }
+        }, 0);
+      }
+      return;
+    }
+    if (__idleParked) return;
+    if (++__idleStreak >= Math.max(IDLE_SETTLE_FRAMES, _stabDebounceK + 2)) {
+      __idleStreak = 0;
+      __idleParked = true;
+      noLoop();
+      if (!window.__statusHold) statusEl().textContent += ' | idle';
+    }
+  }
+  window.__idleState = function () {
+    return { parked: __idleParked, streak: __idleStreak, emaMaxDelta: __emaMaxDelta,
+             timeDependent: frameIsTimeDependent() };
+  };
+
   function draw() {
     /* CONFIG.animation.fps is live-mutated by Tweakpane and batch jobs.
        Keep p5's actual timer cadence in sync with the animation math. */
@@ -1575,6 +1645,8 @@
     /* 4. Record capture. */
     if (recState) {
       handleRecordFrame();
+    } else {
+      idleCheck();
     }
   }
 
@@ -1675,6 +1747,12 @@
   function __prefersReducedMotion() {
     if (!__rmQuery && window.matchMedia) {
       __rmQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+      /* ITER-062: a parked static frame must wake when the OS setting flips. */
+      try {
+        __rmQuery.addEventListener('change', function () {
+          if (__idleParked && !recState) { try { loop(); } catch (_) {} }
+        });
+      } catch (_) {}
     }
     return !!(__rmQuery && __rmQuery.matches);
   }
@@ -2259,13 +2337,18 @@
     // F8 (audit): branchless clamp replaces Math.max/Math.min function-call
     // pair per cell. 28,800 iters × 2 fewer calls/iter at default 240×120 grid.
     // Semantics identical for all finite values (NaN → NaN in both paths).
+    let _emaMaxD = 0;   /* ITER-062: largest EMA step this frame (idle detector) */
     for (let i = 0; i < cellSignal.length; i++) {
+      const _emaPrev = cellSignalEma[i];
       cellSignalEma[i] = (1 - _emaA) * cellSignalEma[i] + _emaA * cellSignal[i];
+      const _emaD = cellSignalEma[i] - _emaPrev;
+      if (_emaD > _emaMaxD) _emaMaxD = _emaD; else if (-_emaD > _emaMaxD) _emaMaxD = -_emaD;
       const h = ((i * 2246822519) ^ _seed) >>> 0;
       const jitter = ((h & 0xff) - 128) * _jScale;
       const _v = cellSignalEma[i] * _breatheGain + jitter;
       cellSignal[i] = _v < 0 ? 0 : _v > 1 ? 1 : _v;
     }
+    __emaMaxDelta = _emaMaxD;
     if (__pfFrame) __pfFrame.stages._ema = performance.now() - _t_ema0;
     /* ITER-046: priming stops here — the EMA is the only cross-frame state
        the signal stages hold; everything below is per-frame. */
