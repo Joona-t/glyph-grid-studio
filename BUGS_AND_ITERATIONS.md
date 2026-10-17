@@ -4,6 +4,28 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-071 — 2026-10-17 — v0.2 integration: Phase 2 (ITER-050..055, 070) merged into Phase 3 + 4
+
+**Problem:** Phase 2 (`audit/v0.2-sota`) and Phases 3 + 4 (`v2/integration`) both rewrote the headless batch path in parallel. `git merge` conflicted in 7 files (BUGS, README, `lib.rs` ×8 hunks, `main.rs` ×5, `mcp.rs` ×2, `index.html` ×3, frontend contracts ×2). It also left seams that compiled but were wrong: the closed manifest schema (ITER-061) would refuse Phase 2's `mp4Quality` job key. The streamed GIF (ITER-053) committed its `.part` without the ITER-068 sidecar and without the ITER-059 `LIVE_PARTS` registration. The per-job border (ITER-057) never reached the streamed encoder. `--jobs` (ITER-055) forked before the job-config and resume checks, and its children ignored `--progress` / `--timeout` / signals.
+
+**Root cause:** each side changed functions the other side called. `build_js_config` became a `Result`. `begin_export_capture` gained `gif_stream` on one side and `label` on the other. `atomic_write_output` was split into `output_part_path` / `commit_output_part` while the other side added the sidecar and `LIVE_PARTS` to its inline body. `run_headless_batch` gained `(timeout, resume)` on one side and `jobs` on the other.
+
+**Fix (merge 3e491f8):**
+- Structural resolution keeps both sides. `run_headless_batch(manifest, show_window, timeout, resume, jobs)`. `begin_export_capture(job_id, total, gif_stream, label)`. `headless_render_json` (Result, `--dry-run`) now carries `mp4Quality`. `stage_export_frame` is Phase 2's PngFrame + bounded-queue retry, plus liveness + the NDJSON capture line. `commit_output_part` writes the resume sidecar, so streamed and buffered commits both record one. A streamed `.part` is in `LIVE_PARTS` from begin until finish.
+- `gifStream` carries `border: jobBorder`. The MP4 finish args carry `border` + `mp4Quality`. The raw-RGBA capture keeps Phase 4's F6 `cap_toBlob_*` stages.
+- Manifest schema: job `mp4Quality` (string; the value is checked by `Mp4Quality::parse`, exit 2). `validate` runs the same check. `job_config_sha256` includes the canonical quality for MP4 jobs only. MCP refuses a bad `mp4_quality` in-process at `/mp4_quality`.
+- `--jobs` fan-out runs after every pre-launch check and the resume filter, which now keeps (raw job, js job) pairs. The parent runs the watchdog, passes `--progress` (NDJSON relayed verbatim), and treats relayed lines as liveness. `abort_headless` SIGTERMs the children, waits ≤ 2 s for the reaper, SIGKILLs stragglers, and removes the 0700 sub-manifest dir. The exit code (3 / 130 / 143) belongs to the abort.
+- `tests/run-all.sh` (uncommitted, hook-protected) gains Phase 2's B8 archive job + **B28** and the batch-jobs gate renamed **G8 → G10** (G8/G9 are the ITER-069 byte-identity checks).
+
+**Measured:**
+- Before the abort fix, `batch --jobs 2 --timeout 3` exited 3 but left **2 live children + 2 `.part` files**. The parent's exit closed their stderr pipe, and the child watchdog's `eprintln!` panicked before its sweep. After the fix: exit 3 in 3 s, both children report "interrupted by SIGTERM (exit 143)", 0 `.part` files, 0 processes, no `ggs-batch-*` dir. `--jobs 2 --progress`: 18 NDJSON lines verbatim, 0 tagged. `--jobs 2 --resume` after a `--jobs 2` run: "skipped 2 of 2" via the sidecars.
+- Output gate: worm-move 120 f, `pB.json`, `--mp4-quality archive` vs `golden-p3-iter057.mp4` gives **PSNR inf** (120/120 frames). The Annex-B H.264 stream is byte-identical (md5 `fb843656…`). The file is +28 B (ITER-050 mdhd timescale 1/25 vs 1/1000), so file md5 `d27fa511…` ≠ `96fc9327…` by design. The same job as a 2-job manifest under `--jobs 2` gives both outputs md5 `d27fa511…`, identical to the single render.
+- Timing (perf-sample, two runs; load average 7-10 on 8 cores, so **not idle**; `suspect_foreign_xpc: false`): wall 15.90 / 15.68 s, app 2.30 / 2.26 s, WebContent 13.55 / 13.42 s, GPU 7.00 / 7.00 s. That compares with Phase 3 alone at 19-26 s under heavier load and Phase 2's archive gate at 15.0-15.5 s.
+
+**Gate:** cargo build --release 0 errors (1 pre-existing `Shell::open` deprecation) · cargo test **46/46** (Phase 3+4 had 28, Phase 2 had 29 with 15 shared; +1 `resume_hash_covers_mp4_quality_for_mp4_only`) · npm test ok (45 contracts) · run-all **PASS 44 / FAIL 0** (`TEST_TIMEOUT=400`) · MCP **27/27** · byte-identity **9/9** · G10 batch-jobs **5/5** · B28 upload 423 KB < archive 950 KB, timescale 1/33.
+
+**Gotchas:** (a) `streamed_gif_overshoot_and_cancel_leave_no_part_files` raced the encoder's lazy `.part` open (1 flake in 13 parallel runs once the suite grew to 45 tests). The test now waits for the `.part` before cancelling (20/20 green). (b) Under `--jobs`, a job without `in` is pinned to its effective source (ITER-055). Its sidecar hash then names that path, while the serial run hashes the manifest `in`. Resuming a `--jobs` run serially (or the reverse) can re-render such jobs: safe, not skipped. (c) Phase 3 sidecars written for MP4 jobs before this merge hash without the quality and no longer match, so those jobs re-render once. (d) A parent killed by SIGKILL still orphans its children (ITER-055 gotcha b), and nothing can catch that.
+
 > **Numbering note (2026-10-17):** Phases 3 and 4 ran in parallel and both took ITER-062. The Phase 3 review-fix entry directly below is referenced as **ITER-068** in code comments, run-all.sh and Cargo.toml; the Phase 4 static-frame-detector entry further down keeps ITER-062.
 
 ### ITER-062 — 2026-10-17 — v0.2 Phase 3 review fixes: `--resume` sidecars, validate == batch, closed preset blocks, MCP error paths, exit-code fallback
