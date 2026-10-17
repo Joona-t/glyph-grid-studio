@@ -4,6 +4,28 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-067 — 2026-10-17 — v0.2 Phase 4: scanlines/kawaii-only postprocess stacks skip the full-canvas readback (F10 Tier A)
+
+**Problem:** any enabled `scanlines` or `kawaii` stage put the frame through Phase A of `applyPostprocess`: `getImageData` of the whole canvas, the JS kernel, `putImageData` — ~32–35 ms per frame at 1024×682 on a GPU-promoted canvas (measured below), for a per-row multiply and ~1,100 single-pixel blends. Preset 05 (y2k-pop) and the kawaii looks pay it every frame.
+
+**Root cause:** only vignette/letterbox had been moved to canvas-2D composites (ITER-015); scanlines and kawaii were left in the imgData set although both are expressible as composites.
+
+**Fix:**
+- `src/index.html`: `_needsImgDataReadback(post)` — true only when a stage other than scanlines/kawaii needs the RGBA buffer (or scanlines has a negative/NaN intensity, which brightens and stays on the CPU kernel); `_hasImgDataStages(p, skipOverlayable)` grew the flag instead of allocating a filtered copy. `applyPostprocess` takes Phase A only on `_needsImgDataReadback`; otherwise a Tier A block draws, in `applyChain`'s order and before vignette/letterbox exactly like Phase A did: scanlines as a cached w×h mask (opaque black on the rows `applyScanlines` darkens — same `(y + phase) % period` test, same `period`/`phase`/reduced-motion handling, keyed `(w, h, period, phase)`) drawn source-over at `globalAlpha = intensity` (= c·(1 − intensity)); then kawaii via the new `GlyphGrid.crt.applyKawaiiCtx`. When Phase A does run, `applyChain` still applies scanlines/kawaii in-buffer, so mixed stacks are unchanged. `_hasImgDataStages` keeps its full meaning for the idle detector (kawaii twinkles → never park). The opt-in GL grid gate now uses `_needsImgDataReadback`.
+- `src/lib/glyph-crt.js`: kawaii particle placement/twinkle moved into `_kawaiiParticles(w, h, opts, frameIdx, blit)`, shared by the RGBA blit (`applyKawaii`, byte-identical) and `_kawaiiBlitCtx` (one 1×1 source-over `fillRect` per lit pattern cell at `alpha·v/3`).
+- `tests/frontend-contracts.test.js`: kawaii ctx blit on a fake source-over context stays within 1 LSB of the RGBA kernel (3 frames); readback truth table (vignette / scanlines / scanlines+kawaii → no readback; brightening scanlines, scanlines+bloom, phosphorDecay → readback); scanline mask rows equal `applyScanlines`' darkened rows for 4 period/phase pairs (incl. fractional phase).
+- Not done: the bloom `strength` vs `intensity` key mismatch (research F10 item 6) — fixing it changes bloom output for every preset that sets `strength`, so it needs its own gated item.
+
+**Measured (under parallel load; PERF_JOB avg of 30 frames, cream-paper 1024×682, ITER-066 binary → this one):**
+- `postprocess` stage: scanlines 32.3 → 0.8 ms, scanlines period 3 32.2 → 0.6 ms, kawaii 33.0 → 1.3 ms, scanlines+kawaii+letterbox 35.2 → 0.9 ms; frame total 42–47 → 10.5–11.0 ms.
+- Capture side effect: the synchronous `toBlob` call grows on these stacks (e.g. 16 → 29 ms scanlines, 4 → 21 ms scanlines+kawaii) because the canvas is no longer read back to the CPU each frame (the ITER-015 GPU-layer pattern in reverse); per-frame main-thread time on export still drops (≈ 59 → 40 ms scanlines, ≈ 51 → 32 ms scanlines+kawaii). The GUI preview has no `toBlob`.
+- Equivalence, lossless PERF_JOB PNG anchors (first/mid/last) vs ITER-066: scanlines 66.7 / 65.2 / 64.5 dB (max |Δ| 1), period-3 scanlines **identical** (intensity 0.6 = alpha 153/255 exactly), kawaii 91.1 / 92.2 / 91.5 dB (max 2), scanlines+kawaii+letterbox 65.9 / 65.4 / 65.2 dB (max 1). Mode renders (MP4, ≥30 bar): still scanlines 38.59, kawaii 51.86, scanlines+kawaii 39.11 dB; animated scanlines 40.20, kawaii 46.11, scanlines+kawaii 40.36 dB; edge-directional, shape octant, dither none, phosphorDecay, period-3 scanlines and scanlines+bloom rgba-identical (still and animated).
+- Worm pB (bloom → still Phase A): 120 frames ×2 = ITER-066 md5 `f24c0b31…`, 40.07 dB vs golden; perf-sample wall 12.02 / 12.42 s, app CPU 2.82 / 2.70 s (`suspect_foreign_xpc:true`).
+
+**Gate:** cargo build 0 errors · cargo test 18/18 · npm test ok (+ Tier A block) · run-all PASS 27 / FAIL 0 (incl. the uncommitted ITER-064 B13 hunk), MCP 10/10, byte-identity 7/7 · output gate 40.07 dB ≥ 35 (moved by ITER-066, unchanged here).
+
+**Gotchas:** (a) The canvas blend rounds where `Uint8ClampedArray` rounds half-to-even — ±1 LSB on darkened rows; MP4 amplifies that to the ~39 dB above, the PNG anchors are the real measure. (b) Tier A only covers stacks with no other imgData stage; bloom/halation/phosphor/CA/barrel/godRays/crtBeam stacks keep the readback (Tier B GPU passes are the follow-up). (c) The scanline mask is a full w×h canvas (≈2.8 MB at 1024×682), rebuilt only on size/period/phase change — intensity changes reuse it.
+
 ### ITER-066 — 2026-10-17 — v0.2 Phase 4: animated-source preprocess runs as three WebGL2 fragment passes (F8 Phase A)
 
 **Problem:** every animated source frame paid the studio scene's full preprocess in JS at the working size (worm-move: 462×622): `buf.loadPixels()` readback, ~9 full-canvas loops over six Float32 planes (luminance ×3, 3×3 and 5-tap blurs, unsharp/gain with a 3-channel inner loop, face fine-sharpen, chip/tweezer/hand zone pass with per-pixel `hypot`/`sqrt`), then `buf.updatePixels()`. Stills run it once (ITER-042 memo); GIFs run it per frame.

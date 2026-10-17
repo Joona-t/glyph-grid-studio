@@ -3129,8 +3129,8 @@
        a successful GL draw; _glOk latches false on GL failure. */
     if (CONFIG.renderer === 'webgl' && _glOk
         && colorMode === 'monochrome' && !depthFogActive && !_dispActive
-        && !(typeof _hasImgDataStages === 'function'
-             && _hasImgDataStages(CONFIG.postprocess))) {
+        && !(typeof _needsImgDataReadback === 'function'
+             && _needsImgDataReadback(CONFIG.postprocess))) {
       if (drawGridWebGL(cellIndex, signal, cols, rows, cellW, cellH,
                         palette, ramp, rampLast, _stabOnInt)) {
         currentCellDepth = -1;
@@ -3995,7 +3995,7 @@
   // NOT trigger the full getImageData + putImageData round-trip (~5 ms/frame
   // combined on default canvas). Mirrors the _stageActive helper in
   // glyph-compat.js — same source of truth as gatePostprocess.
-  function _hasImgDataStages(p) {
+  function _hasImgDataStages(p, skipOverlayable) {
     if (!p) return false;
     function _on(s, ks) {
       if (!s || !s.enabled) return false;
@@ -4010,10 +4010,44 @@
            _on(p.halation, ['intensity', 'strength']) ||
            _on(p.bloom, ['intensity', 'strength']) ||
            _on(p.godRays, ['strength', 'intensity']) ||
-           _on(p.scanlines, ['intensity', 'strength']) ||
+           (!skipOverlayable && _on(p.scanlines, ['intensity', 'strength'])) ||
            _on(p.chromaticAberration, ['amount']) ||
            _on(p.barrel, ['amount']) ||
-           _on(p.kawaii, ['intensity']);
+           (!skipOverlayable && _on(p.kawaii, ['intensity']));
+  }
+
+  /* v0.2 Phase 4 (F10 Tier A): scanlines and kawaii are drawn as canvas-2D
+     composites when they are the ONLY imgData stages, so such stacks skip
+     the full-canvas getImageData/putImageData. True when a stage that still
+     needs the RGBA readback is active. `_hasImgDataStages` keeps its meaning
+     (any per-pixel CRT stage — the idle detector uses it: kawaii twinkles). */
+  function _needsImgDataReadback(p) {
+    if (!p || !_hasImgDataStages(p)) return false;
+    const sl = p.scanlines;
+    const slOn = !!(sl && sl.enabled);
+    const slI = slOn ? (sl.intensity == null ? 0.25 : sl.intensity) : 0;
+    if (slOn && !(slI >= 0)) return true;  /* negative/NaN intensity brightens — CPU only */
+    return _hasImgDataStages(p, true);
+  }
+
+  /* Scanline darken mask: opaque black on the rows applyScanlines darkens,
+     transparent elsewhere; drawn source-over at globalAlpha = intensity it
+     gives c·(1 − intensity) on those rows (±1 LSB vs the RGBA multiply).
+     Cached by (w, h, period, phase). */
+  let _scanlineOverlay = null;       // { canvas, key }
+  function _ensureScanlineOverlay(w, h, period, phase) {
+    const key = w + 'x' + h + ':' + period + ':' + phase;
+    if (_scanlineOverlay && _scanlineOverlay.key === key) return _scanlineOverlay;
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#000';
+    for (let y = 0; y < h; y++) {
+      if ((y + phase) % period === 0) continue;   /* same row test as applyScanlines */
+      ctx.fillRect(0, y, w, 1);
+    }
+    _scanlineOverlay = { canvas: canvas, key: key };
+    return _scanlineOverlay;
   }
 
   // HOT-PATH: applyPostprocess — pixel-stage round-trip. Optimization loop
@@ -4027,8 +4061,9 @@
       : (frameCount - 1);
     const reduced = __prefersReducedMotion();
 
-    /* Phase A — only when any imgData stage is active. */
-    if (_hasImgDataStages(post)) {
+    /* Phase A — only when an imgData stage that needs the RGBA buffer is
+       active (applyChain then also runs scanlines/kawaii in-buffer). */
+    if (_needsImgDataReadback(post)) {
       const imgData = ctx.getImageData(0, 0, w, h);
       /* Stateful stages need a host-owned state: applyChain's own lazy
          init only rebinds its local, so a null crtState meant a fresh
@@ -4045,6 +4080,26 @@
         skipOverlays: true,            /* vignette + letterbox handled below */
       });
       ctx.putImageData(imgData, 0, 0);
+    } else if (_hasImgDataStages(post)) {
+      /* Tier A — scanlines then kawaii, the order applyChain uses, both
+         before the vignette/letterbox overlays like the Phase A path. */
+      const prevAlpha = ctx.globalAlpha, prevFill = ctx.fillStyle;
+      const prevOp = ctx.globalCompositeOperation;
+      ctx.globalCompositeOperation = 'source-over';
+      const sl = post.scanlines;
+      if (sl && sl.enabled) {
+        const intensity = sl.intensity == null ? 0.25 : sl.intensity;
+        if (intensity > 0) {
+          const period = Math.max(1, sl.period | 0 || 2);
+          const phase = reduced ? 0 : (sl.phase || 0);
+          ctx.globalAlpha = intensity > 1 ? 1 : intensity;
+          ctx.drawImage(_ensureScanlineOverlay(w, h, period, phase).canvas, 0, 0);
+        }
+      }
+      const kw = post.kawaii;
+      if (kw && kw.enabled) GlyphGrid.crt.applyKawaiiCtx(ctx, w, h, kw, frameIdx);
+      ctx.globalAlpha = prevAlpha; ctx.fillStyle = prevFill;
+      ctx.globalCompositeOperation = prevOp;
     }
 
     /* Phase B — overlays. drawImage with composite op; no readback. */

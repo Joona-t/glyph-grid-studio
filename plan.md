@@ -77,7 +77,7 @@ Goal: the GUI is cheap when idle, starts offline, imports big GIFs without copyi
 - [ ] **p5 GIF autoplay off** (F21, S) so `setFrame()` can't race wall-clock advance.
 - [x] **GL path, step 0 → 1** (F6): instrument `wave6.draw`/`drawImage`/`toBlob` split at 240×120 and 400×300; then move per-cell placement + gamma into the vertex shader (per-instance `signal`/`cellIndex` bytes). Make the shader output-equivalent to the sprite path (F7) and gate it with the PSNR script. Steps 2–3 (GL as presented surface, FBO postprocess) only if step 0 shows ≥5 ms on the fill loop at default. — ITER-065 (step 0 measured in tests/PERF-V0.2-GL.md: fill loop 0.1–1.0 ms ⇒ step 1 not done; path was dead since v0.1.6, now ≥51 dB vs CPU)
 - [x] **GPU source preprocess, Phase A** (F8, M): three fragment passes replacing the ~10 JS passes for animated sources; JS fallback when no webgl2; keyed by `_processedKey`. — ITER-066 (preprocess 29.7 → 7.4 ms/frame; worm 40.07 dB vs golden, default on)
-- [ ] **imgData postproc Tier A** (F10, S): skip the full-canvas readback for scanlines/kawaii-only stacks.
+- [x] **imgData postproc Tier A** (F10, S): skip the full-canvas readback for scanlines/kawaii-only stacks. — ITER-067 (postprocess 32–35 → 0.6–1.3 ms on those stacks; ≥64 dB lossless)
 - [ ] Skip WASM/SIMD (F9): ceiling is ~2.4 ms/frame at default. Noted, not scheduled.
 - [ ] Bump → v0.1.14.
 

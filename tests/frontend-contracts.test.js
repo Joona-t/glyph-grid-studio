@@ -282,3 +282,57 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   assert(/gpuPreprocess: true,/.test(html), 'studio.gpuPreprocess default is declared');
   console.log('GL preprocess constant parity: ok (' + names.length + ' constants)');
 }
+
+/* ITER-067 (F10 Tier A): scanlines/kawaii-only stacks skip the readback,
+   and their canvas-2D versions reproduce the RGBA kernels. */
+{
+  const crt = require('../src/lib/glyph-crt.js');
+  /* kawaii: the fillRect blit on a fake source-over ctx vs the RGBA loop. */
+  const w = 97, h = 61, opts = { intensity: 0.9, heartCount: 9, sparkleCount: 14, twinkleCount: 30 };
+  for (const frameIdx of [0, 7, 33]) {
+    const ref = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < ref.length; i++) ref[i] = (i * 37) & 255;
+    const out = Float64Array.from(ref);
+    crt.applyChain({ width: w, height: h, data: ref }, null, { kawaii: Object.assign({ enabled: true }, opts) }, { frameIdx });
+    let fill = [0, 0, 0], alpha = 1, rects = 0;
+    const ctx = {
+      set fillStyle(v) { fill = v.match(/\d+/g).map(Number); },
+      set globalAlpha(v) { alpha = v; },
+      fillRect(x, y, rw, rh) {
+        assert(rw === 1 && rh === 1 && x >= 0 && y >= 0 && x < w && y < h, 'kawaii rects are in-bounds 1x1');
+        const o = (y * w + x) * 4; rects++;
+        for (let c = 0; c < 3; c++) out[o + c] = Math.round(out[o + c] * (1 - alpha) + fill[c] * alpha);
+      },
+    };
+    crt.applyKawaiiCtx(ctx, w, h, opts, frameIdx);
+    assert(rects > 0, 'kawaii ctx blit draws');
+    let maxD = 0;
+    for (let i = 0; i < ref.length; i++) if ((i & 3) !== 3) maxD = Math.max(maxD, Math.abs(ref[i] - out[i]));
+    assert(maxD <= 1, `kawaii ctx blit within 1 LSB of the RGBA kernel (frame ${frameIdx}: ${maxD})`);
+  }
+  /* readback gate truth table + scanline mask rows. */
+  const fnSrc = ['_hasImgDataStages', '_needsImgDataReadback', '_ensureScanlineOverlay'].map((n) => {
+    const m = html.match(new RegExp('\\n  function ' + n + '\\([\\s\\S]*?\\n  \\}\\n'));
+    assert(m, n + ' not found'); return m[0];
+  }).join('\n');
+  const rows = [];
+  const sctx = { document: { createElement: () => ({ getContext: () => ({ fillRect: (x, y) => rows.push(y) }) }) } };
+  vm.createContext(sctx);
+  vm.runInContext('let _scanlineOverlay = null;\n' + fnSrc + '\nthis.n = _needsImgDataReadback; this.o = _ensureScanlineOverlay;', sctx);
+  const on = (o) => Object.assign({ enabled: true }, o);
+  assert.strictEqual(sctx.n({ vignette: on({ strength: 0.5 }) }), false, 'vignette only: no readback');
+  assert.strictEqual(sctx.n({ scanlines: on({ intensity: 0.3 }) }), false, 'scanlines only: no readback');
+  assert.strictEqual(sctx.n({ kawaii: on({ intensity: 0.8 }), scanlines: on({ intensity: 0.3 }) }), false, 'scanlines+kawaii: no readback');
+  assert.strictEqual(sctx.n({ scanlines: on({ intensity: -0.3, strength: 0.4 }) }), true, 'brightening scanlines stay on the RGBA path');
+  assert.strictEqual(sctx.n({ scanlines: on({ intensity: 0.3 }), bloom: on({ strength: 0.9 }) }), true, 'scanlines+bloom: readback');
+  assert.strictEqual(sctx.n({ phosphorDecay: on({ decay: 0.8 }) }), true, 'phosphorDecay: readback');
+  for (const [period, phase] of [[2, 0], [3, 1], [1, 0], [2, 0.5]]) {
+    rows.length = 0;
+    sctx.o(10, 9, period, phase);
+    const ref = new Uint8ClampedArray(10 * 9 * 4).fill(200);
+    crt.applyScanlines(ref, 10, 9, { intensity: 0.5, period, phase });
+    const dark = []; for (let y = 0; y < 9; y++) if (ref[y * 40] !== 200) dark.push(y);
+    assert.deepStrictEqual(rows, dark, `scanline mask rows match applyScanlines (period ${period}, phase ${phase})`);
+  }
+  console.log('postprocess Tier A overlays: ok');
+}
