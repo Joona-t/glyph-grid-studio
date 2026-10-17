@@ -548,6 +548,14 @@ impl VideoDecoder {
         Ok(())
     }
 
+    /// Length-prefixed sample -> Annex-B.  ITER-079: an in-band SPS
+    /// (type 7) must declare the admitted size.  openh264 honours the
+    /// newest SPS it sees and reallocates for it, so one that grew the
+    /// picture would bypass check_limits, which only saw the avcC.  Such
+    /// NALs are checked, not dropped: encoders that repeat headers
+    /// (x264 --repeat-headers, broadcast muxes) may carry SPS/PPS that
+    /// differ from the avcC in ids or VUI, and those streams keep decoding.
+    /// Subset SPS (type 15, SVC/MVC) cannot be parsed here and is refused.
     fn to_annexb(&self, avcc: &[u8], sync: bool) -> Result<Vec<u8>, String> {
         let mut out = Vec::with_capacity(avcc.len() + 64);
         if sync {
@@ -564,8 +572,25 @@ impl VideoDecoder {
             if i + len > avcc.len() {
                 return Err("truncated NAL unit".into());
             }
+            let nal = &avcc[i..i + len];
+            match nal.first().map(|h| h & 0x1F) {
+                Some(7) => {
+                    let admitted = (self.info.width, self.info.height);
+                    let got = sps_dimensions(nal);
+                    if got != Some(admitted) {
+                        return Err(format!(
+                            "in-band SPS changes the stream size ({} vs the admitted {}x{})",
+                            got.map_or("unparseable".into(), |(w, h)| format!("{}x{}", w, h)),
+                            admitted.0,
+                            admitted.1
+                        ));
+                    }
+                }
+                Some(15) => return Err("in-band subset SPS (SVC/MVC) is not supported".into()),
+                _ => {}
+            }
             out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&avcc[i..i + len]);
+            out.extend_from_slice(nal);
             i += len;
         }
         Ok(out)
@@ -617,26 +642,29 @@ impl VideoDecoder {
                     .ok_or_else(|| format!("sample {} missing", sid))?;
                 let packet = self.to_annexb(&sample.bytes, self.gops.binary_search(&self.next_sample).is_ok())?;
                 self.next_sample += 1;
+                let want = (self.info.width, self.info.height);
                 let dec = self.decoder.as_mut().ok_or("decoder not initialised")?;
                 let out = dec
                     .decode(&packet)
                     .map_err(|e| format!("decode sample {}: {}", sid, e))?
-                    .map(|y| yuv_rgba(&y));
-                if let Some((rgba, w, h)) = out {
-                    self.emit(rgba, w, h, Some(p))?;
+                    .map(|y| yuv_rgba(&y, want))
+                    .transpose()?;
+                if let Some(rgba) = out {
+                    self.emit(rgba, want.0, want.1, Some(p))?;
                 }
             } else {
                 // End of this GOP: drain the reorder buffer, then start the
                 // next GOP — or stop at the end of the stream.
+                let want = (self.info.width, self.info.height);
                 let dec = self.decoder.as_mut().ok_or("decoder not initialised")?;
-                let rest: Vec<(Vec<u8>, u32, u32)> = dec
+                let rest: Vec<Vec<u8>> = dec
                     .flush_remaining()
                     .map_err(|e| format!("flush: {}", e))?
                     .iter()
-                    .map(yuv_rgba)
-                    .collect();
-                for (rgba, w, h) in rest {
-                    self.emit(rgba, w, h, Some(p))?;
+                    .map(|y| yuv_rgba(y, want))
+                    .collect::<Result<_, _>>()?;
+                for rgba in rest {
+                    self.emit(rgba, want.0, want.1, Some(p))?;
                 }
                 if self.next_out != self.gop_end {
                     return Err(format!(
@@ -682,11 +710,20 @@ fn track_fps(track: &mp4::Mp4Track) -> f64 {
     n as f64 * track.timescale().max(1) as f64 / ticks as f64
 }
 
-fn yuv_rgba(y: &DecodedYUV<'_>) -> (Vec<u8>, u32, u32) {
+/// RGBA8 of a decoded picture.  ITER-079: the picture must be the
+/// admitted `want` size, checked BEFORE the w·h·4 buffer is allocated —
+/// emit() used to be the first size check, after the allocation.
+fn yuv_rgba(y: &DecodedYUV<'_>, want: (u32, u32)) -> Result<Vec<u8>, String> {
     let (w, h) = y.dimensions();
+    if (w as u64, h as u64) != (want.0 as u64, want.1 as u64) {
+        return Err(format!(
+            "decoded picture is {}x{} (stream admitted at {}x{}); resolution changes are not supported",
+            w, h, want.0, want.1
+        ));
+    }
     let mut buf = vec![0u8; w * h * 4];
     y.write_rgba8(&mut buf);
-    (buf, w as u32, h as u32)
+    Ok(buf)
 }
 
 /// Header-only probe for `probe_image_file`: frames / fps / dims / codec,
@@ -1039,5 +1076,151 @@ mod tests {
         assert!(frame_of(a.handle, 0).unwrap_err().contains("not open"));
         let (f, w, h) = frame_of(b.handle, 4).unwrap();
         assert_eq!((f.len(), w, h), (160 * 90 * 4, 160, 90));
+    }
+
+    /// A baseline SPS NAL for a `w_mbs` x `h_mbs` macroblock picture, no
+    /// cropping, emulation prevention applied — hand-built for the crafted
+    /// in-band fixtures below.
+    fn sps_nal(w_mbs: u32, h_mbs: u32) -> Vec<u8> {
+        let mut bits: Vec<u8> = Vec::new();
+        let mut put = |v: u32, n: u32| (0..n).rev().for_each(|k| bits.push(((v >> k) & 1) as u8));
+        let ue = |put: &mut dyn FnMut(u32, u32), v: u32| {
+            let n = 32 - (v + 1).leading_zeros();
+            put(0, n - 1);
+            put(v + 1, n);
+        };
+        put(66, 8); // profile_idc: Baseline
+        put(0, 8); // constraint flags
+        put(51, 8); // level_idc
+        ue(&mut put, 0); // seq_parameter_set_id
+        ue(&mut put, 0); // log2_max_frame_num_minus4
+        ue(&mut put, 2); // pic_order_cnt_type
+        ue(&mut put, 1); // max_num_ref_frames
+        put(0, 1); // gaps_in_frame_num_value_allowed_flag
+        ue(&mut put, w_mbs - 1);
+        ue(&mut put, h_mbs - 1);
+        put(1, 1); // frame_mbs_only_flag
+        put(1, 1); // direct_8x8_inference_flag
+        put(0, 1); // frame_cropping_flag
+        put(0, 1); // vui_parameters_present_flag
+        put(1, 1); // rbsp_stop_one_bit
+        while bits.len() % 8 != 0 {
+            bits.push(0);
+        }
+        let mut nal = vec![0x67];
+        let mut zeros = 0;
+        for byte in bits.chunks(8).map(|c| c.iter().fold(0u8, |a, b| (a << 1) | b)) {
+            if zeros >= 2 && byte <= 3 {
+                nal.push(3);
+                zeros = 0;
+            }
+            zeros = if byte == 0 { zeros + 1 } else { 0 };
+            nal.push(byte);
+        }
+        nal
+    }
+
+    /// A copy of `name` with `nal` (length-prefixed) inserted at the start
+    /// of sample `k` (0-based): the stsz entry and the mdat size grow.  The
+    /// fixtures hold every sample in one chunk, so the chunk offset does not
+    /// move (a moov after the mdat moves, but nothing points into it).
+    fn with_inband(name: &str, k: usize, nal: &[u8], tag: &str) -> PathBuf {
+        let mut b = std::fs::read(fixture(name)).unwrap();
+        let be = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+        let stco = b.windows(4).rposition(|w| w == b"stco").unwrap() - 4;
+        assert_eq!(be(&b, stco + 12), 1, "{}: one chunk", name);
+        let chunk = be(&b, stco + 16) as usize;
+        let stsz = b.windows(4).rposition(|w| w == b"stsz").unwrap() - 4;
+        let at = chunk + (0..k).map(|i| be(&b, stsz + 20 + 4 * i) as usize).sum::<usize>();
+        let mdat = b.windows(4).rposition(|w| w == b"mdat").unwrap() - 4;
+        assert!(mdat < at, "{}: sample inside mdat", name);
+        let grow = 4 + nal.len() as u32;
+        let e = stsz + 20 + 4 * k;
+        let v = be(&b, e) + grow;
+        b[e..e + 4].copy_from_slice(&v.to_be_bytes());
+        let v = be(&b, mdat) + grow;
+        b[mdat..mdat + 4].copy_from_slice(&v.to_be_bytes());
+        let mut ins = (nal.len() as u32).to_be_bytes().to_vec(); // length_size 4
+        ins.extend_from_slice(nal);
+        b.splice(at..at, ins);
+        let dir = std::env::temp_dir().join(format!("ggs-video-inband-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("{}-{}", tag, name));
+        std::fs::write(&out, b).unwrap();
+        out
+    }
+
+    /// ITER-079: an in-band SPS declaring 8192x8192 used to reach openh264,
+    /// which honours the newest SPS; the first size check was emit(), after
+    /// yuv_rgba had allocated 8192·8192·4 bytes.  It is now refused in
+    /// to_annexb, before the packet is decoded.
+    #[test]
+    fn an_in_band_sps_cannot_grow_the_picture() {
+        let big = sps_nal(512, 512);
+        assert_eq!(sps_dimensions(&big), Some((8192, 8192)));
+        assert_eq!(sps_dimensions(&sps_nal(10, 6)), Some((160, 96)), "the writer agrees with the reader");
+        let base = VideoDecoder::open(&fixture("tiny.mp4")).unwrap();
+        assert_eq!(base.length_size, 4);
+
+        // First sample: frame 0 is decoded inside open(), so open refuses it.
+        let first = with_inband("tiny.mp4", 0, &big, "sps0");
+        let reason = VideoDecoder::open(&first).err().and_then(|i| i.reason).unwrap_or_default();
+        assert!(reason.contains("in-band SPS changes the stream size (8192x8192 vs the admitted 160x90)"), "{}", reason);
+
+        // A later sample (the last of GOP 0, a non-sync sample): open
+        // succeeds, frame() refuses the packet.
+        let k = base.gops.get(1).copied().unwrap_or(base.samples) - 1;
+        assert!(k >= 2, "gops {:?}", base.gops);
+        let later = with_inband("tiny.mp4", k as usize, &big, "sps-late");
+        let mut d = VideoDecoder::open(&later).unwrap_or_else(|i| panic!("{:?}", i.reason));
+        let e = d.frame(k).unwrap_err();
+        assert!(e.contains("in-band SPS changes the stream size"), "{}", e);
+        assert!(d.ring.iter().all(|(_, f)| f.len() == 160 * 90 * 4));
+
+        // An unparseable in-band SPS is refused too (openh264 might read it).
+        let junk = with_inband("tiny.mp4", 0, &[0x67, 0x42], "spsjunk");
+        let reason = VideoDecoder::open(&junk).err().and_then(|i| i.reason).unwrap_or_default();
+        assert!(reason.contains("unparseable vs the admitted 160x90"), "{}", reason);
+        let svc = with_inband("tiny.mp4", 0, &[0x6F, 0x53, 0x00], "subset");
+        let reason = VideoDecoder::open(&svc).err().and_then(|i| i.reason).unwrap_or_default();
+        assert!(reason.contains("subset SPS"), "{}", reason);
+
+        // Repeated headers of the admitted size (the avcC's own SPS in-band,
+        // as x264 --repeat-headers writes them) still decode identically.
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            let mut orig = VideoDecoder::open(&fixture(name)).unwrap();
+            let own = {
+                let t = orig.reader.tracks()[&orig.track_id].trak.mdia.minf.stbl.stsd.avc1.as_ref().unwrap();
+                t.avcc.sequence_parameter_sets[0].bytes.clone()
+            };
+            let same = with_inband(name, 0, &own, "same");
+            let mut d = VideoDecoder::open(&same).unwrap_or_else(|i| panic!("{}: {:?}", name, i.reason));
+            for i in 0..12 {
+                assert!(d.frame(i).unwrap() == orig.frame(i).unwrap(), "{} frame {}", name, i);
+            }
+        }
+    }
+
+    /// ITER-079: yuv_rgba checks the picture against the admitted size
+    /// before allocating, so emit() is no longer the first guard.
+    #[test]
+    fn yuv_rgba_refuses_a_picture_of_another_size() {
+        let mut d = VideoDecoder::open(&fixture("tiny.mp4")).unwrap();
+        let mut dec = Decoder::with_api_config(OpenH264API::from_source(), DecoderConfig::new()).unwrap();
+        let mut checked = false;
+        for sid in 1..=d.samples {
+            let s = d.reader.read_sample(d.track_id, sid).unwrap().unwrap();
+            let pkt = d.to_annexb(&s.bytes, sid == 1).unwrap();
+            if let Some(y) = dec.decode(&pkt).unwrap() {
+                assert_eq!(yuv_rgba(&y, (160, 90)).unwrap().len(), 160 * 90 * 4);
+                let e = yuv_rgba(&y, (8192, 8192)).unwrap_err();
+                assert!(e.contains("decoded picture is 160x90 (stream admitted at 8192x8192)"), "{}", e);
+                assert!(yuv_rgba(&y, (160, 96)).is_err(), "coded size is not the cropped size");
+                checked = true;
+                break;
+            }
+        }
+        assert!(checked, "openh264 produced no picture");
+        d.ring.clear();
     }
 }

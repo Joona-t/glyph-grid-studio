@@ -4,6 +4,24 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-079 — 2026-10-18 — video: in-band SPS cannot resize the decode, size checked before the RGBA allocation
+
+**Problem:** ITER-078 enforced SOURCE_LIMITS against the avcC SPS only (stream_dimensions + check_limits in `VideoDecoder::open`). `to_annexb` then copied every sample NAL verbatim, so a type-7 SPS carried in a sample (e.g. declaring 8192×8192 in a file whose avcC says 160×90) reached openh264. openh264 honours the newest SPS and reallocates for it. The first size check was `emit()`, which ran AFTER `yuv_rgba` had already allocated w·h·4 bytes (256 MB for 8192², up to 1 GB at 16384²) for the oversized picture.
+
+**Root cause:** the limits were checked against the header, but the decoder obeys the stream. And the per-frame guard sat after the allocation it was meant to bound.
+
+**Fix:**
+1. `to_annexb` reads every NAL's type (`nal[0] & 0x1F`). A type-7 SPS goes through `sps_dimensions` and must equal the admitted `(info.width, info.height)`, else `Err("in-band SPS changes the stream size (WxH vs the admitted WxH)")`. An unparseable one is refused the same way, since openh264 might still read it. Type 15 (subset SPS, SVC/MVC) is refused: we cannot parse it and the fixtures never need it. **Checked, not dropped:** encoders that repeat headers (x264 `--repeat-headers`, broadcast muxes) can carry in-band SPS/PPS whose ids or VUI differ from the avcC. Dropping types 7/8 would break those streams, or make them decode against the wrong PPS. A same-size SPS changes nothing we bound.
+2. `yuv_rgba(y, want)` compares `y.dimensions()` with the admitted size BEFORE `vec![0; w*h*4]` and returns `Err`. Both the decode and the `flush_remaining` paths pass the admitted size. `emit()` keeps its own check as the third layer. Anamorphic / cropping handling is unchanged: the admitted size is still the cropped SPS size.
+
+**Tests (cargo 62 → 64):** `an_in_band_sps_cannot_grow_the_picture` uses fixtures built at test time from tiny.mp4. A hand-built baseline SPS (exp-Golomb writer + emulation prevention, 512×512 MBs = 8192×8192) is inserted into the first sample: open (which decodes frame 0) fails with the in-band message. Inserted into the last sample of GOP 0: open succeeds, `frame(k)` returns `Err`, and the ring holds only 160×90 frames. A junk SPS and a subset SPS are refused. The avcC's own SPS inserted in-band (tiny.mp4 and tiny-bframes.mp4) still decodes all 12 frames byte-identical to the original. `yuv_rgba_refuses_a_picture_of_another_size` decodes a real picture and checks that `yuv_rgba` errors for 8192×8192 and for the coded 160×96 size, and accepts 160×90.
+
+**Measured:** the golden render (worm-move.gif, 120 frames, pB, `--mp4-quality archive`) vs golden-p3-iter057.mp4 gives PSNR inf (no output change), real 17.75 s, user 2.08 s.
+
+**Gotchas:** the crafted-fixture helper relies on the fixtures storing every sample in one chunk (asserted). tiny-bframes.mp4 has its moov after the mdat, which is fine because nothing points into the moov. A frame-0 failure inside `open()` is still reported as `supported: false`, which hands the clip to the WebView, not `rejected`. That WebView path takes its size from `<video>` metadata.
+
+---
+
 ### ITER-078 — 2026-10-18 — Phase 5 hardening: text-export path guard, bounded video tables, SPS-checked probe, runtime-only camera, review fixes
 
 **Problem:** the automated review of ITER-074..077 and the phase-5 fix queue found five security / privacy holes and nine review defects.
