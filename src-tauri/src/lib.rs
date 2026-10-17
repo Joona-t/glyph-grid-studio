@@ -770,6 +770,19 @@ pub const EXIT_TIMEOUT: i32 = 3;
 /// No liveness touch for this long = a stalled WebView (the 35-min hang
 /// class tests/run-all.sh used to need `timeout` for).
 const STALL_SECS: u64 = 300;
+/// Test-only override of STALL_SECS (tests/batch-jobs-stall.sh, ITER-072):
+/// lets a test reach the stall guard in seconds instead of minutes.  A
+/// `--jobs` parent strips it from its children so only the parent's guard
+/// is under test.
+const STALL_SECS_TEST_ENV: &str = "GGS_TEST_STALL_SECS";
+
+fn stall_secs() -> u64 {
+    std::env::var(STALL_SECS_TEST_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(STALL_SECS)
+}
 
 static WATCHDOG_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
 /// Milliseconds since WATCHDOG_EPOCH of the last liveness touch.
@@ -930,6 +943,7 @@ fn start_watchdog(timeout_secs: Option<u64>) {
     #[cfg(unix)]
     sig::install();
     let deadline_ms = timeout_secs.filter(|s| *s > 0).map(|s| s * 1000);
+    let stall_ms = stall_secs() * 1000;
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let signum = PENDING_SIGNAL.load(Ordering::SeqCst);
@@ -947,7 +961,7 @@ fn start_watchdog(timeout_secs: Option<u64>) {
             }
         }
         let idle = now.saturating_sub(LAST_LIVENESS_MS.load(Ordering::Relaxed));
-        if idle >= STALL_SECS * 1000 {
+        if idle >= stall_ms {
             abort_headless(
                 EXIT_TIMEOUT,
                 &format!("stalled: no render progress for {} s", idle / 1000),
@@ -1431,7 +1445,9 @@ fn split_batch_manifest(
 /// ITER-055: run the split manifest as `n` concurrent `batch` children of
 /// this binary.  Each child's stderr is relayed line by line (PERF_JOB and
 /// `--progress` NDJSON lines verbatim so NDJSON consumers need no change;
-/// everything else tagged `batch[i/n]`).  Exit = the worst child's code (a
+/// everything else tagged `batch[i/n]`).  ITER-072: children always run
+/// with `--progress` so every frame touches the parent's liveness; the
+/// NDJSON is dropped unless the parent itself has `--progress`.  Exit = the worst child's code (a
 /// signal counts as 1).  ITER-071: the parent runs the ITER-059 watchdog
 /// (`--timeout`, stall guard, SIGINT/SIGTERM); `abort_headless` SIGTERMs
 /// the registered children (each sweeps its own `.part` files) and removes
@@ -1480,17 +1496,20 @@ fn run_batch_children(
     }
     start_watchdog(timeout_secs);
 
+    let relay_progress = PROGRESS_NDJSON.load(Ordering::Relaxed);
     let mut worst = 0;
     let mut relays = Vec::with_capacity(n);
     for (i, p) in paths.iter().enumerate() {
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("batch").arg("--manifest").arg(p);
+        cmd.arg("batch").arg("--manifest").arg(p).env_remove(STALL_SECS_TEST_ENV);
         if show_window {
             cmd.arg("--show-window");
         }
-        if PROGRESS_NDJSON.load(Ordering::Relaxed) {
-            cmd.arg("--progress");
-        }
+        // ITER-072: always ask for per-frame NDJSON — the parent's stall
+        // guard only sees liveness through these stderr lines, and a quiet
+        // child prints nothing for a whole job.  Relayed only when the
+        // parent itself has `--progress`.
+        cmd.arg("--progress");
         match cmd.stderr(std::process::Stdio::piped()).spawn() {
             Ok(mut child) => {
                 let stderr = child.stderr.take().expect("piped stderr");
@@ -1505,7 +1524,11 @@ fn run_batch_children(
                         let text = String::from_utf8_lossy(&line);
                         let text = text.trim_end_matches('\n');
                         touch_liveness();
-                        if text.contains("PERF_JOB") || text.starts_with("{\"type\":\"progress\"") {
+                        if text.starts_with("{\"type\":\"progress\"") {
+                            if relay_progress {
+                                eprintln!("{}", text);
+                            }
+                        } else if text.contains("PERF_JOB") {
                             eprintln!("{}", text);
                         } else {
                             eprintln!("batch[{}/{}]: {}", i + 1, n, text);

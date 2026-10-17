@@ -4,6 +4,23 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-072 — 2026-10-17 — `batch --jobs` parent no longer "stalls" on a quiet long job
+
+**Problem:** the ITER-071 merge review found that a `batch --jobs N` parent run without `--progress` could kill a healthy batch. The parent exits 3 ("stalled") after STALL_SECS (300 s) when one child job is quiet. Reproduced with the new test at a 3 s window: `--jobs 2`, 96 frames per job → **exit 3 after 5 s**, children SIGTERMed (143), no outputs.
+
+**Root cause:** the parent runs the ITER-059 watchdog, but its only liveness source is its children's stderr lines. Children got `--progress` only when the parent had it. Without it a child prints a few `prime:` / `batch:` lines per job and nothing per frame or encode tick. So any job longer than STALL_SECS looked like a hang. Each child's own watchdog was fine, because it touches liveness per staged frame in-process.
+
+**Fix:**
+- `run_batch_children` always passes `--progress` to children. The relay touches liveness on every child line. It drops lines that start with `{"type":"progress"` unless the parent itself has `--progress`. PERF_JOB stays verbatim and everything else stays tagged `batch[i/n]`. `--timeout`, SIGINT/SIGTERM and the abort path are unchanged.
+- `GGS_TEST_STALL_SECS` (test-only) overrides STALL_SECS via `stall_secs()`, read once per `start_watchdog`. The parent strips it from children (`env_remove`), so only the parent's guard is under test.
+- New `tests/batch-jobs-stall.sh`: a 2-job `--jobs 2` batch, no `--progress`, 3 s window, 96 frames per job. It must exit 0, write both outputs, take longer than the window, and relay no progress NDJSON. `tests/run-all.sh` (uncommitted, hook-protected) calls it as **G11**.
+
+**Measured:** after the fix the same test passes, **exit 0 after 27 s**, which is 9× the window. The tail includes a 20 s gifski encode that ticks progress. With `--progress` on the parent, 388 NDJSON lines are still relayed.
+
+**Gotchas:** progress NDJSON is stderr-only (Rust `progress_line`), so forcing it on children changes no output byte. The child-side cost is one stderr line per frame and per encode tick, which the relay already read line by line.
+
+**Gate:** cargo build --release 0 errors (1 pre-existing `Shell::open` deprecation) · cargo test **46/46** · npm test ok · run-all **PASS 45 / FAIL 0** (`TEST_TIMEOUT=400`, +G11) · MCP **27/27** · byte-identity **9/9** · G10 batch-jobs **5/5** · G11 batch-jobs-stall **3/3** · output gate worm-move 120 f `pB.json` `--mp4-quality archive` vs `golden-p3-iter057.mp4` **PSNR inf** (120/120), file md5 `d27fa511…` (same as ITER-071; differs from the golden only by the ITER-050 mdhd timescale) · timing (perf-sample ×2, load avg 12-13 on 8 cores, **not idle**): wall 15.54 / 15.51 s, app 1.85 / 1.98 s, WebContent 12.84 / 12.86 s, GPU 7.13 / 6.92 s.
+
 ### ITER-071 — 2026-10-17 — v0.2 integration: Phase 2 (ITER-050..055, 070) merged into Phase 3 + 4
 
 **Problem:** Phase 2 (`audit/v0.2-sota`) and Phases 3 + 4 (`v2/integration`) both rewrote the headless batch path in parallel. `git merge` conflicted in 7 files (BUGS, README, `lib.rs` ×8 hunks, `main.rs` ×5, `mcp.rs` ×2, `index.html` ×3, frontend contracts ×2). It also left seams that compiled but were wrong: the closed manifest schema (ITER-061) would refuse Phase 2's `mp4Quality` job key. The streamed GIF (ITER-053) committed its `.part` without the ITER-068 sidecar and without the ITER-059 `LIVE_PARTS` registration. The per-job border (ITER-057) never reached the streamed encoder. `--jobs` (ITER-055) forked before the job-config and resume checks, and its children ignored `--progress` / `--timeout` / signals.
