@@ -4735,8 +4735,18 @@
            Live draws in that window no longer matter — beginRecord primes
            the per-cell EMA itself (ITER-046). */
         let stagedError = null;
+        /* ITER-053: a GIF job hands its encode settings to begin_export_capture
+           so Rust runs gifski DURING capture (frames stream into the encoder as
+           they are pushed) and finish_gif_export only waits for the tail. The
+           same object is spread into the finish args, which must match. */
+        const gifStream = fmt === 'mp4' ? null : {
+          path: job.path,
+          delayMs: delayMs,
+          capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+          targetMaxBytes: (typeof job.targetMaxBytes === 'number' && job.targetMaxBytes > 0) ? job.targetMaxBytes : null,
+        };
         const stagedReady = Promise.resolve(
-          tauri('begin_export_capture', { jobId: jobId, total: frameTotal })
+          tauri('begin_export_capture', { jobId: jobId, total: frameTotal, gifStream: gifStream })
         ).then(function () { staged = true; }, function (e) { stagedError = e || new Error('begin_export_capture failed'); });
 
         function startCapture() {
@@ -4781,13 +4791,7 @@
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
                     mp4Quality: job.mp4Quality || null,  // ITER-050: 'upload' (default) | 'archive'
                   }
-                : {
-                    jobId: jobId,
-                    delayMs: delayMs,
-                    path: job.path,
-                    capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
-                    targetMaxBytes: (typeof job.targetMaxBytes === 'number' && job.targetMaxBytes > 0) ? job.targetMaxBytes : null,
-                  };
+                : Object.assign({ jobId: jobId }, gifStream);
               /* Sutskever B3 — export wall-time is the dominant real cost
                  (gifski encode 3–25 s/job, ITER-026) and no optimization
                  has ever measured it. Time the full encode round-trip

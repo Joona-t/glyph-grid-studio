@@ -4,6 +4,36 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-053 — 2026-10-17 — v0.2 Phase 2: headless GIF encode streams during capture (F12)
+
+**Problem:** A headless GIF ran capture first and gifski after it. The 120-frame gate job (worm-move, pB, 760×1024) spent ~6.4 s in gifski after the last frame, about a third of wall time, while the cores sat mostly idle during the rAF-throttled capture. The staged raw RGBA set (373 MB) also stayed alive until the encode finished.
+
+**Root cause:** `begin_export_capture` only knew the frame count. The GIF settings (path, delay, capWidth, targetMaxBytes) first reached Rust at `finish_gif_export`, so nothing could start encoding earlier. gifski can stream (`Writer::write<W: Write>`, bounded collector), but it was handed the whole set at once.
+
+**Fix:**
+- `begin_export_capture` takes an optional `gifStream {path, delayMs, capWidth, border, targetMaxBytes}`. When it is set, a per-job `gif-stream` thread (`run_gif_stream`) starts. It owns an UNBOUNDED `mpsc` receiver, so `stage_export_frame` never blocks the IPC/capture chain. The first frame fixes the output width via the same `validate_export_frames` + `validated_gif_width` as the batch path. A feeder decodes each frame (`decode_one_frame`) and calls `add_frame_rgba(idx, img, gif_pts(idx, delay))` in arrival order, which `stage_export_frame` already forces to index order. The writer streams into a `BufWriter<File>` on the `.part` from `output_part_path` (the `atomic_write_output` naming, now shared), then fsyncs. Only the feeder ever waits on gifski's bounded queue.
+- Retention: frames are kept, by the encoder thread, only when `targetMaxBytes` is set, for the twitter-fit re-encode. Without a target, each frame is dropped once gifski has it, and it counts against neither the PNG cap nor the raw cap (`StagedExport.received` now tracks order and completeness separately from `frames`).
+- `finish_gif_export` registers the encoder's own cancellation state (`register_export_state`, peeked by `capture_stream_state` before the take, the same register-then-take order as before), takes the capture, and refuses settings that differ from begin. Then `finish_gif_stream` closes the channel, joins, and either commits the `.part` (`commit_output_part`: RUNNING → COMMITTING, rename, directory fsync) or, on overshoot, deletes it and runs `twitter_fit_shrink` (split out of `encode_gif_gifski_adaptive`) on the retained frames through `atomic_write_output`.
+- Cancel during capture: `cancel_export` drops the capture → `GifStream::drop` sets JOB_CANCELLED **before** closing the channel → gifski stops (`Progress::increase` → false → `Error::Aborted`), and the thread deletes its `.part`. Drop never joins, because it runs under the EXPORT_CAPTURES lock. Cancel during the tail goes through the registered state to the same abort.
+- Headless/CLI/MCP only: `index.html`'s batch path builds one `gifStream` object, passes it to begin, and spreads it into the finish args. The GUI (`glyph-studio.js`) passes nothing and keeps the staged path, so the BUG-009 UI-stutter question doesn't arise yet. MP4 finish on a streaming capture is refused (which also cancels it). `save_gif_real` / `save_gif_to_path` are untouched.
+- Tests: `streamed_gif_is_byte_identical_to_the_staged_encode` (40 mixed PNG/raw frames; streamed == `encode_gif_gifski_adaptive` bytes with no target and with a met target; no `.part` left) and `streamed_gif_overshoot_and_cancel_leave_no_part_files` (impossible target → B11 error, no output; `cancel_export` after 10 of 40 frames → the encoder removes its `.part`). Two new frontend contracts pin the begin/finish wiring.
+
+**Measured** (worm-move, pB, 120 f, 760×1024 GIF; `tests/perf-sample.sh`, three builds interleaved base → ITER-054 → this, 3 rounds; the machine was quieter than the ITER-054 runs, and one base run flagged `suspect_foreign_xpc`):
+
+| build | wall s | app CPU s | WebContent s | GPU s | max RSS | GIF md5 |
+|---|---|---|---|---|---|---|
+| HEAD 7ed11b1 | 18.37 / 16.67 / 18.09 | 20.1 / 17.9 / 20.1 | 16.0 / 13.2 / 18.2 | 7.4 / 7.0 / 11.1 | 1,183 MB | 871b4de2… |
+| ITER-054 window | 22.16 / 19.29 / 15.41 | 20.1 / 21.0 / 18.7 | 19.0 / 16.4 / 12.9 | 8.1 / 7.8 / 6.8 | 861 MB | 871b4de2… |
+| **streaming** | **12.68 / 12.06 / 11.44** | 19.4 / 19.9 / 18.8 | 9.6 / 9.6 / 9.4 | 6.7 / 6.6 / 6.5 | **550 MB** (peak footprint 450 MB) | 871b4de2… (all 9 runs) |
+
+Wall ≈ 17.7 → ≈ 12.1 s (−32 %). The post-capture tail is now `tail after capture 3566 ms` against a 6.4 s gifski pass: gifski falls a little behind the capture and catches up after it. WebContent CPU drops too (≈ 15.8 → 9.5 s), because the webview no longer idles through a 6 s encode before the process exits. Max RSS 1,183 → 550 MB, inside the ~500 MB F13 predicted for both items together.
+- 150 f × 760×1024 (rejected before ITER-054): 15.1 s real, **400 MB** max RSS, 0.8 s tail, md5 identical to the ITER-054 build's output.
+- Twitter-fit overshoot (cream-paper batch, 120 f, capWidth 720, 15 MB target): the same 720 → 536 px passes and a byte-identical 14,700,238 B GIF (md5 1673f85f…) on both builds. Wall 18.96 → 16.20 s, RSS 762 → 735 MB (frames are retained, as designed).
+
+**Gate:** cargo build 0 errors (1 pre-existing deprecation warning) · cargo test 25/25 (was 23) · npm test ok (28 contracts + export tests) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity G1-G7 7/7, B11/B12 ✓ · psnr-gate (archive) **inf** vs golden.mp4.
+
+**Gotchas:** (a) The `.part` now lives for the whole capture, not just the final write. If the process is killed mid-render, a hidden `.<name>.<pid>.<seq>.part` stays in the output directory. Error and cancel paths clean it up. A crash does not. (b) Finish must repeat begin's settings exactly (`GifStreamConfig: PartialEq`, `BorderConfig` gained `PartialEq`). The headless JS guarantees that by spreading the same object. (c) Not done: GUI streaming. It needs a gifski thread cap (BUG-009) and a stutter check at 30 fps realtime capture, and the GUI still ships PNG frames (ITER-052 gotcha d). (d) Another worktree's gate `pkill -f "glyph-grid-studio render"` also matches any shell whose command line contains that string, including this session's tool shells (exit 144 twice). Run renders from a script file when parallel gates are active.
+
 ### ITER-054 — 2026-10-17 — v0.2 Phase 2: bounded decode-ahead for GIF export; total pixel cap removed (F13)
 
 **Problem:** A 150-frame 760×1024 render (`render --frames 150`, worm-move + pB) was refused before capture with `capture-pixel-limit` (116.7M pixels > 100M). At 1024×682 the cap allowed only 143 frames, so `MAX_EXPORT_FRAMES = 600` meant nothing above that. The GIF path also had the highest peak memory of any export: 1,183 MB max RSS for the 120-frame gate job (`/usr/bin/time -l`).

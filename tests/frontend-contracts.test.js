@@ -42,6 +42,9 @@ const contracts = [
   /* ITER-048 (F17 part 1): reduced motion pins the frame-hashed seed + dither phase for stills */
   ['reduced motion pins frame index for still sources', /const _rmPinned = _rmStill && window\.__sourceFrameIdx === -1;\s*const _frameIdx = _rmPinned \? 0 :/],
   ['reduced motion pins the temporal dither phase', /_persistentDitherOpts\.frameIdx = _rmPinned \? 0 : frameIdx;/],
+  /* ITER-053 (F12): headless GIF streams into gifski during capture; finish repeats the same settings */
+  ['headless GIF passes its encode settings to begin_export_capture', /tauri\('begin_export_capture', \{ jobId: jobId, total: frameTotal, gifStream: gifStream \}\)/],
+  ['finish_gif_export args are the streamed settings', /:\s*Object\.assign\(\{ jobId: jobId \}, gifStream\);/],
 ];
 
 for (const [name, pattern] of contracts) {
