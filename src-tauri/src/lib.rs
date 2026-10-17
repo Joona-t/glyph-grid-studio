@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
@@ -796,67 +796,107 @@ async fn push_export_frame(job_id: String, index: usize, b64: String) -> Result<
         let bytes = general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| format!("frame {} b64: {}", index, e))?;
-        let dimensions = png_dimensions(&bytes, index)?;
-        let mut captures = EXPORT_CAPTURES
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .map_err(|_| "export capture state is unavailable".to_string())?;
-        let capture = captures
-            .get_mut(&job_id)
-            .ok_or_else(|| format!("unknown export capture: {}", job_id))?;
-        if index != capture.frames.len() {
-            return Err(format!(
-                "out-of-order frame: got index {}, expected {}",
-                index,
-                capture.frames.len()
-            ));
-        }
-        if index >= capture.expected_frames {
-            return Err(format!(
-                "frame index {} exceeds declared total {}",
-                index, capture.expected_frames
-            ));
-        }
-        if let Some(expected) = capture.dimensions {
-            if dimensions != expected {
-                return Err(format!(
-                    "frame {} dimensions {}x{} do not match first frame {}x{}",
-                    index, dimensions.0, dimensions.1, expected.0, expected.1
-                ));
-            }
-        } else {
-            capture.dimensions = Some(dimensions);
-        }
-        let pixels = u64::from(dimensions.0)
-            .checked_mul(u64::from(dimensions.1))
-            .ok_or_else(|| format!("frame {} pixel count overflow", index))?;
-        let next_pixels = capture
-            .total_pixels
-            .checked_add(pixels)
-            .ok_or_else(|| "total decoded pixel count overflow".to_string())?;
-        if next_pixels > MAX_TOTAL_DECODED_PIXELS {
-            return Err(format!(
-                "export is too large: {} decoded pixels exceeds limit {}",
-                next_pixels, MAX_TOTAL_DECODED_PIXELS
-            ));
-        }
-        let next_bytes = capture
-            .total_bytes
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| "total compressed frame byte count overflow".to_string())?;
-        if next_bytes > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
-            return Err(format!(
-                "compressed frames are too large: {} bytes exceeds limit {} bytes",
-                next_bytes, MAX_TOTAL_COMPRESSED_FRAME_BYTES
-            ));
-        }
-        capture.total_pixels = next_pixels;
-        capture.total_bytes = next_bytes;
-        capture.frames.push(PngFrame { bytes });
-        Ok::<(), String>(())
+        stage_export_frame(&job_id, index, bytes)
     })
     .await
     .map_err(|e| format!("frame staging worker failed: {}", e))?
+}
+
+/// ITER-040: binary twin of `push_export_frame`.  The PNG arrives as the raw
+/// IPC body (`invoke(cmd, Uint8Array, { headers })`), so the webview skips the
+/// FileReader data-URL build + split copy and Rust skips the 33 %-larger JSON
+/// string parse + base64 decode on every captured frame.  jobId/index travel
+/// as headers.  The b64 command stays for older frontends and the fallback.
+#[tauri::command]
+async fn push_export_frame_raw(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    fn header<'a>(request: &'a tauri::ipc::Request<'_>, name: &str) -> Result<&'a str, String> {
+        request
+            .headers()
+            .get(name)
+            .ok_or_else(|| format!("missing {} header", name))?
+            .to_str()
+            .map_err(|_| format!("invalid {} header", name))
+    }
+    let job_id = header(&request, "x-job-id")?.to_string();
+    let index: usize = header(&request, "x-index")?
+        .parse()
+        .map_err(|_| "invalid x-index header".to_string())?;
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => {
+            if bytes.len() as u64 > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
+                return Err(format!("frame {} payload exceeds export byte limit", index));
+            }
+            bytes.clone()
+        }
+        _ => return Err("push_export_frame_raw expects a raw binary body".into()),
+    };
+    tauri::async_runtime::spawn_blocking(move || stage_export_frame(&job_id, index, bytes))
+        .await
+        .map_err(|e| format!("frame staging worker failed: {}", e))?
+}
+
+/// Validate one PNG frame against the job's staged capture (order, declared
+/// total, consistent dimensions, pixel + byte budgets) and retain it.  Shared
+/// by the base64 and raw-body push commands.
+fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), String> {
+    let dimensions = png_dimensions(&bytes, index)?;
+    let mut captures = EXPORT_CAPTURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "export capture state is unavailable".to_string())?;
+    let capture = captures
+        .get_mut(job_id)
+        .ok_or_else(|| format!("unknown export capture: {}", job_id))?;
+    if index != capture.frames.len() {
+        return Err(format!(
+            "out-of-order frame: got index {}, expected {}",
+            index,
+            capture.frames.len()
+        ));
+    }
+    if index >= capture.expected_frames {
+        return Err(format!(
+            "frame index {} exceeds declared total {}",
+            index, capture.expected_frames
+        ));
+    }
+    if let Some(expected) = capture.dimensions {
+        if dimensions != expected {
+            return Err(format!(
+                "frame {} dimensions {}x{} do not match first frame {}x{}",
+                index, dimensions.0, dimensions.1, expected.0, expected.1
+            ));
+        }
+    } else {
+        capture.dimensions = Some(dimensions);
+    }
+    let pixels = u64::from(dimensions.0)
+        .checked_mul(u64::from(dimensions.1))
+        .ok_or_else(|| format!("frame {} pixel count overflow", index))?;
+    let next_pixels = capture
+        .total_pixels
+        .checked_add(pixels)
+        .ok_or_else(|| "total decoded pixel count overflow".to_string())?;
+    if next_pixels > MAX_TOTAL_DECODED_PIXELS {
+        return Err(format!(
+            "export is too large: {} decoded pixels exceeds limit {}",
+            next_pixels, MAX_TOTAL_DECODED_PIXELS
+        ));
+    }
+    let next_bytes = capture
+        .total_bytes
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| "total compressed frame byte count overflow".to_string())?;
+    if next_bytes > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
+        return Err(format!(
+            "compressed frames are too large: {} bytes exceeds limit {} bytes",
+            next_bytes, MAX_TOTAL_COMPRESSED_FRAME_BYTES
+        ));
+    }
+    capture.total_pixels = next_pixels;
+    capture.total_bytes = next_bytes;
+    capture.frames.push(PngFrame { bytes });
+    Ok(())
 }
 
 fn take_export_capture(job_id: &str) -> Result<Vec<PngFrame>, String> {
@@ -1604,24 +1644,34 @@ fn encode_mp4_h264(
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), cfg)
         .map_err(|e| format!("openh264 init: {}", e))?;
 
-    // Decode/preprocess exactly one frame at a time before handing it to the
-    // stateful H.264 encoder. The prior parallel implementation retained an
-    // RGB Vec for every frame (3 * W * H * frame_count bytes), which caused
-    // avoidable export-time RAM spikes. The command itself runs on Tauri's
-    // blocking pool, so this sequential loop does not block the async runtime.
+    // ITER-040: bounded preprocess pipeline.  PNG decode, border, Lanczos3
+    // resize and RGB->YUV are pure per-frame work, so K worker threads run
+    // them while this thread feeds the stateful H.264 encoder strictly in
+    // index order through a reorder buffer — the bitstream is identical to
+    // the old sequential loop.  A window of 2K+2 frames caps how far workers
+    // may run ahead of the encoder, so peak RAM stays a handful of YUV frames
+    // rather than the v0.1.5 design that retained an RGB Vec for every frame.
+    // The command runs on Tauri's blocking pool, so this never blocks async.
     let t_encode = std::time::Instant::now();
+    let n = frames.len();
+    // BUG-009: leave 2 cores free for the live webview draw loop.
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get().saturating_sub(2).max(1))
+        .unwrap_or(2)
+        .min(n.max(1));
+    let window = 2 * workers + 2;
+    let next_index = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    // Frames consumed by the encoder; a worker holding index >= encoded +
+    // window waits here until the encoder catches up.
+    let encoded = (Mutex::new(0usize), std::sync::Condvar::new());
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<YUVBuffer, String>)>(window);
 
-    // Walk frames, encode, capture SPS/PPS once and retain only the much
-    // smaller compressed samples for the in-memory MP4 muxer.
-    let mut sps: Option<Vec<u8>> = None;
-    let mut pps: Option<Vec<u8>> = None;
-    let mut samples: Vec<(Vec<u8>, bool)> = Vec::with_capacity(frames.len());
-
-    for (idx, frame) in frames.iter().enumerate() {
-        control.check_cancelled()?;
-        let dyn_img = image::load_from_memory_with_format(&frame.bytes, image::ImageFormat::Png)
-            .map_err(|e| format!("frame {} decode: {}", idx, e))?;
-        let mut rgba_img = dyn_img.to_rgba8();
+    let preprocess = |idx: usize| -> Result<YUVBuffer, String> {
+        let dyn_img =
+            image::load_from_memory_with_format(&frames[idx].bytes, image::ImageFormat::Png)
+                .map_err(|e| format!("frame {} decode: {}", idx, e))?;
+        let mut rgba_img = dyn_img.into_rgba8();
         if let Some(b) = border {
             rgba_img = apply_border(rgba_img, b);
         }
@@ -1633,91 +1683,167 @@ fn encode_mp4_h264(
         };
         let rgb_data = img_dyn.to_rgb8().into_raw();
         let rgb_source = RgbSliceU8::new(&rgb_data, (target_w as usize, target_h as usize));
-        let yuv = YUVBuffer::from_rgb_source(rgb_source);
+        Ok(YUVBuffer::from_rgb_source(rgb_source))
+    };
 
-        let bitstream = encoder
-            .encode(&yuv)
-            .map_err(|e| format!("frame {} encode: {}", idx, e))?;
+    // Walk frames, encode, capture SPS/PPS once and retain only the much
+    // smaller compressed samples for the in-memory MP4 muxer.
+    let mut sps: Option<Vec<u8>> = None;
+    let mut pps: Option<Vec<u8>> = None;
+    let mut samples: Vec<(Vec<u8>, bool)> = Vec::with_capacity(n);
+    let mut encode_ms = 0.0f64;
 
-        // openh264 emits each NAL with a 4-byte Annex-B start code 00 00 00 01.
-        // For MP4/AVCC we need: SPS (NAL type 7) and PPS (NAL type 8) extracted
-        // and stored in AvcConfig once; slice NALs (type 5 = IDR, type 1 =
-        // non-IDR) length-prefixed (4-byte big-endian) and concatenated as the
-        // sample payload.
-        let mut sample_bytes: Vec<u8> = Vec::new();
-        let mut is_idr = false;
-        let mut nal_types_seen: Vec<u8> = Vec::new();
+    std::thread::scope(|s| -> Result<(), String> {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (next_index, stop, encoded, preprocess) =
+                (&next_index, &stop, &encoded, &preprocess);
+            s.spawn(move || loop {
+                let idx = next_index.fetch_add(1, Ordering::Relaxed);
+                if idx >= n {
+                    return;
+                }
+                {
+                    let mut done = encoded.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while idx >= *done + window && !stop.load(Ordering::Relaxed) {
+                        done = encoded.1.wait(done).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // A panic here would leave the encoder waiting on this index
+                // forever; turn it into an ordinary per-frame error instead.
+                let result = control.check_cancelled().and_then(|_| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| preprocess(idx)))
+                        .unwrap_or_else(|_| Err(format!("frame {} preprocess panicked", idx)))
+                });
+                let failed = result.is_err();
+                if tx.send((idx, result)).is_err() || failed {
+                    return;
+                }
+            });
+        }
+        drop(tx);
 
-        for li in 0..bitstream.num_layers() {
-            let layer = bitstream
-                .layer(li)
-                .ok_or_else(|| format!("frame {} layer {} missing", idx, li))?;
-            for ni in 0..layer.nal_count() {
-                let nal = layer
-                    .nal_unit(ni)
-                    .ok_or_else(|| format!("frame {} layer {} nal {} missing", idx, li, ni))?;
-                let payload: &[u8] = if nal.starts_with(&[0, 0, 0, 1]) {
-                    &nal[4..]
-                } else if nal.starts_with(&[0, 0, 1]) {
-                    &nal[3..]
-                } else {
-                    return Err(format!(
-                        "frame {} unexpected NAL prefix: {:?}",
-                        idx,
-                        &nal[..nal.len().min(5)]
-                    ));
+        let mut pending: std::collections::BTreeMap<usize, Result<YUVBuffer, String>> =
+            std::collections::BTreeMap::new();
+        let mut run = || -> Result<(), String> {
+            for idx in 0..n {
+                let yuv = loop {
+                    if let Some(ready) = pending.remove(&idx) {
+                        break ready?;
+                    }
+                    let (got, result) = rx
+                        .recv()
+                        .map_err(|_| format!("frame {} preprocess worker exited", idx))?;
+                    pending.insert(got, result);
                 };
-                if payload.is_empty() {
-                    continue;
-                }
-                let nal_type = payload[0] & 0x1F;
-                nal_types_seen.push(nal_type);
-                match nal_type {
-                    7 => {
-                        if sps.is_none() {
-                            sps = Some(payload.to_vec());
-                        }
-                    }
-                    8 => {
-                        if pps.is_none() {
-                            pps = Some(payload.to_vec());
-                        }
-                    }
-                    5 => {
-                        // IDR slice — keyframe.
-                        is_idr = true;
-                        sample_bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-                        sample_bytes.extend_from_slice(payload);
-                    }
-                    1 | 2 | 3 | 4 => {
-                        // Non-IDR slice variants: 1=non-IDR, 2-4=DPA/B/C
-                        // (data-partitioned slice types).  All count as slice
-                        // payload for MP4 sample bytes.
-                        sample_bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-                        sample_bytes.extend_from_slice(payload);
-                    }
-                    // Skip SEI (6) / AUD (9) / filler (12) / other NALs —
-                    // the AVC1 file format doesn't require them, and including
-                    // them in samples can confuse strict players.
-                    _ => {}
-                }
-            }
-        }
+                control.check_cancelled()?;
+                let t_frame = std::time::Instant::now();
+                let bitstream = encoder
+                    .encode(&yuv)
+                    .map_err(|e| format!("frame {} encode: {}", idx, e))?;
+                drop(yuv);
 
-        if sample_bytes.is_empty() {
-            return Err(format!(
-                "frame {} produced no slice NALs (saw NAL types {:?})",
-                idx, nal_types_seen
-            ));
+                // openh264 emits each NAL with a 4-byte Annex-B start code 00 00 00 01.
+                // For MP4/AVCC we need: SPS (NAL type 7) and PPS (NAL type 8) extracted
+                // and stored in AvcConfig once; slice NALs (type 5 = IDR, type 1 =
+                // non-IDR) length-prefixed (4-byte big-endian) and concatenated as the
+                // sample payload.
+                let mut sample_bytes: Vec<u8> = Vec::new();
+                let mut is_idr = false;
+                let mut nal_types_seen: Vec<u8> = Vec::new();
+
+                for li in 0..bitstream.num_layers() {
+                    let layer = bitstream
+                        .layer(li)
+                        .ok_or_else(|| format!("frame {} layer {} missing", idx, li))?;
+                    for ni in 0..layer.nal_count() {
+                        let nal = layer
+                            .nal_unit(ni)
+                            .ok_or_else(|| format!("frame {} layer {} nal {} missing", idx, li, ni))?;
+                        let payload: &[u8] = if nal.starts_with(&[0, 0, 0, 1]) {
+                            &nal[4..]
+                        } else if nal.starts_with(&[0, 0, 1]) {
+                            &nal[3..]
+                        } else {
+                            return Err(format!(
+                                "frame {} unexpected NAL prefix: {:?}",
+                                idx,
+                                &nal[..nal.len().min(5)]
+                            ));
+                        };
+                        if payload.is_empty() {
+                            continue;
+                        }
+                        let nal_type = payload[0] & 0x1F;
+                        nal_types_seen.push(nal_type);
+                        match nal_type {
+                            7 => {
+                                if sps.is_none() {
+                                    sps = Some(payload.to_vec());
+                                }
+                            }
+                            8 => {
+                                if pps.is_none() {
+                                    pps = Some(payload.to_vec());
+                                }
+                            }
+                            5 => {
+                                // IDR slice — keyframe.
+                                is_idr = true;
+                                sample_bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                                sample_bytes.extend_from_slice(payload);
+                            }
+                            1 | 2 | 3 | 4 => {
+                                // Non-IDR slice variants: 1=non-IDR, 2-4=DPA/B/C
+                                // (data-partitioned slice types).  All count as slice
+                                // payload for MP4 sample bytes.
+                                sample_bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                                sample_bytes.extend_from_slice(payload);
+                            }
+                            // Skip SEI (6) / AUD (9) / filler (12) / other NALs —
+                            // the AVC1 file format doesn't require them, and including
+                            // them in samples can confuse strict players.
+                            _ => {}
+                        }
+                    }
+                }
+
+                if sample_bytes.is_empty() {
+                    return Err(format!(
+                        "frame {} produced no slice NALs (saw NAL types {:?})",
+                        idx, nal_types_seen
+                    ));
+                }
+                samples.push((sample_bytes, is_idr));
+                control.emit("encode-mp4", idx + 1, n);
+                encode_ms += t_frame.elapsed().as_secs_f64() * 1000.0;
+                *encoded.0.lock().unwrap_or_else(|e| e.into_inner()) = idx + 1;
+                encoded.1.notify_all();
+            }
+            Ok(())
+        };
+        let result = run();
+        // Release any worker parked on the window or blocked on send. Set the
+        // flag under the mutex so a worker can't check it, miss this notify,
+        // and park forever (lost wakeup).
+        {
+            let _g = encoded.0.lock().unwrap_or_else(|e| e.into_inner());
+            stop.store(true, Ordering::Relaxed);
         }
-        samples.push((sample_bytes, is_idr));
-        control.emit("encode-mp4", idx + 1, frames.len());
-    }
+        encoded.1.notify_all();
+        drop(rx);
+        result
+    })?;
 
     eprintln!(
-        "encode-mp4: {} frames decoded, preprocessed, and encoded in {:.0}ms (streamed RGB)",
-        frames.len(),
+        "encode-mp4: {} frames decoded, preprocessed, and encoded in {:.0}ms ({} preprocess workers, openh264 {:.0}ms)",
+        n,
         t_encode.elapsed().as_secs_f64() * 1000.0,
+        workers,
+        encode_ms,
     );
 
     let sps = sps.ok_or("no SPS NAL emitted by encoder")?;
@@ -2218,6 +2344,7 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             choose_export_path,
             begin_export_capture,
             push_export_frame,
+            push_export_frame_raw,
             finish_gif_export,
             finish_mp4_export,
             cancel_export,

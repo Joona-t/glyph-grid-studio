@@ -4,6 +4,224 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-044 — 2026-10-17 — Review fixes for ITER-040..043
+
+**Problem:** An independent review of the perf diff found 5 defects:
+1. MP4 preprocess: a worker could check `stop`, miss the encoder's `notify_all`, and then park forever (lost wakeup).
+2. MP4 preprocess: a panic in a worker deadlocked the encoder, which kept waiting for that frame index.
+3. Edge-directional sprite atlas: an atlas rasterised before the font loaded was never rebuilt.
+4. GUI export progress could run backwards. Pipelined capture moves `frameIdx` up to 3 frames ahead of the completed count that `onProgress` reports.
+5. The alpha-scaled vignette drifted ±2 LSB from the old baked per-strength mask, including in exports.
+
+**Fix:**
+1. `stop` is now set while holding the `encoded` mutex.
+2. Each worker runs `preprocess` inside `catch_unwind` and reports a panic as an ordinary per-frame `Err`.
+3. The edge sprite key includes `document.fonts.check(...)`.
+4. `monitorCapture` reports `recState._completed`, which is initialised to 0.
+5. While `recState` is set (any export), the baked mask is used, so the output matches before ITER-043. The live preview keeps the cheap unit mask.
+
+**Gate:**
+- cargo test: 15/15.
+- npm test: ok.
+- run-all: PASS 24, FAIL 0; MCP 10/10.
+- worm-move 120f vs base2: PSNR 36.1 / 36.2 dB. The baseline's own run-to-run noise is 36–38 dB.
+- encode-mp4: 985 / 1065 ms. It was ~2.5 s before ITER-040.
+
+**Gotcha:** CLI renders hang (exit 124) while the macOS screen is locked, because WebKit stops drawing. Leftover `render` processes then block later runs. Unlock the screen and `pkill -f "glyph-grid-studio render"` before running the suite.
+
+### ITER-043 — 2026-10-17 — GUI latency: single debounce for dropdowns, 64x64 invert probe, p5.Graphics leaks, alpha-scaled vignette
+
+- **Problem:** (a) structural dropdowns (renderer, samplingStrategy,
+  prefilter mode, glyphSet, selectionMode) waited the 125 ms staging
+  debounce, and the regex-matched ones then another 100 ms structural resume
+  timer in `scheduleConfigRender`: ~225 ms of idle wait per pick, with only
+  the last ~100 ms visible in the `switch Xms` status. (b) `maybeSuggestInvert`
+  ran `img.loadPixels()` on the full-res import, pinning w*h*4 bytes on
+  `sourceImg.pixels` for the session (48 MB at 4000x3000, 384 MB at
+  12000x8000). (c) Every import deleted the scenes' `__sourceProcessed` /
+  `__sourceDepth` p5.Graphics and every aspect change replaced `src`
+  without `.remove()`, so a hidden canvas (~2.8 MB at 1024x683) leaked into
+  the DOM and `pInst._elements` each time. (d) The vignette overlay was keyed
+  on strength, so each strength-slider tick rebuilt a full-canvas mask
+  (new canvas + 700k-pixel sqrt loop + putImageData, ~1.35 ms loop alone).
+- **Root cause:** (a) the host's 100 ms quiet period was written for
+  un-debounced scrubs and never learned that the studio already coalesces;
+  a dropdown fires exactly one change, so neither timer coalesced anything.
+  (b) the probe reused p5's full readback for a mean. (c) p5 1.x graphics
+  live until `.remove()`; dropping the JS reference frees nothing.
+  (d) strength was baked into the mask instead of applied at draw time.
+- **Fix:** (a) `addStructuralInput` commits `options` inputs immediately
+  (`commitStructuralNow`, flushing any pending slider values); sliders keep
+  the 125 ms trailing debounce. Staged commits call
+  `__markChange(key, { coalesced: true })`, which cancels an armed resume
+  timer and takes the RAF path. (b) 64x64 cached scratch canvas,
+  drawImage + getImageData, mean over all 4096 pixels (16 KB). (c)
+  `clearSourceDerivedCaches` keeps `__sourceProcessed` (the scene reuses it
+  when WxH matches; the dropped key forces a reprocess) and `.remove()`s it
+  only on a size change; `__sourceDepth`, the studio-side `sceneCacheKeys`
+  drops (`dropSceneCache`) and the old `src` in `fitCanvasToImage` are
+  `.remove()`d. (d) Mask is unit-strength keyed on WxH; strength is applied
+  via `globalAlpha` under `multiply` (c·(1−s) + s·c·M = c·(1−s·r²)).
+  globalAlpha caps at 1, so strengths >1 (slider max 1.5) keep a baked mask.
+- **Measured:** 8-bit model of old vs new vignette at s=0.55 over all c and r:
+  max |Δ| **2 LSB** (80% exact, 20% ±1, 0.004% ±2). worm-move.gif 120 frames,
+  preset pB (vignette 0.4), vs base2.mp4: PSNR **38.85 dB** average (min
+  38.27; y 37.57) — the uniform ±1 LSB vignette rounding, everything else
+  unchanged; real **28.16 / 28.60 s**, user 2.63 / 2.68 s (render path not
+  targeted). Dropdown latency: ~225 ms → ~1 RAF of added wait by
+  construction; in-app timing not profiled (UNCERTAIN). Memory figures are
+  w*h*4 arithmetic, not heap snapshots.
+- **Gate:** cargo build --release clean; npm test both ok (frontend
+  contracts 14 invariants); run-all PASS 24 FAIL 0, MCP 10/0.
+
+### ITER-042 — 2026-10-17 — Render loop: crtState persistence, still-source layer memo, shape selection cache, v1/edge fast paths
+
+- **Problem:** (a) with `crtState` null (any import/resize while postprocess
+  was off, which applyFastLoadDefaults guarantees), enabling phosphorDecay or
+  crtBeam made `applyChain` allocate an 8.4 MB state per frame and throw it
+  away: phosphor never decayed and the beam never moved. (b) A still studio
+  source was repainted into `src` and read back with a full-canvas
+  `src.loadPixels()` (plus a fresh 2.8 MB ImageData) every preview frame,
+  even though the luminance/cell caches discarded the result. (c) Shape modes
+  re-ran `selectGrid` (~16 ms per ITER-013, not re-measured) every frame on an
+  unchanged lumBuf, and from frame 2 on matched against un-prefiltered
+  luminance because cache-hit frames skip the prefilter. (d) dither:none +
+  brightness + no glyphSet falls into the v1 `drawGlyphGrid`, which parsed
+  the ink hex into a p5.Color and allocated a `{r,g,b}` sample per cell.
+  (e) Edge-directional mode drew every edge cell with fill()+fillText, and
+  `glyph-edge.selectGrid` allocated 3 typed arrays per frame.
+- **Root cause:** applyChain's lazy init only rebinds its local parameter;
+  the scene/readback and the selection never had a cache key, although the
+  downstream stages did; ITER-014/016 never touched the v1 or edge drawers.
+- **Fix:** (a) applyPostprocess allocates `crtState` (size-checked) when
+  either stateful stage is on. (b) draw() keys the studio source layer on
+  `revision|WxH|bg|depth` plus the identities of the scene's cached
+  `__sourceProcessed`/`__sourceDepth`, and on a hit skips the scene and
+  `loadPixels` (src.pixels stays valid for every reader). The xdog sigma
+  sweep is hoisted to `studioSigmaSweep` and still runs every frame. Key
+  is cleared with the source caches and on canvas reallocation.
+  (c) drawShapeGrid caches indices in `__sourceSignalCache` under
+  `cellKey|cellPx|reach` + atlas identity; it stores only on the frame the
+  prefilter ran (or when none is active), so every frame uses the
+  prefiltered selection. (d) The v1 monochrome branch now parses the ink
+  once and inlines the box sampler. It keeps fill()+text(), so the output is
+  byte-identical. (e) Pure edge-directional monochrome blits the 4 box-drawing
+  strokes from a sprite atlas (globalAlpha, fractional destination);
+  `selectGrid` uses persistent grow-only buffers (`sobel` and `emitDirectional`
+  still allocate, as public API).
+- **Tried and dropped (measured, not shipped):** sprite blits for v1
+  dither:none (23.8 dB vs baseline, ~10% darker: glyphs rasterised on the
+  transparent atlas come out thinner than text() on the opaque canvas),
+  flow mono (29.7 dB), flow duotone (24.7 dB) and edge gradient (27.9 dB),
+  even with 64 tint steps. Integer-snapped blit positions cost edge mono
+  ~10 dB (23.0 dB), so fractional destinations are used.
+- **Measured:** stills of worm.jpg, 8 frames, new vs HEAD binary
+  (baseline-vs-baseline is inf for every case): edge-directional mono
+  **32.8 dB**; shape/octant **41.0 dB**, a uniform sub-level drift. With the
+  selection cache disabled it is inf, so the cause is EMA warm-up from more
+  pre-capture draws rather than different glyphs (see ITER-041).
+  dither:none, flow mono/duotone, edge gradient and phosphorDecay are
+  **inf** (identical). worm-move.gif 120 frames, preset pB, vs base2.mp4:
+  PSNR **inf / inf**; real **28.86 / 28.47 s**, user 2.63 s (pB is an
+  animated preserve/brightness source, so none of these paths are on it).
+  Per-frame ms gains in the preview were not profiled (UNCERTAIN).
+- **Gate:** cargo build --release clean; npm test both ok; run-all PASS 24
+  FAIL 0, MCP 10/0.
+
+### ITER-041 — 2026-10-17 — Capture pipeline: pipelined toBlob + staged batch/CLI frames
+
+- **Problem:** (a) `handleRecordFrame` held queue depth one: `noLoop()` →
+  `toBlob` → base64/IPC → only then `loop()`, so every frame paid draw + PNG
+  encode + consumer back to back. (b) `runBatchExport` (CLI `render`, `batch`,
+  perf bench) retained every frame as base64 in JS and shipped them in one
+  giant `save_*_to_path` JSON IPC after capture (≈3–4 copies of the frame set
+  at peak), while the GUI had used the staged path since v0.1.9.
+- **Root cause:** the one-deep backpressure was written to stop toBlob seeing
+  a later redraw, but toBlob snapshots the bitmap when called; the batch path
+  was never migrated to staging.
+- **Fix:** (a) capture is pipelined at depth 3: frameIdx advances right after
+  `toBlob` is called, the draw loop pauses only at the cap (or after the last
+  frame), and zip/base64/onFrame consumers run on one serial promise chain so
+  frames stay strictly in index order; finish runs after the last link, errors
+  and cancel still go through `failRecording` / `cancelRecord`. (b) batch jobs
+  call `begin_export_capture` (issued during the settle window so
+  `beginRecord` still fires exactly when the settle timer does — an extra IPC
+  hop there shifted the per-cell EMA warm-up), stream each PNG via
+  `push_export_frame_raw`, and finish with `finish_gif_export` /
+  `finish_mp4_export`; `cancel_export` on capture/encode failure. Perf mode
+  keeps only the 3 PERF_JOB anchor PNGs as base64.
+- **Measured (worm-move.gif, 120 frames, preset pB, mp4, interleaved A/B):**
+  output equivalent — PSNR vs base2.mp4 **inf / 38.54 / inf** (baseline binary
+  itself: 38.20 / 36.37 / 38.20; the first ~15 frames depend on how many live
+  draws preceded capture, in both). Wall time unchanged within noise: new
+  29.10 / 18.76 / 29.50 s vs base 28.20 / 28.71 / 28.26 s (user ≈2.6–3.0 s).
+  Instrumented runs show why: the capture is bound by WebKit throttling the
+  off-screen CLI window — rAF ≈5 Hz and the studio scene's per-source-frame
+  JS ≈320–400 ms/frame for the first ~30–40 frames (until the process gets
+  un-throttled, sometimes never), then ≈70–90 ms/frame. IPC push is 7–9 ms
+  and getImageData 6–10 ms, so encode/IPC were not the critical path.
+  Memory win stands: no retained base64 frame set, no giant JSON IPC.
+- **Tried and dropped (evidence, not shipped):** raw-RGBA capture
+  (`getImageData` + Rust fast-PNG; 92 → 72 ms/frame steady state but output
+  drifted to ~39 dB vs the toBlob path); worker-pool OffscreenCanvas PNG
+  encode (≈400 ms/frame, worse); driving draws by `redraw()` instead of rAF
+  (no gain, stayed throttled); `_setWindowOcclusionDetectionEnabled:NO` and an
+  NSProcessInfo LatencyCritical activity (no change in the throttled phase).
+- **Skipped — finding #20 (replace startup/settle sleeps with readiness
+  promises):** implemented and measured, then reverted. Removing the
+  1500/300/200/120 ms waits cuts the live draws before frame 0, and the
+  per-cell EMA (alpha 0.35) carries that state into the first ~15 recorded
+  frames: PSNR vs base2 fell to 33.5–34.4 dB (frame 1 ≈19–20 dB). Even
+  warm-up on frame 0 did not restore it. Needs an owner call on making the
+  warm-up deterministic (e.g. prime the EMA from the loop tail) before the
+  sleeps can go. Next lever for CLI wall time is the WebKit throttling of the
+  off-screen window, not the export path.
+- **Gate:** cargo build --release clean; npm test both ok; run-all PASS 24
+  FAIL 0, MCP 10/0 (B10 PERF_JOB anchors present).
+
+### ITER-040 — 2026-10-17 — Rust export path: pipelined MP4 preprocess + raw-body frame IPC
+
+- **Problem:** (a) `encode_mp4_h264` ran PNG decode, border, Lanczos3 resize
+  and RGB→YUV on the same single thread as the openh264 encoder (BUG-013 had
+  made it sequential to kill the v0.1.5 "RGB Vec per frame" RAM spike, which
+  also threw away the throughput). (b) Every staged frame was base64'd in the
+  webview (FileReader data-URL + split copy), sent as a 33 %-larger JSON
+  string, and base64-decoded in Rust — on the capture critical path, since
+  capture waits on each `push_export_frame`.
+- **Root cause:** preprocess is pure per-frame work but was serialized behind a
+  stateful encoder; the staged IPC kept the legacy string transport.
+- **Fix:** (a) K = cores−2 (≥1) scoped worker threads preprocess frames from a
+  shared index counter; the encoder thread consumes them strictly in index
+  order via a BTreeMap reorder buffer, so the bitstream is unchanged. A
+  2K+2-frame window (Condvar on "frames encoded") bounds how far workers run
+  ahead, so peak RAM is a handful of YUV frames, not the whole set. Errors and
+  cancellation surface in frame order; a stop flag + dropped receiver release
+  parked workers. `to_rgba8` → `into_rgba8` drops one copy per frame.
+  (b) New `push_export_frame_raw(tauri::ipc::Request)`: PNG bytes are the raw
+  IPC body, jobId/index ride in `x-job-id`/`x-index` headers. Validation moved
+  into shared `stage_export_frame` used by both commands. JS `pushStagedFrame`
+  sends `blob.arrayBuffer()` bytes; on an "unknown command" error it falls back
+  once to the b64 command (base64 built from the same bytes) for the session.
+  `index.html` now base64-encodes only when frames are retained (non-staged
+  path). The `_tauriInvoke` wrapper also forwards its options argument (it
+  silently dropped them — caught by the new test).
+- **Measured (worm-move.gif, 120 frames, preset pB, `--format mp4`):**
+  `encode-mp4` stage 2523 / 2682 ms → 1458 / 1702 ms (≈1.6×, now openh264-bound:
+  1435 / 1667 ms of it is the encoder itself). Output pixel-identical to
+  baseline: PSNR average **inf** vs base2.mp4. Whole-run wall time is
+  capture-dominated and unchanged within noise (real 27.5 / 29.4 s vs
+  baseline 19.7–30.0 s). Raw IPC gain is unmeasured (CLI render does not use
+  the staged GUI path); estimated 2–8 ms per ~1 MB frame.
+- **Not done — finding #14 (stream MP4 encode during capture):** skipped. It
+  needs a new `begin_export_capture` contract (format/fps/cap/border), a
+  per-job encoder thread living in the global capture map with cancel/join
+  semantics, and its win (≈ min(capture, encode)) shrinks now that encode is
+  ~1.5 s for 120 frames while workers would compete with WebView capture for
+  the same cores. Revisit only with a GUI capture-vs-encode timing showing
+  encode is a meaningful share.
+- **Gate:** cargo build --release clean; cargo test 15 passed; npm test both ok
+  (export tests +2 raw/fallback cases); run-all PASS 24 FAIL 0, MCP 10/0.
+
 ## 2026-08-08 — v0.1.9: bounded imports, staged exports, responsive controls
 
 This release follows a source-level performance audit prompted by freezes and

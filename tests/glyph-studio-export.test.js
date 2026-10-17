@@ -94,6 +94,7 @@ function loadStudio(invokeImpl) {
       revokeObjectURL() {},
     },
     Blob,
+    btoa,
     Promise,
     Date,
     JSON,
@@ -369,6 +370,79 @@ async function cancelledSaveDialogSettlesVisiblePhase() {
   }
 }
 
+async function stagedFramesPushRawBytesWithBase64Fallback(rawAvailable) {
+  const calls = [];
+  const payloads = [Buffer.from('png-frame-0'), Buffer.from('png-frame-1')];
+  const env = loadStudio((cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    if (cmd === 'kv_load_all') return Promise.resolve('{}');
+    if (cmd === 'choose_export_path') return Promise.resolve('/tmp/raw.mp4');
+    if (cmd === 'begin_export_capture') return Promise.resolve();
+    if (cmd === 'push_export_frame_raw') {
+      return rawAvailable ? Promise.resolve() : Promise.reject('Command push_export_frame_raw not found');
+    }
+    if (cmd === 'push_export_frame') return Promise.resolve();
+    if (cmd === 'finish_mp4_export' || cmd === 'finish_gif_export') return Promise.resolve('/tmp/raw.out');
+    return Promise.reject(new Error('unexpected command ' + cmd));
+  });
+  let recState = null;
+  const hook = {
+    beginRecord(options) {
+      recState = { frameIdx: 0, done: false };
+      Promise.resolve().then(async () => {
+        for (let index = 0; index < 2; index++) {
+          await options.onFrame({ jobId: options.jobId, index, blob: new Blob([payloads[index]]), b64: null, total: 2 });
+          recState.frameIdx++;
+        }
+        recState.done = true;
+        options.onFinish(null, { getFrames: () => [] });
+        recState = null;
+      });
+    },
+    cancelRecord() { recState = null; return true; },
+    getRecState() { return recState; },
+    getConfig() { return { animation: { fps: 25 } }; },
+  };
+  env.window.__glyphGridTest = hook;
+  env.studio.init({
+    config: {
+      studio: { enabled: true },
+      animation: { fps: 25, duration: 0.08, loop: true },
+      grid: { cols: 80, rows: 40 },
+      font: { family: 'monospace', size: 8 },
+      ramp: 'gradient',
+      brightnessGamma: 1,
+      samplingStrategy: 'average',
+      colorMode: 'monochrome',
+      palette: 'cream-paper',
+      selectionMode: 'brightness',
+      glyphSet: null,
+    },
+    testHook: hook,
+  });
+  env.buttons.get('Export GIF').fire('click');
+  for (let i = 0; i < 6; i++) await settle();
+
+  const raw = calls.filter((call) => call.cmd === 'push_export_frame_raw');
+  const b64 = calls.filter((call) => call.cmd === 'push_export_frame');
+  if (rawAvailable) {
+    assert.strictEqual(raw.length, 2, 'every staged frame should use the raw command');
+    assert.strictEqual(b64.length, 0);
+    raw.forEach((call, index) => {
+      assert.deepStrictEqual(Buffer.from(call.args), payloads[index]);
+      assert.strictEqual(call.options.headers['x-index'], String(index));
+      assert(call.options.headers['x-job-id']);
+    });
+  } else {
+    assert.strictEqual(raw.length, 1, 'raw command should be probed once, then abandoned');
+    assert.strictEqual(b64.length, 2, 'both frames should fall back to base64');
+    b64.forEach((call, index) => {
+      assert.strictEqual(call.args.b64, payloads[index].toString('base64'));
+      assert.strictEqual(call.args.index, index);
+    });
+  }
+}
+
 function twitterFitCopyDoesNotPromiseSuccess() {
   const source = fs.readFileSync(require.resolve('../src/lib/glyph-studio.js'), 'utf8');
   assert(!/GUARANTEES output|GUARANTEE < 15 MB/.test(source));
@@ -383,6 +457,8 @@ function twitterFitCopyDoesNotPromiseSuccess() {
   await cancelButtonStopsCorrelatedCaptureAndNativeJob();
   await cancelBeforeBeginCleansLateNativeCapture();
   await cancelledSaveDialogSettlesVisiblePhase();
+  await stagedFramesPushRawBytesWithBase64Fallback(true);
+  await stagedFramesPushRawBytesWithBase64Fallback(false);
   twitterFitCopyDoesNotPromiseSuccess();
   console.log('glyph-studio export tests: ok');
 })().catch((error) => {
