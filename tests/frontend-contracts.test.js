@@ -35,6 +35,9 @@ const contracts = [
   ['throttled capture draws are no-ops (stray p5 rAF)', /if \(recState && recState\._capturing && !__primeOnly\) return;/],
   ['animated sources are paused so setFrame owns playback (F21)', /if \(typeof img\.pause === 'function'\) img\.pause\(\);/],
   ['headless start waits on readiness, not the clock', /await __setupReady;\s*await __assetsReady\(\);/],
+  /* ITER-048 (F17 part 1): reduced motion pins the frame-hashed seed + dither phase for stills */
+  ['reduced motion pins frame index for still sources', /const _rmPinned = _rmStill && window\.__sourceFrameIdx === -1;\s*const _frameIdx = _rmPinned \? 0 :/],
+  ['reduced motion pins the temporal dither phase', /_persistentDitherOpts\.frameIdx = _rmPinned \? 0 : frameIdx;/],
 ];
 
 for (const [name, pattern] of contracts) {

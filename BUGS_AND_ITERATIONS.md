@@ -4,6 +4,20 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-048 — 2026-10-17 — v0.2 Phase 1: prefers-reduced-motion pins the frame index for still sources (F17 part 1, WCAG 2.3.3)
+
+**Problem:** The reduced-motion policy (audit 2026-06-10) only zeroed the breathing terms — `_gainSwing` and `_jitterAmt` at the EMA stage. The per-frame seed `(CONFIG.seed | 0) ^ ((_frameIdx + 1) * 2654435761)` and the temporal dither phase (`_persistentDitherOpts.frameIdx`) still advanced with `frameCount`, so a still source kept shimmering for a user who asked for reduced motion (research F17, skeptic note: "that is the genuinely new a11y bug here").
+
+**Root cause:** `_frameIdx` in `drawGlyphGridV2` came straight from `frameCount - 1` in the live view regardless of the media query; the dither options took the function's `frameIdx` parameter from the same source.
+
+**Fix (src/index.html, `drawGlyphGridV2`):** `const _rmPinned = _rmStill && window.__sourceFrameIdx === -1;` — reduced motion requested, not recording, still source. `_frameIdx` (and so `_loopPhase` and `_seed`) is 0 when pinned; `_persistentDitherOpts.frameIdx` is 0 when pinned. Animated sources keep their timeline (the motion is the content), recordings are exempt as before (`_rmStill` is false while `recState` is active), and the EMA still smooths config changes. Two frontend contracts pin the two sites.
+
+**Measured:** no headless output change by construction — worm-move 120 frames vs golden **inf dB**, MP4 md5 `163e203c…` (unchanged since ITER-046); two sampled runs wall 14.72 / 15.15 s, WebContent 12.28 / 12.28 s, GPU 6.23 / 6.39 s, host 2.71 / 2.13 s.
+
+**Gate:** cargo build 0 errors · cargo test 15/15 · npm test ok (23 invariants) · run-all PASS 25 / FAIL 0, MCP 10/10 · psnr-gate inf.
+
+**Gotchas:** (a) The headless gate cannot exercise this path — the CLI window reports the system's reduced-motion setting but never draws in live mode during capture — so verification is the two contracts plus a GUI check still to do: enable *Reduce motion* in System Settings → Accessibility → Display, load a PNG, and confirm the grid holds still (frame-to-frame identical) while an animated GIF still plays. (b) Part 2 of F17 (the `frameIsTimeDependent()` static-frame detector that lets the loop stop) is Phase 4 as planned; this entry only makes the still output actually still.
+
 ### ITER-047 — 2026-10-17 — v0.2 Phase 1: readiness promises replace the headless sleeps; stray p5 draw during capture backpressure; GIF autoplay paused (F3, F21)
 
 **Problem:** Every headless render paid 1500 ms (DOMContentLoaded → `tryHeadlessRender`) + 300 ms (after source decode) + 200 ms (after `setConfig`) + 120 ms per batch job (`settleMs`) of fixed wall-clock sleeps. The #20 attempt to remove them was reverted in ITER-044 because the pre-capture live draws drifted the EMA; ITER-046 made that safe. Removing the sleeps then exposed two more wall-clock dependencies the sleeps had been hiding.
