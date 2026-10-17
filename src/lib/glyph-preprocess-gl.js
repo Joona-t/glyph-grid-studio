@@ -155,6 +155,7 @@
 
   let state = null;      // { canvas, gl, progs, vao, texSrc, texA, texB, fboA, fboB, w, h }
   let failed = false;
+  let lastErr = null;    // reason for the latch (ITER-069)
 
   function compileProgram(gl, fsSrc) {
     function sh(type, src) {
@@ -244,10 +245,10 @@
     try {
       if (!state) {
         state = init();
-        if (!state) { failed = true; return null; }
+        if (!state) { failed = true; lastErr = 'WebGL2 unavailable'; return null; }
       }
       const s = state, gl = s.gl;
-      if (gl.isContextLost()) { failed = true; return null; }
+      if (gl.isContextLost()) { failed = true; lastErr = 'WebGL2 context lost'; return null; }
       ensureSize(s, w, h);
       gl.disable(gl.BLEND);
       gl.disable(gl.DITHER);
@@ -274,6 +275,7 @@
     } catch (e) {
       console.warn('glyph-preprocess-gl: WebGL2 preprocess failed, latching the JS path:', e);
       failed = true;
+      lastErr = String((e && e.message) || e);
       return null;
     }
   }
@@ -284,5 +286,7 @@
     run: run,
     /* true until a GL failure latches the JS path for the session */
     available: function () { return !failed; },
+    /* ITER-069: why it latched (null while healthy) — forwarded to cli_log */
+    lastError: function () { return lastErr; },
   });
 })();

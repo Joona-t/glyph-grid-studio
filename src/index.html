@@ -671,8 +671,9 @@
           /* F8 Phase A: animated frames go through the GPU port; its output
              replaces buf's pixels with one drawImage (no getImageData /
              putImageData, no Float32 planes). Any GL miss → JS path. */
-          const _ppGL = (_curFrame >= 0 && config.studio && config.studio.gpuPreprocess
-              && window.GlyphGrid && GlyphGrid.preprocessGL && GlyphGrid.preprocessGL.available())
+          const _ppWantGL = _curFrame >= 0 && config.studio && config.studio.gpuPreprocess
+              && window.GlyphGrid && GlyphGrid.preprocessGL && GlyphGrid.preprocessGL.available();
+          const _ppGL = _ppWantGL
             ? GlyphGrid.preprocessGL.run(buf.elt, W0, H0, {
                 faceY1: faceY1, tipX: tipX, tipY: tipY, ux: ux, uy: uy,
                 tLo: -sourceDrawW * 0.06, tHi: axisLen + sourceDrawW * 0.04,
@@ -680,6 +681,15 @@
                 handX: handX, handY: handY, handRx: handRx, handRy: handRy, handFlatR: handFlatR,
               })
             : null;
+          /* ITER-069: the path that actually ran is reported per job
+             (batch line + PERF_JOB); a GL latch is forwarded to the CLI
+             log so a headless run never silently mixes the two paths. */
+          window.__preprocessPath = _ppGL ? 'gl' : 'js';
+          if (_ppWantGL && !_ppGL && window.__TAURI__ && window.__TAURI__.core) {
+            Promise.resolve(window.__TAURI__.core.invoke('cli_log', {
+              msg: 'warn: GL preprocess latched the JS path: ' + (GlyphGrid.preprocessGL.lastError() || 'unknown'),
+            })).catch(function () {});
+          }
           if (_ppGL) {
             const bctx = buf.drawingContext;
             bctx.save();
@@ -967,6 +977,22 @@
      each await still sees the rejection. */
   __setupReady.catch(function () {});
   let __fontLoadPromise = null;
+  /* ITER-069 (ITER-062 follow-up): studio-panel font swaps (glyph-studio.js)
+     route through window.__glyphFontSwap so the idle detector counts them
+     as pending, and the loop re-arms when the face lands — otherwise a
+     parked still kept painting the old face until the next config edit. */
+  let __fontSwapPending = 0;
+  window.__glyphFontSwap = function (opts) {
+    if (!(window.GlyphGrid && GlyphGrid.fonts && GlyphGrid.fonts.load)) return null;
+    __fontSwapPending++;
+    const p = __fontLoadPromise = Promise.resolve(GlyphGrid.fonts.load(opts))
+      .then(function (d) { if (d) fontDescriptor = d; });
+    p.catch(function () {}).then(function () {
+      __fontSwapPending--;
+      if (!recState) { try { loop(); } catch (_) {} }
+    });
+    return p;
+  };
   let retroResolved = null;         /* retro-merged CONFIG, if modeset */
   let gradientStopsCache = null;    /* { key, stops } — parsed OKLab stops for gradient colorMode */
   let sceneResult = null;           /* captured scene return: { zones?, depth? } */
@@ -1426,6 +1452,7 @@
     if (window.__sourceFrameIdx !== -1) return true;              // animated source
     if (CONFIG.scene !== 'studio') return true;                    // generative scenes animate on t
     if (__fontLoadPromise && !fontDescriptor) return true;         // face swap still pending
+    if (__fontSwapPending > 0) return true;                        // studio font swap in flight
     for (const _id in _atlasInflight) return true;                 // atlas commit pending
     if (CONFIG.glyphSet && !_atlasCache[CONFIG.glyphSet]) return true;
     if (CONFIG.prefilter && CONFIG.prefilter.mode === 'xdog') return true;  // studioSigmaSweep
@@ -2923,7 +2950,13 @@
       const wave6 = window.GlyphGrid && window.GlyphGrid.wave6;
       if (!wave6 || !wave6.makeSprite) { _glOk = false; return false; }
       const W = width | 0, H = height | 0;
-      if (!_glCanvas) _glCanvas = document.createElement('canvas');
+      if (!_glCanvas) {
+        _glCanvas = document.createElement('canvas');
+        /* ITER-069: a lost context (GPU reset, driver update, tab pressure)
+           draws nothing without throwing — latch the CPU sprite path for
+           this frame and every later one instead of compositing blanks. */
+        _glCanvas.addEventListener('webglcontextlost', function () { _glOk = false; });
+      }
       if (_glCanvas.width !== W || _glCanvas.height !== H) {
         _glCanvas.width = W; _glCanvas.height = H;
       }
@@ -2931,6 +2964,7 @@
         ramp, fontFamilyForActive(), CONFIG.font.size, palette.inks[0]
       );
       const r = wave6.makeSprite(_glCanvas);
+      if (r.gl.isContextLost()) { _glOk = false; return false; }
 
       const _tFill0 = performance.now();
       const N = cols * rows;
@@ -2973,6 +3007,7 @@
       const _tDraw0 = performance.now();
       wave6.drawSprite(r, _glCanvas, sprite.canvas, sprite.tileW, sprite.tileH, inst, n,
                        [_ic[0] / 255, _ic[1] / 255, _ic[2] / 255]);
+      if (!_glOk || r.gl.isContextLost()) { _glOk = false; return false; }  // lost mid-draw
       const _tComp0 = performance.now();
       drawingContext.drawImage(_glCanvas, 0, 0);
       const _tEnd = performance.now();
@@ -4907,8 +4942,11 @@
               .then(p => {
                 staged = false;              // finish_* consumed the capture
                 const _encMs = performance.now() - _encT0;
-                console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);
-                tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p }).catch(()=>{});
+                /* ITER-069: which preprocess path produced this job — headless
+                   output is only reproducible across machines on 'js'. */
+                const _pp = window.__preprocessPath || 'js';
+                console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p, 'preprocess:' + _pp);
+                tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p + ' preprocess:' + _pp }).catch(()=>{});
                 /* Emit PERF_JOB NDJSON when in perf mode — orchestrator
                    parses this from the studio's stderr. */
                 if (perfMode) {
@@ -4916,6 +4954,7 @@
                     const snap = snapshotPerf(job.name, job.frames || 24, anchorFrames);
                     if (snap) {
                       snap.encode_ms = _encMs;
+                      snap.preprocess = _pp;
                       tauri('cli_log', { msg: 'PERF_JOB ' + JSON.stringify(snap) }).catch(()=>{});
                     }
                   } catch (e) {
@@ -5401,6 +5440,16 @@
        (ITER-046), so pre-capture live draws no longer influence output. */
   }
 
+  /* ITER-069: headless output must stay a pure function of (source, config,
+     seed). The WebGL2 preprocess (ITER-066) is driver-dependent, so headless
+     runs (CLI render/batch, MCP — which spawns `render` — and window.PIPELINE
+     pieces) default to the JS preprocess; a preset or manifest job opts back
+     in with an explicit studio.gpuPreprocess:true, applied on top of this.
+     The GUI keeps CONFIG's GL default for interactive speed. */
+  function __headlessPreprocessDefault() {
+    if (CONFIG.studio) CONFIG.studio.gpuPreprocess = false;
+  }
+
   async function tryHeadlessRender() {
     if (!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)) {
       // Not running in Tauri at all (browser preview): nothing to do.
@@ -5418,6 +5467,7 @@
       return;
     }
     console.log('CLI: render job received', job);
+    __headlessPreprocessDefault();
 
     // Pick the initial source — top-level `inPath`, or first job's `in`
     // (multi-source manifests may omit the top-level field).

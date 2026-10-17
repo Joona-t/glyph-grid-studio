@@ -74,6 +74,47 @@ const banned = [
 for (const [name, pattern] of banned) {
   assert(!pattern.test(html), `frontend contract violated: ${name} is back`);
 }
+/* ITER-069: the offline guarantee covers the runtime libs too — no CDN
+   script fallback, no remote import(). Only the SVG namespace URI may appear. */
+{
+  const libDir = require('path').join(__dirname, '../src/lib');
+  for (const f of fs.readdirSync(libDir).filter((n) => n.endsWith('.js'))) {
+    const src = fs.readFileSync(require('path').join(libDir, f), 'utf8');
+    const hit = src.match(/https?:\/\/(?!www\.w3\.org\/2000\/svg)[^\s'"`]+/);
+    assert(!hit, `frontend contract violated: remote URL in src/lib/${f}: ${hit && hit[0]}`);
+  }
+  const studio = fs.readFileSync(require.resolve('../src/lib/glyph-studio.js'), 'utf8');
+  assert(/s\.src = 'vendor\/tweakpane-3\.1\.10\/tweakpane\.min\.js'/.test(studio), 'Tweakpane fallback is the vendored file');
+  /* ITER-069 (ITER-062 follow-up): panel font swaps go through the host hook
+     the idle detector can see. */
+  assert.strictEqual((studio.match(/swapFont\(config\);/g) || []).length, 2, 'both panel font swaps use swapFont()');
+  assert(/window\.__glyphFontSwap\(opts\)/.test(studio), 'swapFont() prefers the host __glyphFontSwap hook');
+  assert(/window\.__glyphFontSwap = function \(opts\) \{[\s\S]{0,200}__fontSwapPending\+\+;[\s\S]{0,300}__fontLoadPromise = [\s\S]{0,300}__fontSwapPending--;\s*\n\s*if \(!recState\) \{ try \{ loop\(\); \}/.test(html),
+    '__glyphFontSwap tracks the swap as pending and re-arms the loop when it resolves');
+}
+
+/* ITER-069: headless determinism — CLI/MCP jobs default to the JS preprocess
+   (only an explicit studio.gpuPreprocess:true from the preset/job opts in),
+   and every job reports the path it ran. */
+{
+  const at = html.indexOf("console.log('CLI: render job received', job);");
+  assert(at > 0, 'CLI job entry located');
+  assert(/^\s*__headlessPreprocessDefault\(\);/.test(html.slice(at + 46, at + 120)), 'headless default applied on job receipt');
+  const apply = html.indexOf('__glyphGridTest.setConfig(job.config)');
+  const batch = html.indexOf('__glyphGridTest.runBatchExport(batchJobs');
+  assert(at < apply && at < batch, 'headless default lands before the preset/manifest config is applied');
+  const fm = html.match(/function __headlessPreprocessDefault\(\) \{[\s\S]*?\n  \}/);
+  assert(fm, '__headlessPreprocessDefault() found');
+  const c = { CONFIG: { studio: { gpuPreprocess: true, enabled: true } } };
+  vm.createContext(c);
+  vm.runInContext(fm[0] + '\n__headlessPreprocessDefault();', c);
+  assert.strictEqual(c.CONFIG.studio.gpuPreprocess, false, 'headless default is the JS preprocess');
+  assert(/' preprocess:' \+ _pp/.test(html), 'batch result line reports preprocess path');
+  assert(/snap\.preprocess = _pp;/.test(html), 'PERF_JOB reports preprocess path');
+  assert(/window\.__preprocessPath = _ppGL \? 'gl' : 'js';/.test(html), 'preprocess path recorded where it is chosen');
+  assert(/'warn: GL preprocess latched the JS path: '/.test(html), 'GL latch warning is forwarded through cli_log');
+  console.log('headless preprocess determinism: ok');
+}
 
 console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${contracts.length} invariants)`);
 
@@ -91,7 +132,7 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     };
     const ctx = Object.assign({
       CONFIG: Object.assign(still, over && over.CONFIG),
-      recState: null, __primeOnly: false, __fontLoadPromise: null, fontDescriptor: null,
+      recState: null, __primeOnly: false, __fontLoadPromise: null, fontDescriptor: null, __fontSwapPending: 0,
       sourceImg: { width: 10 }, _atlasInflight: {}, _atlasCache: {},
       window: { PIPELINE: null, __sourceFrameIdx: -1 },
       __prefersReducedMotion: () => false,
@@ -119,6 +160,7 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     ['priming', { ctx: { __primeOnly: true } }],
     ['no source', { ctx: { sourceImg: null } }],
     ['font pending', { ctx: { __fontLoadPromise: {}, fontDescriptor: null } }],
+    ['studio font swap pending', { ctx: { __fontLoadPromise: {}, fontDescriptor: {}, __fontSwapPending: 1 } }],
     ['atlas in flight', { ctx: { _atlasInflight: { octant: {} } } }],
     ['atlas missing', { CONFIG: { glyphSet: 'octant' } }],
     ['CRT pixel stage', { ctx: { _hasImgDataStages: () => true } }],
@@ -232,11 +274,17 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     _hexToRgb: () => [17, 34, 51], _stableIdx: (s, i, v, idx) => idx, _stableIdxInt: (i, idx) => idx,
     __pfAdd: () => {}, performance: { now: () => 0 }, console: { warn: (...a) => { seen.warn = a; } },
     drawingContext: { drawImage: (c) => { seen.composited = c; } },
-    document: { createElement: () => ({ width: 0, height: 0 }) },
+    document: { createElement: () => ({ width: 0, height: 0,
+      addEventListener: (type, fn) => { seen.listeners = Object.assign(seen.listeners || {}, { [type]: fn }); } }) },
   };
+  const glState = { lost: false, loseInDraw: false };
+  const glStub = { isContextLost: () => glState.lost };
   ctx.window = { GlyphGrid: { wave6: {
-    makeSprite: () => ({}),
-    drawSprite: (r, c, atlas, tw, th, inst, n, ink) => { Object.assign(seen, { atlas, tw, th, inst: Array.from(inst.subarray(0, n * 4)), n, ink }); },
+    makeSprite: () => ({ gl: glStub }),
+    drawSprite: (r, c, atlas, tw, th, inst, n, ink) => {
+      Object.assign(seen, { atlas, tw, th, inst: Array.from(inst.subarray(0, n * 4)), n, ink });
+      if (glState.loseInDraw) glState.lost = true;
+    },
   } } };
   vm.createContext(ctx);
   vm.runInContext(m[0].replace(/^  let _glInst = null;/, 'var _glInst = null;') + '\nthis.__f = drawGridWebGL;', ctx);
@@ -258,7 +306,20 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   assert.strictEqual(seen.atlas, sprite.canvas, 'GL samples the CPU ramp sprite atlas');
   assert.deepStrictEqual([seen.tw, seen.th], [9, 12], 'tile size is the sprite tile, not the cell');
   assert.strictEqual(seen.composited, ctx._glCanvas, 'GL result is composited onto the p5 canvas');
-  console.log('GL sprite-equivalent instance fill: ok');
+  /* ITER-069: context loss latches the CPU sprite path — via the event, a
+     pre-draw isContextLost(), or a loss during the draw (nothing composited). */
+  assert(seen.listeners && typeof seen.listeners.webglcontextlost === 'function', 'webglcontextlost listener installed');
+  seen.listeners.webglcontextlost();
+  assert.strictEqual(ctx._glOk, false, 'webglcontextlost latches _glOk=false');
+  const lostCases = [['lost before draw', { lost: true, loseInDraw: false }], ['lost during draw', { lost: false, loseInDraw: true }]];
+  for (const [name, st] of lostCases) {
+    ctx._glOk = true; Object.assign(glState, st); seen.composited = null;
+    assert.strictEqual(ctx.__f(null, signal, cols, rows, cellW, cellH, { inks: ['#112233'] }, ' .:-=+*#%@', 9, false), false,
+      `${name}: falls through to the CPU path`);
+    assert.strictEqual(ctx._glOk, false, `${name}: latches _glOk=false`);
+    assert.strictEqual(seen.composited, null, `${name}: nothing composited from the lost context`);
+  }
+  console.log('GL sprite-equivalent instance fill + context loss: ok');
 }
 
 /* ITER-066 (F8 Phase A): the WebGL2 preprocess port must keep every tuned

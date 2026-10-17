@@ -28,7 +28,7 @@
   'use strict';
 
   /* ----------------------------------------------------------------
-   * 1.  Tweakpane availability check + CDN-load fallback
+   * 1.  Tweakpane availability check + vendored-load fallback
    * ---------------------------------------------------------------- */
   function ensureTweakpane(cb) {
     /* Tweakpane 3.x ships UMD (works with <script>); 4.x is ESM-only.
@@ -37,13 +37,29 @@
        this lib uses addInput throughout. */
     if (window.Tweakpane && window.Tweakpane.Pane) { cb(window.Tweakpane.Pane); return; }
     var s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/tweakpane@3.1.10/dist/tweakpane.min.js';
+    /* ITER-069: the vendored copy (ITER-063), never a CDN — offline boot. */
+    s.src = 'vendor/tweakpane-3.1.10/tweakpane.min.js';
     s.onload = function () {
       if (window.Tweakpane && window.Tweakpane.Pane) cb(window.Tweakpane.Pane);
       else console.warn('glyph-studio: Tweakpane loaded but no Pane export found');
     };
-    s.onerror = function () { console.warn('glyph-studio: Tweakpane CDN unreachable'); };
+    s.onerror = function () { console.warn('glyph-studio: vendored Tweakpane failed to load'); };
     document.head.appendChild(s);
+  }
+
+  /* ITER-069: font swaps go through the host's __glyphFontSwap so the
+     idle detector (ITER-062) sees them pending and re-arms the loop when
+     the face resolves; bare fonts.load is the fallback for other hosts. */
+  function swapFont(config) {
+    var opts = {
+      sizePx: config.font.size,
+      glyphSet: config.glyphSet || 'ascii',
+      trustRequested: !!config.glyphSet,
+    };
+    if (typeof window.__glyphFontSwap === 'function') { window.__glyphFontSwap(opts); return; }
+    if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
+      window.GlyphGrid.fonts.load(opts);
+    }
   }
 
   /* ----------------------------------------------------------------
@@ -1523,13 +1539,7 @@
     if (!config.font) config.font = { family: 'monospace', size: 8 };
     tip(addStructuralInput(fGrid, config.font, 'size', { min: 3, max: 14, step: 1 }, {
       onCommit: function () {
-        if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
-          window.GlyphGrid.fonts.load({
-            sizePx: config.font.size,
-            glyphSet: config.glyphSet || 'ascii',
-            trustRequested: !!config.glyphSet,
-          });
-        }
+        swapFont(config);
       },
     }),
         'Glyph pixel size. Tune until characters bleed into neighbours and the grid pattern dissolves.');
@@ -1635,13 +1645,7 @@
       fromTarget: function (value) { return value || 'null'; },
       toTarget: function (value) { return value === 'null' ? null : value; },
       onCommit: function () {
-        if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
-          window.GlyphGrid.fonts.load({
-            sizePx: config.font.size,
-            glyphSet: config.glyphSet || 'ascii',
-            trustRequested: !!config.glyphSet,
-          });
-        }
+        swapFont(config);
       },
     });
     tip(_gsBinding, 'Atlas used by shape modes. `octant` (Unicode 16) gives the densest texture; `ascii` is widely compatible.');
