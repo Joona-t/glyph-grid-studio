@@ -61,5 +61,10 @@ else
   pass "no progress NDJSON relayed without --progress"
 fi
 
+# ITER-073: the two 96-frame outputs are ~28 MB each; left in tests/scratch
+# they fail run-all F3 ("no test GIF over 15 MB") on the NEXT run, since
+# Phase F runs before Phase G.  They are only checked for presence above.
+rm -f "$SCRATCH"/s1.gif "$SCRATCH"/s2.gif
+
 echo "  batch-jobs-stall: PASS $PASS FAIL $FAIL"
 [[ "$FAIL" == "0" ]] && exit 0 || exit 1

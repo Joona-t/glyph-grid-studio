@@ -1164,6 +1164,47 @@
   let cellSignalEma = null;  /* Float32Array, per-cell EMA — pixel breathing */
   let cellCpGrid = null;  /* Uint16Array, per-cell chosen codepoint/idx */
   let cellDepth = null;   /* Float32Array, per-cell depth in [0,1] (v2.1 depth channel) */
+
+  /* ITER-073 (Phase 5.0): GlyphFrame IR — the last painted grid AS DATA.
+     Every drawer (v1, brightness CPU/GL fast paths, shape, edge-directional,
+     flow) writes the cell it just placed — codepoint, ink rgb, alpha 0..255 —
+     at the point it already knows the pick; cp 0 = nothing drawn (space or
+     skipped cell).  fg is interleaved rgb (N*3).  Uint32 because octants
+     live at U+1CD00.  Grow-only typed arrays: zero allocation per frame once
+     sized.  Pure side channel — nothing on the canvas reads it — so headless
+     output is unchanged.  Consumers: captureGridSnapshot (TXT/SVG in every
+     selection mode) and the Phase 5 exporters.  ROI overdraw and dispersal
+     offsets are raster-only and not represented. */
+  const glyphFrame = {
+    cols: 0, rows: 0,
+    cp: new Uint32Array(0), fg: new Uint8Array(0), alpha: new Uint8Array(0),
+    bgHex: '', font: '', mode: '', seq: 0,
+  };
+  function irBegin(cols, rows, font, mode) {
+    const n = cols * rows;
+    if (glyphFrame.cp.length < n) {
+      glyphFrame.cp = new Uint32Array(n);
+      glyphFrame.fg = new Uint8Array(n * 3);
+      glyphFrame.alpha = new Uint8Array(n);
+    } else {
+      glyphFrame.cp.fill(0, 0, n);
+    }
+    glyphFrame.cols = cols; glyphFrame.rows = rows;
+    glyphFrame.bgHex = PALETTES[CONFIG.palette].bg;
+    glyphFrame.font = font; glyphFrame.mode = mode;
+    glyphFrame.seq++;
+  }
+  /* rgb in [0,255] (Uint8 store truncates like the old snapshot's `| 0`);
+     a is the drawn opacity in [0,1] before clamping. */
+  function irPut(i, cp, r, g, b, a) {
+    glyphFrame.cp[i] = cp;
+    const fg = glyphFrame.fg, o = i * 3;
+    fg[o] = r; fg[o + 1] = g; fg[o + 2] = b;
+    glyphFrame.alpha[i] = a >= 1 ? 255 : (a > 0 ? (a * 255 + 0.5) | 0 : 0);
+  }
+  /* applyCellFill's resolved ink, for the slow paths' irPut. */
+  let _irR = 0, _irG = 0, _irB = 0, _irA = 1;
+
   /* F10 — persistent ditherOpts object reused across all frames in
      the dither dispatch.  Mutated in place each frame, never replaced. */
   const _persistentDitherOpts = {
@@ -1499,6 +1540,50 @@
              timeDependent: frameIsTimeDependent() };
   };
 
+  /* ITER-073 (Phase 5.0): FrameSource adapter — the one seam an input
+     goes through to become this frame's source image.
+       { kind: 'still'|'gif', durationMs, frameAt(tMs) → p5.Image,
+         index, revision }
+     `index` is the source frame frameAt() just selected (-1 for a still);
+     draw() publishes it as window.__sourceFrameIdx, so the ITER-042/052
+     memo busting keyed on that global is unchanged.  durationMs is the
+     source's own loop length (0 = none).  Rebuilt when sourceImg or
+     __sourceRevision changes.  Video / camera / text sources (R3/R4) add an
+     adapter here; nothing else in draw() moves. */
+  let __frameSource = null;
+  function makeFrameSource(img, revision) {
+    if (img && img.gifProperties && img.numFrames && img.numFrames() > 1) {
+      const props = img.gifProperties;
+      let totalMs = 0;
+      for (let i = 0; i < props.numFrames; i++) totalMs += (props.frames[i].delay || 100);
+      return {
+        kind: 'gif', img: img, revision: revision, durationMs: totalMs, index: -1,
+        /* The source frame whose delay window contains tMs mod loop. */
+        frameAt(tMs) {
+          const loopT = tMs % totalMs;
+          let acc = 0, target = props.numFrames - 1;
+          for (let i = 0; i < props.numFrames; i++) {
+            acc += (props.frames[i].delay || 100);
+            if (loopT < acc) { target = i; break; }
+          }
+          if (target !== props.displayIndex) img.setFrame(target);
+          this.index = target;
+          return img;
+        },
+      };
+    }
+    return {
+      kind: 'still', img: img, revision: revision, durationMs: 0, index: -1,
+      frameAt() { return img; },
+    };
+  }
+  function frameSourceFor(img) {
+    if (!__frameSource || __frameSource.img !== img || __frameSource.revision !== __sourceRevision) {
+      __frameSource = makeFrameSource(img, __sourceRevision);
+    }
+    return __frameSource;
+  }
+
   function draw() {
     /* CONFIG.animation.fps is live-mutated by Tweakpane and batch jobs.
        Keep p5's actual timer cadence in sync with the animation math. */
@@ -1555,28 +1640,11 @@
 
        The scene's __sourceProcessed cache is busted via the global
        `__sourceFrameIdx` watcher (scenes that compare against this
-       reset their cache when the source frame changes). */
-    if (sourceImg && sourceImg.gifProperties && sourceImg.numFrames && sourceImg.numFrames() > 1) {
-      const props = sourceImg.gifProperties;
-      const totalMs = props.__totalMs || (function () {
-        let s = 0;
-        for (let i = 0; i < props.numFrames; i++) s += (props.frames[i].delay || 100);
-        props.__totalMs = s;
-        return s;
-      })();
-      const loopT = (t * 1000) % totalMs;
-      let acc = 0, target = props.numFrames - 1;
-      for (let i = 0; i < props.numFrames; i++) {
-        acc += (props.frames[i].delay || 100);
-        if (loopT < acc) { target = i; break; }
-      }
-      if (target !== props.displayIndex) {
-        sourceImg.setFrame(target);
-      }
-      window.__sourceFrameIdx = target;
-    } else {
-      window.__sourceFrameIdx = -1;
-    }
+       reset their cache when the source frame changes).  ITER-073: the
+       selection itself lives in the FrameSource adapter (makeFrameSource). */
+    const _fsrc = frameSourceFor(sourceImg);
+    _fsrc.frameAt(t * 1000);
+    window.__sourceFrameIdx = _fsrc.index;
 
     /* Wave 1 opt-in path: a piece may declare `window.PIPELINE = pipeline()...`
        to run through the new runtime. When present, it fully replaces the
@@ -2020,6 +2088,7 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(CONFIG.font.family);
+    irBegin(cols, rows, CONFIG.font.family, 'brightness');
 
     /* Monochrome fast path (dither:none / compat:v1 configs land here).
        Same signal math and the same fill()+text() calls as the loop
@@ -2035,6 +2104,7 @@
         && palette.inks && palette.inks[0]
         && strategy !== 'nearest' && strategy !== 'edge-weighted') {
       const ink = color(palette.inks[0]);
+      const inkR = ink.levels[0], inkG = ink.levels[1], inkB = ink.levels[2];
       for (let row = 0; row < rows; row++) {
         const y0 = Math.floor(row * cellH);
         const cy = y0 + cellH / 2;
@@ -2063,6 +2133,7 @@
           ink.setAlpha(255 * Math.min(1, curved * 1.1));
           fill(ink);
           text(ch, x0 + cellW / 2, cy);
+          irPut(row * cols + col, ramp.charCodeAt(idx), inkR, inkG, inkB, curved * 1.1);
         }
       }
       return;
@@ -2089,6 +2160,7 @@
         if (ch === ' ') continue;
         applyCellFill(sample, palette, curved, bgR, bgG, bgB);
         text(ch, cx, cy);
+        irPut(row * cols + col, ramp.charCodeAt(idx), _irR, _irG, _irB, _irA);
       }
     }
   }
@@ -2152,12 +2224,14 @@
         const r = Math.max(0, Math.min(255, bgR + dr * s));
         const g = Math.max(0, Math.min(255, bgG + dg * s));
         const b = Math.max(0, Math.min(255, bgB + db * s));
+        _irR = r; _irG = g; _irB = b; _irA = 1;
         fill(r, g, b);
         return;
       }
       if (mode === 'monochrome') {
         const c = color(palette.inks[0]);
         c.setAlpha(255 * Math.min(1, curved * 1.1));
+        _irR = c.levels[0]; _irG = c.levels[1]; _irB = c.levels[2]; _irA = curved * 1.1;
         fill(c);
         return;
       }
@@ -2165,6 +2239,7 @@
         const a = color(palette.inks[0]);
         const b = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
         const lerped = lerpColor(a, b, Math.min(1, curved));
+        _irR = lerped.levels[0]; _irG = lerped.levels[1]; _irB = lerped.levels[2]; _irA = 1;
         fill(lerped);
         return;
       }
@@ -2175,10 +2250,12 @@
           const curve = typeof gmap.curve === 'number' ? gmap.curve : 1.0;
           const u = Math.pow(Math.min(1, Math.max(0, curved)), curve);
           const rgb = GlyphGrid.paletteMorph.interpAtU(stops, u);
+          _irR = rgb[0]; _irG = rgb[1]; _irB = rgb[2]; _irA = 1;
           fill(rgb[0], rgb[1], rgb[2]);
           return;
         }
       }
+      _irR = 255; _irG = 255; _irB = 255; _irA = 1;
       fill(255);
       return;
     }
@@ -2229,6 +2306,7 @@
     r = r * (1 - tf) + fr * tf;
     g = g * (1 - tf) + fg * tf;
     b = b * (1 - tf) + fb * tf;
+    _irR = r; _irG = g; _irB = b; _irA = alpha / 255;
     fill(r, g, b, alpha);
   }
 
@@ -2983,6 +3061,7 @@
       const spaceMask = _rampSpriteSpaceMask;
       const halfTW = sprite.halfW, halfTH = sprite.halfH;
       const halfCellW = cellW * 0.5, halfCellH = cellH * 0.5;
+      const _ic = _hexToRgb(palette.inks[0] || '#000');
       let n = 0;
       for (let rr = 0; rr < rows; rr++) {
         const y0 = ((((rr * cellH) | 0) + halfCellH) - halfTH) | 0;
@@ -3005,6 +3084,7 @@
           if (spaceMask[idx]) continue;
           /* globalAlpha semantics: a > 1 clamps to 1; a <= 0 draws nothing. */
           const a = curved * 1.1;
+          irPut(i, ramp.charCodeAt(idx), _ic[0], _ic[1], _ic[2], a);
           const o = n * 4;
           inst[o]     = ((((c * cellW) | 0) + halfCellW) - halfTW) | 0;
           inst[o + 1] = y0;
@@ -3013,7 +3093,6 @@
           n++;
         }
       }
-      const _ic = _hexToRgb(palette.inks[0] || '#000');
       const _tDraw0 = performance.now();
       wave6.drawSprite(r, _glCanvas, sprite.canvas, sprite.tileW, sprite.tileH, inst, n,
                        [_ic[0] / 255, _ic[1] / 255, _ic[2] / 255]);
@@ -3051,6 +3130,7 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(fontFamilyForActive());
+    irBegin(cols, rows, fontFamilyForActive(), 'brightness');
     const ramp = RAMPS[CONFIG.ramp];
     const rampLast = ramp.length - 1;
     const gamma = CONFIG.brightnessGamma;
@@ -3246,6 +3326,7 @@
             }
           }
 
+          irPut(i, ramp.charCodeAt(idx), monoR, monoG, monoB, a);
           ctx.globalAlpha = a > 1 ? 1 : a;
           ctx.drawImage(
             spriteCanvas, idx * tileW, 0, tileW, tileH,
@@ -3293,6 +3374,8 @@
           const cx = ((c * cellW) | 0) + halfCellW;
           const t = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
           const stepIdx = (t * stepsLast + 0.5) | 0;
+          irPut(i, ramp.charCodeAt(idx), dueR0 + (dueR1 - dueR0) * t,
+                dueG0 + (dueG1 - dueG0) * t, dueB0 + (dueB1 - dueB0) * t, 1);
           ctx.drawImage(
             spriteCanvas, idx * tileW, stepIdx * tileH, tileW, tileH,
             (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
@@ -3339,6 +3422,8 @@
           const cx = ((c * cellW) | 0) + halfCellW;
           const cClamped = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
           const stepIdx = (cClamped * stepsLast + 0.5) | 0;
+          const lo = ((cClamped * 255) | 0) * 3;
+          irPut(i, ramp.charCodeAt(idx), _gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2], 1);
           ctx.drawImage(
             spriteCanvas, idx * tileW, stepIdx * tileH, tileW, tileH,
             (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
@@ -3380,6 +3465,7 @@
         currentCellDepth = cellDepth[i];
         applyCellFill(_sampleObj, palette, curved, bgR, bgG, bgB);
         text(ch, cx, cy);
+        irPut(i, ch.charCodeAt(0), _irR, _irG, _irB, _irA);
       }
     }
     currentCellDepth = -1;
@@ -3446,6 +3532,7 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(fontFamilyForActive());
+    irBegin(cols, rows, fontFamilyForActive(), edgeAware ? 'shape-edge-aware' : 'shape');
     const pixels = g.pixels;
     const srcW = g.width;
     const srcH = g.height;
@@ -3543,6 +3630,7 @@
           const sig = cellSignal[i];
           const sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
           const a = sigQ * 1.1;
+          irPut(i, glyph.cp, monoR, monoG, monoB, a);
           ctx.globalAlpha = a > 1 ? 1 : a;
           ctx.drawImage(
             spriteCanvas, gi * tileW, 0, tileW, tileH,
@@ -3579,6 +3667,8 @@
           const sig = cellSignal[i];
           const t = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
           const stepIdx = (t * stepsLast + 0.5) | 0;
+          irPut(i, glyph.cp, dueR0 + (dueR1 - dueR0) * t,
+                dueG0 + (dueG1 - dueG0) * t, dueB0 + (dueB1 - dueB0) * t, 1);
           ctx.drawImage(
             spriteCanvas, gi * tileW, stepIdx * tileH, tileW, tileH,
             (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
@@ -3614,6 +3704,8 @@
           const sig = cellSignal[i];
           const sigC = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
           const stepIdx = (sigC * stepsLast + 0.5) | 0;
+          const lo = ((sigC * 255) | 0) * 3;
+          irPut(i, glyph.cp, _gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2], 1);
           ctx.drawImage(
             spriteCanvas, gi * tileW, stepIdx * tileH, tileW, tileH,
             (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
@@ -3643,6 +3735,7 @@
         currentCellDepth = cellDepth[i];
         applyCellFill(_sampleObj, palette, cellSignal[i], bgR, bgG, bgB);
         text(glyph.s, cx, cy);
+        irPut(i, glyph.cp, _irR, _irG, _irB, _irA);
       }
     }
     currentCellDepth = -1;
@@ -3732,6 +3825,7 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(fontFamilyForActive());
+    irBegin(cols, rows, fontFamilyForActive(), cpsOverride ? 'flow' : 'edge-directional');
     const pixels = src.pixels;
     const srcW = src.width;
     const srcH = src.height;
@@ -3800,6 +3894,7 @@
           const cx = ((c * cellW) | 0) + halfCellW;
           const sig = cellSignal[i];
           const sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          irPut(i, cp, monoR, monoG, monoB, sigQ * 1.1);
           const tile = _edgeTile[cp];
           if (tile < 0) {
             const a = sigQ * 280.5;
@@ -3835,6 +3930,7 @@
           const a = sigQ * 280.5;
           fill(monoR, monoG, monoB, a > 255 ? 255 : a);
           text(String.fromCodePoint(cp), cx, cy);
+          irPut(i, cp, monoR, monoG, monoB, sigQ * 1.1);
         }
       }
       currentCellDepth = -1;
@@ -3857,6 +3953,7 @@
           const fb = dueB0 + (dueB1 - dueB0) * t;
           fill(fr, fg, fb);
           text(String.fromCodePoint(cp), cx, cy);
+          irPut(i, cp, fr, fg, fb, 1);
         }
       }
       currentCellDepth = -1;
@@ -3877,6 +3974,7 @@
           const lo = ((sigC * 255) | 0) * 3;
           fill(_gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2]);
           text(String.fromCodePoint(cp), cx, cy);
+          irPut(i, cp, _gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2], 1);
         }
       }
       currentCellDepth = -1;
@@ -3899,6 +3997,7 @@
         currentCellDepth = cellDepth[i];
         applyCellFill(_sampleObj, palette, cellSignal[i], bgR, bgG, bgB);
         text(String.fromCodePoint(cp), cx, cy);
+        irPut(i, cp, _irR, _irG, _irB, _irA);
       }
     }
     currentCellDepth = -1;
@@ -4582,97 +4681,32 @@
     getRenderGeneration: () => __renderGeneration,
     getSkillVersion: () => (window.GlyphGrid && GlyphGrid.compat ? GlyphGrid.compat.SKILL_VERSION : '1.x'),
 
-    /* ── captureGridSnapshot (v0.1.6, SOTA feature 2) ──────────────────
+    /* ── captureGridSnapshot (v0.1.6; ITER-073 reads the GlyphFrame IR) ──
        Vector/text export needs the grid AS DATA, not pixels.  Reads the
-       PERSISTENT cellSignal buffer (the post-EMA brightness the last
-       frame rendered from) and replays the brightness-mode glyph +
-       colour selection OUTSIDE the draw loop — zero cost to the hot
-       paths.  Honors temporal stability (reads the displayed _stabIdx).
-       Brightness selection mode only; shape/edge modes return null
-       (their per-cell picks aren't persisted) — callers show a hint. */
+       glyphFrame IR the last painted frame's drawer filled, so it works in
+       every selection mode (brightness, shape, shape-edge-aware,
+       edge-directional, flow) and on the v1 + GL paths, and honours
+       temporal stability by construction (the IR holds the displayed pick).
+       Zero cost to the hot paths beyond the IR stores.  null until a frame
+       has been painted at the current grid size. */
     captureGridSnapshot() {
       try {
-        const mode = GlyphGrid.compat.resolveSelectionMode(CONFIG);
-        if (mode !== 'brightness') return null;
-        if (!cellSignal || !sourceImg) return null;
+        const f = glyphFrame;
         const cols = CONFIG.grid.cols, rows = CONFIG.grid.rows;
-        if (cellSignal.length !== cols * rows) return null;
-        const ramp = RAMPS[CONFIG.ramp];
-        const rampLast = ramp.length - 1;
-        _buildGammaLut(CONFIG.brightnessGamma);
-        const palette = PALETTES[CONFIG.palette];
-        const bgC = color(palette.bg);
-        const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
-        const colorMode = CONFIG.colorMode;
+        if (!sourceImg || !f.seq || f.cols !== cols || f.rows !== rows) return null;
         const cellW = width / cols, cellH = height / rows;
-        const cellPxW = Math.max(1, Math.floor(cellW));
-        const cellPxH = Math.max(1, Math.floor(cellH));
-        const gSrc = src, pixels = gSrc.pixels, srcW = gSrc.width;
-        const stride = srcW * 4;
-        /* Colour hoists mirroring drawBrightnessGrid. */
-        let monoR = 0, monoG = 0, monoB = 0;
-        if (colorMode === 'monochrome' && palette.inks && palette.inks[0]) {
-          const ic = color(palette.inks[0]);
-          monoR = red(ic); monoG = green(ic); monoB = blue(ic);
-        }
-        let dueR0 = 0, dueG0 = 0, dueB0 = 0, dueR1 = 0, dueG1 = 0, dueB1 = 0;
-        if (colorMode === 'duotone' && palette.inks && palette.inks.length > 0) {
-          const c0 = color(palette.inks[0]);
-          const c1 = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
-          dueR0 = red(c0); dueG0 = green(c0); dueB0 = blue(c0);
-          dueR1 = red(c1); dueG1 = green(c1); dueB1 = blue(c1);
-        }
-        let useGrad = false;
-        if (colorMode === 'gradient') {
-          const gStops = resolveGradientStops(palette);
-          if (gStops && gStops.length > 0) {
-            const gmap = CONFIG.gradientColorMap || {};
-            _ensureGradColorLut(gStops, gmap.blend || 'oklab',
-                                (typeof gmap.curve === 'number') ? gmap.curve : 1.0);
-            useGrad = true;
-          }
-        }
-        const stab = (CONFIG.temporalStability && CONFIG.temporalStability.enabled
-                      && _stabIdx && _stabIdx.length === cols * rows) ? _stabIdx : null;
+        const cp = f.cp, fg = f.fg, al = f.alpha;
         const cells = [];
         for (let r = 0; r < rows; r++) {
           for (let c = 0; c < cols; c++) {
             const i = r * cols + c;
-            const sigI = cellSignal[i];
-            const sigQ = sigI < 0 ? 0 : (sigI > 1 ? 1 : sigI);
-            const curved = _gammaLut[(sigQ * 255) | 0];
-            let idx = (curved * rampLast + 0.0001) | 0;
-            if (idx > rampLast) idx = rampLast; else if (idx < 0) idx = 0;
-            if (stab && stab[i] >= 0) idx = stab[i];
-            const ch = ramp.charAt(idx);
-            if (ch === ' ') continue;
-            let fr, fg, fb, fo = 1;
-            if (colorMode === 'monochrome') {
-              fr = monoR; fg = monoG; fb = monoB;
-              fo = Math.min(1, curved * 1.1);
-            } else if (colorMode === 'duotone') {
-              const t = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
-              fr = dueR0 + (dueR1 - dueR0) * t;
-              fg = dueG0 + (dueG1 - dueG0) * t;
-              fb = dueB0 + (dueB1 - dueB0) * t;
-            } else if (colorMode === 'gradient' && useGrad) {
-              const o = ((curved * 255) | 0) * 3;
-              fr = _gradColorLut[o]; fg = _gradColorLut[o + 1]; fb = _gradColorLut[o + 2];
-            } else {
-              /* preserve — sample + contrast-stretch (applyCellFill math) */
-              const x0 = (c * cellW) | 0, y0 = (r * cellH) | 0;
-              sampleCellInto(_sampleObj, pixels, stride, x0, y0, cellPxW, cellPxH, srcW, gSrc.height);
-              const dr = _sampleObj.r - bgR, dg = _sampleObj.g - bgG, db = _sampleObj.b - bgB;
-              const m = Math.max(Math.abs(dr), Math.abs(dg), Math.abs(db), 1);
-              const sc = 255 / m;
-              fr = Math.max(0, Math.min(255, bgR + dr * sc));
-              fg = Math.max(0, Math.min(255, bgG + dg * sc));
-              fb = Math.max(0, Math.min(255, bgB + db * sc));
-            }
+            const code = cp[i];
+            if (code === 0 || code === 0x20) continue;
+            const o = i * 3;
             cells.push({
-              c: ch, col: c, row: r,
-              f: 'rgb(' + (fr | 0) + ',' + (fg | 0) + ',' + (fb | 0) + ')',
-              o: Math.round(fo * 1000) / 1000,
+              c: String.fromCodePoint(code), col: c, row: r,
+              f: 'rgb(' + fg[o] + ',' + fg[o + 1] + ',' + fg[o + 2] + ')',
+              o: Math.round(al[i] / 255 * 1000) / 1000,
             });
           }
         }
@@ -4681,8 +4715,9 @@
           w: width, h: height,
           cellW: cellW, cellH: cellH,
           fontSize: CONFIG.font.size,
-          fontFamily: (CONFIG.font && CONFIG.font.family) || 'monospace',
-          bg: palette.bg,
+          fontFamily: f.font || (CONFIG.font && CONFIG.font.family) || 'monospace',
+          bg: f.bgHex || PALETTES[CONFIG.palette].bg,
+          mode: f.mode,
           ramp: CONFIG.ramp,
           palette: CONFIG.palette,
           cells: cells,
@@ -4692,6 +4727,13 @@
         return null;
       }
     },
+    /* ITER-073: the live GlyphFrame IR (read-only by convention — Phase 5
+       exporters copy what they need) and the active FrameSource. */
+    getGlyphFrame: () => glyphFrame,
+    getFrameSource: () => (__frameSource
+      ? { kind: __frameSource.kind, durationMs: __frameSource.durationMs,
+          index: __frameSource.index, revision: __frameSource.revision }
+      : null),
 
     /* Batch GIF export — drive hundreds of variations unattended.
        Each `job` is { name: 'human-label', path: '/abs/path/foo.gif',

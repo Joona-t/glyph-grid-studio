@@ -1929,8 +1929,8 @@
     /* ── Vector + plain-text export (v0.1.6, SOTA feature 2) ─────────
        The grid IS typeset characters — export it in its native forms:
        SVG (infinite-resolution vector for print/posters/plotters) and
-       plain text.  Brightness selection mode only (shape/edge picks
-       aren't persisted per-cell); the hook returns null otherwise. */
+       plain text.  Every selection mode: the hook reads the GlyphFrame IR
+       the drawers fill (ITER-073); null only before a frame is painted. */
     function xmlEsc(ch) {
       if (ch === '&') return '&amp;';
       if (ch === '<') return '&lt;';
@@ -1976,7 +1976,7 @@
       var snap = opts.testHook && opts.testHook.captureGridSnapshot
         ? opts.testHook.captureGridSnapshot() : null;
       if (!snap) {
-        exportFeedback('Vector/text export needs selectionMode "brightness" and a loaded image.', true);
+        exportFeedback('Vector/text export needs a loaded image and a rendered frame.', true);
         return;
       }
       var body = kind === 'svg' ? buildSvg(snap) : buildTxt(snap);
@@ -1996,10 +1996,10 @@
       }
     }
     var btnSvg = fExp.addButton({ title: 'Export SVG (vector)' });
-    tip(btnSvg, 'Infinite-resolution vector export — every glyph is real text. Perfect for print, posters, laser engraving. Brightness selection mode only.');
+    tip(btnSvg, 'Infinite-resolution vector export — every glyph is real text. Perfect for print, posters, laser engraving. Works in every selection mode.');
     btnSvg.on('click', function () { exportGridAs('svg'); });
     var btnTxt = fExp.addButton({ title: 'Export TXT (plain text)' });
-    tip(btnTxt, 'The grid as actual text — paste into a terminal, README, or anywhere monospace lives. Brightness selection mode only.');
+    tip(btnTxt, 'The grid as actual text — paste into a terminal, README, or anywhere monospace lives. Works in every selection mode.');
     btnTxt.on('click', function () { exportGridAs('txt'); });
     /* Compute the frame count + per-frame delay we'll actually pass to
        the GIF encoder.  The GIF format stores delays in centiseconds

@@ -86,8 +86,8 @@ Goal: the GUI is cheap when idle, starts offline, imports big GIFs without copyi
 Two seams first, then four features on top. Each feature ships behind its own flag with CLI/MCP/preset surface from day one (rule: headless parity).
 
 ### 5.0 Seams (effort M)
-- [ ] **`GlyphFrame` IR** (from R6): `{cols, rows, cp: Uint32Array, fg: Uint8Array×3, alpha: Uint8Array, bgHex, font}` filled by every drawer (brightness/shape/edge/flow) at the point it already knows the pick. `captureGridSnapshot()` reads the IR → TXT/SVG work in every mode. Uint32 because octants are U+1CD00.
-- [ ] **`FrameSource` adapter** (from R4): `{kind, durationMs, frameAt(tMs), revision}`; still + GIF become adapters; `__sourceFrameIdx` memo busting unchanged.
+- [x] **`GlyphFrame` IR** (from R6): `{cols, rows, cp: Uint32Array, fg: Uint8Array×3, alpha: Uint8Array, bgHex, font}` filled by every drawer (brightness/shape/edge/flow) at the point it already knows the pick. `captureGridSnapshot()` reads the IR → TXT/SVG work in every mode. Uint32 because octants are U+1CD00. — ITER-073 (fg interleaved N×3; also v1 + GL paths; grow-only buffers)
+- [x] **`FrameSource` adapter** (from R4): `{kind, durationMs, frameAt(tMs), revision}`; still + GIF become adapters; `__sourceFrameIdx` memo busting unchanged. — ITER-073
 
 ### 5.1 Feature R1 — Terminal-native export (effort M)
 `--format txt|ansi|cast|html` from GUI, CLI, batch and MCP, every selection mode. Pure module `src/lib/glyph-text-export.js` (`toTxt`, `toAnsi` with RLE 24-bit colour, `toCastV2` asciinema events, `toHtml` single-file with inlined WOFF2 + reduced-motion stepper). Rust `save_text_export`. Default octant/sextant sets to `ascii|blockElements` for ANSI with a compat warning. Why first: it's the "agents can read the output as tokens" feature and needs only the IR.

@@ -287,6 +287,7 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     _ensureRampSprite: () => sprite, fontFamilyForActive: () => 'mono',
     _hexToRgb: () => [17, 34, 51], _stableIdx: (s, i, v, idx) => idx, _stableIdxInt: (i, idx) => idx,
     __pfAdd: () => {}, performance: { now: () => 0 }, console: { warn: (...a) => { seen.warn = a; } },
+    irPut: (i, cp, r, g, b, a) => { (seen.ir = seen.ir || []).push([i, cp, r, g, b]); },
     drawingContext: { drawImage: (c) => { seen.composited = c; } },
     document: { createElement: () => ({ width: 0, height: 0,
       addEventListener: (type, fn) => { seen.listeners = Object.assign(seen.listeners || {}, { [type]: fn }); } }) },
@@ -316,6 +317,11 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     want.push(((((c * cellW) | 0) + cellW * 0.5) - 4.5) | 0, ((((r * cellH) | 0) + cellH * 0.5) - 6) | 0, idx, Math.fround(a));
   }
   assert.strictEqual(seen.n, want.length / 4, 'space glyphs are dropped from the instance list');
+  /* ITER-073: every GL instance is mirrored into the GlyphFrame IR. */
+  assert.strictEqual(seen.ir.length, seen.n, 'GL path writes one IR cell per instance');
+  assert.deepStrictEqual(seen.ir.map((e) => e[1]), want.filter((_, k) => (k & 3) === 2).map((idx) => ' .:-=+*#%@'.charCodeAt(idx)),
+    'GL IR codepoints are the ramp glyphs it instanced');
+  assert(seen.ir.every((e) => e[2] === 17 && e[3] === 34 && e[4] === 51), 'GL IR ink is the palette ink');
   assert.deepStrictEqual(seen.inst, want, 'instance origins/idx/alpha match the CPU sprite blit');
   assert.strictEqual(seen.atlas, sprite.canvas, 'GL samples the CPU ramp sprite atlas');
   assert.deepStrictEqual([seen.tw, seen.th], [9, 12], 'tile size is the sprite tile, not the cell');
@@ -410,4 +416,211 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     assert.deepStrictEqual(rows, dark, `scanline mask rows match applyScanlines (period ${period}, phase ${phase})`);
   }
   console.log('postprocess Tier A overlays: ok');
+}
+
+/* ITER-073 (Phase 5.0): GlyphFrame IR.  Drive every drawer (v1, brightness
+   CPU sprite/text + GL, shape, shape-edge-aware, edge-directional, flow) in
+   a vm harness with p5 stubs and assert the IR holds exactly what was drawn:
+   one cell per draw op, same codepoint, nothing for skipped cells.  Then
+   captureGridSnapshot() must export from the IR in a non-brightness mode. */
+{
+  const grab = (re, what) => { const m = html.match(re); assert(m, what + ' not found'); return m[0]; };
+  const fn = (name) => grab(new RegExp('\\n  function ' + name + '\\([\\s\\S]*?\\n  \\}\\n'), name + '()');
+  const irBlock = grab(/  const glyphFrame = \{[\s\S]*?let _irR = 0, _irG = 0, _irB = 0, _irA = 1;\n/, 'GlyphFrame IR block');
+  const flowBlock = grab(/  let _flowCps = null;[\s\S]*?\n  function drawFlowGrid\([\s\S]*?\n  \}\n/, 'drawFlowGrid()');
+  const glBlock = grab(/  let _glInst = null;[^\n]*\n[\s\S]*?\n  function drawGridWebGL\([\s\S]*?\n  \}\n/, 'drawGridWebGL()')
+    .replace(/^  let _glInst = null;/, 'var _glInst = null;');
+  const snapSrc = grab(/    captureGridSnapshot\(\) \{[\s\S]*?\n    \},\n/, 'captureGridSnapshot()');
+  const code = [irBlock, fn('applyCellFill'), fn('sampleCell'), fn('sampleCellInto'), fn('drawGlyphGrid'),
+    fn('drawBrightnessGrid'), fn('drawShapeGrid'), fn('drawEdgeDirectionalGrid'), flowBlock, glBlock,
+    'var __hook = {\n' + snapSrc + '};',
+    'this.gf = () => glyphFrame; this.hook = __hook;'].join('\n');
+
+  const cols = 4, rows = 2, cellW = 10, cellH = 10;
+  const ramp = ' .:-=+*#%@';
+  const hex = (h) => [1, 3, 5].map((k) => parseInt(h.slice(k, k + 2), 16));
+  const mkColor = (lv) => ({ levels: lv.slice(0, 3).concat([255]),
+    setAlpha(a) { this.levels = this.levels.slice(0, 3).concat([Math.round(a)]); } });
+  const ops = [];
+  const cellOf = (x, y) => Math.floor(y / cellH) * cols + Math.floor(x / cellW);
+  const sprite = (cps) => ({ canvas: { cps }, tileW: 4, tileH: 4, halfW: 2, halfH: 2, steps: 16 });
+  const octant = 0x1CD00;
+  const atlas = { name: 't', glyphs: [{ cp: 0x41, s: 'A' }, { cp: octant, s: String.fromCodePoint(octant) }, { cp: 0x2588, s: '█' }] };
+  const shapeIdx = Int32Array.from([0, 1, 2, 9, 1, 0, 2, 1]);       /* 9 → no glyph → skipped */
+  const edgeTile = new Int16Array(0x10000).fill(-1); edgeTile[0x2500] = 0; edgeTile[0x2502] = 1;
+  const gradLut = new Uint8Array(768); for (let k = 0; k < 256; k++) gradLut.set([k, 255 - k, 7], k * 3);
+  const lut = new Float32Array(256); for (let k = 0; k < 256; k++) lut[k] = k / 255;
+  const W = cols * cellW, H = rows * cellH;
+  const pixels = new Uint8ClampedArray(W * H * 4);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const c = cellOf(x, y), o = (y * W + x) * 4;
+    pixels.set(c === 0 ? [0xf0, 0xe8, 0xd8, 255] : [(c * 37) & 255, 20 + c * 25, 200 - c * 20, 255], o);   /* cell 0 = paper → skipped */
+  }
+  const src = { width: W, height: H, pixels };
+  const ctx = {
+    width: W, height: H, CENTER: 'center', frameCount: 1, recState: null, currentCellDepth: -1,
+    MAX_RGB_DIST: Math.sqrt(3 * 255 * 255), src, lumBuf: new Float32Array(W * H),
+    cellSignal: Float32Array.from([0, 0.1, 0.3, 0.5, 0.7, 0.9, 1, 0.6]), cellDepth: new Float32Array(8).fill(-1),
+    PALETTES: { t: { bg: '#f0e8d8', inks: ['#112233', '#c04080'] } }, RAMPS: { r: ramp },
+    CONFIG: { palette: 't', ramp: 'r', colorMode: 'monochrome', samplingStrategy: 'box', brightnessGamma: 1,
+      font: { size: 8, family: 'mono' }, grid: { cols, rows }, renderer: 'cpu', seed: 1, flow: {} },
+    color: (h) => mkColor(typeof h === 'string' ? hex(h) : [h, h, h]),
+    red: (c) => c.levels[0], green: (c) => c.levels[1], blue: (c) => c.levels[2],
+    lerpColor: (a, b, t) => mkColor(a.levels.map((v, k) => v + (b.levels[k] - v) * t)),
+    noStroke() {}, textAlign() {}, textSize() {}, textFont() {}, fill() {},
+    text: (ch, x, y) => ops.push([cellOf(x, y), ch.codePointAt(0)]),
+    drawingContext: { globalAlpha: 1, drawImage: (cv, sx, sy, sw, sh, dx, dy) => {
+      if (cv.cps) ops.push([cellOf(dx + 2, dy + 2), cv.cps[sx / 4]]);
+    } },
+    _gammaLut: lut, _buildGammaLut() {}, _gradColorLut: gradLut, _ensureGradColorLut() {},
+    resolveGradientStops: () => [[0, 0, 0]], fontFamilyForActive: () => 'mono',
+    __prefersReducedMotion: () => false, _needsImgDataReadback: () => false, _glOk: true,
+    _stableIdx: (s, i, v, idx) => idx, _stableIdxInt: (i, idx) => idx, _ensureStabBuf() {},
+    _stabDamped: 0, _stabSwapped: 0, _stabIdx: null, _stabOn: false, _sampleObj: { r: 0, g: 0, b: 0 },
+    __pfAdd() {}, __pfFrame: null, __curCellKey: null, __curCellsFresh: false, __sourceSignalCache: null,
+    performance: { now: () => 0 }, console,
+    _ensureRampSprite: () => sprite(Array.from(ramp, (ch) => ch.charCodeAt(0))),
+    _rampSpriteSpaceMask: Uint8Array.from(Array.from(ramp, (ch) => ch === ' ' ? 1 : 0)),
+    _ensureRampDuotoneSprite: () => sprite(Array.from(ramp, (ch) => ch.charCodeAt(0))),
+    _rampDuotoneSpaceMask: Uint8Array.from(Array.from(ramp, (ch) => ch === ' ' ? 1 : 0)),
+    _ensureRampGradientSprite: () => sprite(Array.from(ramp, (ch) => ch.charCodeAt(0))),
+    _rampGradientSpaceMask: Uint8Array.from(Array.from(ramp, (ch) => ch === ' ' ? 1 : 0)),
+    glyphAtlas: atlas, _ensureSpriteAtlas: () => sprite(atlas.glyphs.map((g) => g.cp)),
+    _ensureGlyphDuotoneSprite: () => sprite(atlas.glyphs.map((g) => g.cp)),
+    _ensureGlyphGradientSprite: () => sprite(atlas.glyphs.map((g) => g.cp)),
+    _edgeTile: edgeTile, _ensureEdgeSprite: () => sprite([0x2500, 0x2502]),
+    _hexToRgb: hex, sourceImg: { width: W }, _glCanvas: null, __glDraws: 0,
+    document: { createElement: () => ({ width: 0, height: 0, addEventListener() {} }) },
+  };
+  ctx.window = { GlyphGrid: {
+    compat: { gateDepthFog: () => false },
+    paletteMorph: { interpAtU: () => [1, 2, 3] },
+    shapeIndex: { selectGrid: () => shapeIdx },
+    edge: {
+      selectGrid: () => Uint16Array.from([0x2500, 0x20, 0x2502, 0x41, 0x2500, 0x2502, 0x20, 0x42]),
+      flowField: () => ({ coherence: Float32Array.from([1, 0, 1, 0, 1, 0, 1, 0]), energy: new Float32Array(8).fill(1),
+        tangent: new Float32Array(8) }),
+      flowGlyph: () => 0x2571,
+    },
+    wave6: { makeSprite: () => ({ gl: { isContextLost: () => false } }),
+      drawSprite: (r, c, at, tw, th, inst, n) => {
+        ctx.__glDraws++;
+        for (let k = 0; k < n; k++) ops.push([cellOf(inst[k * 4] + 2, inst[k * 4 + 1] + 2), at.cps[inst[k * 4 + 2]]]);
+      } },
+  } };
+  ctx.GlyphGrid = ctx.window.GlyphGrid;
+  vm.createContext(ctx);
+  vm.runInContext(code, ctx);
+
+  const runs = [
+    ['v1 mono', 'monochrome', () => ctx.drawGlyphGrid(src), 'brightness'],
+    ['v1 preserve', 'preserve', () => ctx.drawGlyphGrid(src), 'brightness'],
+    ['brightness GL', 'monochrome', () => { ctx.CONFIG.renderer = 'webgl'; ctx.drawBrightnessGrid(null, ctx.cellSignal, cols, rows, cellW, cellH); ctx.CONFIG.renderer = 'cpu'; }, 'brightness'],
+    ...['monochrome', 'duotone', 'gradient', 'preserve'].flatMap((cm) => [
+      ['brightness ' + cm, cm, () => ctx.drawBrightnessGrid(null, ctx.cellSignal, cols, rows, cellW, cellH), 'brightness'],
+      ['shape ' + cm, cm, () => ctx.drawShapeGrid(src, cols, rows, cellW, cellH, 10, 10, false), 'shape'],
+      ['shape-edge-aware ' + cm, cm, () => ctx.drawShapeGrid(src, cols, rows, cellW, cellH, 10, 10, true), 'shape-edge-aware'],
+      ['edge-directional ' + cm, cm, () => ctx.drawEdgeDirectionalGrid(cols, rows, cellW, cellH), 'edge-directional'],
+      ['flow ' + cm, cm, () => ctx.drawFlowGrid(cols, rows, cellW, cellH), 'flow'],
+    ]),
+  ];
+  let seq = 0;
+  for (const [name, cm, run, mode] of runs) {
+    ctx.CONFIG.colorMode = cm;
+    /* poison the IR so a drawer that forgets irBegin/irPut can't pass on stale data */
+    const before = ctx.gf();
+    if (before.cp.length) { before.cp.fill(0xDEAD); }
+    ops.length = 0;
+    run();
+    const f = ctx.gf();
+    assert.strictEqual(f.seq, ++seq, name + ': drawer called irBegin once');
+    assert.deepStrictEqual([f.cols, f.rows, f.mode], [cols, rows, mode], name + ': IR shape + mode');
+    assert.strictEqual(Object.prototype.toString.call(f.cp), '[object Uint32Array]', name + ': cp is Uint32');
+    const drawn = new Map(ops);
+    assert(drawn.size > 0 && drawn.size === ops.length && drawn.size < cols * rows, name + ': drew a strict subset of cells once each');
+    const ir = new Map();
+    for (let i = 0; i < cols * rows; i++) if (f.cp[i]) ir.set(i, f.cp[i]);
+    assert.deepStrictEqual([...ir].sort((a, b) => a[0] - b[0]), [...drawn].sort((a, b) => a[0] - b[0]),
+      name + ': IR cells == drawn cells, same codepoints');
+    if (cm === 'monochrome') {
+      for (const i of ir.keys()) assert.deepStrictEqual(Array.from(f.fg.subarray(i * 3, i * 3 + 3)), [0x11, 0x22, 0x33], name + ': mono ink in IR');
+    }
+    if (cm === 'gradient' && mode !== 'brightness') {
+      const i = 4, sig = ctx.cellSignal[i], lo = ((sig * 255) | 0) * 3;
+      if (ir.has(i)) assert.deepStrictEqual(Array.from(f.fg.subarray(12, 15)), Array.from(gradLut.subarray(lo, lo + 3)), name + ': gradient LUT ink');
+    }
+  }
+  assert.strictEqual(ctx.__glDraws, 1, 'the GL run went through drawGridWebGL, not the CPU fallback');
+  assert.strictEqual(ctx._glOk, true, 'GL path did not latch off');
+  /* alpha: brightness mono cell 3 (signal 0.5) → min(1, 0.55) * 255 */
+  ctx.CONFIG.colorMode = 'monochrome';
+  ctx.drawBrightnessGrid(null, ctx.cellSignal, cols, rows, cellW, cellH);
+  assert.strictEqual(ctx.gf().alpha[3], Math.round(0.5 * 1.1 * 255), 'IR alpha is the drawn opacity');
+  assert.strictEqual(ctx.gf().alpha[6], 255, 'IR alpha clamps at 1');
+  /* captureGridSnapshot reads the IR: shape mode exports (incl. an octant). */
+  ctx.CONFIG.colorMode = 'duotone';
+  ctx.drawShapeGrid(src, cols, rows, cellW, cellH, 10, 10, false);
+  const snap = ctx.hook.captureGridSnapshot();
+  assert(snap && snap.mode === 'shape', 'snapshot available in shape mode');
+  assert.strictEqual(snap.cells.length, [...ctx.gf().cp.subarray(0, 8)].filter((v) => v).length, 'snapshot = IR cells');
+  assert(snap.cells.some((c) => c.c === String.fromCodePoint(octant)), 'octant survives the IR (Uint32)');
+  assert.strictEqual(snap.bg, '#f0e8d8', 'snapshot bg from IR');
+  ctx.CONFIG.grid.cols = 5;
+  assert.strictEqual(ctx.hook.captureGridSnapshot(), null, 'stale IR (grid resized) → null');
+  ctx.CONFIG.grid.cols = cols;
+  /* grow-only: a same-or-smaller grid reuses the buffers. */
+  const cpBuf = ctx.gf().cp;
+  ctx.drawEdgeDirectionalGrid(cols, rows, cellW, cellH);
+  assert.strictEqual(ctx.gf().cp, cpBuf, 'IR buffers are reused across frames');
+  console.log('GlyphFrame IR: ok (' + runs.length + ' drawer/colour-mode runs)');
+}
+
+/* ITER-073 (Phase 5.0): FrameSource adapter — still + GIF behind one seam,
+   frame selection identical to the pre-adapter inline GIF branch. */
+{
+  const m = html.match(/  let __frameSource = null;[\s\S]*?\n  function frameSourceFor\([\s\S]*?\n  \}\n/);
+  assert(m, 'FrameSource adapter not found');
+  assert(/const _fsrc = frameSourceFor\(sourceImg\);\s*_fsrc\.frameAt\(t \* 1000\);\s*window\.__sourceFrameIdx = _fsrc\.index;/.test(html),
+    'draw() routes the source through the adapter and publishes __sourceFrameIdx');
+  const ctx = { __sourceRevision: 1 };
+  vm.createContext(ctx);
+  vm.runInContext(m[0] + '\nthis.make = makeFrameSource; this.forImg = frameSourceFor;', ctx);
+  const delays = [100, 0, 50, 70];
+  const setCalls = [];
+  const gif = {
+    gifProperties: { numFrames: 4, displayIndex: 0, frames: delays.map((d) => ({ delay: d })) },
+    numFrames: () => 4,
+    setFrame(i) { setCalls.push(i); this.gifProperties.displayIndex = i; },
+  };
+  const fs1 = ctx.forImg(gif);
+  assert.strictEqual(fs1.kind, 'gif');
+  assert.strictEqual(fs1.durationMs, 320, 'GIF loop length uses delay||100');
+  /* legacy inline algorithm (pre-ITER-073 draw()) as the oracle */
+  const legacy = (t) => {
+    const total = delays.reduce((s, d) => s + (d || 100), 0);
+    const loopT = (t * 1000) % total;
+    let acc = 0, target = 3;
+    for (let i = 0; i < 4; i++) { acc += (delays[i] || 100); if (loopT < acc) { target = i; break; } }
+    return target;
+  };
+  let prev = gif.gifProperties.displayIndex, wantCalls = 0;
+  for (let f = 0; f < 200; f++) {
+    const t = f / 30;
+    const want = legacy(t);
+    assert.strictEqual(fs1.frameAt(t * 1000), gif, 'frameAt returns the source image');
+    assert.strictEqual(fs1.index, want, 'GIF frame at t=' + t.toFixed(3));
+    if (want !== prev) wantCalls++;
+    prev = want;
+  }
+  assert.strictEqual(setCalls.length, wantCalls, 'setFrame only when the frame changes');
+  assert.strictEqual(ctx.forImg(gif), fs1, 'adapter memoised per (img, revision)');
+  ctx.__sourceRevision = 2;
+  assert.notStrictEqual(ctx.forImg(gif), fs1, 'revision bump rebuilds the adapter');
+  const still = { width: 10 };
+  const fs2 = ctx.forImg(still);
+  assert.deepStrictEqual([fs2.kind, fs2.durationMs, fs2.index], ['still', 0, -1], 'still adapter');
+  assert.strictEqual(fs2.frameAt(1234), still, 'still frameAt returns the image');
+  const one = { gifProperties: { numFrames: 1, frames: [{ delay: 100 }] }, numFrames: () => 1 };
+  assert.strictEqual(ctx.make(one, 3).kind, 'still', 'single-frame GIF is a still');
+  console.log('FrameSource adapter: ok');
 }
