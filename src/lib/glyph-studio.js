@@ -2063,10 +2063,11 @@
          exportRun('mp4',  720)  — mobile-fit MP4
        `capOverride === null` means "honour the panel dropdown".
        `capOverride > 0` means "force this exact capWidth, ignore dropdown".
-       `targetMaxBytes` (ITER-026): when > 0, the Rust encoder retries
-       smaller caps (600→540→480→420→360) until output ≤ N. Used by the
-       Twitter-fit button to target 15 MB; Rust returns an error when even
-       the smallest configured attempt cannot meet that target. */
+       `targetMaxBytes` (ITER-026): when > 0, the Rust encoder retries at a
+       width predicted from the first pass (plus at most one correction,
+       floor 360 px; ITER-051) until output ≤ N. Used by the Twitter-fit
+       button to target 15 MB; Rust returns an error when even the
+       narrowest attempt cannot meet that target. */
     function exportRun(format, capOverride, targetMaxBytes) {
       /* BUG-010 (v0.1.8): block GIF/MP4 export before any image is loaded.
          draw() early-returns in the empty state, so the recorder would

@@ -1411,11 +1411,14 @@ fn encode_gif_gifski(
 /// driver-level safety-net pipeline that proved 53 / 53 rescue on the
 /// ghost-I.gif 64-variant batch (see ITER-024 / ITER-025).
 ///
-/// `target_max_bytes`: when `Some(N)`, the function tries `cap_width`
-/// first, then `[600, 540, 480, 420, 360]` (skipping any caps ≥ the
-/// initial cap), and returns the first buffer ≤ N.  If all six caps
-/// overshoot the target, returns an error rather than silently producing an
-/// upload that violates the requested hard limit.
+/// `target_max_bytes`: when `Some(N)`, the function encodes at `cap_width`
+/// first; on overshoot it predicts the width that fits from that pass's
+/// size (`twitter_fit_width`, ITER-051), encodes once there, and if that
+/// still overshoots re-predicts from the second pass for one correction
+/// rung — at most three full gifski passes, never below
+/// `TWITTER_FIT_MIN_WIDTH`.  Returns the first buffer ≤ N; if none fits,
+/// returns an error rather than silently producing an upload that violates
+/// the requested hard limit.
 /// When `None`, behaves identically to `encode_gif_gifski` (single try).
 fn encode_gif_gifski_adaptive(
     frames: &[PngFrame],
@@ -1457,35 +1460,55 @@ fn encode_gif_gifski_adaptive(
         );
         return Ok(single);
     }
-    // Try shrink ladder.
+    // ITER-051 (F14): predict instead of walking the fixed 600/540/480/420/360
+    // ladder.  GIF bytes scale ~linearly with pixel count at fixed content
+    // (ITER-026 log: 18.54 MB × (600/720)² = 12.87 MB predicted vs 12.82 MB
+    // measured), and pixels scale with width², so one pass gives the width.
+    // Below ~400 px the linear model over-predicts (LZW + palette do better),
+    // which errs toward fitting.
     let initial_cap = first_width;
-    let ladder: [u32; 5] = [600, 540, 480, 420, 360];
     let mut best = single;
+    let pixels = |width: u32| -> f64 {
+        let height = (u64::from(dimensions.output_height) * u64::from(width))
+            .div_ceil(u64::from(dimensions.output_width));
+        frames.len() as f64 * f64::from(width) * height as f64
+    };
     eprintln!(
-        "twitter-fit: cap={} size={:.2}MB > target {:.2}MB — entering shrink ladder",
+        "twitter-fit: cap={} size={:.2}MB ({:.3} B/px) > target {:.2}MB — entering shrink ladder",
         initial_cap,
         best.len() as f64 / 1024.0 / 1024.0,
+        best.len() as f64 / pixels(initial_cap),
         target as f64 / 1024.0 / 1024.0,
     );
-    for (attempt_index, cap) in ladder.iter().enumerate() {
+    // Pass 2: predicted width × 0.96 (≈8 % byte headroom).  Measured B/px
+    // drift between 720 px and the fitted width: +6.4 % on worm-move.gif,
+    // +1.9 % on cream-paper, -0.4 % on the ITER-026 sample.  Pass 3
+    // (correction): re-predict from pass 2's own size × 0.97 — B/px measured
+    // that close to the answer moves < 1 %, and there is no fourth pass.
+    let mut width = initial_cap;
+    let mut size = best.len();
+    for (attempt, margin) in [(2usize, 0.96f64), (3, 0.97)] {
         control.check_cancelled()?;
-        if *cap >= initial_cap {
-            continue;
-        }
-        let phase = format!("encode-gif-attempt-{}", attempt_index + 2);
-        let encode_width = validated_gif_width(dimensions, Some(*cap))?;
+        let Some(next) = twitter_fit_width(width, size, target, margin) else {
+            break;
+        };
+        let phase = format!("encode-gif-attempt-{}", attempt);
+        let encode_width = validated_gif_width(dimensions, Some(next))?;
         let buf = encode_gif_gifski_decoded(&decoded, Some(encode_width), control, &phase)?;
         eprintln!(
-            "twitter-fit: cap={} size={:.2}MB",
-            cap,
+            "twitter-fit: predicted cap={} size={:.2}MB ({:.3} B/px)",
+            next,
             buf.len() as f64 / 1024.0 / 1024.0,
+            buf.len() as f64 / pixels(next),
         );
         let fits = (buf.len() as u64) <= target;
+        width = next;
+        size = buf.len();
         if buf.len() < best.len() {
             best = buf;
         }
         if fits {
-            eprintln!("twitter-fit: cap={} ✓", cap);
+            eprintln!("twitter-fit: cap={} ✓", next);
             return Ok(best);
         }
     }
@@ -1496,13 +1519,33 @@ fn encode_gif_gifski_adaptive(
     ))
 }
 
+/// Narrowest width the Twitter-fit predictor will try (the old ladder's
+/// last rung); below it glyph cells stop being legible.
+const TWITTER_FIT_MIN_WIDTH: u32 = 360;
+
+/// Width predicted to bring a GIF that measured `bytes` at `width` under
+/// `target`, assuming bytes ∝ width² (pixels at a fixed aspect), scaled by
+/// `margin` and rounded down to even.  Clamped to
+/// [`TWITTER_FIT_MIN_WIDTH`, largest even width < `width`]; `None` when that
+/// range is empty, i.e. there is nothing narrower left to try.
+fn twitter_fit_width(width: u32, bytes: usize, target: u64, margin: f64) -> Option<u32> {
+    let upper = width.saturating_sub(1) & !1;
+    if upper < TWITTER_FIT_MIN_WIDTH || bytes == 0 {
+        return None;
+    }
+    let predicted = f64::from(width) * (target as f64 / bytes as f64).sqrt() * margin;
+    let predicted = (predicted.max(0.0) as u32) & !1;
+    Some(predicted.clamp(TWITTER_FIT_MIN_WIDTH, upper))
+}
+
 /// Save a recorded sequence of PNG frames as a single animated GIF.
 /// Pops the native save dialog and writes the encoded bytes there.
 /// `cap_width` (optional) resizes frames before encoding for smaller
 /// output files (Twitter's 15 MB GIF limit, etc.).
-/// `target_max_bytes` (optional, ITER-026): when set, walks a shrink
-/// ladder (720 → 600 → 540 → 480 → 420 → 360) until output ≤ N.  The
-/// GUI's `Export GIF (Twitter-fit)` button passes 15 MB.
+/// `target_max_bytes` (optional, ITER-026): when set, shrinks the width
+/// until output ≤ N — predicted from the first pass, plus at most one
+/// correction (ITER-051).  The GUI's `Export GIF (Twitter-fit)` button
+/// passes 15 MB.
 #[tauri::command]
 async fn save_gif_real(
     app: tauri::AppHandle,
@@ -2749,6 +2792,26 @@ mod export_guard_tests {
         )
         .unwrap_err();
         assert!(error.contains("cannot meet target size"));
+    }
+
+    #[test]
+    fn twitter_fit_width_predicts_from_bytes_per_pixel() {
+        // run-all B12: 720 px → 1.60 MB, 700 KB target. sqrt(0.4375)·0.96·720
+        // = 457.2 → 456 (the old ladder walked 600/540/480 to land on 420).
+        assert_eq!(twitter_fit_width(720, 1_600_000, 700_000, 0.96), Some(456));
+        // worm-move.gif 120 f: 31.23 MB at 720, 15 MB cap → 478 px in one
+        // pass (the ladder spent 600/540 to land on 480).
+        assert_eq!(
+            twitter_fit_width(720, 32_747_000, 15 * 1024 * 1024, 0.96),
+            Some(478)
+        );
+        // Tiny targets clamp to the floor; nothing narrower than the floor
+        // (or than the current width) is ever proposed.
+        assert_eq!(twitter_fit_width(720, 1_600_000, 1, 0.96), Some(360));
+        assert_eq!(twitter_fit_width(360, 1_600_000, 1, 0.90), None);
+        assert_eq!(twitter_fit_width(8, 100, 1, 0.95), None);
+        // A barely-over first pass still shrinks by at least one step.
+        assert_eq!(twitter_fit_width(720, 700_001, 700_000, 1.0), Some(718));
     }
 
     #[test]

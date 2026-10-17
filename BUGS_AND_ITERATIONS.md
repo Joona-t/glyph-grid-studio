@@ -4,6 +4,29 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-051 — 2026-10-17 — v0.2 Phase 2: Twitter-fit predicts the fitting width from the first pass (F14)
+
+**Problem:** On overshoot, `encode_gif_gifski_adaptive` walked a fixed 600 → 540 → 480 → 420 → 360 ladder, one full gifski pass per rung. A 720 px export at 1.6-2× the cap spent one or two passes on rungs that could never fit, and the user got whichever rung fell under the cap first rather than the widest width that fits.
+
+**Root cause:** The ladder ignored what the first pass already measured. GIF bytes scale ~linearly with pixel count at fixed content (ITER-026 log: 18.54 MB × (600/720)² = 12.87 MB predicted vs 12.82 MB measured), so one pass is enough to estimate the width.
+
+**Fix:** `twitter_fit_width(width, bytes, target, margin)` = even(width × √(target/bytes) × margin), clamped to [`TWITTER_FIT_MIN_WIDTH` = 360, largest even width below the current one]; `None` when that range is empty. After the first pass overshoots, pass 2 encodes at the predicted width × 0.96 (≈8 % byte headroom). If that still overshoots, pass 3 re-predicts from pass 2's own size × 0.97 (B/px measured that close to the answer moves < 1 %). Nothing else is tried; if pass 3 misses, or there is nothing narrower than 360 px left, the same "GIF cannot meet target size: smallest attempt is N bytes" error as before is returned (B11 fail-closed unchanged). At most 3 gifski passes instead of 6. The log now prints B/px per pass, and keeps the "entering shrink ladder" line that B11/B12 grep for. Unit test `twitter_fit_width_predicts_from_bytes_per_pixel` covers the B12 and worm-move numbers, the floor clamp, the `None` cases and the minimum one-step shrink.
+
+**Measured (batch, 120 f, `capWidth: 720`, 15 MB target, release binaries; other phases were building and rendering on this machine, so encode_ms is under parallel load and noisy):**
+
+| source | old ladder | predictor |
+|---|---|---|
+| cream-paper.png (24.83 MB @ 720) | 720 → 600 (17.66 MB) → **540** ✓ 14.27 MB · 3 passes · encode 18.9 / 18.6 s | 720 → **536** ✓ 14.02 MB · 2 passes · encode 13.3 s |
+| worm-move.gif (31.23 MB @ 720) | 720 → 600 → 540 → **480** ✓ 14.66 MB · 4 passes · encode 13.4 s | 720 → **478** ✓ 14.64 MB · 2 passes · encode 14.5 s |
+| run-all B12 (4 f, 700 KB target) | 720 → 600 → 540 → 480 → **420** ✓ · 5 passes | 720 → **446** ✓ 586 KB · 2 passes |
+| run-all B11 (4 f, 200 KB target) | 6 passes, then error | 720 → 360 (0.35 MB), then the same error · 2 passes |
+
+The expected 2-8 % width gain did not show up on the two real sources. B/px rises as the width shrinks (+1.9 % cream-paper 720 → 536, +6.4 % worm-move 720 → 478), so the margin that keeps pass 2 inside the cap gives back what the ladder lost to its coarse rungs. The output lands within 1 % of the ladder's width (−0.7 %, −0.4 %), and on tiny 4-frame jobs it is wider (446 vs 420). The real gain is passes: 2 instead of 3-5. Encode wall time is too noisy under parallel load to quote as a speedup. gifski output also varies about 2 % run to run on the same width.
+
+**Gate:** cargo build 0 errors · cargo test 19/19 · npm test ok (both files) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity G1-G7 7/7 · psnr-gate (`--mp4-quality archive`) inf vs golden · perf-sample (archive gate render) wall 15.3 / 15.0 s, app 2.44 / 2.74 s, WebContent 12.5 / 12.4 s, GPU 6.26 / 6.27 s.
+
+**Gotchas:** (a) A margin of 0.97 on pass 2 missed worm-move by 10 KB (484 px → 15.01 MB); a 0.95 correction from there overshot down to 458 px. That is how 0.96 / 0.97 were picked; revisit with more sources. (b) Concurrent run-all gates from other worktrees `pkill -f "glyph-grid-studio render"`, which also matches this worktree's renders. Three gate runs here lost a random render (G3-G7, C5, C7) to that before a quiet window gave a clean 25/0. Wait for other run-all processes to finish before gating. (c) Not done: GUI `_estimateBytes` calibration from the measured B/px (the other half of F14) and a `gifQuality` knob. The new log lines carry the B/px value that calibration would need.
+
 ### ITER-050 — 2026-10-17 — v0.2 Phase 2: MP4 bitrate rate control (upload default, archive keeps QP 26) + track timescale fix (F11)
 
 **Problem:** MP4 export claimed a "5 Mbps cap … 1-2 MB for a 90-frame loop" but shipped 7-13× that: cream-paper 120 f at 1024×682 was 17.3 MB (≈38 Mbps), the worm-move preset 22.0 MB (≈37 Mbps). Separately, every MP4 declared 1 ms per frame — ffprobe read a 120-frame clip as `time_base=1/1000, r_frame_rate=1000/1, duration=0.12`.
