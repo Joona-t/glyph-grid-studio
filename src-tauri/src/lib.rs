@@ -537,13 +537,96 @@ fn abort_headless(code: i32, why: &str) -> ! {
     std::process::exit(code);
 }
 
+/* ---------- F26 (ITER-060): NDJSON progress + SIGINT/SIGTERM ---------- */
+
+/// `--progress`: one `{"type":"progress",...}` line per staged frame and
+/// per encode tick on stderr.  Off by default — stderr stays the human /
+/// `PERF_JOB` / `batch:` stream existing parsers read.
+static PROGRESS_NDJSON: AtomicBool = AtomicBool::new(false);
+/// Capture job id → the manifest job name (`begin_export_capture` label).
+static CAPTURE_LABELS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// Signal number caught by `on_signal` (0 = none); the watchdog acts on it.
+static PENDING_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+pub fn enable_progress_ndjson() {
+    PROGRESS_NDJSON.store(true, Ordering::Relaxed);
+}
+
+fn progress_line(job_id: &str, phase: &str, frame: usize, total: usize) {
+    if !PROGRESS_NDJSON.load(Ordering::Relaxed) {
+        return;
+    }
+    let job = CAPTURE_LABELS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|m| m.get(job_id).cloned())
+        .unwrap_or_else(|| job_id.to_string());
+    // Hand-ordered (json! sorts keys) so every line starts with
+    // `{"type":"progress"` — a cheap prefix test for consumers.
+    eprintln!(
+        "{{\"type\":\"progress\",\"job\":{},\"phase\":{},\"frame\":{},\"total\":{}}}",
+        serde_json::Value::from(job),
+        serde_json::Value::from(phase),
+        frame.min(total),
+        total
+    );
+}
+
+#[cfg(unix)]
+mod sig {
+    extern "C" {
+        fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    pub const SIGINT: i32 = 2;
+    pub const SIGTERM: i32 = 15;
+
+    /// Async-signal-safe: an atomic store only; the watchdog thread does the
+    /// cleanup + exit within 100 ms.
+    extern "C" fn on_signal(signum: i32) {
+        super::PENDING_SIGNAL.store(signum, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn install() {
+        unsafe {
+            signal(SIGINT, on_signal);
+            signal(SIGTERM, on_signal);
+        }
+    }
+
+    pub fn terminate(pid: u32) {
+        unsafe {
+            kill(pid as i32, SIGTERM);
+        }
+    }
+}
+
+/// Ask a headless child (`render`/`batch`) to stop cleanly: SIGTERM → its
+/// watchdog removes its `.part` files and exits 143.  Used by MCP cancel.
+pub fn terminate_child(pid: u32) {
+    #[cfg(unix)]
+    sig::terminate(pid);
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 /// Spawn the watchdog for a headless run.  `timeout_secs` = the overall
 /// `--timeout` budget (None/0 = none); the stall guard always applies.
+/// F26 (ITER-060): it also turns a caught SIGINT/SIGTERM into a clean exit
+/// (128 + signal: 130 / 143).
 fn start_watchdog(timeout_secs: Option<u64>) {
     touch_liveness();
+    #[cfg(unix)]
+    sig::install();
     let deadline_ms = timeout_secs.filter(|s| *s > 0).map(|s| s * 1000);
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
+        let signum = PENDING_SIGNAL.load(Ordering::SeqCst);
+        if signum != 0 {
+            let name = if signum == 2 { "SIGINT" } else { "SIGTERM" };
+            abort_headless(128 + signum, &format!("interrupted by {}", name));
+        }
         let now = watchdog_now_ms();
         if let Some(d) = deadline_ms {
             if now >= d {
@@ -983,6 +1066,9 @@ impl ExportControl {
 
     fn emit(&self, phase: &str, completed: usize, total: usize) {
         touch_liveness();
+        if let Some(job_id) = &self.job_id {
+            progress_line(job_id, phase, completed, total);
+        }
         if let (Some(app), Some(job_id)) = (&self.app, &self.job_id) {
             let _ = app.emit(
                 "export-progress",
@@ -1202,9 +1288,16 @@ fn cancel_export(job_id: String) -> bool {
 }
 
 #[tauri::command]
-fn begin_export_capture(job_id: String, total: usize) -> Result<(), String> {
+fn begin_export_capture(job_id: String, total: usize, label: Option<String>) -> Result<(), String> {
     if job_id.trim().is_empty() {
         return Err("jobId must not be empty".into());
+    }
+    // F26 (ITER-060): the batch driver names its capture so `--progress`
+    // lines say which manifest job they belong to.
+    if let Some(label) = label {
+        if let Ok(mut labels) = CAPTURE_LABELS.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+            labels.insert(job_id.clone(), label);
+        }
     }
     if total == 0 || total > MAX_EXPORT_FRAMES {
         return Err(format!(
@@ -1355,6 +1448,9 @@ fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), 
     capture.total_pixels = next_pixels;
     capture.total_bytes = next_bytes;
     capture.frames.push(PngFrame { bytes });
+    let (staged, expected) = (capture.frames.len(), capture.expected_frames);
+    drop(captures);
+    progress_line(job_id, "capture", staged, expected);
     Ok(())
 }
 
@@ -3001,7 +3097,7 @@ mod export_guard_tests {
             .lock()
             .unwrap();
         let job_id = "rust-staged-export-test".to_string();
-        begin_export_capture(job_id.clone(), 2).unwrap();
+        begin_export_capture(job_id.clone(), 2, None).unwrap();
         let frame = png_header_frame(10, 10);
         let b64 = general_purpose::STANDARD.encode(&frame.bytes);
 
@@ -3031,7 +3127,7 @@ mod export_guard_tests {
         let early = "rust-early-cancel-test".to_string();
         assert!(cancel_export(early.clone()));
         assert_eq!(
-            begin_export_capture(early.clone(), 1).unwrap_err(),
+            begin_export_capture(early.clone(), 1, None).unwrap_err(),
             "export cancelled"
         );
 
@@ -3039,9 +3135,9 @@ mod export_guard_tests {
             .map(|index| format!("rust-capture-limit-{index}"))
             .collect();
         for id in &ids {
-            begin_export_capture(id.clone(), 1).unwrap();
+            begin_export_capture(id.clone(), 1, None).unwrap();
         }
-        let overflow = begin_export_capture("rust-capture-overflow".into(), 1).unwrap_err();
+        let overflow = begin_export_capture("rust-capture-overflow".into(), 1, None).unwrap_err();
         assert!(overflow.contains("too many concurrent export captures"));
         for id in ids {
             assert!(cancel_export(id));

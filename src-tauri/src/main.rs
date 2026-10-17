@@ -22,7 +22,8 @@ enum Command {
 
     /// Render a single image to an animated GIF, headlessly.
     /// Exit codes: 0 ok, 1 render/encode failed, 2 bad input (usage, preset,
-    /// config, source path), 3 timed out (`--timeout` or 300 s stalled).
+    /// config, source path), 3 timed out (`--timeout` or 300 s stalled),
+    /// 130 / 143 interrupted by SIGINT / SIGTERM (`.part` files removed).
     Render(RenderArgs),
 
     /// Render many variants of the SAME source in ONE Tauri session.  Reads a
@@ -135,6 +136,12 @@ struct RenderArgs {
     /// with no progress for 300 s still exits 3).
     #[arg(long, value_name = "SECONDS")]
     timeout: Option<u64>,
+
+    /// Print NDJSON progress on stderr, one line per captured frame and
+    /// encode step: `{"type":"progress","job":"cli","phase":"capture",
+    /// "frame":12,"total":120}`.
+    #[arg(long)]
+    progress: bool,
 }
 
 /// `--frames` value: `None` = auto.
@@ -168,6 +175,11 @@ struct BatchArgs {
     /// still exits 3).
     #[arg(long, value_name = "SECONDS")]
     timeout: Option<u64>,
+
+    /// Print NDJSON progress on stderr (see `render --progress`); `job` is
+    /// the manifest job's `name`.
+    #[arg(long)]
+    progress: bool,
 }
 
 fn main() {
@@ -226,6 +238,9 @@ fn main() {
                     }
                 }
             }
+            if args.progress {
+                app_lib::enable_progress_ndjson();
+            }
             let code = app_lib::run_headless_render(job);
             // Tauri's `app.exit(code)` triggers `tauri::run()` to return without
             // process-exiting (despite docs implying otherwise). Always exit
@@ -234,6 +249,9 @@ fn main() {
             std::process::exit(code);
         }
         Some(Command::Batch(args)) => {
+            if args.progress {
+                app_lib::enable_progress_ndjson();
+            }
             let code = app_lib::run_headless_batch(args.manifest, args.show_window, args.timeout);
             std::process::exit(code);
         }

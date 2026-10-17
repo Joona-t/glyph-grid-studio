@@ -365,6 +365,67 @@ if res.get("isError") is True and isinstance(body, dict) and body.get("code") ==
 else:
     bad("C13c timeout_s", str(res)[:200])
 
+# --- Test C14 (F26/ITER-060): glyph_grid_render sends per-frame progress ---
+out14 = os.path.join(SCRATCH, "c14_progress.gif")
+send(proc, {"jsonrpc": "2.0", "id": 15, "method": "tools/call", "params": {
+    "name": "glyph_grid_render", "_meta": {"progressToken": "c14"},
+    "arguments": {"in_path": TEST_IMG, "out_path": out14, "frames": 4},
+}})
+progress14, r14, deadline = [], None, time.time() + 120
+while time.time() < deadline:
+    msg = recv(proc, timeout=max(1, deadline - time.time()))
+    if msg is None:
+        break
+    if msg.get("method") == "notifications/progress":
+        progress14.append(msg["params"])
+    elif msg.get("id") == 15:
+        r14 = msg
+        break
+steps14 = [(q.get("progress"), q.get("total")) for q in progress14 if q.get("progressToken") == "c14"]
+if steps14 == [(1, 4), (2, 4), (3, 4), (4, 4)] and r14 and not r14.get("result", {}).get("isError"):
+    ok("C14 render progress notifications 1/4..4/4 per captured frame")
+else:
+    bad("C14 render frame progress", str(steps14)[:200])
+
+# --- Test C15 (F26/ITER-060): notifications/cancelled stops the render child ---
+out15 = os.path.join(SCRATCH, "c15_cancel.gif")
+send(proc, {"jsonrpc": "2.0", "id": 16, "method": "tools/call", "params": {
+    "name": "glyph_grid_render", "_meta": {"progressToken": "c15"},
+    "arguments": {"in_path": TEST_IMG, "out_path": out15, "frames": 120},
+}})
+deadline = time.time() + 60
+while time.time() < deadline:            # wait until the child is capturing
+    msg = recv(proc, timeout=max(1, deadline - time.time()))
+    if msg is None or (msg.get("method") == "notifications/progress"
+                       and msg["params"].get("progressToken") == "c15"):
+        break
+send(proc, {"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": 16, "reason": "test"}})
+t0 = time.time()
+alive = True
+while time.time() - t0 < 5:
+    alive = subprocess.run(["pgrep", "-f", out15], capture_output=True).returncode == 0
+    if not alive:
+        break
+    time.sleep(0.2)
+parts15 = [f for f in os.listdir(SCRATCH) if f.startswith(".c15_cancel.gif.") and f.endswith(".part")]
+if not alive and not os.path.exists(out15) and not parts15:
+    ok("C15 cancel stops the render child in %.1fs (no output, no .part)" % (time.time() - t0))
+else:
+    bad("C15 cancel stops the render child", "alive=%s out=%s parts=%s" % (alive, os.path.exists(out15), parts15))
+# Drain anything the cancelled call still emits, then confirm the server answers.
+send(proc, {"jsonrpc": "2.0", "id": 17, "method": "ping"})
+pong, deadline = None, time.time() + 10
+while time.time() < deadline:
+    msg = recv(proc, timeout=1)
+    if msg and msg.get("id") == 17:
+        pong = msg
+        break
+if pong is not None and "result" in pong:
+    ok("C15b server still answers after a cancel")
+else:
+    bad("C15b server answers after cancel", str(pong))
+
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")
 sys.exit(0 if FAIL == 0 else 1)

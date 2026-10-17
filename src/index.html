@@ -4674,7 +4674,7 @@
            the per-cell EMA itself (ITER-046). */
         let stagedError = null;
         const stagedReady = Promise.resolve(
-          tauri('begin_export_capture', { jobId: jobId, total: frameTotal })
+          tauri('begin_export_capture', { jobId: jobId, total: frameTotal, label: job.name })
         ).then(function () { staged = true; }, function (e) { stagedError = e || new Error('begin_export_capture failed'); });
 
         function startCapture() {

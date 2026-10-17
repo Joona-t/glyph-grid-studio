@@ -96,6 +96,11 @@ glyph-grid-studio batch --manifest variants.json
 # Bound the wall time: past --timeout the render is killed (exit 3)
 glyph-grid-studio render --in a.png --out a.gif --timeout 120
 
+# Machine-readable progress on stderr (render and batch), one line per
+# captured frame and encode step:
+#   {"type":"progress","job":"cli","phase":"capture","frame":12,"total":120}
+glyph-grid-studio render --in a.png --out a.gif --progress
+
 # Help
 glyph-grid-studio render --help
 glyph-grid-studio batch --help
@@ -109,6 +114,7 @@ glyph-grid-studio batch --help
 | `1` | Render or encode failed (for `batch`: at least one job failed; the others are still written). |
 | `2` | Bad input: usage error, unreadable source / preset / manifest, config that fails the schema. Exits before the app window starts. |
 | `3` | Timed out: `--timeout <seconds>` elapsed, or no render progress for 300 s (a stalled WebView). The render is killed and its `.part` temp files removed. |
+| `130` / `143` | Interrupted by Ctrl-C (SIGINT) / SIGTERM. The render stops within ~0.1 s and its `.part` temp files are removed; finished outputs are never partial (writes are atomic). |
 
 ### As a Claude / Cursor tool — MCP server
 

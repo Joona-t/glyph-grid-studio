@@ -4,6 +4,27 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-060 — 2026-10-17 — v0.2 Phase 3: NDJSON `--progress`, SIGINT/SIGTERM clean exit, MCP per-frame progress + clean cancel (F26)
+
+**Problem:** progress existed in-process (`export-progress` events) but headless runs printed one line per finished job — an 18–56 s render was silent. Ctrl-C killed the process with whatever `.part` temp file was open, no handler at all (grep signal/ctrlc: 0 hits). MCP `glyph_grid_render` sent no progress, and an MCP cancel SIGKILLed the child (ITER-058), which skips any cleanup.
+
+**Root cause:** the CLI had no machine-readable progress channel and no signal handling; MCP could only `kill()`.
+
+**Fix:**
+- `--progress` on `render` / `batch`: `{"type":"progress","job":<manifest name>,"phase":...,"frame":n,"total":m}` on stderr per staged frame (`stage_export_frame`, phase `capture`) and per encode tick (`ExportControl::emit`: `validate`, `decode`, `encode-gif-attempt-N`, `encode-mp4`, `write`). Keys hand-ordered so every line starts with `{"type":"progress"`. Off by default, so existing `PERF_JOB` / `batch:` stderr parsers see nothing new. The JS batch driver passes `label: job.name` to `begin_export_capture` (new optional arg; the GUI omits it) so lines name the job.
+- SIGINT/SIGTERM: a libc `signal()` handler (declared via `extern "C"`, no new crate) that only stores the signal number; the ITER-059 watchdog thread turns it into `abort_headless(128 + sig)` — `.part` files removed, exit 130 / 143.
+- MCP: `glyph_grid_render` runs the child with `--progress` and forwards capture lines as `notifications/progress` (frame, total) when the call has a `progressToken`; the trailing `batch: 1/1` line is not forwarded for renders, and NDJSON lines are kept out of `stderr_tail`. Cancel now sends SIGTERM (clean exit, `.part` sweep) and SIGKILLs only if the child is still alive after 2 s.
+
+**Measured:**
+- `render --frames 4 --progress` → 13 lines (4 capture, validate ×2, decode, 4 gifski ticks, write ×2). 2-job batch (3 + 2 frames, GIF + MP4) → 19 lines, capture sequence exactly p1 1..3/3, p2 1..2/2.
+- SIGINT mid-capture → exit **130 in < 1 s**, no output, no `.part`. MCP cancel → render child gone in **0.3–0.6 s**, no output, no `.part`; server answers a ping right after.
+- Output gate (pixels untouched): worm-move 120 f / `pB.json` md5 `96fc9327…` (identical to ITER-057..059); vs `golden-p3.mp4` **37.62 dB**.
+- Timing (perf-sample, two runs, **under parallel load**, load avg ~18–28): wall 22.22 / 19.74 s, host 3.79 / 1.95 s; run 2 `suspect_foreign_xpc: false`: WebContent 16.31 s, GPU 7.47 s.
+
+**Gate:** cargo build 0 errors · cargo test **25/25** (+1 `frame_progress_lines_are_parsed`) · npm test ok (32 contracts) · run-all **PASS 35 / FAIL 0** (`TEST_TIMEOUT=400`; +B20 NDJSON, +B21 SIGINT) · byte-identity **7/7** · MCP **23/23** (+C14 per-frame progress, +C15 cancel stops the child, +C15b server alive after cancel).
+
+**Gotchas:** (a) MCP progress for renders covers the capture phase only — progress values must increase, and encode phases restart at 0; the encode tail (~1–25 s) is silent to the client. (b) The handler is `#[cfg(unix)]`; elsewhere Ctrl-C keeps the old behaviour. (c) A `.part` sweep can only remove files this process opened (`LIVE_PARTS`); strays from an earlier SIGKILL stay. (d) B20/B21 live in the uncommitted tests/run-all.sh.
+
 ### ITER-059 — 2026-10-17 — v0.2 Phase 3: machine-readable errors, exit codes 0/1/2/3, `--timeout` + stall watchdog (F25)
 
 **Problem:** MCP failures came back as *successful* tool calls whose text began "Render failed: …" (tool fns returned `String`; rmcp only sets `isError` for `Err`/`CallToolResult::error`), and "exit 0 but no file" was reported as "Rendered (no output file …)". The CLI had 0 / 1 / 2 with every in-WebView failure collapsing to 1 and nothing documented. A stalled WebView never exited — tests/run-all.sh wraps every call in `timeout 180` because of a 35-min hang; an MCP client inherited that hang.

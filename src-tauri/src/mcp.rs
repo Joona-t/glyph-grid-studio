@@ -157,6 +157,31 @@ fn parse_batch_progress(line: &str) -> Option<(u64, u64)> {
     Some((n.parse().ok()?, m.parse().ok()?))
 }
 
+/// `--progress` capture line → (frame, total).  Encode-phase lines are
+/// skipped: MCP progress must increase, and capture is the long phase.
+fn parse_frame_progress(line: &str) -> Option<(u64, u64)> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type")?.as_str()? != "progress" || v.get("phase")?.as_str()? != "capture" {
+        return None;
+    }
+    Some((v.get("frame")?.as_u64()?, v.get("total")?.as_u64()?))
+}
+
+/// F26 (ITER-060): stop a child cleanly — SIGTERM lets its watchdog remove
+/// its `.part` files and exit 143; SIGKILL after 2 s if it has not.
+async fn stop_child(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        crate::terminate_child(pid);
+        if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    let _ = child.kill().await;
+}
+
 /// How a spawned child ended.
 enum ChildEnd {
     Exited(std::process::ExitStatus, String),
@@ -169,7 +194,11 @@ enum ChildEnd {
 /// read line by line: kept for the error report, and `batch: N/M` lines
 /// are forwarded as progress notifications when the client asked for
 /// them.  A cancelled request kills the child.
-async fn run_child(mut cmd: Command, ctx: &RequestContext<RoleServer>) -> Result<ChildEnd, String> {
+async fn run_child(
+    mut cmd: Command,
+    ctx: &RequestContext<RoleServer>,
+    frame_progress: bool,
+) -> Result<ChildEnd, String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -183,12 +212,30 @@ async fn run_child(mut cmd: Command, ctx: &RequestContext<RoleServer>) -> Result
     loop {
         tokio::select! {
             _ = ctx.ct.cancelled() => {
-                let _ = child.kill().await;
+                stop_child(&mut child).await;
                 return Ok(ChildEnd::Cancelled);
             }
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
-                    if let (Some(token), Some((n, m))) = (&token, parse_batch_progress(&line)) {
+                    let frame = if frame_progress { parse_frame_progress(&line) } else { None };
+                    if frame.is_some() || line.starts_with("{\"type\":\"progress\"") {
+                        // NDJSON progress is not kept for the error report.
+                        if let (Some(token), Some((n, m))) = (&token, frame) {
+                            let _ = ctx
+                                .peer
+                                .notify_progress(
+                                    ProgressNotificationParam::new(token.clone(), n as f64)
+                                        .with_total(m as f64)
+                                        .with_message(format!("capture {}/{}", n, m)),
+                                )
+                                .await;
+                        }
+                        continue;
+                    }
+                    // Per-job `batch: N/M` lines are the batch tool's progress;
+                    // a render (one job, `batch: 1/1`) reports frames instead.
+                    let job = if frame_progress { None } else { parse_batch_progress(&line) };
+                    if let (Some(token), Some((n, m))) = (&token, job) {
                         let _ = ctx
                             .peer
                             .notify_progress(
@@ -208,7 +255,7 @@ async fn run_child(mut cmd: Command, ctx: &RequestContext<RoleServer>) -> Result
     }
     let status = tokio::select! {
         _ = ctx.ct.cancelled() => {
-            let _ = child.kill().await;
+            stop_child(&mut child).await;
             return Ok(ChildEnd::Cancelled);
         }
         status = child.wait() => status.map_err(|e| format!("subprocess wait failed: {}", e))?,
@@ -452,8 +499,10 @@ impl GlyphGridServer {
         if let Some(v) = p.timeout_s {
             cmd.arg("--timeout").arg(v.to_string());
         }
+        // F26 (ITER-060): per-frame progress → notifications/progress.
+        cmd.arg("--progress");
 
-        let end = run_child(cmd, &ctx).await;
+        let end = run_child(cmd, &ctx, true).await;
         drop(temp);
         match end {
             Ok(ChildEnd::Exited(status, _)) if status.success() => {
@@ -514,7 +563,7 @@ impl GlyphGridServer {
             cmd.arg("--timeout").arg(v.to_string());
         }
 
-        let end = run_child(cmd, &ctx).await;
+        let end = run_child(cmd, &ctx, false).await;
         drop(temp);
         match end {
             Ok(ChildEnd::Exited(status, stderr)) => {
@@ -577,7 +626,20 @@ pub async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_path, parse_batch_progress};
+    use super::{error_path, parse_batch_progress, parse_frame_progress};
+
+    #[test]
+    fn frame_progress_lines_are_parsed() {
+        assert_eq!(
+            parse_frame_progress(r#"{"type":"progress","job":"cli","phase":"capture","frame":12,"total":120}"#),
+            Some((12, 120))
+        );
+        assert_eq!(
+            parse_frame_progress(r#"{"type":"progress","job":"cli","phase":"encode","frame":3,"total":120}"#),
+            None
+        );
+        assert_eq!(parse_frame_progress("glyph-grid-studio[js]: batch: 1/1 cli → x"), None);
+    }
 
     #[test]
     fn error_paths_point_at_the_argument() {
