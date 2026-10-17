@@ -4709,6 +4709,7 @@
                     fps: Math.round(effFps),
                     path: job.path,
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+                    mp4Quality: job.mp4Quality || null,  // ITER-050: 'upload' (default) | 'archive'
                   }
                 : {
                     jobId: jobId,
@@ -5277,6 +5278,7 @@
           config:         j.config || {},
           capWidth:       (j.capWidth && j.capWidth > 0) ? j.capWidth : 0,
           targetMaxBytes: (j.targetMaxBytes && j.targetMaxBytes > 0) ? j.targetMaxBytes : null,
+          mp4Quality:     j.mp4Quality || null,
         };
       });
       console.log('CLI: batch mode — ' + batchJobs.length + ' jobs queued' + (job.perf ? ' (perf:on)' : ''));
@@ -5316,6 +5318,7 @@
       path: job.outPath,
       frames: job.frames || 24,
       format: job.format,  // 'gif' (default) | 'mp4' — Rust pre-resolves
+      mp4Quality: job.mp4Quality || null,  // --mp4-quality (ITER-050)
       config: {},  // already applied above
     }], {
       onComplete: function (result) {

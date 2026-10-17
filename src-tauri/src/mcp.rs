@@ -62,6 +62,10 @@ pub struct RenderParams {
     /// from `out_path`'s extension.
     #[serde(default)]
     pub format: Option<String>,
+    /// MP4 rate control: `upload` (default; ~5 Mbps, a few MB per loop) or
+    /// `archive` (fixed QP 26, near-lossless, ~30-60 Mbps). Ignored for GIF.
+    #[serde(default)]
+    pub mp4_quality: Option<String>,
 }
 
 /* ---------- Server handler ---------- */
@@ -125,6 +129,9 @@ impl GlyphGridServer {
         }
         if let Some(v) = &p.format {
             cmd.arg("--format").arg(v);
+        }
+        if let Some(v) = &p.mp4_quality {
+            cmd.arg("--mp4-quality").arg(v);
         }
 
         match cmd.output() {

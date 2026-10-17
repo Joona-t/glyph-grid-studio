@@ -57,7 +57,7 @@ The selected glyph is typeset into the cell, in a chosen palette and color mode.
 - **6-D shape-vector matching** (Alex Harri 2024): each glyph is encoded as 6 floats describing local mass distribution; per-cell lookup picks the closest match via k-d tree. Matches CNN-quality at ~1% the cost (Chen et al. arXiv 2503.14375, 2025).
 - **STBN dithering**: a Halton(2,3)-driven approximation of NVIDIA's Spatiotemporal Blue Noise. Smoother per-frame variation than hash-jittered Bayer without shipping a 50 KB texture asset.
 - **OKLCH palette interpolation**: cylindrical OKLab interpolation along the shorter hue arc, so palette transitions across distant hues stay saturated instead of dipping through gray.
-- **Native GIF/MP4 encoding**: frames go straight from the JS canvas → Rust via base64 IPC. GIF through `gifski` (quality-100 palette encoding; the Twitter-fit path retries at 600→540→480→420→360 px until the output fits the 15 MB cap). MP4 through `openh264` + the `mp4` muxer for Instagram-compatible loops.
+- **Native GIF/MP4 encoding**: frames go straight from the JS canvas → Rust via base64 IPC. GIF through `gifski` (quality-100 palette encoding; the Twitter-fit path retries at 600→540→480→420→360 px until the output fits the 15 MB cap). MP4 through `openh264` + the `mp4` muxer for Instagram-compatible loops: `--mp4-quality upload` (default) is ~5 Mbps bitrate rate control, `archive` is fixed QP 26 (near-lossless, ~30-60 Mbps, the v0.1.x bitstream).
 
 ## Two ways to use it
 
@@ -89,7 +89,8 @@ glyph-grid-studio catalog | jq
 # (~10x faster than per-variant render calls — startup + decode paid once).
 # Manifest shape: {"in": "<default source>", "frames": N, "perf": false,
 #   "jobs": [{"name", "out", "format": "gif|mp4", "in": "<per-job source>",
-#             "capWidth": 720, "targetMaxBytes": 15728640, "config": {...}}]}
+#             "capWidth": 720, "targetMaxBytes": 15728640,
+#             "mp4Quality": "upload|archive", "config": {...}}]}
 # capWidth 720 auto-targets Twitter's 15 MB cap (adaptive shrink ladder).
 glyph-grid-studio batch --manifest variants.json
 

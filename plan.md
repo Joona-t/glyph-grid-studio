@@ -41,7 +41,7 @@ Goal: headless output = pure function of (source, config, seed). Bit-identical a
 Goal: 120-frame CLI render from 18–56 s to a measured, reproducible number; exports stream; memory bounded by design not by a pixel cap.
 
 Quick wins first:
-- [ ] **MP4 rate control** (F11, S): `RateControlMode::Bitrate` + `skip_frames(false)` + `track_config.timescale` fix; `--mp4-quality upload|archive` (archive = today's QP-26 path). Cargo test on 120 synthetic frames asserting non-empty samples and size < 1.5× target. Expected 17 MB → ~3–4 MB.
+- [x] **MP4 rate control** (F11, S): `RateControlMode::Bitrate` + `skip_frames(false)` + `track_config.timescale` fix; `--mp4-quality upload|archive` (archive = today's QP-26 path). Cargo test on 120 synthetic frames asserting non-empty samples and size < 1.5× target. Expected 17 MB → ~3–4 MB. — ITER-050 (cream-paper 17.3 → 2.27 MB at 22.6 dB vs archive; worm-move gate 22.0 → 5.18 MB at 24.3 dB, RC overshoots 1.7× on temporal dither; archive = inf vs golden; psnr-gate now pairs frames by index)
 - [ ] **Twitter-fit ladder predictor** (F14, S): first full pass → size/pixel ratio → one-shot width estimate, then at most one correction rung.
 
 Then the capture path:

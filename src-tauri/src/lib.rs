@@ -48,6 +48,9 @@ pub struct HeadlessRenderJob {
     /// Output format. `"gif"` (default) → gifski; `"mp4"` → openh264 + mp4.
     /// When None, derived from `out_path`'s extension.
     pub format: Option<String>,
+    /// MP4 rate control: `"upload"` (default, bitrate RC) or `"archive"`
+    /// (fixed QP 26, the v0.1.x bitstream).  Ignored for GIF output.
+    pub mp4_quality: Option<String>,
 }
 
 impl HeadlessRenderJob {
@@ -294,6 +297,18 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
             );
             return 2;
         }
+        // ITER-050: a typo'd `mp4Quality` would otherwise only surface after
+        // the whole capture ran; refuse it with the manifest instead.
+        let quality = j.get("mp4Quality");
+        if let Some(e) = match quality {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(q)) => Mp4Quality::parse(Some(q)).err(),
+            Some(other) => Some(format!("mp4Quality must be a string, got {}", other)),
+        } {
+            let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            eprintln!("batch: job {} ({:?}): {}", i, name, e);
+            return 2;
+        }
     }
 
     // Build the JS-shaped batch JSON.  Each job carries its own out/format/config.
@@ -359,6 +374,7 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
                 "config": config,
                 "capWidth": cap_width,
                 "targetMaxBytes": target_max_bytes,
+                "mp4Quality": j.get("mp4Quality").and_then(|v| v.as_str()),
             })
         })
         .collect();
@@ -402,6 +418,7 @@ pub fn run_headless_render(job: HeadlessRenderJob) -> i32 {
         "outPath": job.out_path.to_string_lossy().to_string(),
         "frames": job.frames,
         "format": format,
+        "mp4Quality": job.mp4_quality,
         "config": job.build_js_config(),
     });
     let exit_code = Arc::new(Mutex::new(2)); // 2 = "didn't complete"
@@ -1581,11 +1598,48 @@ fn mp4_sample_timing(index: usize, frame_duration: u32) -> (u64, u32) {
     (index as u64 * u64::from(frame_duration), frame_duration)
 }
 
+/// MP4 rate-control profile (F11 / ITER-050).
+///   - `Upload` (default): openh264 bitrate RC at `mp4_upload_bitrate`, frame
+///     skipping off — a few MB for a typical loop, sized for social uploads.
+///   - `Archive`: the pre-v0.2 path, RC Off = fixed QP 26 (openh264's
+///     SVC_QUALITY_BASE_QP).  Near-lossless for glyph art and bit-identical
+///     to v0.1.x output, at ~30-60 Mbps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mp4Quality {
+    Upload,
+    Archive,
+}
+
+impl Mp4Quality {
+    /// `None` / empty → `Upload`.  Unknown values are an error rather than a
+    /// silent fallback, so a typo in a batch manifest can't change the output.
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("upload") => Ok(Self::Upload),
+            Some("archive") => Ok(Self::Archive),
+            Some(other) => Err(format!(
+                "unknown mp4 quality {:?} (expected \"upload\" or \"archive\")",
+                other
+            )),
+        }
+    }
+}
+
+/// Upload-mode target bitrate: 5 Mbps up to 1080p, scaled by pixel count
+/// above that so 1440p/4K exports don't get starved.
+fn mp4_upload_bitrate(width: u32, height: u32) -> u32 {
+    const BASE_BPS: u64 = 5_000_000;
+    const BASE_PIXELS: u64 = 1920 * 1080;
+    let pixels = (u64::from(width) * u64::from(height)).max(BASE_PIXELS);
+    (BASE_BPS * pixels / BASE_PIXELS).min(u64::from(u32::MAX)) as u32
+}
+
 fn encode_mp4_h264(
     frames: &[PngFrame],
     fps: u32,
     cap_width: Option<u32>,
     border: Option<&BorderConfig>,
+    quality: Mp4Quality,
     control: &ExportControl,
 ) -> Result<Vec<u8>, String> {
     use mp4::{AvcConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
@@ -1628,19 +1682,30 @@ fn encode_mp4_h264(
         ));
     }
 
-    // Configure the encoder explicitly:
-    //   - Rate control = Off — never skip frames.  Glyph art has very low
-    //     inter-frame motion in static backgrounds; under default bitrate-
-    //     based RC openh264 was emitting zero NAL units for some frames,
-    //     producing a broken stream.  RC Off makes every encode() yield a
-    //     real slice NAL.
-    //   - Bitrate = 5 Mbps cap (still small for our content; usually
-    //     produces 1-2 MB output for a 90-frame loop).
-    //   - Max frame rate 30 — tells the encoder the playback target.
-    let cfg = EncoderConfig::new()
-        .max_frame_rate(FrameRate::from_hz(fps as f32))
-        .bitrate(BitRate::from_bps(5_000_000))
-        .rate_control_mode(RateControlMode::Off);
+    // Configure the encoder explicitly (F11 / ITER-050):
+    //   - Frame skipping OFF.  The "zero NAL units for some frames" breakage
+    //     that once forced RC Off was openh264 *skipping* frames to hold the
+    //     bitrate (the crate defaults `enable_skip_frame: true`).  With skip
+    //     off every encode() yields a slice; the "no slice NALs" check below
+    //     stays as the tripwire.
+    //   - Upload: bitrate RC at `mp4_upload_bitrate`.  Without skipping, RC
+    //     steers QP and can overshoot the target on high-entropy sources.
+    //   - Archive: RC Off = fixed QP 26 — the bitrate field is never read on
+    //     that path (ratectl.cpp WelsRcPictureInitDisable).  Kept verbatim so
+    //     archive output is bit-identical to v0.1.x.
+    //   - Max frame rate = the export fps — the playback target RC budgets
+    //     per-frame bits against.
+    let cfg = match quality {
+        Mp4Quality::Upload => EncoderConfig::new()
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            .bitrate(BitRate::from_bps(mp4_upload_bitrate(target_w, target_h)))
+            .rate_control_mode(RateControlMode::Bitrate)
+            .skip_frames(false),
+        Mp4Quality::Archive => EncoderConfig::new()
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            .bitrate(BitRate::from_bps(5_000_000))
+            .rate_control_mode(RateControlMode::Off),
+    };
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), cfg)
         .map_err(|e| format!("openh264 init: {}", e))?;
 
@@ -1839,11 +1904,12 @@ fn encode_mp4_h264(
     })?;
 
     eprintln!(
-        "encode-mp4: {} frames decoded, preprocessed, and encoded in {:.0}ms ({} preprocess workers, openh264 {:.0}ms)",
+        "encode-mp4: {} frames decoded, preprocessed, and encoded in {:.0}ms ({} preprocess workers, openh264 {:.0}ms, quality {:?})",
         n,
         t_encode.elapsed().as_secs_f64() * 1000.0,
         workers,
         encode_ms,
+        quality,
     );
 
     let sps = sps.ok_or("no SPS NAL emitted by encoder")?;
@@ -1865,12 +1931,16 @@ fn encode_mp4_h264(
     let mut writer =
         Mp4Writer::write_start(buf, &mp4_config).map_err(|e| format!("mp4 write_start: {}", e))?;
 
-    let track_config = TrackConfig::from(AvcConfig {
+    let mut track_config = TrackConfig::from(AvcConfig {
         width: target_w as u16,
         height: target_h as u16,
         seq_param_set: sps,
         pic_param_set: pps,
     });
+    // mp4 0.14 leaves the track (mdhd) timescale at 1000 regardless of the
+    // movie timescale, so `frame_duration = 1` meant 1 ms per frame: a
+    // 120-frame clip claimed 0.12 s at 1000 fps (ITER-050).
+    track_config.timescale = timescale;
     writer
         .add_track(&track_config)
         .map_err(|e| format!("mp4 add_track: {}", e))?;
@@ -1906,8 +1976,10 @@ async fn save_mp4_real(
     fps: u32,
     cap_width: Option<u32>,
     border: Option<BorderConfig>,
+    mp4_quality: Option<String>,
     job_id: Option<String>,
 ) -> Result<String, String> {
+    let quality = Mp4Quality::parse(mp4_quality.as_deref())?;
     // Ask first: cancelling the dialog must not decode or encode any frames.
     let path: Option<PathBuf> = app
         .dialog()
@@ -1923,7 +1995,14 @@ async fn save_mp4_real(
     tauri::async_runtime::spawn_blocking(move || {
         let _registration = registration;
         let frames = decode_frame_payloads(frames)?;
-        let mp4_buf = encode_mp4_h264(&frames, fps, cap_width, border.as_ref(), &control)?;
+        let mp4_buf = encode_mp4_h264(
+            &frames,
+            fps,
+            cap_width,
+            border.as_ref(),
+            quality,
+            &control,
+        )?;
         atomic_write_output(&p, &mp4_buf, &control)?;
         Ok::<String, String>(p.display().to_string())
     })
@@ -1942,14 +2021,23 @@ async fn save_mp4_to_path(
     path: String,
     cap_width: Option<u32>,
     border: Option<BorderConfig>,
+    mp4_quality: Option<String>,
     job_id: Option<String>,
 ) -> Result<String, String> {
+    let quality = Mp4Quality::parse(mp4_quality.as_deref())?;
     let p = PathBuf::from(&path);
     let (control, registration) = register_export(app, job_id);
     tauri::async_runtime::spawn_blocking(move || {
         let _registration = registration;
         let frames = decode_frame_payloads(frames)?;
-        let mp4_buf = encode_mp4_h264(&frames, fps, cap_width, border.as_ref(), &control)?;
+        let mp4_buf = encode_mp4_h264(
+            &frames,
+            fps,
+            cap_width,
+            border.as_ref(),
+            quality,
+            &control,
+        )?;
         atomic_write_output(&p, &mp4_buf, &control)?;
         Ok::<String, String>(p.display().to_string())
     })
@@ -2025,13 +2113,23 @@ async fn finish_mp4_export(
     fps: u32,
     cap_width: Option<u32>,
     border: Option<BorderConfig>,
+    mp4_quality: Option<String>,
 ) -> Result<String, String> {
     let (control, registration) = register_export(app, Some(job_id.clone()));
     let frames = take_export_capture(&job_id)?;
+    // Parsed after the capture is taken so a bad value still releases it.
+    let quality = Mp4Quality::parse(mp4_quality.as_deref())?;
     let path = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || {
         let _registration = registration;
-        let mp4_buf = encode_mp4_h264(&frames, fps, cap_width, border.as_ref(), &control)?;
+        let mp4_buf = encode_mp4_h264(
+            &frames,
+            fps,
+            cap_width,
+            border.as_ref(),
+            quality,
+            &control,
+        )?;
         atomic_write_output(&path, &mp4_buf, &control)?;
         Ok::<String, String>(path.display().to_string())
     })
@@ -2662,6 +2760,108 @@ mod export_guard_tests {
             assert_eq!(mp4_sample_timing(119, duration), (119, 1));
         }
         assert_eq!(mp4_timing(0).unwrap_err(), "fps must be > 0");
+    }
+
+    /// ITER-050 (F11): upload mode must hold its bitrate target without
+    /// dropping frames.  60 flat frames (where the old skip-frame RC emitted
+    /// nothing) then 60 frames with a fresh noise band each (where RC without
+    /// skipping overshoots), 640x360 @ 30 fps = 4 s.
+    #[test]
+    fn mp4_upload_rate_control_keeps_every_frame_near_target() {
+        const W: u32 = 640;
+        const H: u32 = 360;
+        const FPS: u32 = 30;
+        const N: u32 = 120;
+        let mut seed: u32 = 0x1234_5678;
+        let frames: Vec<PngFrame> = (0..N)
+            .map(|i| {
+                let mut img = image::RgbImage::from_pixel(W, H, image::Rgb([0xf2, 0xe8, 0xd8]));
+                if i >= N / 2 {
+                    for y in H / 4..3 * H / 4 {
+                        for x in 0..W {
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            let v = (seed >> 24) as u8;
+                            img.put_pixel(x, y, image::Rgb([v, v, v]));
+                        }
+                    }
+                }
+                let mut cursor = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut cursor, image::ImageFormat::Png)
+                    .unwrap();
+                PngFrame {
+                    bytes: cursor.into_inner(),
+                }
+            })
+            .collect();
+
+        let out = encode_mp4_h264(
+            &frames,
+            FPS,
+            None,
+            None,
+            Mp4Quality::Upload,
+            &test_control(JOB_RUNNING),
+        )
+        .unwrap();
+
+        let size = out.len() as u64;
+        let mut reader = mp4::Mp4Reader::read_header(std::io::Cursor::new(out), size).unwrap();
+        let track_id = *reader.tracks().keys().next().unwrap();
+        assert_eq!(reader.tracks()[&track_id].timescale(), FPS);
+        assert_eq!(reader.sample_count(track_id).unwrap(), N);
+        let mut sample_bytes = 0u64;
+        for sample_id in 1..=N {
+            let sample = reader.read_sample(track_id, sample_id).unwrap().unwrap();
+            assert!(!sample.bytes.is_empty(), "sample {} is empty", sample_id);
+            assert_eq!(sample.duration, 1);
+            sample_bytes += sample.bytes.len() as u64;
+        }
+        let duration_s = f64::from(N) / f64::from(FPS);
+        let budget = f64::from(mp4_upload_bitrate(W, H)) / 8.0 * duration_s;
+        assert!(
+            (size as f64) < 1.5 * budget,
+            "upload MP4 is {} bytes ({} in samples), over 1.5x the {:.0}-byte budget",
+            size,
+            sample_bytes,
+            budget
+        );
+    }
+
+    /// A typo'd per-job `mp4Quality` must be refused with the manifest
+    /// (exit 2, before any webview starts), not after the capture ran.
+    #[test]
+    fn batch_manifest_rejects_unknown_mp4_quality() {
+        let dir = std::env::temp_dir().join(format!(
+            "glyph-grid-mp4-quality-{}-{}",
+            std::process::id(),
+            OUTPUT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("in.png");
+        fs::write(&source, &valid_png_frame(4, 4).bytes).unwrap();
+        let manifest = dir.join("manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::json!({
+                "in": source,
+                "jobs": [{"name": "typo", "out": dir.join("out.mp4"), "mp4Quality": "lossless"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(run_headless_batch(manifest, false), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mp4_quality_parse_defaults_to_upload_and_rejects_typos() {
+        assert_eq!(Mp4Quality::parse(None).unwrap(), Mp4Quality::Upload);
+        assert_eq!(Mp4Quality::parse(Some("")).unwrap(), Mp4Quality::Upload);
+        assert_eq!(Mp4Quality::parse(Some("Archive")).unwrap(), Mp4Quality::Archive);
+        assert!(Mp4Quality::parse(Some("lossless")).is_err());
+        assert_eq!(mp4_upload_bitrate(1024, 682), 5_000_000);
+        assert_eq!(mp4_upload_bitrate(3840, 2160), 20_000_000);
     }
 
     #[test]

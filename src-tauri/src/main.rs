@@ -105,12 +105,18 @@ struct RenderArgs {
     /// is inferred from the output path extension (`.mp4` → mp4).
     #[arg(long, value_name = "FORMAT")]
     format: Option<String>,
+
+    /// MP4 rate control: `upload` (default; ~5 Mbps bitrate target, a few MB
+    /// per loop) or `archive` (fixed QP 26, near-lossless, ~30-60 Mbps).
+    /// Ignored for GIF output.
+    #[arg(long, value_name = "QUALITY", value_parser = ["upload", "archive"])]
+    mp4_quality: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
 struct BatchArgs {
     /// Path to a JSON manifest. Shape:
-    /// `{"in":"<source>","frames":<N>,"jobs":[{"name":"...","out":"...","format":"gif|mp4","config":{...}}, ...]}`
+    /// `{"in":"<source>","frames":<N>,"jobs":[{"name":"...","out":"...","format":"gif|mp4","mp4Quality":"upload|archive","config":{...}}, ...]}`
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
 
@@ -160,6 +166,7 @@ fn main() {
                     rows: args.rows,
                 },
                 format: args.format,
+                mp4_quality: args.mp4_quality,
             };
             let code = app_lib::run_headless_render(job);
             // Tauri's `app.exit(code)` triggers `tauri::run()` to return without
