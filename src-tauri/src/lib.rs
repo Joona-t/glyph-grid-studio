@@ -512,13 +512,17 @@ impl PngFrame {
 
 /// Hard safety limits for native animation export. These limits are checked
 /// from PNG IHDR metadata before any frame is decompressed into RGB/RGBA.
-/// 100M pixels is about 381 MiB as raw RGBA before encoder overhead.
-/// ITER-052: the 256 MiB byte cap counts PNG payloads only.  Raw RGBA frames
-/// are exactly w×h×4 bytes, so the pixel cap already bounds them (≤ 400 MB
-/// staged, the same set the GIF path held decoded anyway).
+/// ITER-054: there is no total decoded-pixel cap any more.  It existed
+/// because the GIF path decoded the whole set up front; both encoders now
+/// decode through a bounded window, so decode-side memory is flat in frame
+/// count.  What is retained is bounded directly: PNG payloads by the 256 MiB
+/// byte cap, raw RGBA frames (ITER-052, exactly w×h×4) by the raw byte cap.
+/// `MAX_FRAME_PIXELS` is a per-frame decompression-bomb guard (one
+/// 10000×10000 frame), not a budget.
 const MAX_EXPORT_FRAMES: usize = 600;
-const MAX_TOTAL_DECODED_PIXELS: u64 = 100_000_000;
+const MAX_FRAME_PIXELS: u64 = 100_000_000;
 const MAX_TOTAL_COMPRESSED_FRAME_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_RAW_FRAME_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TOTAL_COMPRESSED_BASE64_CHARS: u64 =
     (((MAX_TOTAL_COMPRESSED_FRAME_BYTES + 2) / 3) * 4) + 4;
 const MAX_SOURCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -538,8 +542,8 @@ struct StagedExport {
     expected_frames: usize,
     frames: Vec<PngFrame>,
     dimensions: Option<(u32, u32)>,
-    total_pixels: u64,
     total_bytes: u64,
+    total_raw_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -819,8 +823,8 @@ fn begin_export_capture(job_id: String, total: usize) -> Result<(), String> {
         expected_frames: total,
         frames: Vec::with_capacity(total),
         dimensions: None,
-        total_pixels: 0,
         total_bytes: 0,
+        total_raw_bytes: 0,
     };
     let mut captures = EXPORT_CAPTURES
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -914,12 +918,9 @@ async fn push_export_frame_raw(request: tauri::ipc::Request<'_>) -> Result<(), S
 }
 
 /// ITER-052: a raw frame must be exactly width×height×4 bytes and fit the
-/// pixel cap on its own — checked before the IPC body is copied.
+/// per-frame pixel guard — checked before the IPC body is copied.
 fn check_raw_rgba_len(len: usize, width: u32, height: u32, index: usize) -> Result<(), String> {
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_TOTAL_DECODED_PIXELS {
-        return Err(format!("frame {} exceeds export pixel limit", index));
-    }
+    let pixels = check_frame_pixels(width, height, index)?;
     if len as u64 != pixels * 4 {
         return Err(format!(
             "frame {} raw RGBA is {} bytes, expected {}x{}x4 = {}",
@@ -933,8 +934,23 @@ fn check_raw_rgba_len(len: usize, width: u32, height: u32, index: usize) -> Resu
     Ok(())
 }
 
+/// Per-frame decompression-bomb guard (ITER-054): one frame's pixel count,
+/// never a running total.
+fn check_frame_pixels(width: u32, height: u32, index: usize) -> Result<u64, String> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| format!("frame {} pixel count overflow", index))?;
+    if pixels > MAX_FRAME_PIXELS {
+        return Err(format!(
+            "frame {} is {}x{} = {} pixels, exceeds the per-frame pixel limit {}",
+            index, width, height, pixels, MAX_FRAME_PIXELS
+        ));
+    }
+    Ok(pixels)
+}
+
 /// Validate one frame against the job's staged capture (order, declared
-/// total, consistent dimensions, pixel + byte budgets) and retain it.  Shared
+/// total, consistent dimensions, retained-byte budgets) and retain it.  Shared
 /// by the base64 and raw-body push commands.
 fn stage_export_frame(job_id: &str, index: usize, frame: PngFrame) -> Result<(), String> {
     let dimensions = frame.dimensions(index)?;
@@ -968,38 +984,35 @@ fn stage_export_frame(job_id: &str, index: usize, frame: PngFrame) -> Result<(),
     } else {
         capture.dimensions = Some(dimensions);
     }
-    let pixels = u64::from(dimensions.0)
-        .checked_mul(u64::from(dimensions.1))
-        .ok_or_else(|| format!("frame {} pixel count overflow", index))?;
-    let next_pixels = capture
-        .total_pixels
-        .checked_add(pixels)
-        .ok_or_else(|| "total decoded pixel count overflow".to_string())?;
-    if next_pixels > MAX_TOTAL_DECODED_PIXELS {
-        return Err(format!(
-            "export is too large: {} decoded pixels exceeds limit {}",
-            next_pixels, MAX_TOTAL_DECODED_PIXELS
-        ));
-    }
-    // ITER-052: raw RGBA is bounded by the pixel cap above; only PNG
-    // payloads count against the compressed-byte cap.
-    let compressed = if frame.rgba.is_some() {
-        0
+    check_frame_pixels(dimensions.0, dimensions.1, index)?;
+    // ITER-054: PNG payloads count against the compressed-byte cap, raw
+    // RGBA (ITER-052) against the raw-byte cap — what is held, not what a
+    // decode would produce.
+    let (mut next_bytes, mut next_raw_bytes) = (capture.total_bytes, capture.total_raw_bytes);
+    let len = frame.bytes.len() as u64;
+    if frame.rgba.is_some() {
+        next_raw_bytes = next_raw_bytes
+            .checked_add(len)
+            .ok_or_else(|| "total raw frame byte count overflow".to_string())?;
+        if next_raw_bytes > MAX_TOTAL_RAW_FRAME_BYTES {
+            return Err(format!(
+                "raw frames are too large: {} bytes exceeds limit {} bytes; lower duration, FPS, or output size",
+                next_raw_bytes, MAX_TOTAL_RAW_FRAME_BYTES
+            ));
+        }
     } else {
-        frame.bytes.len() as u64
-    };
-    let next_bytes = capture
-        .total_bytes
-        .checked_add(compressed)
-        .ok_or_else(|| "total compressed frame byte count overflow".to_string())?;
-    if next_bytes > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
-        return Err(format!(
-            "compressed frames are too large: {} bytes exceeds limit {} bytes",
-            next_bytes, MAX_TOTAL_COMPRESSED_FRAME_BYTES
-        ));
+        next_bytes = next_bytes
+            .checked_add(len)
+            .ok_or_else(|| "total compressed frame byte count overflow".to_string())?;
+        if next_bytes > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
+            return Err(format!(
+                "compressed frames are too large: {} bytes exceeds limit {} bytes",
+                next_bytes, MAX_TOTAL_COMPRESSED_FRAME_BYTES
+            ));
+        }
     }
-    capture.total_pixels = next_pixels;
     capture.total_bytes = next_bytes;
+    capture.total_raw_bytes = next_raw_bytes;
     capture.frames.push(frame);
     Ok(())
 }
@@ -1128,18 +1141,12 @@ fn validate_export_frames(
             _ => dimensions,
         };
         output_dimensions = Some((output_width, output_height));
-        let frame_pixels = u64::from(output_width)
-            .checked_mul(u64::from(output_height))
-            .ok_or_else(|| format!("frame {} pixel count overflow", index))?;
+        // ITER-054: per-frame guard only; the encoders decode through a
+        // bounded window, so the total is not a memory figure any more.
+        let frame_pixels = check_frame_pixels(output_width, output_height, index)?;
         total_output_pixels = total_output_pixels
             .checked_add(frame_pixels)
             .ok_or_else(|| "total decoded pixel count overflow".to_string())?;
-        if total_output_pixels > MAX_TOTAL_DECODED_PIXELS {
-            return Err(format!(
-                "export is too large: {} decoded pixels exceeds limit {}",
-                total_output_pixels, MAX_TOTAL_DECODED_PIXELS
-            ));
-        }
     }
 
     let (width, height) = first_dimensions.expect("non-empty frames checked above");
@@ -1299,17 +1306,6 @@ async fn save_png(app: tauri::AppHandle, data_url: String) -> Result<String, Str
     }
 }
 
-/// Encode a recorded sequence of PNG frames as a single animated GIF using
-/// the `gifski` crate.  gifski produces ~30-50% smaller files than the
-/// previous `gif` crate path because it computes a SHARED palette across
-/// all frames (not one palette per frame) and uses error-diffusion
-/// dithering across the whole sequence.  Quality 100 is genuinely lossless
-/// for our use case (glyph art has ≤ ~20 unique colours).
-///
-/// `cap_width` resizes frames to that width with aspect ratio preserved
-/// (gifski handles the resize internally).  `None` keeps the source size.
-/// At Twitter's recommended 720 px wide for posts, kaneki drops from
-/// ~30 MB → ~6-8 MB without visible quality change on phone screens.
 /// Decode one staged frame (PNG, or raw RGBA since ITER-052) to RGBA, applying the optional border.
 /// Pure per-frame function — safe to run on any thread (EXPORT-OPT-1).
 fn decode_one_frame(
@@ -1334,159 +1330,183 @@ fn decode_one_frame(
     Ok(imgref::ImgVec::new(pixels, w, h))
 }
 
-/// EXPORT-OPT-1 (2026-06-10): parallel frame decode with std scoped
-/// threads (no new deps).  The old sequential base64→PNG→RGBA loop was
-/// the single-threaded head of every export: ~40-60 % of GIF encode
-/// wall-time on a 150-frame loop, while 7+ cores idled.  Each frame is
-/// an independent pure decode, so this is bit-exact by construction —
-/// frame N's bytes are identical regardless of which thread decoded it.
-fn decode_frames_parallel(
-    frames: &[PngFrame],
-    delay_ms: u32,
-    border: Option<&BorderConfig>,
-    control: &ExportControl,
-) -> Result<Vec<(imgref::ImgVec<rgb::RGBA8>, f64)>, String> {
-    let n = frames.len();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    // BUG-009: leave 2 cores free — a GUI export runs this while the
-    // webview's draw loop is live (the loop resumes during encode since
-    // v0.1.7); saturating every core starves the UI thread and the app
-    // reads as frozen even though the encode is progressing.
-    let threads = std::thread::available_parallelism()
-        .map(|p| p.get().saturating_sub(2).max(2))
-        .unwrap_or(4)
-        .min(n);
-    let chunk = n.div_ceil(threads);
-
-    let mut slots: Vec<Option<Result<imgref::ImgVec<rgb::RGBA8>, String>>> = Vec::with_capacity(n);
-    slots.resize_with(n, || None);
-
-    std::thread::scope(|s| {
-        for (t, slot_chunk) in slots.chunks_mut(chunk).enumerate() {
-            let base = t * chunk;
-            s.spawn(move || {
-                for (i, slot) in slot_chunk.iter_mut().enumerate() {
-                    let idx = base + i;
-                    *slot = Some(
-                        control
-                            .check_cancelled()
-                            .and_then(|_| decode_one_frame(&frames[idx], idx, border)),
-                    );
-                }
-            });
-        }
-    });
-
-    let mut out = Vec::with_capacity(n);
-    for (idx, slot) in slots.into_iter().enumerate() {
-        let img = slot.ok_or_else(|| format!("frame {}: decode slot empty", idx))??;
-        let pts = (idx as f64) * (delay_ms as f64) / 1000.0;
-        out.push((img, pts));
-    }
-    control.check_cancelled()?;
-    control.emit("decode", n, n);
-    Ok(out)
+/// gifski progress hook: forwards per-frame progress and turns a cancelled
+/// job into `false`, which makes gifski stop with `Error::Aborted`.
+struct GifProgress {
+    control: ExportControl,
+    phase: String,
+    completed: usize,
+    total: usize,
 }
 
-/// Encode pre-decoded frames with gifski.  Split out of
-/// `encode_gif_gifski` so the twitter-fit ladder can decode ONCE and
-/// re-encode at each cap width (EXPORT-OPT-2) — previously every ladder
-/// rung re-decoded all frames from base64.  Frames are cloned one at a
-/// time into the collector (gifski wants owned ImgVecs); transient peak
-/// is the decoded set + one frame.
-fn encode_gif_gifski_decoded(
-    decoded: &[(imgref::ImgVec<rgb::RGBA8>, f64)],
-    cap_width: Option<u32>,
-    control: &ExportControl,
-    progress_phase: &str,
-) -> Result<Vec<u8>, String> {
-    if decoded.is_empty() {
-        return Err("no frames provided".into());
+impl gifski::progress::ProgressReporter for GifProgress {
+    fn increase(&mut self) -> bool {
+        self.completed = (self.completed + 1).min(self.total);
+        self.control.emit(&self.phase, self.completed, self.total);
+        self.control.state.load(Ordering::Acquire) != JOB_CANCELLED
     }
-    let settings = gifski::Settings {
-        width: cap_width,
+    fn done(&mut self, _msg: &str) {}
+}
+
+/// Presentation timestamp gifski gets for frame `idx` (seconds).
+fn gif_pts(idx: usize, delay_ms: u32) -> f64 {
+    (idx as f64) * (delay_ms as f64) / 1000.0
+}
+
+/// gifski settings shared by every GIF encode.  Quality 100 is genuinely
+/// lossless for our use case (glyph art has ≤ ~20 unique colours).
+fn gifski_settings(width: u32) -> gifski::Settings {
+    gifski::Settings {
+        width: Some(width),
         height: None,
         quality: 100,
         fast: false,
         repeat: gif::Repeat::Infinite,
-    };
-    let (collector, writer) = gifski::new(settings).map_err(|e| format!("gifski init: {}", e))?;
-
-    struct Progress {
-        control: ExportControl,
-        phase: String,
-        completed: usize,
-        total: usize,
     }
-    impl gifski::progress::ProgressReporter for Progress {
-        fn increase(&mut self) -> bool {
-            self.completed = (self.completed + 1).min(self.total);
-            self.control.emit(&self.phase, self.completed, self.total);
-            self.control.state.load(Ordering::Acquire) != JOB_CANCELLED
-        }
-        fn done(&mut self, _msg: &str) {}
-    }
+}
 
-    // Collector and writer must run concurrently — the collector
-    // quantises each frame as it arrives, the writer assembles the final
-    // palette + LZW stream after the collector closes.  Scoped thread so
-    // the collector can borrow `decoded`.
+/// Encode staged frames as one animated GIF with the `gifski` crate.
+/// gifski produces ~30-50% smaller files than the old `gif` crate path
+/// because it computes a SHARED palette across all frames and uses
+/// error-diffusion dithering across the whole sequence.  `width` is the
+/// output width (gifski resizes internally, aspect preserved; at Twitter's
+/// 720 px kaneki drops from ~30 MB → ~6-8 MB).
+///
+/// ITER-054 (F13): bounded decode-ahead, the ITER-040 MP4 pattern.  K
+/// workers decode frames (`decode_one_frame`, pure per frame) into a
+/// sync_channel; a feeder thread hands them to the collector strictly in
+/// index order through a reorder buffer, so gifski sees exactly the
+/// sequence the old decode-everything-first loop fed it and the output is
+/// bit-identical.  A window of 2K+2 frames caps how far workers run ahead,
+/// so at most a handful of decoded frames exist at once instead of the whole
+/// set (373 MB for 120 × 760×1024).  The twitter-fit ladder re-decodes per
+/// rung — a raw RGBA "decode" is one copy, a PNG set ~0.3 s.
+fn encode_gif_gifski_frames(
+    frames: &[PngFrame],
+    delay_ms: u32,
+    border: Option<&BorderConfig>,
+    width: u32,
+    control: &ExportControl,
+    progress_phase: &str,
+) -> Result<Vec<u8>, String> {
+    let n = frames.len();
+    if n == 0 {
+        return Err("no frames provided".into());
+    }
+    let (collector, writer) =
+        gifski::new(gifski_settings(width)).map_err(|e| format!("gifski init: {}", e))?;
+
+    // BUG-009: leave 2 cores free — a GUI export runs this while the
+    // webview's draw loop is live (the loop resumes during encode since
+    // v0.1.7); saturating every core starves the UI thread.
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get().saturating_sub(2).max(1))
+        .unwrap_or(2)
+        .min(n);
+    let window = 2 * workers + 2;
+    let next_index = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    // Frames handed to gifski; a worker holding index >= fed + window waits
+    // here until the feeder catches up.
+    let fed = (Mutex::new(0usize), std::sync::Condvar::new());
+    let (tx, rx) =
+        std::sync::mpsc::sync_channel::<(usize, Result<imgref::ImgVec<rgb::RGBA8>, String>)>(window);
+
     let mut output: Vec<u8> = Vec::new();
     std::thread::scope(|s| -> Result<(), String> {
-        let handle = s.spawn(move || -> Result<(), String> {
-            for (idx, (imgvec, pts)) in decoded.iter().enumerate() {
-                control.check_cancelled()?;
-                collector
-                    .add_frame_rgba(idx, imgvec.clone(), *pts)
-                    .map_err(|e| format!("frame {} add: {}", idx, e))?;
-            }
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (next_index, stop, fed) = (&next_index, &stop, &fed);
+            s.spawn(move || loop {
+                let idx = next_index.fetch_add(1, Ordering::Relaxed);
+                if idx >= n {
+                    return;
+                }
+                {
+                    let mut done = fed.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while idx >= *done + window && !stop.load(Ordering::Relaxed) {
+                        done = fed.1.wait(done).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // A panic here would leave the feeder waiting on this index
+                // forever; turn it into an ordinary per-frame error instead.
+                let result = control.check_cancelled().and_then(|_| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decode_one_frame(&frames[idx], idx, border)
+                    }))
+                    .unwrap_or_else(|_| Err(format!("frame {} decode panicked", idx)))
+                });
+                let failed = result.is_err();
+                if tx.send((idx, result)).is_err() || failed {
+                    return;
+                }
+            });
+        }
+        drop(tx);
+
+        // Collector and writer must run concurrently: gifski quantises frames
+        // as they arrive and the writer streams them out, so the feeder gets
+        // its own thread and the writer runs on this one.
+        let (stop_ref, fed_ref) = (&stop, &fed);
+        let feeder = s.spawn(move || -> Result<(), String> {
+            let mut pending: std::collections::BTreeMap<
+                usize,
+                Result<imgref::ImgVec<rgb::RGBA8>, String>,
+            > = std::collections::BTreeMap::new();
+            let result = (|| -> Result<(), String> {
+                for idx in 0..n {
+                    let img = loop {
+                        if let Some(ready) = pending.remove(&idx) {
+                            break ready?;
+                        }
+                        let (got, result) = rx
+                            .recv()
+                            .map_err(|_| format!("frame {} decode worker exited", idx))?;
+                        pending.insert(got, result);
+                    };
+                    control.check_cancelled()?;
+                    collector
+                        .add_frame_rgba(idx, img, gif_pts(idx, delay_ms))
+                        .map_err(|e| format!("frame {} add: {}", idx, e))?;
+                    *fed_ref.0.lock().unwrap_or_else(|e| e.into_inner()) = idx + 1;
+                    fed_ref.1.notify_all();
+                }
+                Ok(())
+            })();
             drop(collector); // signals the writer to finalise
-            Ok(())
+            // Release any worker parked on the window or blocked on send.
+            // Set the flag under the mutex so a worker can't check it, miss
+            // this notify, and park forever (lost wakeup).
+            {
+                let _g = fed_ref.0.lock().unwrap_or_else(|e| e.into_inner());
+                stop_ref.store(true, Ordering::Relaxed);
+            }
+            fed_ref.1.notify_all();
+            drop(rx);
+            result
         });
-        writer
-            .write(
-                &mut output,
-                &mut Progress {
-                    control: control.clone(),
-                    phase: progress_phase.to_string(),
-                    completed: 0,
-                    total: decoded.len(),
-                },
-            )
-            .map_err(|e| format!("gifski write: {}", e))?;
-        handle
+        let written = writer.write(
+            &mut output,
+            &mut GifProgress {
+                control: control.clone(),
+                phase: progress_phase.to_string(),
+                completed: 0,
+                total: n,
+            },
+        );
+        let feed = feeder
             .join()
-            .map_err(|_| "gifski collector thread panicked".to_string())??;
-        Ok(())
+            .map_err(|_| "gifski feeder thread panicked".to_string())?;
+        control.check_cancelled()?;
+        feed?;
+        written.map_err(|e| format!("gifski write: {}", e))
     })?;
 
     control.check_cancelled()?;
-
     Ok(output)
-}
-
-fn encode_gif_gifski(
-    frames: &[PngFrame],
-    delay_ms: u32,
-    cap_width: Option<u32>,
-    border: Option<&BorderConfig>,
-    control: &ExportControl,
-) -> Result<Vec<u8>, String> {
-    let dimensions = validate_export_frames(frames, border)?;
-    let encode_width = validated_gif_width(dimensions, cap_width)?;
-    let t0 = std::time::Instant::now();
-    let decoded = decode_frames_parallel(frames, delay_ms, border, control)?;
-    let t_decode = t0.elapsed();
-    let out = encode_gif_gifski_decoded(&decoded, Some(encode_width), control, "encode-gif")?;
-    eprintln!(
-        "encode: {} frames — decode {:.0}ms (parallel) + gifski {:.0}ms",
-        frames.len(),
-        t_decode.as_secs_f64() * 1000.0,
-        t0.elapsed().as_secs_f64() * 1000.0 - t_decode.as_secs_f64() * 1000.0,
-    );
-    Ok(out)
 }
 
 /// Adaptive Twitter-fit wrapper.  ITER-025 surfaced that the GUI's
@@ -1520,19 +1540,24 @@ fn encode_gif_gifski_adaptive(
     control.check_cancelled()?;
     control.emit("validate", frames.len(), frames.len());
 
-    // EXPORT-OPT-2 (2026-06-10): decode ONCE for the entire ladder.
-    // Previously every rung re-ran the full base64→PNG→RGBA decode of
-    // all frames; a 5-rung walk decoded the set 6 times. gifski resizes
-    // internally from cap_width, so one decoded set serves every rung.
+    // ITER-054: no shared decoded set any more (EXPORT-OPT-2 decoded once for
+    // the whole ladder and held all of it); each pass decodes through the
+    // bounded window, which costs a raw-RGBA copy or ~0.3 s of PNG decode
+    // per extra rung, and only when target_max_bytes is set.
     let t0 = std::time::Instant::now();
-    let decoded = decode_frames_parallel(frames, delay_ms, border, control)?;
+    let single = encode_gif_gifski_frames(
+        frames,
+        delay_ms,
+        border,
+        first_width,
+        control,
+        "encode-gif-attempt-1",
+    )?;
     eprintln!(
-        "encode: {} frames decoded once in {:.0}ms (parallel, shared across ladder)",
+        "encode: {} frames decoded (bounded window) + gifski in {:.0}ms",
         frames.len(),
         t0.elapsed().as_secs_f64() * 1000.0,
     );
-    let single =
-        encode_gif_gifski_decoded(&decoded, Some(first_width), control, "encode-gif-attempt-1")?;
     let target = match target_max_bytes {
         Some(t) if t > 0 => t,
         _ => return Ok(single),
@@ -1580,7 +1605,8 @@ fn encode_gif_gifski_adaptive(
         };
         let phase = format!("encode-gif-attempt-{}", attempt);
         let encode_width = validated_gif_width(dimensions, Some(next))?;
-        let buf = encode_gif_gifski_decoded(&decoded, Some(encode_width), control, &phase)?;
+        let buf =
+            encode_gif_gifski_frames(frames, delay_ms, border, encode_width, control, &phase)?;
         eprintln!(
             "twitter-fit: predicted cap={} size={:.2}MB ({:.3} B/px)",
             next,
@@ -2653,12 +2679,17 @@ mod export_guard_tests {
     }
 
     #[test]
-    fn export_guard_accepts_consistent_frames_at_pixel_limit() {
-        let frames: Vec<_> = (0..100).map(|_| png_header_frame(1_000, 1_000)).collect();
+    fn export_guard_has_no_total_pixel_cap() {
+        // ITER-054: 150 × 760×1024 (116.7M pixels) was rejected by the old
+        // 100M total cap; 600 × 1024×682 is the MAX_EXPORT_FRAMES ceiling.
+        let frames: Vec<_> = (0..150).map(|_| png_header_frame(760, 1_024)).collect();
         let dimensions = validate_export_frames(&frames, None).unwrap();
-        assert_eq!(dimensions.width, 1_000);
-        assert_eq!(dimensions.height, 1_000);
-        assert_eq!(dimensions.total_output_pixels, MAX_TOTAL_DECODED_PIXELS);
+        assert_eq!((dimensions.width, dimensions.height), (760, 1_024));
+        assert_eq!(dimensions.total_output_pixels, 150 * 760 * 1_024);
+        let frames: Vec<_> = (0..MAX_EXPORT_FRAMES)
+            .map(|_| png_header_frame(1_024, 682))
+            .collect();
+        assert!(validate_export_frames(&frames, None).is_ok());
     }
 
     #[test]
@@ -2721,7 +2752,7 @@ mod export_guard_tests {
             .contains("frame 3 raw RGBA is 95 bytes"));
         assert!(check_raw_rgba_len(0, 100_000, 100_000, 0)
             .unwrap_err()
-            .contains("pixel limit"));
+            .contains("per-frame pixel limit"));
     }
 
     #[test]
@@ -2742,7 +2773,7 @@ mod export_guard_tests {
         let oversized = vec![png_header_frame(10_001, 10_000)];
         assert!(validate_export_frames(&oversized, None)
             .unwrap_err()
-            .contains("decoded pixels exceeds limit"));
+            .contains("per-frame pixel limit"));
 
         let border = BorderConfig {
             enabled: true,
@@ -2816,6 +2847,58 @@ mod export_guard_tests {
         let _ = take_remembered(
             CANCELLED_CAPTURE_JOBS.get_or_init(|| Mutex::new(VecDeque::new())),
             &job_id,
+        );
+    }
+
+    #[test]
+    fn staged_capture_accepts_sets_past_the_old_pixel_cap() {
+        // ITER-054: 150 × 760×1024 failed staging with "decoded pixels
+        // exceeds limit"; PNG headers keep the test allocation tiny.
+        let _guard = STATE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let job_id = "rust-staged-past-pixel-cap".to_string();
+        begin_export_capture(job_id.clone(), 150).unwrap();
+        for index in 0..150 {
+            stage_export_frame(&job_id, index, png_header_frame(760, 1_024)).unwrap();
+        }
+        assert_eq!(take_export_capture(&job_id).unwrap().len(), 150);
+    }
+
+    #[test]
+    fn windowed_gif_encode_is_deterministic_and_cancellable() {
+        // ITER-054: more frames than the decode window, PNG and raw mixed;
+        // two runs must produce the same bytes (in-order feed), and a
+        // cancelled job must stop with the cancel error.
+        let frames: Vec<PngFrame> = (0..40u8)
+            .map(|i| {
+                let image = image::RgbaImage::from_fn(32, 24, |x, y| {
+                    image::Rgba([i.wrapping_mul(6), (x * 8) as u8, (y * 10) as u8, 0xff])
+                });
+                if i % 2 == 0 {
+                    PngFrame {
+                        bytes: image.into_raw(),
+                        rgba: Some((32, 24)),
+                    }
+                } else {
+                    let mut cursor = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::ImageRgba8(image)
+                        .write_to(&mut cursor, image::ImageFormat::Png)
+                        .unwrap();
+                    PngFrame::png(cursor.into_inner())
+                }
+            })
+            .collect();
+        let control = test_control(JOB_RUNNING);
+        let a = encode_gif_gifski_frames(&frames, 40, None, 32, &control, "t").unwrap();
+        let b = encode_gif_gifski_frames(&frames, 40, None, 32, &control, "t").unwrap();
+        assert!(a.starts_with(b"GIF89a"));
+        assert_eq!(a, b);
+        let cancelled = test_control(JOB_CANCELLED);
+        assert_eq!(
+            encode_gif_gifski_frames(&frames, 40, None, 32, &cancelled, "t").unwrap_err(),
+            "export cancelled"
         );
     }
 

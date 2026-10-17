@@ -3987,7 +3987,10 @@
      imperceptible — frames are still in temporal order. */
   let __recordJobSequence = 0;
   const MAX_CAPTURE_FRAMES = 600;
-  const MAX_CAPTURE_PIXELS = 100 * 1000 * 1000;
+  /* ITER-054: no total pixel budget. The Rust GIF/MP4 encoders decode
+     through a bounded window, so decode memory no longer grows with frames;
+     Rust bounds what it retains (256 MB of PNG, 1 GiB of raw RGBA) and
+     guards single frames. Only the frame count is checked here. */
 
   function validateCaptureBudget(requestedTotal, captureWidth, captureHeight) {
     const total = Math.max(1, Math.round(Number(requestedTotal) || 1));
@@ -3998,9 +4001,6 @@
     if (total > MAX_CAPTURE_FRAMES) {
       code = 'capture-frame-limit';
       message = 'Export frame limit exceeded (' + total + ' > ' + MAX_CAPTURE_FRAMES + ')';
-    } else if (!Number.isSafeInteger(pixels) || pixels > MAX_CAPTURE_PIXELS) {
-      code = 'capture-pixel-limit';
-      message = 'Export pixel budget exceeded; lower duration, FPS, or output size';
     }
     return { ok: !code, code, message, total, pixels };
   }

@@ -17,7 +17,6 @@ const contracts = [
   ['recorder preserves supplied job IDs', /jobId:\s*opts\.jobId\s*\|\|\s*\(\+\+__recordJobSequence\)/],
   ['frame consumer participates in capture backpressure', /return state\.onFrame\(\{/],
   ['capture frame limit is explicit', /MAX_CAPTURE_FRAMES\s*=\s*600/],
-  ['capture pixel budget is aligned with Rust', /MAX_CAPTURE_PIXELS\s*=\s*100\s*\*\s*1000\s*\*\s*1000/],
   ['source file limit is aligned with Rust', /maxFileBytes:\s*64\s*\*\s*1024\s*\*\s*1024/],
   ['source frame limit is explicit', /maxFrames:\s*480/],
   ['source decoded-pixel limit is explicit', /maxDecodedPixels:\s*100\s*\*\s*1000\s*\*\s*1000/],
@@ -54,6 +53,8 @@ const banned = [
   ['headless start-up sleep', /setTimeout\(tryHeadlessRender,\s*\d+\)/],
   ['post-load / post-config settle sleeps', /await new Promise\(function \(r\) \{ setTimeout\(r, (300|200|1500)\); \}\);/],
   ['batch settle timer', /opts\.settleMs/],
+  /* ITER-054: the total capture pixel cap went away with the GIF path's decode-everything step. */
+  ['total capture pixel cap', /MAX_CAPTURE_PIXELS|capture-pixel-limit/],
 ];
 for (const [name, pattern] of banned) {
   assert(!pattern.test(html), `frontend contract violated: ${name} is back`);

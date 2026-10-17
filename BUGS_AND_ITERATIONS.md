@@ -4,6 +4,30 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-054 — 2026-10-17 — v0.2 Phase 2: bounded decode-ahead for GIF export; total pixel cap removed (F13)
+
+**Problem:** A 150-frame 760×1024 render (`render --frames 150`, worm-move + pB) was refused before capture with `capture-pixel-limit` (116.7M pixels > 100M). At 1024×682 the cap allowed only 143 frames, so `MAX_EXPORT_FRAMES = 600` meant nothing above that. The GIF path also had the highest peak memory of any export: 1,183 MB max RSS for the 120-frame gate job (`/usr/bin/time -l`).
+
+**Root cause:** `encode_gif_gifski_adaptive` called `decode_frames_parallel` to decode every frame into one `Vec<ImgVec<RGBA8>>` before gifski started (EXPORT-OPT-2 kept it so the twitter-fit ladder could reuse it). Since ITER-052 the staged headless frames are raw RGBA already, so the job held the set twice: 373 MB staged plus 373 MB decoded. `MAX_TOTAL_DECODED_PIXELS` / JS `MAX_CAPTURE_PIXELS` existed only to keep that decoded set under ~400 MB. Its own comment said so. Since ITER-040 bounded MP4, nothing else needed it.
+
+**Fix:**
+- `encode_gif_gifski_frames(frames, delay, border, width, …)` replaces `decode_frames_parallel` + `encode_gif_gifski_decoded`. It uses the ITER-040 pattern: K = ncpu−2 workers (BUG-009) run `decode_one_frame` into a `sync_channel(2K+2)`, a Condvar holds any worker more than 2K+2 frames ahead of the feeder, and the feeder thread reorders through a BTreeMap and calls `collector.add_frame_rgba(idx, img, pts)` in index order. Frames move into gifski without a clone. The writer runs on the calling thread. A cancel goes through `GifProgress` → `Error::Aborted`, and the "export cancelled" error is reported ahead of the feeder's or writer's own error. Each twitter-fit rung re-decodes through the window (a raw frame decode is one copy; a PNG set takes ~0.3 s), and that cost only applies when `targetMaxBytes` is set.
+- Caps: `MAX_TOTAL_DECODED_PIXELS` is gone from Rust, and `MAX_CAPTURE_PIXELS` + `capture-pixel-limit` are gone from JS. `MAX_EXPORT_FRAMES = 600` and the 256 MB PNG byte cap stay. **Deviation from the F13 text:** F13 was written before ITER-052, when every staged frame was PNG. Raw RGBA frames don't count against the PNG cap, so removing the pixel cap would have left them with no bound. They now count against a new `MAX_TOTAL_RAW_FRAME_BYTES = 1 GiB` (≈ 2.7× the old 400 MB, 344 frames at 760×1024). `MAX_FRAME_PIXELS = 100M` per frame is a decompression-bomb guard on PNG IHDR / raw headers, not a budget. The old dead `encode_gif_gifski` (no callers, compiler warning) is removed.
+- Tests: `export_guard_has_no_total_pixel_cap` (150 × 760×1024 and 600 × 1024×682 validate), `staged_capture_accepts_sets_past_the_old_pixel_cap`, and `windowed_gif_encode_is_deterministic_and_cancellable` (40 mixed PNG/raw frames, more than the window; two runs byte-equal; a cancelled control returns "export cancelled"). The per-frame assertions in the two guard tests were updated. frontend-contracts drops the `MAX_CAPTURE_PIXELS` pin and adds a negative contract so it cannot come back.
+
+**Measured** (worm-move, pB, 120 f, 760×1024 GIF, release binaries. Other worktrees were running run-all on this machine, so wall times are **under parallel load**, and the baseline perf runs flagged `suspect_foreign_xpc`):
+
+| build | max RSS | peak footprint | wall (perf-sample) | app CPU s | GIF md5 |
+|---|---|---|---|---|---|
+| HEAD 7ed11b1 | 1,183 MB | 1,084 MB | 26.97 / 23.97 | 21.7 / 21.7 | 871b4de2… |
+| bounded window | **861 MB** | **761 MB** | 18.52 / 15.64 | 20.5 / 18.2 | 871b4de2… (identical ×3) |
+
+−322 MB RSS. The decoded set was 373 MB, and some of that is now spread across the window and gifski's queues. Wall is within load noise. Decode is no longer a separate step: `encode: 120 frames decoded (bounded window) + gifski in 6397ms` versus `decoded once in 76-113 ms` + gifski before. 150 f × 760×1024: HEAD exits 1 with `capture-pixel-limit`. Now it exits 0, writes a 38.7 MB GIF (ffprobe: 760×1024, 150 frames), 19.5 s real, 984 MB max RSS.
+
+**Gate:** cargo build 0 errors (1 warning, the pre-existing `Shell::open` deprecation) · cargo test 23/23 (was 21) · npm test ok (26 contracts + export tests) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity G1-G7 7/7 · psnr-gate (archive) **inf** vs golden.mp4.
+
+**Gotchas:** (a) The remaining ~860 MB is mostly the 373 MB staged raw set, the Tauri/WebKit host, and the 32 MB output Vec. ITER-053 (streaming) removes the staged set for jobs without a byte target. (b) Over-size jobs now fail at `push_export_frame_raw` partway through capture ("raw frames are too large … lower duration, FPS, or output size"), not at the JS preflight. Before, the preflight rejected far smaller jobs. (c) `tests/run-all.sh`'s `pkill -f` pattern also matches the calling shell's own command line. Bracket the pattern (`[g]lyph-grid-studio-perf/…`) or the gate kills itself (exit 144).
+
 ### ITER-052 — 2026-10-17 — v0.2 Phase 2: raw RGBA capture over the raw-body IPC + working layer memo for animated sources (F2 steps 2-3)
 
 **Problem:** Every headless frame went through `canvas.toBlob('image/png')`. WebKit runs that readback and the PNG encode synchronously inside the JS call (research F2: ~40 % of the WebContent main thread was waiting in `toBlob`), and WebContent is the process that bounds the run (PERF-V0.2-BASELINE). Rust then PNG-decoded every frame again before the MP4/GIF encoders. Separately, the ITER-042 still-source layer memo was off for animated sources, and it turned out it never hit at all.
