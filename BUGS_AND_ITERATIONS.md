@@ -4,6 +4,32 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-047 — 2026-10-17 — v0.2 Phase 1: readiness promises replace the headless sleeps; stray p5 draw during capture backpressure; GIF autoplay paused (F3, F21)
+
+**Problem:** Every headless render paid 1500 ms (DOMContentLoaded → `tryHeadlessRender`) + 300 ms (after source decode) + 200 ms (after `setConfig`) + 120 ms per batch job (`settleMs`) of fixed wall-clock sleeps. The #20 attempt to remove them was reverted in ITER-044 because the pre-capture live draws drifted the EMA; ITER-046 made that safe. Removing the sleeps then exposed two more wall-clock dependencies the sleeps had been hiding.
+
+**Root causes (three):**
+1. *Sleeps instead of readiness.* Nothing in the start-up path exposed "setup done / fonts settled / atlas for this glyph set loaded", so the CLI guessed with timers.
+2. *A stray uncaptured draw during capture backpressure.* `handleRecordFrame` pauses the loop with `noLoop()` when `CAPTURE_PIPELINE_DEPTH` (3) frames are in flight and re-arms with `loop()` as a blob settles. p5 1.11.2's `_draw` is `(!_loop || gate) && redraw(); _loop && requestAnimationFrame(_draw)` and `loop()` is `_loop = true; _draw()` — it never cancels a pending rAF and draws *unconditionally* once `_loop` is false, so one rAF still lands after the pause and runs `draw()` with `recState._capturing === true`. That draw is not captured, but every stage mutates cross-frame state (EMA at :2204, phosphor, stability), so every later frame shifts. Instrumented: `draws per captured frame` = `[1,1,1,1,1,1,2,1]`, with the `2` at frame 6 / 3 / 4 depending on when capture started (sweep of a start floor 0/600/1000 ms gave three different outputs, headless == `--show-window` at each floor). ITER-046's gate passed only because the 2 s of sleeps made the stray draw land at the same frame every run — determinism by timing luck. Pixel signature: frame 0 identical, frames after the stray draw differ in ~170 k px (max |Δ| 182).
+3. *p5 GIF autoplay (research F21, Phase 4 item).* A loaded animated GIF is `playing`; p5's `image()` calls `_animateGif`, which advances `displayIndex` by wall clock and races the per-frame `setFrame(target)` in `draw()`. Visible as run-to-run differences on the animated fixture once the sleeps were gone.
+
+**Fix (src/index.html):**
+1. `__setupReady` (resolved at the end of p5 `setup()`), `__fontLoadPromise` (the v2 font cascade started there) and `__assetsReady()` (font promise + every in-flight glyph-set atlas + the atlas for `CONFIG.glyphSet`, kicked if missing; never rejects). `tryHeadlessRender` runs straight from DOMContentLoaded and awaits `__setupReady` → `__assetsReady()` → source decode → `setConfig` → `__assetsReady()` again (the config may name a glyph set). `_cliLoadSource` drops its settle sleep. Batch: `stagedReady.then(__assetsReady).then(startCapture)` replaces the 120 ms timer; `opts.settleMs` is gone.
+2. Top of `draw()`: `if (recState && recState._capturing && !__primeOnly) return;` — a draw that cannot be captured is a no-op, so the capture owns every state mutation. Priming passes keep their own flag.
+3. `acceptSourceImage`: `img.pause()` on animated sources — `setFrame()` is the only frame driver.
+4. Five positive + three negative frontend contracts (`npm test`, now 21 invariants): priming before frame 0, the three state resets, the throttled-draw guard, the GIF pause, readiness awaits; and the 1500/300/200 ms sleeps and `opts.settleMs` must not come back.
+
+**Measured (same job as ITER-045/046: worm-move 760×1024 / 150×200 / 120 frames / pB.json, `tests/perf-sample.sh`):**
+- wall **15.20 / 15.20 s** (ITER-046: 28.68 / 28.37; ITER-045 baseline 28.09), WebContent **12.52 / 12.62 s** (24.5), GPU 6.52 / 6.25 s (6.5), host 2.56 / 2.63 s. A third run under `/usr/bin/time`: real 14.63 s.
+- Output: run A vs run B **inf dB**, and **byte-identical to the ITER-046 golden** (md5 `163e203c…` for all three MP4s) — this change moves no pixels; the golden regenerated in ITER-046 stands.
+- Priming on the worm: 380 ms for 11 passes (was 4.0 s in ITER-046): with the GIF paused, a pass on a new source frame costs ~34 ms (scene 29 ms) instead of ~360 ms. The recorded frames got the same cut — ~100 ms/frame vs 234 ms — which is where most of the 13 s went; the removed sleeps account for ~2.1 s. Mechanism of the autoplay cost is UNCERTAIN (p5 re-blitting/`setModified` on every `image()` of a playing GIF is the likely path); Phase 2 should re-baseline from these numbers.
+- `run-all` B8 (2-job batch, 4 frames): wall 4.66 s → 2.61 s.
+- byte-identity G1–G7: all identical, md5s equal to ITER-046's (`d375474a…` still, `582bc0d3…` animated); start-floor sweep 0/600/1000 ms × headless/`--show-window`: one md5.
+
+**Gate:** cargo build 0 errors · cargo test 15/15 · npm test ok (21 invariants) · run-all **PASS 25 / FAIL 0**, MCP 10/10 · psnr-gate vs golden inf.
+
+**Gotchas:** (a) Three dead ends are worth recording so nobody re-runs them: a process-age settle floor (`GLYPH_SETTLE_MS`, 0–2000 ms), four full warm-up draws after priming, and a DOM/DPR/visibility/font/rAF probe all changed nothing — the rAF rate is ~60 Hz off-screen too (the "5 Hz throttled" model from research §0/F3 did not hold here), DPR stays 2, fonts are `loaded` by 0.47 s. The stray draw was found only by counting draws per captured frame. (b) `window.loop`/`redraw` wrappers saw no caller during the throttle: the extra draw is p5's own rAF, so the guard belongs in `draw()`, not around `loop()`. (c) The per-frame speed-up from pausing the GIF is a Phase-2-sized win that fell out of a determinism fix; re-check it survives F18's `asset://` import path, which replaces how the GIF is loaded. (d) The one-in-~50 blank first capture noted in ITER-046 did not recur in ~60 renders today; the `prime:` log line still carries `emaMean` for the next time.
+
 ### ITER-046 — 2026-10-17 — v0.2 Phase 1: prime temporal state in beginRecord; byte-identity gate (F23)
 
 **Problem:** Headless output was not a pure function of (source, config, seed). The same `render` run twice gave different pixels (ITER-045 measured 37.95–38.18 dB run-to-run, frame #1 at 28.5–28.9 dB); `--show-window` gave a third result; job N+1 of a `batch` started from job N's tail. ITER-044 had to revert the sleep removal (#20) because of it, and the autonomous loop's "phantom SSIM drift" (ITER-034) came from the same place.

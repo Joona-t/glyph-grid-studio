@@ -919,6 +919,13 @@
   let crtState = null;              /* phosphor-decay state, if active */
   let glyphAtlas = null;            /* shape-vector atlas, if loaded */
   let fontDescriptor = null;        /* glyph-fonts.load result */
+  /* ITER-047 (F3): readiness promises replace the headless wall-clock sleeps.
+     __setupReady resolves at the end of p5 setup(); __fontLoadPromise is the
+     v2 font cascade started there; __assetsReady() (below, with the atlas
+     cache) waits for both plus any glyph-set atlas the config needs. */
+  let __setupReadyResolve = null;
+  const __setupReady = new Promise(function (r) { __setupReadyResolve = r; });
+  let __fontLoadPromise = null;
   let retroResolved = null;         /* retro-merged CONFIG, if modeset */
   let gradientStopsCache = null;    /* { key, stops } — parsed OKLab stops for gradient colorMode */
   let sceneResult = null;           /* captured scene return: { zones?, depth? } */
@@ -1127,7 +1134,7 @@
        so octants/sextants/braille actually paint when the WOFF2 is slow to decode. */
     if (window.GlyphGrid && GlyphGrid.fonts && GlyphGrid.compat.isV2(CONFIG)) {
       const requested = CONFIG.glyphSet || 'ascii';
-      GlyphGrid.fonts.load({
+      __fontLoadPromise = GlyphGrid.fonts.load({
         sizePx: CONFIG.font.size,
         glyphSet: requested,
         trustRequested: requested !== 'ascii',
@@ -1198,6 +1205,7 @@
         console.error('[glyph-grid runtime init] ' + (e.message || e));
       }
     }
+    if (__setupReadyResolve) __setupReadyResolve();
   }
 
   /* =========================================================================
@@ -1320,6 +1328,11 @@
     try {
       if (img.gifProperties && img.numFrames && img.numFrames() > 1) {
         const props = img.gifProperties;
+        /* ITER-047 (F21 pulled forward): p5 advances a playing GIF by wall
+           clock inside image() (_animateGif), racing the frame draw() pins
+           with setFrame().  Pause it — our animation time is the only
+           driver, so animated output stops depending on draw timing. */
+        if (typeof img.pause === 'function') img.pause();
         let totalMs = 0;
         for (let i = 0; i < props.numFrames; i++) totalMs += (props.frames[i].delay || 100);
         if (totalMs > 0) {
@@ -1342,6 +1355,14 @@
        Keep p5's actual timer cadence in sync with the animation math. */
     syncAnimationFrameRate();
     if (recState && recState.done) { noLoop(); return; }
+    /* ITER-047: a draw that cannot be captured must not happen at all.
+       p5's _draw draws unconditionally once _loop is false and never cancels
+       a pending rAF, so the pipeline's backpressure pause (handleRecordFrame
+       → noLoop) still lets one draw through at a timing-dependent frame;
+       every stage below mutates cross-frame state (EMA, phosphor,
+       stability), so that stray draw shifted every later frame.  Priming
+       passes (__primeOnly) run with recState set but never while capturing. */
+    if (recState && recState._capturing && !__primeOnly) return;
     if (!CONFIG.animation.loop && !recState && frameCount > 1) { noLoop(); return; }
 
     const t = recState
@@ -3752,6 +3773,22 @@
     });
   }
 
+  /* ITER-047: everything a capture needs that loads asynchronously — the
+     font cascade from setup() and the atlas for CONFIG.glyphSet (pre-warm
+     usually has it; a slow machine may still be fetching).  Headless callers
+     await this instead of sleeping; the live preview never waits (draw()
+     already falls back per frame).  Never rejects: atlas failures are logged
+     inside loadAtlasAsync and draw() falls back to brightness. */
+  function __assetsReady() {
+    const waits = [];
+    if (__fontLoadPromise) waits.push(__fontLoadPromise.catch(function () {}));
+    for (const id in _atlasInflight) waits.push(_atlasInflight[id]);
+    if (CONFIG.glyphSet && !_atlasCache[CONFIG.glyphSet] && !_atlasInflight[CONFIG.glyphSet]) {
+      waits.push(loadAtlasAsync(CONFIG.glyphSet, { warmOnly: true }));
+    }
+    return Promise.all(waits).then(function () {});
+  }
+
   /* ---- post-process (v2 only). ----
 
      Two-phase pipeline:
@@ -4380,7 +4417,8 @@
        config: { palette: 'spice', colorMode: 'duotone', dither: {mode:'stbn'} },
        frames: 24 }.
        opts: { onProgress(idx,total,name), onComplete({ ok, errors }),
-              settleMs:120, perf:false }.
+              perf:false }.  (settleMs went away in ITER-047: capture
+       starts when the staged job and the config's assets are ready.)
        When opts.perf === true: clears the __pfRing before each job, snapshots
        per-stage timings + p50/p95 totals after each job, and emits a
        `PERF_JOB <json>` NDJSON line via the cli_log Tauri command (stderr).
@@ -4390,7 +4428,6 @@
       const total = jobs.length;
       const errors = [];
       let idx = 0;
-      const settle = opts.settleMs != null ? opts.settleMs : 120;
       const perfMode = !!opts.perf;
       const tauri = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
       if (!tauri) { console.warn('batch: not in Tauri, aborting'); return; }
@@ -4543,7 +4580,7 @@
           setTimeout(next, 50);
         }
 
-        /* Fail before the settle timer when dimensions/frame count already
+        /* Fail before staging when dimensions/frame count already
            exceed the same envelope enforced by beginRecord/Rust.  This is
            especially important in headless mode: an uncaught timer error
            otherwise leaves exit_with_status waiting forever. */
@@ -4592,10 +4629,10 @@
           });
         }
 
-        /* Register the staged capture during the settle window so
-           beginRecord still fires exactly when the settle timer does: an
-           extra IPC hop before it let additional live draws in, shifting
-           the per-cell EMA warm-up of the first recorded frames. */
+        /* Register the staged capture first; beginRecord fires as soon as
+           the IPC round-trip and the config's assets are ready (ITER-047).
+           Live draws in that window no longer matter — beginRecord primes
+           the per-cell EMA itself (ITER-046). */
         let stagedError = null;
         const stagedReady = Promise.resolve(
           tauri('begin_export_capture', { jobId: jobId, total: frameTotal })
@@ -4606,14 +4643,14 @@
             advanceCaptureFailure(stagedError, null, 'capture-start');
             return;
           }
-          /* Sutskever B2 — mark the switch point AFTER the artificial
-             settle, immediately before the first recorded draw. The
-             first __pfCommit then yields __pfLastLatency = wall time of
-             the first frame that reflects this job's config (atlas
-             rebuild / buffer realloc included). That is exactly the
-             interactive "slider → visible" cost; the artificial settle
-             delay is deliberately excluded so switch_ms reflects felt
-             latency, not the bench's pacing. */
+          /* Sutskever B2 — mark the switch point immediately before the
+             first recorded draw (after staging/readiness, which replaced
+             the artificial settle in ITER-047). The first __pfCommit then
+             yields __pfLastLatency = wall time of the first frame that
+             reflects this job's config (atlas rebuild / buffer realloc
+             included). That is exactly the interactive "slider → visible"
+             cost; the signal-only priming passes (ITER-046) never commit a
+             perf frame, so switch_ms still reflects felt latency. */
           if (perfMode && typeof window.__markChange === 'function') {
             try { window.__markChange('job:' + job.name); } catch (_) {}
           }
@@ -4702,10 +4739,11 @@
           }
         }
 
-        setTimeout(() => {
-          if (staged || stagedError) startCapture();
-          else stagedReady.then(startCapture);
-        }, settle);
+        /* ITER-047: no settle timer.  stagedReady never rejects (errors land
+           in stagedError and startCapture reports them); __assetsReady covers
+           a glyph-set atlas this job's config may have just switched to.
+           Pre-capture live draws cannot affect output any more (ITER-046). */
+        stagedReady.then(__assetsReady).then(startCapture);
       }  // _runJob
       }  // next
       next();
@@ -5101,8 +5139,8 @@
      =========================================================================== */
   /* CLI/batch source loader — shared by tryHeadlessRender (initial load)
      and runBatchExport (per-job source swap when manifest jobs have
-     heterogeneous `in` fields). Awaits decode + fit + one settle frame
-     so the caller can immediately apply config and begin recording. */
+     heterogeneous `in` fields). Awaits decode + fit (ITER-047 dropped
+     the settle sleep) so the caller can apply config and begin recording. */
   let __cliCurrentSource = null;
   async function _cliLoadSource(inPath) {
     const importGeneration = beginSourceImport(inPath);
@@ -5132,8 +5170,9 @@
       });
     });
     __cliCurrentSource = inPath;
-    // Settle one or two frames so the canvas reflects the loaded image.
-    await new Promise(function (r) { setTimeout(r, 300); });
+    /* ITER-047: no settle sleep — acceptSourceImage already fitted the canvas
+       and painted once, and beginRecord primes the temporal state itself
+       (ITER-046), so pre-capture live draws no longer influence output. */
   }
 
   async function tryHeadlessRender() {
@@ -5166,6 +5205,11 @@
       return;
     }
 
+    /* ITER-047: readiness instead of the 1500 ms start-up sleep — p5 setup()
+       done (canvas, buffers, loadImage bound) and the font cascade settled. */
+    await __setupReady;
+    await __assetsReady();
+
     try {
       await _cliLoadSource(initialSource);
     } catch (e) {
@@ -5173,6 +5217,7 @@
       try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
     }
+
 
     /* Batch mode (ITER-024 + multi-source extension): the Rust side may
        pass `batch:true` with a jobs array.  Each job may carry its own
@@ -5220,8 +5265,9 @@
       }
     }
 
-    // Settle once more so the new config takes effect on the next frame.
-    await new Promise(function (r) { setTimeout(r, 200); });
+    // ITER-047: the config may name a glyph set whose atlas is still being
+    // pre-warmed — wait for the asset, not for the clock.
+    await __assetsReady();
 
     // Run a single-job batch export to the requested output path.
     __glyphGridTest.runBatchExport([{
@@ -5239,10 +5285,10 @@
     });
   }
 
-  // Wait for the p5 setup() + studio init + font load before polling.
-  // 1500ms is generous; the actual setup is usually done by ~300ms.
+  // tryHeadlessRender awaits __setupReady / __assetsReady itself (ITER-047),
+  // so it can start as soon as the document is parsed.
   window.addEventListener('DOMContentLoaded', function () {
-    setTimeout(tryHeadlessRender, 1500);
+    tryHeadlessRender();
   });
   </script>
 </body>

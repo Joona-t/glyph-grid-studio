@@ -30,7 +30,7 @@ Goal: no perf number is ever reported without XPC CPU again; a reusable PSNR gat
 Goal: headless output = pure function of (source, config, seed). Bit-identical across runs, `--show-window`, and consecutive batch jobs.
 
 - [x] `primeTemporalState(total)` in `beginRecord`: reset `cellSignalEma`, phosphor state (expose `GlyphGrid.crt.resetState()`), then K=11 `signalOnly` scene passes over the loop tail (or K× frame 0 for stills). `signalOnly` early-return after the EMA stage (index.html ~:2125). (F23) — ITER-046 (phosphor reset is `crtState = null`, re-made lazily; no lib change needed)
-- [ ] Replace the 1500/300/200/120 ms sleeps with readiness promises (setup done · source decoded · config applied) — the #20 re-land, now safe. (F3, F23)
+- [x] Replace the 1500/300/200/120 ms sleeps with readiness promises (setup done · source decoded · config applied) — the #20 re-land, now safe. (F3, F23) — ITER-047 (`__setupReady` / `__assetsReady()`; also found and fixed the stray uncaptured p5 draw during backpressure, and pulled F21's GIF-autoplay pause forward)
 - [x] Per-job `resetToBaseline()` + priming in batch so job N doesn't inherit job N-1's EMA. Document as an intentional baseline change in BUGS (ITER entry). — ITER-046 (every batch job goes through `beginRecord`, so it is primed; baseline change documented there)
 - [ ] Pin `_frameIdx`/`_seed`/dither phase to 0 under `prefers-reduced-motion` for still sources (WCAG 2.3.3). (F17 part 1)
 - [x] Regression test: same job twice headless + once `--show-window` + a 2-job batch → decode PNG frames, assert RGBA byte-identity. Regenerate goldens once (`base2.mp4` etc.). — ITER-046 (`tests/byte-identity.sh`, run-all Phase G, G1–G7; golden regenerated, old one kept as `golden-v0.1.10-pre-phase1.mp4`)

@@ -29,10 +29,26 @@ const contracts = [
   ['CLI accepts metadata-bearing native image payloads', /typeof loaded === ['"]object['"]\)[\s\S]{0,100}loaded\.dataUrl/],
   ['memory probe sums every audited cache (F20)', /GlyphGrid\.memProbe = function[\s\S]{0,6000}totalBytes: total/],
   ['memory probe covers the wave6 atlas map', /wave6\.atlasCacheStats\(\)/],
+  /* v0.2 Phase 1 determinism (ITER-046/047) */
+  ['beginRecord primes temporal state before frame 0', /try \{ loop\(\); \} catch \(e\) \{\}\s*\/\*[\s\S]{0,200}\*\/\s*primeTemporalState\(total\);/],
+  ['priming resets EMA, CRT state and stability hysteresis', /cellSignalEma\.fill\(0\.5\);\s*crtState = null;[\s\S]{0,80}_stabKey = '';/],
+  ['throttled capture draws are no-ops (stray p5 rAF)', /if \(recState && recState\._capturing && !__primeOnly\) return;/],
+  ['animated sources are paused so setFrame owns playback (F21)', /if \(typeof img\.pause === 'function'\) img\.pause\(\);/],
+  ['headless start waits on readiness, not the clock', /await __setupReady;\s*await __assetsReady\(\);/],
 ];
 
 for (const [name, pattern] of contracts) {
   assert(pattern.test(html), `frontend contract missing: ${name}`);
+}
+
+/* Negative contracts: the wall-clock sleeps ITER-047 removed must not come back. */
+const banned = [
+  ['headless start-up sleep', /setTimeout\(tryHeadlessRender,\s*\d+\)/],
+  ['post-load / post-config settle sleeps', /await new Promise\(function \(r\) \{ setTimeout\(r, (300|200|1500)\); \}\);/],
+  ['batch settle timer', /opts\.settleMs/],
+];
+for (const [name, pattern] of banned) {
+  assert(!pattern.test(html), `frontend contract violated: ${name} is back`);
 }
 
 console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${contracts.length} invariants)`);
