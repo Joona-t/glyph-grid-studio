@@ -580,6 +580,193 @@
       },
       "additionalProperties": false
     },
+    "textSource": {
+      "description": "Kinetic typography: text (or SRT/LRC cues) rendered per frame as the source raster.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "w": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 4096,
+          "default": 1024,
+          "description": "Text canvas width (px)."
+        },
+        "h": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 4096,
+          "default": 512,
+          "description": "Text canvas height (px)."
+        },
+        "bg": {
+          "type": "string",
+          "pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
+          "default": "#000000"
+        },
+        "fg": {
+          "type": "string",
+          "pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$",
+          "default": "#ffffff"
+        },
+        "blend": {
+          "type": "string",
+          "enum": [
+            "replace",
+            "multiply",
+            "screen",
+            "mask"
+          ],
+          "default": "replace",
+          "description": "With an image loaded: replace = text only; multiply / screen / mask composite in linear light."
+        },
+        "font": {
+          "type": "string",
+          "minLength": 1,
+          "default": "Cascadia Mono",
+          "description": "Font family: Cascadia Mono / IBM VGA8 (bundled) or a system font."
+        },
+        "size": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 160,
+          "description": "px at the text canvas height h."
+        },
+        "weight": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 700
+        },
+        "align": {
+          "type": "string",
+          "enum": [
+            "left",
+            "center",
+            "right"
+          ],
+          "default": "center"
+        },
+        "x": {
+          "type": "number",
+          "default": 0.5,
+          "description": "Anchor, 0..1 of the canvas width."
+        },
+        "y": {
+          "type": "number",
+          "default": 0.5,
+          "description": "Anchor (row centre), 0..1 of the canvas height."
+        },
+        "anim": {
+          "type": "string",
+          "enum": [
+            "none",
+            "typewriter",
+            "rise",
+            "fade",
+            "scale"
+          ],
+          "default": "none"
+        },
+        "easeIn": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0.3,
+          "description": "Seconds of the in-envelope."
+        },
+        "easeOut": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0.2,
+          "description": "Seconds of the out-envelope before a finite end."
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "text"
+            ],
+            "properties": {
+              "text": {
+                "type": "string",
+                "description": "Line text; \\n stacks rows."
+              },
+              "start": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Seconds; default 0."
+              },
+              "end": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "description": "Seconds, exclusive; null = until the loop ends."
+              },
+              "font": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Font family: Cascadia Mono / IBM VGA8 (bundled) or a system font."
+              },
+              "size": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "px at the text canvas height h."
+              },
+              "weight": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 1000
+              },
+              "align": {
+                "type": "string",
+                "enum": [
+                  "left",
+                  "center",
+                  "right"
+                ]
+              },
+              "x": {
+                "type": "number",
+                "description": "Anchor, 0..1 of the canvas width."
+              },
+              "y": {
+                "type": "number",
+                "description": "Anchor (row centre), 0..1 of the canvas height."
+              },
+              "anim": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "typewriter",
+                  "rise",
+                  "fade",
+                  "scale"
+                ]
+              },
+              "easeIn": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Seconds of the in-envelope."
+              },
+              "easeOut": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Seconds of the out-envelope before a finite end."
+              }
+            },
+            "additionalProperties": false
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
     "temporalStability": {
       "description": "Anti-flicker Schmitt trigger on the ramp index.",
       "type": "object",

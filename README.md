@@ -50,6 +50,7 @@ The selected glyph is typeset into the cell, in a chosen palette and color mode.
 | Glyph sets (7) | ASCII, asciiDense, blockElements, braille, sextant, octant, ramp-only |
 | Postprocess (8) | vignette, bloom, halation, scanlines, chromaticAberration, phosphorDecay, depthFog, **CRT-beam** (Lottes / Blur Busters 2024) |
 | Animation | breathing-cell EMA, per-frame gain pulse, per-cell jitter — runtime-tunable · keyframe timeline on any CONFIG path (OKLab palette morphs) |
+| Text source | kinetic typography (typewriter / rise / fade / scale) and `.srt` / `.lrc` lyric cues rendered as the source, alone or composited onto the image (multiply / screen / mask) |
 | Export | PNG snapshot · animated GIF89a · MP4 (H.264) · preset JSON · share URL |
 
 ## Algorithmic notes
@@ -145,6 +146,15 @@ glyph-grid-studio render --in a.png --out a.mp4 --frames auto \
   --timeline 'palette=0:(cream-paper),1:(spice)' \
   --timeline 'studio.breathing.gainSwing=0:(0.1),0.5:(0.6):inOutSine' \
   --timeline 'grid.cols=0:(80),0.5:(200)'
+
+# Text as the source (ITER-076): no --in needed.  --srt takes .srt or .lrc;
+# the last cue sets the loop length.  --text-anim typewriter|rise|fade|scale,
+# --text-font 'Cascadia Mono'|'IBM VGA8'|<system font>, --text-size <px at 512 px>.
+# With --in, --text-blend multiply|screen|mask composites onto the image.
+# JSON form: the `textSource` preset key (src/glyph-grid.schema.json).
+glyph-grid-studio render --text 'DROP' --text-anim typewriter --out drop.gif
+glyph-grid-studio render --srt lyrics.lrc --text-anim rise --frames auto --out lyrics.mp4
+glyph-grid-studio render --in photo.jpg --text 'HELLO' --text-blend mask --out hello.gif
 
 # Help
 glyph-grid-studio render --help

@@ -54,8 +54,10 @@ enum Command {
 #[derive(Parser, Debug, Clone)]
 struct RenderArgs {
     /// Path to the source image (PNG / JPG / WebP / GIF / BMP / TIFF).
+    /// Optional with `--text` / `--srt` (the text is the source) or a preset
+    /// that enables `textSource`.
     #[arg(short = 'i', long = "in", value_name = "PATH")]
-    in_path: PathBuf,
+    in_path: Option<PathBuf>,
 
     /// Path to write the output GIF.
     #[arg(short = 'o', long = "out", value_name = "PATH")]
@@ -161,6 +163,41 @@ struct RenderArgs {
     /// manifest `mp4Quality` and the MCP tool (ITER-070).
     #[arg(long, value_name = "QUALITY", value_parser = app_lib::parse_mp4_quality_arg)]
     mp4_quality: Option<String>,
+
+    #[command(flatten)]
+    text: TextArgs,
+}
+
+/// R3 (ITER-076): kinetic typography.  The text is rendered per frame as the
+/// source raster; with `--in` too and `--text-blend` other than `replace` it
+/// is composited onto the image.  JSON form: the `textSource` preset key.
+#[derive(clap::Args, Debug, Clone)]
+struct TextArgs {
+    /// Render this text as the source (one line over the whole loop; `\n`
+    /// stacks rows).  `--in` becomes optional.
+    #[arg(long, value_name = "TEXT")]
+    text: Option<String>,
+
+    /// Timed cues from a subtitle (.srt) or lyric (.lrc) file, appended to
+    /// the lines; the last cue's end sets animation.duration.
+    #[arg(long, value_name = "FILE")]
+    srt: Option<PathBuf>,
+
+    /// Text animation for every line: none | typewriter | rise | fade | scale.
+    #[arg(long, value_name = "ANIM")]
+    text_anim: Option<String>,
+
+    /// Font family: `Cascadia Mono` / `IBM VGA8` (bundled) or a system font.
+    #[arg(long, value_name = "FAMILY")]
+    text_font: Option<String>,
+
+    /// Font size in px at the text canvas height (textSource.h, 512).
+    #[arg(long, value_name = "PX")]
+    text_size: Option<f64>,
+
+    /// How text meets an `--in` image: replace | multiply | screen | mask.
+    #[arg(long, value_name = "MODE")]
+    text_blend: Option<String>,
 }
 
 /// `--frames` value: `None` = auto.
@@ -226,12 +263,13 @@ fn main() {
             // read_image_file with a different effective cwd and HANG the
             // process instead of erroring (found during the CS-2 gate
             // bisection). Fail fast, with a message, before Tauri spins up.
-            let in_path = match args.in_path.canonicalize() {
-                Ok(p) => p,
-                Err(e) => {
+            let in_path = match args.in_path.as_ref().map(|p| p.canonicalize()) {
+                None => None,
+                Some(Ok(p)) => Some(p),
+                Some(Err(e)) => {
                     eprintln!(
                         "render: cannot resolve --in {:?}: {} (file must exist; relative paths resolve against the current directory)",
-                        args.in_path, e
+                        args.in_path.as_ref().unwrap(), e
                     );
                     std::process::exit(2);
                 }
@@ -256,10 +294,16 @@ fn main() {
                     rows: args.rows,
                     set: args.set,
                     timeline: args.timeline,
+                    text: args.text.text,
+                    text_anim: args.text.text_anim,
+                    text_font: args.text.text_font,
+                    text_size: args.text.text_size,
+                    text_blend: args.text.text_blend,
                 },
                 format: args.format,
                 timeout_secs: args.timeout,
                 mp4_quality: args.mp4_quality,
+                text_import: args.text.srt,
             };
             if args.dry_run {
                 match app_lib::headless_render_json(&job) {

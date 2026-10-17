@@ -38,7 +38,10 @@ use tokio::process::Command;
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RenderParams {
     /// Absolute path to the source image (PNG / JPG / WebP / GIF / BMP / TIFF).
-    pub in_path: String,
+    /// Optional when `text`, `srt_path` or `text_options.enabled` gives a
+    /// text source (the text is rendered as the source raster).
+    #[serde(default)]
+    pub in_path: Option<String>,
     /// Absolute path to write the output file (GIF / MP4 / text, per `format`).
     pub out_path: String,
     /// Frames in the output animation. Default 24.
@@ -101,6 +104,22 @@ pub struct RenderParams {
     /// `archive` (fixed QP 26, near-lossless, ~30-60 Mbps). Ignored for GIF.
     #[serde(default)]
     pub mp4_quality: Option<String>,
+    /// Kinetic typography (R3): render this text as the source, one line
+    /// over the whole loop (`\n` stacks rows).  With `in_path` too and
+    /// `text_options.blend` multiply / screen / mask, it is composited onto
+    /// the image.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Absolute path to a .srt (subtitles) or .lrc (lyrics) file: its timed
+    /// cues become text lines and the last cue's end sets the loop length.
+    #[serde(default)]
+    pub srt_path: Option<String>,
+    /// Partial `textSource` block (schema: src/glyph-grid.schema.json):
+    /// `{anim: typewriter|rise|fade|scale|none, font, size, weight, align,
+    /// x, y, easeIn, easeOut, bg, fg, blend: replace|multiply|screen|mask,
+    /// w, h, lines:[{text, start, end, ...}]}`.  Deep-merges onto `config`.
+    #[serde(default)]
+    pub text_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -362,6 +381,12 @@ fn render_error_path(p: &RenderParams, path: Option<String>) -> Option<String> {
     if !p.postprocess.is_empty() && ptr.starts_with("/postprocess/") && ptr.ends_with("/enabled") {
         return Some("/postprocess".to_string());
     }
+    // ITER-076: text_options is merged as config.textSource.
+    if let (Some(opts), Some(rest)) = (&p.text_options, ptr.strip_prefix("/textSource")) {
+        if rest.is_empty() || opts.pointer(rest).is_some() {
+            return Some(format!("/text_options{}", rest));
+        }
+    }
     match (&p.config, &p.preset) {
         (Some(cfg), Some(_)) if cfg.pointer(ptr).is_none() => Some(format!("/preset{}", ptr)),
         (Some(_), _) => Some(format!("/config{}", ptr)),
@@ -422,7 +447,8 @@ pub struct GlyphGridServer;
 #[tool_router(server_handler)]
 impl GlyphGridServer {
     #[tool(
-        description = "Render an image to an animated character-grid GIF (ASCII / Unicode glyphs). \
+        description = "Render an image, or text (`text` / `srt_path` — kinetic typography, no image needed), \
+                       to an animated character-grid GIF (ASCII / Unicode glyphs). \
                        Returns the absolute path of the written file (GIF, MP4, or TXT/ANSI/CAST/HTML text, per \
                        `format`) on success; for txt/ansi the text itself (up to 64 KB) follows the path."
     )]
@@ -444,17 +470,36 @@ impl GlyphGridServer {
                 format!("invalid arguments: `config` must be a JSON object, got {}", other),
             );
         }
+        if let Some(other) = p.text_options.as_ref().filter(|c| !c.is_object()) {
+            return tool_error(
+                "invalid_arguments",
+                Some("/text_options".into()),
+                format!("invalid arguments: `text_options` must be a JSON object, got {}", other),
+            );
+        }
         // F25 (ITER-059): the CLI would exit 2 on this after ~0.1 s; answer
         // in-process with the argument path instead.
-        if !std::path::Path::new(&p.in_path).is_file() {
+        if let Some(in_path) = p.in_path.as_ref().filter(|ip| !std::path::Path::new(ip).is_file()) {
             return tool_error(
                 "invalid_arguments",
                 Some("/in_path".into()),
-                format!("invalid arguments: in_path {} is not a readable file", p.in_path),
+                format!("invalid arguments: in_path {} is not a readable file", in_path),
             );
         }
+        if let Some(Err(e)) = p.srt_path.as_deref().map(|sp| crate::read_text_import(std::path::Path::new(sp))) {
+            return tool_error("invalid_arguments", Some("/srt_path".into()), format!("invalid arguments: {}", e));
+        }
+        // ITER-076: text_options travels as config.textSource.
+        let config_arg: Option<serde_json::Value> = match (&p.config, &p.text_options) {
+            (c, None) => c.clone(),
+            (c, Some(opts)) => {
+                let mut v = c.clone().unwrap_or_else(|| serde_json::json!({}));
+                crate::json_deep_merge(&mut v, serde_json::json!({ "textSource": opts }));
+                Some(v)
+            }
+        };
         let mut temp = None;
-        let preset_path: Option<std::path::PathBuf> = match (&p.preset, &p.config) {
+        let preset_path: Option<std::path::PathBuf> = match (&p.preset, &config_arg) {
             (None, None) => None,
             (Some(path), None) => Some(std::path::PathBuf::from(path)),
             (base, Some(cfg)) => {
@@ -497,7 +542,7 @@ impl GlyphGridServer {
         // in-process, before paying ~5 s of Tauri start-up for a render the
         // CLI would reject anyway.  Same resolver as `render`.
         let probe = crate::HeadlessRenderJob {
-            in_path: std::path::PathBuf::from(&p.in_path),
+            in_path: p.in_path.as_ref().map(std::path::PathBuf::from),
             out_path: std::path::PathBuf::from(&p.out_path),
             frames: Some(p.frames.unwrap_or(24)),
             show_window: false,
@@ -515,10 +560,13 @@ impl GlyphGridServer {
                 rows: p.rows,
                 set: Vec::new(),
                 timeline: Vec::new(),
+                text: p.text.clone(),
+                ..Default::default()
             },
             format: p.format.clone(),
             timeout_secs: p.timeout_s,
             mp4_quality: p.mp4_quality.clone(),
+            text_import: p.srt_path.as_ref().map(std::path::PathBuf::from),
         };
         // ITER-071: a typo'd mp4_quality is refused here too, not after a
         // spawn (the CLI's clap parser would exit 2 anyway).
@@ -529,12 +577,24 @@ impl GlyphGridServer {
         if let Some(Err(e)) = p.format.as_deref().map(crate::parse_format_arg) {
             return tool_error("invalid_arguments", Some("/format".into()), e);
         }
-        if let Err(e) = probe.build_js_config() {
-            return tool_error(
-                "invalid_arguments",
-                render_error_path(&p, error_path(&e, false)),
-                format!("invalid arguments: {}", e),
-            );
+        match probe.build_js_config() {
+            Err(e) => {
+                return tool_error(
+                    "invalid_arguments",
+                    render_error_path(&p, error_path(&e, false)),
+                    format!("invalid arguments: {}", e),
+                );
+            }
+            // ITER-076: in_path is optional only for a text source.
+            Ok((cfg, _)) => {
+                if let Err(e) = crate::require_source(&probe, &cfg) {
+                    return tool_error(
+                        "invalid_arguments",
+                        Some("/in_path".into()),
+                        format!("invalid arguments: {} (MCP: in_path, text, srt_path or text_options.enabled)", e),
+                    );
+                }
+            }
         }
 
         let exe = match std::env::current_exe() {
@@ -543,11 +603,17 @@ impl GlyphGridServer {
         };
 
         let mut cmd = Command::new(&exe);
-        cmd.arg("render")
-            .arg("--in")
-            .arg(&p.in_path)
-            .arg("--out")
-            .arg(&p.out_path);
+        cmd.arg("render");
+        if let Some(in_path) = &p.in_path {
+            cmd.arg("--in").arg(in_path);
+        }
+        cmd.arg("--out").arg(&p.out_path);
+        if let Some(v) = &p.text {
+            cmd.arg("--text").arg(v);
+        }
+        if let Some(v) = &p.srt_path {
+            cmd.arg("--srt").arg(v);
+        }
         if let Some(f) = p.frames {
             cmd.arg("--frames").arg(f.to_string());
         }

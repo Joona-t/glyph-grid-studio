@@ -162,6 +162,7 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
       usesAdvancedPipeline: () => true,
       _hasImgDataStages: () => false,
       __tlScrubU: null,
+      __frameSource: null,
     }, over && over.ctx);
     ctx.GlyphGrid = { compat: { isV2: () => true, gateDither: (c) => c.dither.mode !== 'none',
       gatePostprocess: () => true },
@@ -190,6 +191,8 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     ['atlas missing', { CONFIG: { glyphSet: 'octant' } }],
     ['CRT pixel stage', { ctx: { _hasImgDataStages: () => true } }],
     ['timeline playing', { CONFIG: { timeline: { enabled: true } } }],
+    ['animated text source', { ctx: { window: { PIPELINE: null, __sourceFrameIdx: 4 },
+      __frameSource: { kind: 'text', dynamic: true } } }],
   ];
   for (const [name, over] of dynamic) {
     assert.strictEqual(make(over), true, `frameIsTimeDependent must be true for: ${name}`);
@@ -198,6 +201,9 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   assert.strictEqual(make({ CONFIG: { studio: { breathing: {} }, dither: { mode: 'temporal' } },
     ctx: { __prefersReducedMotion: () => true } }), false, 'reduced motion still source must be static');
   assert.strictEqual(make({ CONFIG: { dither: { mode: 'bayer8' } } }), false, 'ordered dither is static');
+  /* ITER-076: a settled text title is a still even though its index is >= 0. */
+  assert.strictEqual(make({ ctx: { window: { PIPELINE: null, __sourceFrameIdx: 4 },
+    __frameSource: { kind: 'text', dynamic: false } } }), false, 'static text title may idle');
   /* ITER-075: a scrubbed (paused) timeline is a still frame. */
   assert.strictEqual(make({ CONFIG: { timeline: { enabled: true } }, ctx: { __tlScrubU: 0.4 } }), false,
     'scrubbed timeline must be static');
@@ -644,3 +650,17 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
 require('./glyph-text-export.test.js');
 /* ITER-075: timeline evaluator unit tests. */
 require('./glyph-timeline.test.js');
+/* ITER-076: text source — parsers, layout, composite, stroke estimate. */
+require('./glyph-text-source.test.js');
+{
+  assert(html.indexOf('<script src="lib/glyph-text-source.js"></script>') > html.indexOf('<script src="lib/glyph-timeline.js"></script>'),
+    'glyph-text-source.js is loaded with the other libs');
+  assert(/function makeFrameSource\(img, revision\) \{\s*if \(img && img\.__ggsTextSource\) return makeTextFrameSource\(img, revision\);/.test(html),
+    'text rasters go through the FrameSource adapter');
+  assert(/function draw\(\) \{\s*if \(__textCanvas \|\| \(CONFIG_BASE\.textSource && CONFIG_BASE\.textSource\.enabled\)\) syncTextSource\(false\);/.test(html),
+    'draw() syncs the text source before the timeline wrapper');
+  assert(/applyConfig\(job\.config\);[\s\S]{0,200}syncTextSource\(true\);/.test(html), 'batch jobs (un)install their text source');
+  const studio = fs.readFileSync(require.resolve('../src/lib/glyph-studio.js'), 'utf8');
+  assert(/'timeline',\s*\/\*[^*]*\*\/\s*'textSource'\]/.test(studio), 'textSource is in the preset whitelist');
+  console.log('text source contracts: ok');
+}

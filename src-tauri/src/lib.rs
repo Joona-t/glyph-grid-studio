@@ -42,11 +42,28 @@ pub struct ConfigOverrides {
     /// `--set` (ITER-075).
     #[serde(default)]
     pub timeline: Vec<String>,
+    /// R3 (ITER-076): `--text` — one line over the whole loop; `\n` stacks
+    /// rows.  Turns `textSource.enabled` on.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// `--text-anim / --text-font / --text-size / --text-blend` →
+    /// block-level `textSource.anim / font / size / blend` (inherited by
+    /// every line, `--srt` cues included).
+    #[serde(default)]
+    pub text_anim: Option<String>,
+    #[serde(default)]
+    pub text_font: Option<String>,
+    #[serde(default)]
+    pub text_size: Option<f64>,
+    #[serde(default)]
+    pub text_blend: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HeadlessRenderJob {
-    pub in_path: PathBuf,
+    /// `None` only for a text source (R3, ITER-076): `--text`, `--srt`, or a
+    /// preset with `textSource.enabled`.
+    pub in_path: Option<PathBuf>,
     pub out_path: PathBuf,
     /// `None` = `--frames auto`: the JS side derives the count from the
     /// resolved `animation.duration` x effective fps, like the GUI export.
@@ -65,7 +82,14 @@ pub struct HeadlessRenderJob {
     /// MP4 rate control: `"upload"` (default, bitrate RC) or `"archive"`
     /// (fixed QP 26, the v0.1.x bitstream).  Ignored for GIF output.
     pub mp4_quality: Option<String>,
+    /// R3 (ITER-076): `--srt <file>` (.srt or .lrc) — shipped raw to the JS
+    /// side, parsed there by `GlyphGrid.text.parseCues` (the GUI importer),
+    /// cues appended to `textSource.lines`.
+    pub text_import: Option<PathBuf>,
 }
+
+/// `--srt` files above this are refused (lyrics / captions are KBs).
+const MAX_TEXT_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
 
 impl HeadlessRenderJob {
     /// Resolve the output format: explicit `format` wins, otherwise infer
@@ -229,6 +253,11 @@ impl HeadlessRenderJob {
 
         json_deep_merge(&mut config, serde_json::Value::Object(config_patch));
 
+        // 2b. R3 text flags (ITER-076), still below `--set`.
+        if let Some(patch) = text_flags_patch(o) {
+            json_deep_merge(&mut config, patch);
+        }
+
         // 3. `--set a.b.c=<json>` last, through the same merge.
         for spec in &o.set {
             let patch = parse_set_override(spec)?;
@@ -245,6 +274,62 @@ impl HeadlessRenderJob {
         strip_preset_meta(&mut config);
         Ok((config, warnings))
     }
+}
+
+/// `--text` / `--text-*` → a `textSource` patch (None when no text flag).
+/// `--text` replaces the preset's `lines` (arrays replace in the merge).
+fn text_flags_patch(o: &ConfigOverrides) -> Option<serde_json::Value> {
+    let mut ts = serde_json::Map::new();
+    if let Some(t) = &o.text {
+        ts.insert("enabled".into(), serde_json::Value::Bool(true));
+        ts.insert(
+            "lines".into(),
+            serde_json::json!([{ "text": t.replace("\\n", "\n"), "start": 0 }]),
+        );
+    }
+    if let Some(v) = &o.text_anim {
+        ts.insert("anim".into(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(v) = &o.text_font {
+        ts.insert("font".into(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(v) = o.text_size {
+        ts.insert("size".into(), serde_json::json!(v));
+    }
+    if let Some(v) = &o.text_blend {
+        ts.insert("blend".into(), serde_json::Value::String(v.clone()));
+    }
+    if ts.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "textSource": ts }))
+    }
+}
+
+/// R3 (ITER-076): a render needs a source — an `--in` image, or a text
+/// source (`--text`, `--srt`, or a resolved `textSource.enabled`).
+pub fn require_source(job: &HeadlessRenderJob, config: &serde_json::Value) -> Result<(), String> {
+    let text_on = config.pointer("/textSource/enabled").and_then(|v| v.as_bool()) == Some(true);
+    if job.in_path.is_none() && job.text_import.is_none() && !text_on {
+        return Err("no source: pass --in <image>, or --text / --srt (a text source needs no --in)".into());
+    }
+    Ok(())
+}
+
+/// `--srt` → `{"name": <file name>, "body": <text>}` for the JS importer.
+pub fn read_text_import(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("cannot read --srt {}: {}", path.display(), e))?;
+    if meta.len() > MAX_TEXT_IMPORT_BYTES {
+        return Err(format!(
+            "--srt {} is {} bytes (limit {})",
+            path.display(),
+            meta.len(),
+            MAX_TEXT_IMPORT_BYTES
+        ));
+    }
+    let body = fs::read_to_string(path).map_err(|e| format!("cannot read --srt {}: {}", path.display(), e))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    Ok(serde_json::json!({ "name": name, "body": body }))
 }
 
 fn json_kind(v: &serde_json::Value) -> &'static str {
@@ -1484,8 +1569,14 @@ pub fn headless_render_json(job: &HeadlessRenderJob) -> Result<serde_json::Value
     for w in warnings {
         eprintln!("render: warning: config{}", w);
     }
+    require_source(job, &config)?;
+    let text_import = match &job.text_import {
+        Some(p) => read_text_import(p)?,
+        None => serde_json::Value::Null,
+    };
     Ok(serde_json::json!({
-        "inPath": job.in_path.to_string_lossy().to_string(),
+        "inPath": job.in_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "textImport": text_import,
         "outPath": job.out_path.to_string_lossy().to_string(),
         "frames": match job.frames {
             Some(n) => serde_json::Value::from(n),
@@ -5509,7 +5600,7 @@ mod preset_schema_tests {
 
     fn job_with(preset: Option<PathBuf>, overrides: ConfigOverrides) -> HeadlessRenderJob {
         HeadlessRenderJob {
-            in_path: PathBuf::from("/tmp/in.png"),
+            in_path: Some(PathBuf::from("/tmp/in.png")),
             out_path: PathBuf::from("/tmp/out.gif"),
             frames: Some(24),
             show_window: false,
@@ -5518,6 +5609,7 @@ mod preset_schema_tests {
             format: None,
             timeout_secs: None,
             mp4_quality: None,
+            text_import: None,
         }
     }
 
@@ -5733,6 +5825,46 @@ mod preset_schema_tests {
     }
 
     #[test]
+    fn text_source_flags_and_source_rule() {
+        // --text + style flags → a schema-valid textSource patch.
+        let job = job_with(None, ConfigOverrides {
+            text: Some("GL\\nYPH".into()),
+            text_anim: Some("typewriter".into()),
+            text_size: Some(120.0),
+            text_blend: Some("screen".into()),
+            ..Default::default()
+        });
+        let (cfg, _) = job.build_js_config().unwrap();
+        assert_eq!(cfg["textSource"]["enabled"], true);
+        assert_eq!(cfg["textSource"]["lines"], serde_json::json!([{ "text": "GL\nYPH", "start": 0 }]));
+        assert_eq!(cfg["textSource"]["anim"], "typewriter");
+        assert_eq!(cfg["textSource"]["size"], 120.0);
+        // Enums are the schema's: a typo'd anim / blend is a path error.
+        for (o, path) in [
+            (ConfigOverrides { text_anim: Some("bounce".into()), ..Default::default() }, "config/textSource/anim"),
+            (ConfigOverrides { text_blend: Some("overlay".into()), ..Default::default() }, "config/textSource/blend"),
+            (ConfigOverrides { set: vec!["textSource.lines=[{\"start\":0}]".into()], ..Default::default() }, "config/textSource/lines/0"),
+        ] {
+            let e = job_with(None, o).build_js_config().unwrap_err();
+            assert!(e.contains(path), "{}", e);
+        }
+        // No --in is fine for a text source, an error otherwise.
+        let mut job = job_with(None, ConfigOverrides { text: Some("HI".into()), ..Default::default() });
+        job.in_path = None;
+        assert!(headless_render_json(&job).unwrap()["inPath"].is_null());
+        job.config_overrides.text = None;
+        assert!(headless_render_json(&job).unwrap_err().contains("no source"));
+        // --srt ships the raw file; unreadable = error before launch.
+        let srt = temp_preset("srt", "1\n00:00:00,000 --> 00:00:01,500\nHI\n");
+        job.text_import = Some(srt.clone());
+        let v = headless_render_json(&job).unwrap();
+        assert!(v["textImport"]["body"].as_str().unwrap().contains("--> 00:00:01,500"));
+        job.text_import = Some(PathBuf::from("/tmp/__nonexistent__.srt"));
+        assert!(headless_render_json(&job).unwrap_err().contains("cannot read --srt"));
+        let _ = fs::remove_file(srt);
+    }
+
+    #[test]
     fn manifest_frames_and_border_are_validated_and_normalised() {
         assert_eq!(manifest_frames(None, "m").unwrap(), None);
         assert_eq!(manifest_frames(Some(&serde_json::json!(12)), "m").unwrap(), Some(serde_json::json!(12)));
@@ -5884,7 +6016,7 @@ mod integration_tests {
         assert_eq!(parse_format_arg(" CAST ").as_deref(), Ok("cast"));
         assert!(parse_format_arg("webm").unwrap_err().contains("txt, ansi, cast, html"));
         let job = |out: &str, format: Option<&str>| HeadlessRenderJob {
-            in_path: PathBuf::from("/i.png"),
+            in_path: Some(PathBuf::from("/i.png")),
             out_path: PathBuf::from(out),
             frames: Some(4),
             show_window: false,
@@ -5893,6 +6025,7 @@ mod integration_tests {
             format: format.map(String::from),
             timeout_secs: None,
             mp4_quality: None,
+            text_import: None,
         };
         assert_eq!(job("/o/a.txt", None).resolved_format(), "txt");
         assert_eq!(job("/o/a.gif", Some("html")).resolved_format(), "html");

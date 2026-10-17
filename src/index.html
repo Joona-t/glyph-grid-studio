@@ -84,6 +84,7 @@
   <script src="lib/glyph-xdog.js"></script>
   <script src="lib/glyph-palette-morph.js"></script>
   <script src="lib/glyph-timeline.js"></script>
+  <script src="lib/glyph-text-source.js"></script>
   <script src="lib/glyph-crt.js"></script>
   <!-- Wave 1 runtime (load AFTER all primitive libs; order-sensitive). -->
   <script src="lib/glyph-runtime.js"></script>
@@ -136,6 +137,7 @@
        - CONFIG.zones — scene-contract v2 zone-variable pipeline.
        - CONFIG.paletteMorph — OKLab interpolation across palettes over time.
        - CONFIG.timeline — keyframe tracks on any CONFIG path (lib/glyph-timeline.js).
+       - CONFIG.textSource — kinetic type / SRT / LRC as the source (lib/glyph-text-source.js).
        - CONFIG.recording — streaming output via File System Access API.
      ================================================================= */
 
@@ -278,6 +280,16 @@
        per frame into a shadow config.  tracks: { '<path>': [{u, v, ease}] },
        u in [0,1] of animation.duration; ease linear | inOutSine | step. */
     timeline: { enabled: false, tracks: {} },
+    /* ITER-076 (R3): text rendered per frame as the source raster (or
+       composited onto the loaded image when blend != replace).  Block-level
+       font..easeOut are defaults for lines that omit them; line times are
+       seconds, end null = until the loop ends.  See lib/glyph-text-source.js. */
+    textSource: {
+      enabled: false, w: 1024, h: 512, bg: '#000000', fg: '#ffffff', blend: 'replace',
+      font: 'Cascadia Mono', size: 160, weight: 700, align: 'center', x: 0.5, y: 0.5,
+      anim: 'none', easeIn: 0.3, easeOut: 0.2,
+      lines: [],
+    },
     /* v0.1.6: anti-flicker Schmitt trigger on ramp index (off = legacy). */
     temporalStability: { enabled: false, strength: 0.75 },
     /* v0.1.6: ETF flow mode tuning (selectionMode: 'flow'). */
@@ -1503,7 +1515,8 @@
     if (__tlScrubU === null && window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.active(CONFIG)
         && !__prefersReducedMotion()) return true;               // ITER-075 timeline
     if (!sourceImg || !sourceImg.width) return true;
-    if (window.__sourceFrameIdx !== -1) return true;              // animated source
+    if (window.__sourceFrameIdx !== -1                            // animated source
+        && !(__frameSource && __frameSource.kind === 'text' && !__frameSource.dynamic)) return true;
     if (CONFIG.scene !== 'studio') return true;                    // generative scenes animate on t
     if (__fontLoadPromise && !fontDescriptor) return true;         // face swap still pending
     if (__fontSwapPending > 0) return true;                        // studio font swap in flight
@@ -1566,6 +1579,7 @@
      adapter here; nothing else in draw() moves. */
   let __frameSource = null;
   function makeFrameSource(img, revision) {
+    if (img && img.__ggsTextSource) return makeTextFrameSource(img, revision);   // ITER-076
     if (img && img.gifProperties && img.numFrames && img.numFrames() > 1) {
       const props = img.gifProperties;
       let totalMs = 0;
@@ -1598,6 +1612,161 @@
     return __frameSource;
   }
 
+  /* ITER-076 (R3): text source.  While CONFIG.textSource.enabled, a
+     p5.Graphics text raster IS sourceImg (tagged __ggsTextSource), so the
+     whole pipeline — fit-to-image, priming, the studio scene, the layer and
+     lum memos, captureGridSnapshot — sees an ordinary source.  The image the
+     user loaded is kept as __textBase and restored when text is switched
+     off; a new image dropped while text is on becomes the new base on the
+     next draw.  Per frame the FrameSource adapter (kind 'text') lays the
+     lines out for t, re-renders the raster only when that state changes
+     (layout() quantises progress to 1/255) and then bumps its index, which
+     draw() publishes as __sourceFrameIdx — so a settled title keeps the
+     ITER-042/052 memo.  blend != replace with a base loaded composites the
+     text onto the base (its current GIF frame) in linear light. */
+  let __textCanvas = null;     // p5.Graphics, sourceImg while installed
+  let __textMask = null;       // <canvas> coverage mask for composites
+  let __textBase = null;       // the user's image under the text (null = text only)
+  let __textLinesSig = null;   // start/end signature the duration was derived from
+  let __textEpoch = 0;         // adapter index: bumps on every rendered-state change
+  let __textFontEpoch = 0;     // bumps when a webfont finishes loading
+  let __textStrokeWarned = '';
+  try {
+    if (document.fonts && document.fonts.addEventListener) {
+      document.fonts.addEventListener('loadingdone', function () { __textFontEpoch++; });
+    }
+  } catch (_) {}
+  function textSourceDims(ts, base) {
+    const clampDim = function (v, d) { v = Math.round(Number(v) || d); return Math.max(16, Math.min(4096, v - (v % 2))); };
+    const w = clampDim(ts.w, 1024), h = clampDim(ts.h, 512);
+    if (!base || !base.width || !base.height || ts.blend === 'replace') return [w, h];
+    /* Composite: the base's aspect at the text block's long edge (a 4K
+       photo is not composited at 4K per changed frame). */
+    const L = Math.max(w, h), a = base.width / base.height;
+    return a >= 1 ? [L, clampDim(L / a, h)] : [clampDim(L * a, w), L];
+  }
+  /* Install / resize / uninstall the text raster to match CONFIG_BASE.
+     force: re-derive animation.duration from the cues even if they did not
+     change (batch jobs reset CONFIG to the baseline first). */
+  function syncTextSource(force) {
+    const ts = CONFIG_BASE.textSource;
+    const on = !!(ts && ts.enabled) && !window.PIPELINE;
+    const installed = !!__textCanvas && sourceImg === __textCanvas;
+    if (!on) {
+      if (installed) {
+        sourceImg = __textBase;
+        __textBase = null;
+        ++__sourceRevision;
+        clearSourceDerivedCaches();
+        if (sourceImg) { try { fitCanvasToImage(sourceImg); } catch (e) { console.warn(e); } }
+      }
+      __textLinesSig = null;
+      return;
+    }
+    const base = installed ? __textBase : sourceImg;
+    const dims = textSourceDims(ts, base);
+    if (!installed || __textCanvas.width !== dims[0] || __textCanvas.height !== dims[1]) {
+      if (__textCanvas) { try { __textCanvas.remove(); } catch (_) {} }
+      __textCanvas = createGraphics(dims[0], dims[1]);
+      __textCanvas.pixelDensity(1);
+      __textCanvas.__ggsTextSource = true;
+      __textBase = base || null;
+      sourceImg = __textCanvas;
+      ++__sourceRevision;
+      clearSourceDerivedCaches();
+      try { fitCanvasToImage(__textCanvas); } catch (e) { console.warn(e); }
+    }
+    /* Timed cues set the loop length, as an animated GIF's delays do. */
+    const sig = JSON.stringify((ts.lines || []).map(function (l) { return [l && l.start, l && l.end]; }));
+    if (force || sig !== __textLinesSig) {
+      __textLinesSig = sig;
+      const end = GlyphGrid.text.lastEnd(ts.lines);
+      if (end > 0) CONFIG_BASE.animation.duration = end;
+    }
+  }
+  function renderTextFrame(g, ops, ts, baseImg) {
+    const w = g.width, h = g.height;
+    const ctx = g.drawingContext;
+    if (!baseImg) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = ts.bg || '#000000';
+      ctx.fillRect(0, 0, w, h);
+      GlyphGrid.text.drawOps(ctx, ops, ts.fg || '#ffffff');
+      ctx.restore();
+      return;
+    }
+    g.clear();
+    g.image(baseImg, 0, 0, w, h);
+    if (!__textMask) __textMask = document.createElement('canvas');
+    if (__textMask.width !== w || __textMask.height !== h) { __textMask.width = w; __textMask.height = h; }
+    const mctx = __textMask.getContext('2d', { willReadFrequently: true });
+    mctx.setTransform(1, 0, 0, 1, 0, 0);
+    mctx.clearRect(0, 0, w, h);
+    GlyphGrid.text.drawOps(mctx, ops, '#ffffff');
+    const basePx = ctx.getImageData(0, 0, w, h);
+    const maskPx = mctx.getImageData(0, 0, w, h);
+    GlyphGrid.text.compositeLinear(basePx.data, maskPx.data, ts.blend,
+      GlyphGrid.text.hexRgb(ts.fg), GlyphGrid.text.hexRgb(ts.bg));
+    ctx.putImageData(basePx, 0, 0);
+  }
+  function makeTextFrameSource(img, revision) {
+    const inner = __textBase ? makeFrameSource(__textBase, revision) : null;
+    return {
+      kind: 'text', img: img, revision: revision, durationMs: 0, index: -1,
+      key: null, dynamic: true, strokeCells: Infinity,
+      frameAt(tMs) {
+        const ts = CONFIG.textSource;
+        const composite = !!inner && ts.blend !== 'replace';
+        if (composite) inner.frameAt(tMs);
+        const ops = GlyphGrid.text.layout(ts, tMs / 1000, img.width, img.height);
+        const key = JSON.stringify(ops) + '|' + ts.bg + '|' + ts.fg + '|'
+          + (composite ? ts.blend + '|' + inner.index : '') + '|' + __textFontEpoch;
+        if (key !== this.key) {
+          this.key = key;
+          renderTextFrame(img, ops, ts, composite ? inner.img : null);
+          this.index = ++__textEpoch;
+        }
+        this.durationMs = GlyphGrid.text.lastEnd(ts.lines) * 1000;
+        this.dynamic = GlyphGrid.text.isDynamic(ts) || (composite && inner.kind === 'gif');
+        this.strokeCells = GlyphGrid.text.minStrokeCells(ts, img.width, img.height,
+          CONFIG.canvas.w, CONFIG.grid.cols);
+        return img;
+      },
+    };
+  }
+  /* GUI / CLI import: SRT or LRC text → CONFIG_BASE.textSource.lines
+     (appended, so a --text title survives an --srt).  Throws on garbage. */
+  /* GUI Text folder: any edit re-syncs the raster and re-arms the loop
+     (the idle detector may have parked it on a static title). */
+  window.__textSourceKick = function () {
+    syncTextSource(false);
+    if (!recState) { try { loop(); } catch (_) {} }
+  };
+  /* Headless twin of the status-bar warning: one stderr line per job. */
+  function textStrokeCheck() {
+    const ts = CONFIG_BASE.textSource;
+    if (!(ts && ts.enabled && __textCanvas && window.__TAURI__ && window.__TAURI__.core)) return;
+    const sc = GlyphGrid.text.minStrokeCells(ts, __textCanvas.width, __textCanvas.height,
+      CONFIG_BASE.canvas.w, CONFIG_BASE.grid.cols);
+    if (!(sc < GlyphGrid.text.MIN_STROKE_CELLS)) return;
+    Promise.resolve(window.__TAURI__.core.invoke('cli_log', {
+      msg: 'text: warn: smallest stroke is ' + sc.toFixed(2) + ' glyph cells (< '
+        + GlyphGrid.text.MIN_STROKE_CELLS + '); letters may dissolve. Raise textSource.size or lower grid.cols.',
+    })).catch(function () {});
+  }
+  window.__textSourceImport = function (body, nameHint, opts) {
+    const cues = GlyphGrid.text.parseCues(body, nameHint);
+    const ts = CONFIG_BASE.textSource;
+    ts.lines = ((opts && opts.replace) ? [] : (ts.lines || [])).concat(cues);
+    ts.enabled = true;
+    syncTextSource(true);
+    if (!recState) { try { loop(); redraw(); } catch (_) {} }
+    return cues.length;
+  };
+
   /* ITER-075 (R2): timeline.  With CONFIG.timeline active, every draw —
      live, captured, and the Phase-1 priming passes (primeTemporalState
      redraws through here) — renders against a shadow config built by
@@ -1621,6 +1790,7 @@
     return CONFIG_BASE.animation.loop ? (u - Math.floor(u)) : Math.min(1, u);
   }
   function draw() {
+    if (__textCanvas || (CONFIG_BASE.textSource && CONFIG_BASE.textSource.enabled)) syncTextSource(false);
     if (!(window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.active(CONFIG_BASE))) {
       drawFrame();
       return;
@@ -1838,6 +2008,15 @@
         const idx = (typeof window.__sourceFrameIdx === 'number' && window.__sourceFrameIdx >= 0)
           ? window.__sourceFrameIdx : sourceImg.gifProperties.displayIndex;
         animTag = ` | gif=${idx + 1}/${sourceImg.numFrames()}`;
+      }
+      /* ITER-076: legibility floor — a stem under MIN_STROKE_CELLS glyph
+         cells tends to dissolve.  Warned here and once per state on the CLI. */
+      if (_fsrc.kind === 'text') {
+        const sc = _fsrc.strokeCells;
+        animTag += ' | text';
+        if (sc < GlyphGrid.text.MIN_STROKE_CELLS) {
+          animTag += ` | warn: text stroke ${sc.toFixed(2)} cells — raise size or lower cols`;
+        }
       }
       /* Rolling-average fps from the perf ring (last 30 frames, ~1s).
          "is the build keeping up?" answer in one glance.  total can be 0
@@ -4162,6 +4341,17 @@
         }
       }
     }
+    /* ITER-076: every face a text line names, at its size, before frame 0
+       (a fallback face for the first frames would change the output). */
+    const _ts = CONFIG.textSource;
+    if (_ts && _ts.enabled && Array.isArray(_ts.lines) && document.fonts && document.fonts.load) {
+      const specs = {};
+      for (const line of _ts.lines) {
+        const r = GlyphGrid.text.resolveLine(line, _ts);
+        specs[GlyphGrid.text.fontSpec(r.weight, r.size, r.font)] = r.text;
+      }
+      for (const spec in specs) waits.push(document.fonts.load(spec, specs[spec]).catch(function () {}));
+    }
     return Promise.all(waits).then(function () {});
   }
 
@@ -5003,6 +5193,10 @@
       function _runJob() {
         resetToBaseline();          // audit 2026-06-10: no cross-job leakage
         applyConfig(job.config);
+        /* ITER-076: (un)install this job's text source + its cue duration
+           before frames 'auto' and the capture size are resolved. */
+        syncTextSource(true);
+        textStrokeCheck();
         // Force loop on so draw() advances
         try { loop(); } catch (e) {}
 
@@ -5812,7 +6006,11 @@
     if (!initialSource && job.batch && Array.isArray(job.jobs) && job.jobs.length) {
       initialSource = job.jobs[0].inPath || null;
     }
-    if (!initialSource) {
+    /* ITER-076: `render --text/--srt` needs no --in — the text raster is
+       the source. */
+    const textOnly = !initialSource && !job.batch
+      && ((job.config && job.config.textSource && job.config.textSource.enabled) || job.textImport);
+    if (!initialSource && !textOnly) {
       console.error('CLI: no source path in manifest');
       try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
@@ -5833,7 +6031,7 @@
     await __assetsReady();
 
     try {
-      await _cliLoadSource(initialSource);
+      if (!textOnly) await _cliLoadSource(initialSource);
     } catch (e) {
       console.error('CLI: initial loadImage failed:', e);
       try { await window.__TAURI__.core.invoke('cli_log', { msg: 'source load failed: ' + ((e && e.message) || e) }); } catch (_) {}
@@ -5889,6 +6087,21 @@
         console.error('CLI: setConfig failed:', e);
       }
     }
+
+    /* ITER-076: --srt / MCP srt_path ship the raw cue file; parse it here
+       with the same parser the GUI import uses, then install the raster. */
+    if (job.textImport && typeof job.textImport.body === 'string') {
+      try {
+        const n = window.__textSourceImport(job.textImport.body, job.textImport.name || '');
+        console.log('CLI: text import — ' + n + ' cues');
+      } catch (e) {
+        console.error('CLI: text import failed:', e);
+        try { await window.__TAURI__.core.invoke('cli_log', { msg: 'text import failed: ' + ((e && e.message) || e) }); } catch (_) {}
+        try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
+        return;
+      }
+    }
+    syncTextSource(true);
 
     // ITER-047: the config may name a glyph set whose atlas is still being
     // pre-warmed — wait for the asset, not for the clock.

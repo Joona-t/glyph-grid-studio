@@ -120,6 +120,8 @@ for (const m of studioSrc.matchAll(/config\.postprocess\.(\w+) = \{/g)) {
 
 /* ---- 5. timeline easings + structural keys (ITER-075) ---- */
 const TIMELINE = require(path.join(ROOT, 'src', 'lib', 'glyph-timeline.js'));
+/* ---- 6. text-source enums (ITER-076) ---- */
+const TEXT = require(path.join(ROOT, 'src', 'lib', 'glyph-text-source.js'));
 
 const compatSrc = read('src/lib/glyph-compat.js');
 const COMPAT = literalAfter(compatSrc, 'COMPAT_VERSIONS = Object.freeze(', 'COMPAT_VERSIONS');
@@ -166,6 +168,7 @@ const DESCRIPTIONS = {
   postprocess: 'Per-stage post effects; each stage has `enabled` plus its params.',
   depth: 'Depth-map fog zones.',
   paletteMorph: 'OKLab palette interpolation over time; null = off.',
+  textSource: 'Kinetic typography: text (or SRT/LRC cues) rendered per frame as the source raster.',
   timeline: 'Keyframe tracks on dotted CONFIG paths, evaluated per frame (u = t / animation.duration).',
   temporalStability: 'Anti-flicker Schmitt trigger on the ramp index.',
   flow: 'ETF tuning for selectionMode "flow".',
@@ -251,6 +254,48 @@ for (const k of Object.keys(CONFIG)) {
           default: CONFIG.timeline.tracks,
         },
       },
+      additionalProperties: false,
+    };
+  }
+  if (k === 'textSource') {
+    const D = CONFIG.textSource;
+    /* Style keys exist on the block (defaults) and on each line (overrides). */
+    const style = (dflt) => ({
+      font: { type: 'string', minLength: 1, default: dflt ? dflt.font : undefined,
+        description: 'Font family: ' + TEXT.BUNDLED_FONTS.join(' / ') + ' (bundled) or a system font.' },
+      size: { type: 'number', exclusiveMinimum: 0, default: dflt ? dflt.size : undefined, description: 'px at the text canvas height h.' },
+      weight: { type: 'number', minimum: 1, maximum: 1000, default: dflt ? dflt.weight : undefined },
+      align: { type: 'string', enum: TEXT.ALIGNS.slice(), default: dflt ? dflt.align : undefined },
+      x: { type: 'number', default: dflt ? dflt.x : undefined, description: 'Anchor, 0..1 of the canvas width.' },
+      y: { type: 'number', default: dflt ? dflt.y : undefined, description: 'Anchor (row centre), 0..1 of the canvas height.' },
+      anim: { type: 'string', enum: TEXT.ANIMS.slice(), default: dflt ? dflt.anim : undefined },
+      easeIn: { type: 'number', minimum: 0, default: dflt ? dflt.easeIn : undefined, description: 'Seconds of the in-envelope.' },
+      easeOut: { type: 'number', minimum: 0, default: dflt ? dflt.easeOut : undefined, description: 'Seconds of the out-envelope before a finite end.' },
+    });
+    const strip = (o) => { for (const k2 in o) { if (o[k2].default === undefined) delete o[k2].default; } return o; };
+    const line = {
+      type: 'object',
+      required: ['text'],
+      properties: Object.assign({
+        text: { type: 'string', description: 'Line text; \\n stacks rows.' },
+        start: { type: 'number', minimum: 0, description: 'Seconds; default 0.' },
+        end: { type: ['number', 'null'], minimum: 0, description: 'Seconds, exclusive; null = until the loop ends.' },
+      }, strip(style(null))),
+      additionalProperties: false,
+    };
+    p = {
+      type: 'object',
+      properties: Object.assign({
+        enabled: { type: 'boolean', default: D.enabled },
+        w: { type: 'integer', minimum: 16, maximum: 4096, default: D.w, description: 'Text canvas width (px).' },
+        h: { type: 'integer', minimum: 16, maximum: 4096, default: D.h, description: 'Text canvas height (px).' },
+        bg: { type: 'string', pattern: '^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$', default: D.bg },
+        fg: { type: 'string', pattern: '^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$', default: D.fg },
+        blend: { type: 'string', enum: TEXT.BLENDS.slice(), default: D.blend,
+          description: 'With an image loaded: replace = text only; multiply / screen / mask composite in linear light.' },
+      }, style(D), {
+        lines: { type: 'array', items: line, default: D.lines },
+      }),
       additionalProperties: false,
     };
   }

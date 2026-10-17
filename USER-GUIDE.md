@@ -354,6 +354,18 @@ Keyframe tracks that change settings over the loop: a palette that morphs from c
 
 Numbers glide between keys (`linear` or `inOutSine`), the palette blends in OKLab, and grid size, glyph set, selection mode and dither mode jump at their key (`step`). Under reduced motion the live preview holds the start of the timeline; exports are unaffected.
 
+#### Text (collapsed by default)
+Type a word and it becomes the picture: the letters are drawn every frame and then turned into glyphs like any image, so a title or a lyric line is made of the glyph grid itself.
+- `text source` turns it on. Typing in the box turns it on too. Each new line in the box is a new row.
+- `font`: Cascadia Mono and IBM VGA8 are bundled and look the same on every machine. The system fonts listed are the ones installed on this Mac.
+- `size` (px at the 512 px text canvas), `weight`, `align`, `x` / `y` (where the text sits, 0..1).
+- `anim`: `typewriter` types the letters in, `rise` slides up, `fade` fades in, `scale` grows in, `none` cuts. `in (s)` / `out (s)` are how long the entrance and the exit take (the exit only plays for lines with an end time).
+- `text colour` / `background`.
+- `blend` only matters with an image loaded: `replace` shows the text alone, `multiply` darkens the image with the letters, `screen` lightens it, `mask` shows the image only inside the letters.
+- `Import SRT/LRC…` loads subtitles or lyrics. Each cue appears at its time, and the loop length is set to the last cue's end. `Clear lines` removes them.
+
+If the letters get thinner than one glyph cell they start to dissolve. The status bar then says `warn: text stroke … cells`. Make the text bigger or lower the column count.
+
 ---
 
 ### 5.10 Perf (collapsed by default)

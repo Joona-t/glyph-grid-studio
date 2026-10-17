@@ -104,8 +104,10 @@ catalog_tool = next((t for t in tools if t["name"] == "glyph_grid_catalog"), Non
 if render_tool and "inputSchema" in render_tool:
     schema = render_tool["inputSchema"]
     required = set(schema.get("required", []))
-    if required == {"in_path", "out_path"}:
-        ok("C3a render tool schema requires in_path + out_path")
+    # ITER-076: in_path is optional (a text source needs none).
+    if required == {"out_path"} and "in_path" in schema.get("properties", {}) \
+            and {"text", "srt_path", "text_options"} <= set(schema.get("properties", {})):
+        ok("C3a render tool schema requires out_path; in_path optional, text/srt_path/text_options present")
     else:
         bad("C3a render tool schema required fields", str(required))
     # check at least 10 properties
@@ -479,6 +481,43 @@ if res.get("isError") is True and isinstance(body, dict) and body.get("code") ==
     ok("C17b unknown format → invalid_arguments at /format")
 else:
     bad("C17b unknown format", str(res)[:200])
+
+# --- Test C18 (ITER-076): text source, no in_path → txt inline shows the word ---
+out18 = os.path.join(SCRATCH, "c18_mcp.txt")
+if os.path.exists(out18):
+    os.remove(out18)
+send(proc, {"jsonrpc": "2.0", "id": 21, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"out_path": out18, "format": "txt", "cols": 80, "rows": 40, "text": "HI",
+                  "text_options": {"size": 300}},
+}})
+print("    (waiting up to 90s for MCP text-source render…)")
+r18 = recv(proc, timeout=90)
+c18 = (r18 or {}).get("result", {}).get("content", []) or []
+body18 = c18[1].get("text", "") if len(c18) > 1 else ""
+inked18 = sum(1 for ch in body18 if not ch.isspace())
+if "Rendered" in (c18[0].get("text", "") if c18 else "") and os.path.exists(out18) \
+        and len(body18.split("\n")[:-1]) == 40 and 100 < inked18 < 80 * 40 * 0.6:
+    ok("C18 text source without in_path: 40x80 txt, %d inked cells" % inked18)
+else:
+    bad("C18 text source", str(r18)[:240])
+
+# C18b: no in_path and no text → invalid_arguments at /in_path, in-process.
+send(proc, {"jsonrpc": "2.0", "id": 22, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"out_path": os.path.join(SCRATCH, "c18b.gif"), "text_options": {"anim": "bounce"}},
+}})
+res, body = tool_result(recv(proc, timeout=10))
+send(proc, {"jsonrpc": "2.0", "id": 23, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"out_path": os.path.join(SCRATCH, "c18c.gif")},
+}})
+res2, body2 = tool_result(recv(proc, timeout=10))
+if isinstance(body, dict) and body.get("path") == "/text_options/anim" \
+        and isinstance(body2, dict) and body2.get("code") == "invalid_arguments" and body2.get("path") == "/in_path":
+    ok("C18b bad text_options.anim → /text_options/anim; no source → /in_path")
+else:
+    bad("C18b text argument errors", str(body)[:160] + " | " + str(body2)[:160])
 
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")

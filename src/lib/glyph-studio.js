@@ -144,7 +144,9 @@
          from the preset whitelist, so save → reload silently dropped them. */
       'invertSignal', 'bgThreshold', 'dispersal', 'scene',
       /* ITER-075: keyframe tracks (CONFIG.timeline). */
-      'timeline'];
+      'timeline',
+      /* ITER-076: kinetic typography (CONFIG.textSource). */
+      'textSource'];
     /* R7: stamp the schema so editors autocomplete and `validate` knows
        which preset format it is reading. */
     var out = { $schema: PRESET_SCHEMA_ID, version: PRESET_SCHEMA_VERSION };
@@ -1820,6 +1822,101 @@
     fTl.addButton({ title: 'Resume loop' }).on('click', function () {
       if (window.__timelineScrub) window.__timelineScrub(null);
     });
+
+    /* Text (ITER-076, R3) — kinetic typography as the source.  The raster
+       is built in index.html (syncTextSource / the 'text' FrameSource);
+       this folder edits CONFIG.textSource.  The textarea edits line 1 (rows
+       split on newlines); Import SRT/LRC replaces the lines with timed cues.
+       Font list: the bundled faces + the system fonts that are really there
+       (document.fonts.check, then a width test against two generic
+       fallbacks — check() alone answers true for a family it has no face
+       for). */
+    var TXT = window.GlyphGrid && window.GlyphGrid.text;
+    if (TXT && config.textSource) {
+      var ts = config.textSource;
+      if (!Array.isArray(ts.lines)) ts.lines = [];
+      var kickText = function () { if (window.__textSourceKick) window.__textSourceKick(); };
+      var fText = pane.addFolder({ title: 'Text', expanded: false });
+      fText.on('change', kickText);
+      tip(fText.addInput(ts, 'enabled', { label: 'text source' }),
+          'Render the text below as the source (instead of, or composited onto, the image).');
+      var area = document.createElement('textarea');
+      area.rows = 3;
+      area.placeholder = 'Type a title… (new line = new row)';
+      area.setAttribute('aria-label', 'Text source, line 1');
+      area.style.cssText = 'box-sizing:border-box;width:calc(100% - 8px);margin:4px;resize:vertical;'
+        + 'font:12px ui-monospace,Menlo,monospace;background:var(--tp-input-background-color,#222);'
+        + 'color:var(--tp-input-foreground-color,#ddd);border:1px solid rgba(127,127,127,.45);border-radius:2px;';
+      area.value = (ts.lines[0] && ts.lines[0].text) || '';
+      area.addEventListener('input', function () {
+        if (!ts.lines.length) ts.lines.push({ text: '', start: 0 });
+        ts.lines[0].text = area.value;
+        if (area.value && !ts.enabled) { ts.enabled = true; pane.refresh(); }
+        kickText();
+      });
+      var fTextBody = fText.element && fText.element.querySelector('.tp-fldv_c');
+      if (fTextBody) fTextBody.appendChild(area);
+      var txtState = {
+        get cues() { return ts.lines.length + (ts.lines.length === 1 ? ' line' : ' lines'); },
+      };
+      fText.addMonitor(txtState, 'cues', { label: 'lines', interval: 1000 });
+      var fontOpts = {};
+      var fontAvailable = function (f) {
+        try {
+          if (document.fonts && !document.fonts.check('12px "' + f + '"')) return false;
+          var c = document.createElement('canvas').getContext('2d');
+          c.font = '24px "' + f + '", monospace';
+          var a = c.measureText('mmmmmmmmmmlli1WQ').width;
+          c.font = '24px "' + f + '", serif';
+          return a === c.measureText('mmmmmmmmmmlli1WQ').width;
+        } catch (e) { return false; }
+      };
+      TXT.BUNDLED_FONTS.forEach(function (f) { fontOpts[f + ' (bundled)'] = f; });
+      TXT.SYSTEM_FONTS.forEach(function (f) { if (fontAvailable(f)) fontOpts[f] = f; });
+      if (ts.font && Object.keys(fontOpts).map(function (k) { return fontOpts[k]; }).indexOf(ts.font) < 0) fontOpts[ts.font] = ts.font;
+      tip(fText.addInput(ts, 'font', { options: fontOpts }),
+          'Bundled faces render the same on every machine; system fonts depend on what is installed.');
+      tip(fText.addInput(ts, 'size', { min: 8, max: 400, step: 1 }),
+          'Font size in px at the text canvas height (' + ts.h + ' px). The status bar warns when stems get thinner than one glyph cell.');
+      fText.addInput(ts, 'weight', { options: { regular: 400, bold: 700, black: 900 } });
+      fText.addInput(ts, 'align', { options: { left: 'left', center: 'center', right: 'right' } });
+      fText.addInput(ts, 'x', { min: 0, max: 1, step: 0.01 });
+      fText.addInput(ts, 'y', { min: 0, max: 1, step: 0.01 });
+      var animOpts = {};
+      TXT.ANIMS.forEach(function (a) { animOpts[a] = a; });
+      tip(fText.addInput(ts, 'anim', { options: animOpts }),
+          'How each line enters (and leaves, when it has an end time): typewriter, rise, fade, scale.');
+      fText.addInput(ts, 'easeIn', { min: 0, max: 5, step: 0.05, label: 'in (s)' });
+      fText.addInput(ts, 'easeOut', { min: 0, max: 5, step: 0.05, label: 'out (s)' });
+      fText.addInput(ts, 'fg', { label: 'text colour' });
+      fText.addInput(ts, 'bg', { label: 'background' });
+      var blendOpts = {};
+      TXT.BLENDS.forEach(function (b) { blendOpts[b] = b; });
+      tip(fText.addInput(ts, 'blend', { options: blendOpts }),
+          'With an image loaded: replace = text only; multiply darkens the image with the letters; screen lightens; mask shows the image only inside the letters.');
+      fText.addButton({ title: 'Import SRT/LRC…' }).on('click', function () {
+        var inp = document.createElement('input');
+        inp.type = 'file'; inp.accept = '.srt,.lrc,text/plain';
+        inp.onchange = function () {
+          var f = inp.files && inp.files[0];
+          if (!f) return;
+          f.text().then(function (body) {
+            var n = window.__textSourceImport(body, f.name, { replace: true });
+            area.value = (ts.lines[0] && ts.lines[0].text) || '';
+            if (opts.__refreshPane) opts.__refreshPane(); else pane.refresh();
+            exportFeedback('Imported ' + n + ' cues from ' + f.name + '; loop set to the last cue.', false);
+          }).catch(function (e) {
+            exportFeedback('Could not import ' + f.name + ': ' + ((e && e.message) || e), true);
+          });
+        };
+        inp.click();
+      });
+      fText.addButton({ title: 'Clear lines' }).on('click', function () {
+        ts.lines = [];
+        area.value = '';
+        kickText();
+      });
+    }
 
     /* Perf — Phase 0 instrumentation. Live rolling averages of per-stage
        frame time + last switch latency. Click "Report (console)" to
