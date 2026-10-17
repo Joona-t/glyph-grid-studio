@@ -11,6 +11,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 pub mod mcp;
+pub mod video;
 
 /* ============================================================================
  *  CLI / headless-render plumbing.
@@ -57,6 +58,9 @@ pub struct ConfigOverrides {
     pub text_size: Option<f64>,
     #[serde(default)]
     pub text_blend: Option<String>,
+    /// R4 (ITER-077): `--video-decode auto|native|webview` → `video.decode`.
+    #[serde(default)]
+    pub video_decode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +260,10 @@ impl HeadlessRenderJob {
         // 2b. R3 text flags (ITER-076), still below `--set`.
         if let Some(patch) = text_flags_patch(o) {
             json_deep_merge(&mut config, patch);
+        }
+        // 2c. R4 video decode path (ITER-077); enum checked by the schema.
+        if let Some(v) = &o.video_decode {
+            json_deep_merge(&mut config, serde_json::json!({ "video": { "decode": v } }));
         }
 
         // 3. `--set a.b.c=<json>` last, through the same merge.
@@ -4389,8 +4397,8 @@ async fn pick_image_with_path(app: tauri::AppHandle) -> Result<serde_json::Value
         .dialog()
         .file()
         .add_filter(
-            "Image",
-            &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "avif"],
+            "Image or video",
+            &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "avif", "mp4", "mov", "m4v", "webm"],
         )
         .blocking_pick_file()
         .and_then(|fp| fp.into_path().ok());
@@ -4450,11 +4458,53 @@ struct ImageProbe {
     size_bytes: u64,
     mime_type: &'static str,
     probed: bool,
+    /// R4 (ITER-077): `"video"` for mp4/mov/m4v/webm; absent for images
+    /// (image probes serialise exactly as before).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codec: Option<String>,
 }
 
 fn probe_image_path(p: &PathBuf) -> Result<ImageProbe, String> {
     let size_bytes = source_file_size(p)?;
     let mime_type = image_mime_type(p);
+    /* R4 (ITER-077): video containers.  MP4/MOV headers give frames / fps /
+       dims without decoding, so the same SOURCE_LIMITS apply before the
+       first frame; webm (or an MP4 the demuxer rejects) is probed: false
+       and validated once the <video> element has its metadata. */
+    if let Some(container) = video::sniff_container(p) {
+        let info = match container {
+            video::Container::IsoBmff => video::probe_mp4(p),
+            video::Container::Webm => None,
+        };
+        return Ok(match info {
+            Some(v) => ImageProbe {
+                width: v.width,
+                height: v.height,
+                frames: v.frames.max(1),
+                size_bytes,
+                mime_type: video::video_mime_type(p),
+                probed: true,
+                kind: Some("video"),
+                fps: Some(v.fps),
+                codec: Some(v.codec),
+            },
+            None => ImageProbe {
+                width: 0,
+                height: 0,
+                frames: 0,
+                size_bytes,
+                mime_type: video::video_mime_type(p),
+                probed: false,
+                kind: Some("video"),
+                fps: None,
+                codec: None,
+            },
+        });
+    }
     let reader = image::ImageReader::open(p)
         .map_err(|e| format!("could not open {:?}: {}", p, e))?
         .with_guessed_format()
@@ -4483,6 +4533,9 @@ fn probe_image_path(p: &PathBuf) -> Result<ImageProbe, String> {
                 size_bytes,
                 mime_type: "image/gif",
                 probed: true,
+                kind: None,
+                fps: None,
+                codec: None,
             })
         }
         Some(format) if format.reading_enabled() => {
@@ -4496,6 +4549,9 @@ fn probe_image_path(p: &PathBuf) -> Result<ImageProbe, String> {
                 size_bytes,
                 mime_type,
                 probed: true,
+                kind: None,
+                fps: None,
+                codec: None,
             })
         }
         _ => Ok(ImageProbe {
@@ -4505,6 +4561,9 @@ fn probe_image_path(p: &PathBuf) -> Result<ImageProbe, String> {
             size_bytes,
             mime_type,
             probed: false,
+            kind: None,
+            fps: None,
+            codec: None,
         }),
     }
 }
@@ -4584,11 +4643,12 @@ fn image_mime_type(p: &PathBuf) -> &'static str {
         Some("bmp") => "image/bmp",
         Some("tiff") => "image/tiff",
         Some("avif") => "image/avif",
+        Some("mp4") | Some("m4v") | Some("mov") | Some("webm") | Some("mkv") => video::video_mime_type(p),
         _ => "image/png",
     }
 }
 
-fn source_file_size(p: &PathBuf) -> Result<u64, String> {
+pub(crate) fn source_file_size(p: &PathBuf) -> Result<u64, String> {
     let size_bytes = fs::metadata(p)
         .map_err(|e| format!("could not inspect {:?}: {}", p, e))?
         .len();
@@ -4746,6 +4806,8 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             pick_image_with_path,
             read_image_file,
             probe_image_file,
+            video::video_open,
+            video::video_frame,
             kv_load_all,
             kv_save,
             save_preset_json,
@@ -5976,6 +6038,27 @@ mod source_probe_tests {
         fs::write(&unknown, b"not an image header at all").unwrap();
         assert!(!probe_image_path(&unknown).unwrap().probed);
         assert!(probe_image_path(&dir.join("missing.png")).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// R4 (ITER-077): a video's frames / fps / dims come from the MP4
+    /// headers, so SOURCE_LIMITS apply before decode; image probes keep
+    /// their exact JSON shape (no kind / fps / codec keys).
+    #[test]
+    fn probe_reads_video_headers_and_keeps_image_json_shape() {
+        let v = probe_image_path(&fixture("tiny.mp4")).unwrap();
+        assert_eq!((v.width, v.height, v.frames, v.kind, v.mime_type), (160, 90, 12, Some("video"), "video/mp4"));
+        assert_eq!((v.fps, v.codec.as_deref(), v.probed), (Some(25.0), Some("h264"), true));
+        let img = serde_json::to_value(probe_image_path(&fixture("cream-paper.png")).unwrap()).unwrap();
+        let keys: Vec<&str> = img.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(keys.len(), 6, "{:?}", keys);
+        assert!(img.get("kind").is_none());
+        let dir = std::env::temp_dir().join(format!("ggs-probe-v-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let webm = dir.join("clip.webm");
+        fs::write(&webm, [0x1Au8, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81]).unwrap();
+        let w = probe_image_path(&webm).unwrap();
+        assert_eq!((w.kind, w.probed, w.mime_type), (Some("video"), false, "video/webm"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

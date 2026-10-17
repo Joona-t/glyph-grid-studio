@@ -39,7 +39,7 @@ A friendly walkthrough for both **non-technical readers** (drop a GIF in, get gl
 **System requirements:**
 - macOS 11+ (Apple Silicon or Intel)
 - ~50 MB free disk space (~10 MB app, ~30 MB working space for renders)
-- An image to render — supported: PNG, JPG, WebP, GIF (animated), BMP, TIFF, AVIF
+- An image to render — supported: PNG, JPG, WebP, GIF (animated), BMP, TIFF, AVIF — or a video clip: MP4, MOV, M4V, WebM
 
 > **Under the hood**
 > The pipeline samples each source pixel into an `M × N` cell grid, picks a glyph per cell from either a luminance ramp or a 6-D shape-vector nearest-neighbour lookup, and typesets the result. Front end: p5.js sketch in a Tauri 2 WKWebView. Back end: Rust (gifski for GIF, openh264 + mp4 for MP4). UI: Tweakpane v3 with 70+ live-tunable bindings. See `README.md` for the algorithmic citations.
@@ -115,6 +115,22 @@ Each source frame plays in real time. The studio computes the right source frame
 > sourceImg.setFrame(srcIdx)
 > ```
 > This wraps cleanly on loop (no stutter at the seam) and supports recording the GIF straight back to MP4/GIF at any duration.
+
+### Video clips (MP4, MOV, M4V, WebM)
+Drop a clip or pick it with `Pick image…`. Each studio frame shows the clip frame for the current time, and the loop length becomes the clip's length, as with a GIF.
+
+- **H.264 clips** (most `.mp4` files, screen recordings, many phone clips) are decoded by the app itself. Every export of the same clip and settings comes out the same. The status bar says `video=12/120 (openh264)`.
+- **Other codecs** (HEVC from iPhones, WebM / VP9) play through the system video decoder. While exporting, the studio seeks to each frame and waits for it, so exports still get every frame in order, only slower. The status bar says `(webview)`.
+- The same limits as images apply before anything is decoded: at most 480 frames (16 s at 30 fps) and 64 MB. Trim longer clips first. 4K clips are rejected by the pixel limit; 1080p is fine.
+- Audio is dropped.
+
+#### Video folder (collapsed by default)
+- `decode`: `auto` uses the built-in H.264 decoder when it can and the system decoder otherwise. `native` only uses the built-in one and refuses other codecs. `webview` always uses the system decoder. It applies to the next clip you open.
+- `camera (beta)`: uses the webcam as the source while it is on. Turning it off brings back the previous image or clip. macOS asks for camera permission the first time. Camera exports are a live recording, so two exports are not identical. This is experimental: it needs the bundled app (the camera permission string lives in its Info.plist) and has not been tested in an automated run.
+- `mirror`: flips the camera picture left to right (selfie view).
+
+> **Under the hood**
+> Frame index = floor(t × clip fps) mod frame count (variable-frame-rate clips use their average rate). The built-in path is `video_open` / `video_frame` in `src-tauri/src/video.rs`: the `mp4` crate reads the container, `openh264` decodes, and the frame crosses to the page as raw RGBA. It handles B-frames and needs closed GOPs (an open-GOP stream falls back to the system decoder). The page keeps the last 16 decoded frames. While exporting, a frame that is not decoded yet pauses the draw loop until it is, so the speed of the decoder never changes the output.
 
 ### Aspect-ratio auto-fit
 When `studio.fitCanvasToImage = true` (default), loading an image resizes the canvas to match the source aspect, capping the long edge at 1024 px. This keeps render cost predictable while preserving framing.

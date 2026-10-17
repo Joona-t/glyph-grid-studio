@@ -519,6 +519,35 @@ if isinstance(body, dict) and body.get("path") == "/text_options/anim" \
 else:
     bad("C18b text argument errors", str(body)[:160] + " | " + str(body2)[:160])
 
+# --- Test C19 (ITER-077): a video in_path renders through the Rust decoder ---
+TINY_MP4 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sources", "tiny.mp4")
+out19 = os.path.join(SCRATCH, "c19_mcp.gif")
+if os.path.exists(out19):
+    os.remove(out19)
+send(proc, {"jsonrpc": "2.0", "id": 24, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TINY_MP4, "out_path": out19, "frames": 4, "video_decode": "native"},
+}})
+print("    (waiting up to 90s for MCP video render…)")
+r19 = recv(proc, timeout=90)
+c19 = (r19 or {}).get("result", {}).get("content", []) or []
+if "Rendered" in (c19[0].get("text", "") if c19 else "") and os.path.exists(out19) \
+        and open(out19, "rb").read(6) in (b"GIF89a", b"GIF87a"):
+    ok("C19 video in_path (tiny.mp4, video_decode native) → GIF")
+else:
+    bad("C19 video in_path", str(r19)[:240])
+
+# C19b: a typo'd video_decode is blamed on the argument, before any spawn.
+send(proc, {"jsonrpc": "2.0", "id": 25, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TINY_MP4, "out_path": os.path.join(SCRATCH, "c19b.gif"), "video_decode": "ffmpeg"},
+}})
+res, body = tool_result(recv(proc, timeout=10))
+if isinstance(body, dict) and body.get("code") == "invalid_arguments" and body.get("path") == "/video_decode":
+    ok("C19b bad video_decode → invalid_arguments at /video_decode")
+else:
+    bad("C19b video_decode error path", str(body)[:200])
+
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")
 sys.exit(0 if FAIL == 0 else 1)

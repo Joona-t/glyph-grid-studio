@@ -767,6 +767,33 @@
       },
       "additionalProperties": false
     },
+    "video": {
+      "description": "Video sources (mp4 / mov / m4v / webm as the input): decoder choice and the GUI camera.",
+      "type": "object",
+      "properties": {
+        "decode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "native",
+            "webview"
+          ],
+          "default": "auto",
+          "description": "auto = H.264 MP4/MOV via the Rust openh264 decoder (frame-exact), other codecs via the WebView <video>; native = Rust only (non-H.264 is an error); webview = always the <video> seek path."
+        },
+        "camera": {
+          "type": "boolean",
+          "default": false,
+          "description": "GUI only (experimental): the webcam is the source while on. Ignored headless."
+        },
+        "mirror": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mirror the camera image."
+        }
+      },
+      "additionalProperties": false
+    },
     "temporalStability": {
       "description": "Anti-flicker Schmitt trigger on the ramp index.",
       "type": "object",

@@ -53,7 +53,8 @@ enum Command {
 
 #[derive(Parser, Debug, Clone)]
 struct RenderArgs {
-    /// Path to the source image (PNG / JPG / WebP / GIF / BMP / TIFF).
+    /// Path to the source image (PNG / JPG / WebP / GIF / BMP / TIFF) or
+    /// video (MP4 / MOV / M4V / WebM — R4).
     /// Optional with `--text` / `--srt` (the text is the source) or a preset
     /// that enables `textSource`.
     #[arg(short = 'i', long = "in", value_name = "PATH")]
@@ -166,6 +167,12 @@ struct RenderArgs {
 
     #[command(flatten)]
     text: TextArgs,
+
+    /// Video sources (R4): auto (H.264 MP4/MOV decoded frame-exactly in
+    /// Rust, other codecs via the WebView <video>), native (Rust only; a
+    /// non-H.264 clip is an error) or webview.  JSON form: `video.decode`.
+    #[arg(long, value_name = "MODE")]
+    video_decode: Option<String>,
 }
 
 /// R3 (ITER-076): kinetic typography.  The text is rendered per frame as the
@@ -299,6 +306,7 @@ fn main() {
                     text_font: args.text.text_font,
                     text_size: args.text.text_size,
                     text_blend: args.text.text_blend,
+                    video_decode: args.video_decode,
                 },
                 format: args.format,
                 timeout_secs: args.timeout,

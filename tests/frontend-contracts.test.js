@@ -652,6 +652,8 @@ require('./glyph-text-export.test.js');
 require('./glyph-timeline.test.js');
 /* ITER-076: text source — parsers, layout, composite, stroke estimate. */
 require('./glyph-text-source.test.js');
+/* ITER-077: video source — frame mapping, priming, adapter, contracts. */
+require('./glyph-video-source.test.js');
 {
   assert(html.indexOf('<script src="lib/glyph-text-source.js"></script>') > html.indexOf('<script src="lib/glyph-timeline.js"></script>'),
     'glyph-text-source.js is loaded with the other libs');

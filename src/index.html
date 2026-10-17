@@ -85,6 +85,7 @@
   <script src="lib/glyph-palette-morph.js"></script>
   <script src="lib/glyph-timeline.js"></script>
   <script src="lib/glyph-text-source.js"></script>
+  <script src="lib/glyph-video-source.js"></script>
   <script src="lib/glyph-crt.js"></script>
   <!-- Wave 1 runtime (load AFTER all primitive libs; order-sensitive). -->
   <script src="lib/glyph-runtime.js"></script>
@@ -290,6 +291,13 @@
       anim: 'none', easeIn: 0.3, easeOut: 0.2,
       lines: [],
     },
+    /* ITER-077 (R4): video sources (mp4 / mov / m4v / webm via --in, the
+       picker or drag-drop; see lib/glyph-video-source.js).  decode: auto =
+       H.264 MP4/MOV through the Rust openh264 decoder (frame-exact), other
+       codecs through a hidden <video>; native = Rust only (a non-H.264
+       clip is an error); webview = always the <video> seek path.  camera
+       (GUI only, experimental): the webcam replaces the source while on. */
+    video: { decode: 'auto', camera: false, mirror: true },
     /* v0.1.6: anti-flicker Schmitt trigger on ramp index (off = legacy). */
     temporalStability: { enabled: false, strength: 0.75 },
     /* v0.1.6: ETF flow mode tuning (selectionMode: 'flow'). */
@@ -1056,12 +1064,16 @@
       if (img && typeof img.numFrames === 'function') frames = Math.max(1, Number(img.numFrames()) || 1);
       else if (img && img.gifProperties && img.gifProperties.numFrames) frames = Math.max(1, Number(img.gifProperties.numFrames) || 1);
     } catch (_) {}
+    /* ITER-077: a video is streamed — at most GlyphGrid.video.CACHE
+       decoded frames exist at once, whatever its length. */
+    const streamed = !!(img && img.__ggsVideo) || !!(extra && extra.video);
+    const resident = streamed ? Math.min(frames, (window.GlyphGrid && GlyphGrid.video) ? GlyphGrid.video.CACHE : 16) : frames;
     return {
       width,
       height,
       frames,
       sizeBytes: Number(extra && extra.sizeBytes) || 0,
-      decodedPixels: width * height * frames,
+      decodedPixels: width * height * resident,
     };
   }
 
@@ -1442,7 +1454,25 @@
     }
     if (!taggedGeneration) ++__sourceImportGeneration;
 
+    /* ITER-077: retire the outgoing video / camera (its <video>, decode
+       cache, camera tracks) unless the camera toggle keeps it to restore. */
+    function retireVideo() {
+      const old = sourceImg;
+      if (!old || old === img || !old.__ggsVideo) return;
+      if (options.keepPrevious) {
+        if (old.__ggsVideo.video) { try { old.__ggsVideo.video.pause(); } catch (_) {} }
+        return;
+      }
+      if (old.__ggsVideo.camera && !(img && img === __cameraPrev)) {
+        if (__cameraPrev && __cameraPrev !== img) disposeVideoSource(__cameraPrev);
+        __cameraPrev = null;
+        if (CONFIG_BASE.video) CONFIG_BASE.video.camera = false;
+      }
+      disposeVideoSource(old);
+    }
+
     if (!img) {
+      retireVideo();
       sourceImg = null;
       ++__sourceRevision;
       clearSourceDerivedCaches();
@@ -1459,6 +1489,7 @@
       return false;
     }
 
+    retireVideo();
     sourceImg = img;
     ++__sourceRevision;
     window.__glyphLastImportError = null;
@@ -1485,6 +1516,11 @@
         }
       }
     } catch (e) { console.warn('animated-source auto-tune failed:', e); }
+    /* ITER-077: a clip sets the loop to its own length, as a GIF does. */
+    if (img.__ggsVideo && !img.__ggsVideo.camera && img.__ggsVideo.fps > 0) {
+      CONFIG.animation.duration = img.__ggsVideo.frames / img.__ggsVideo.fps;
+      CONFIG.animation.loop = true;
+    }
 
     statusEl().textContent = 'Loaded ' + checked.meta.width + '×' + checked.meta.height
       + (checked.meta.frames > 1 ? ' · ' + checked.meta.frames + ' frames' : '');
@@ -1580,6 +1616,7 @@
   let __frameSource = null;
   function makeFrameSource(img, revision) {
     if (img && img.__ggsTextSource) return makeTextFrameSource(img, revision);   // ITER-076
+    if (img && img.__ggsVideo) return GlyphGrid.video.adapter(img, img.__ggsVideo, revision, __videoHooks);   // ITER-077
     if (img && img.gifProperties && img.numFrames && img.numFrames() > 1) {
       const props = img.gifProperties;
       let totalMs = 0;
@@ -1611,6 +1648,120 @@
     }
     return __frameSource;
   }
+
+  /* ITER-077 (R4): video sources.  sourceImg is a p5.Graphics tagged
+     __ggsVideo (the clip's state from GlyphGrid.video.open); the 'video'
+     adapter repaints it from a decoded-frame cache.  Recording is
+     frame-exact: beginRecord prefetches the priming frames before it
+     primes, and drawFrame skips (and re-arms after the decode) any captured
+     draw whose frame is not decoded yet.  A text source composited onto a
+     video gates on the inner video the same way. */
+  const __videoHooks = {
+    invoke: function (cmd, args) { return window.__TAURI__.core.invoke(cmd, args); },
+    recording: function () { return !!recState; },
+  };
+  function videoAdapterOf(fsrc) {
+    if (!fsrc) return null;
+    if (fsrc.kind === 'video') return fsrc.video.camera ? null : fsrc;
+    if (fsrc.kind === 'text' && fsrc.inner && fsrc.inner.kind === 'video' && !fsrc.inner.video.camera) return fsrc.inner;
+    return null;
+  }
+  function awaitVideoFrame(vsrc, tMs, state) {
+    if (state._srcWait) return;
+    state._srcWait = true;
+    try { noLoop(); } catch (_) {}
+    vsrc.load(tMs).then(function () {
+      if (recState !== state || state.cancelled) return;
+      state._srcWait = false;
+      try { loop(); } catch (_) {}
+    }, function (e) { failRecording(state, e); });
+  }
+  /* beginRecord: the priming passes run synchronously, so every frame they
+     and frame 0 touch must be decoded first.  Returns null when nothing is
+     missing (images, GIFs, cached clips). */
+  function prefetchCaptureFrames(total) {
+    if (!sourceImg || window.PIPELINE) return null;
+    const vsrc = videoAdapterOf(frameSourceFor(sourceImg));
+    if (!vsrc) return null;
+    const times = GlyphGrid.video.primeTimes(total, PRIME_FRAMES, CONFIG.animation.fps);
+    if (times.every(function (tm) { return vsrc.ready(tm); })) return null;
+    return vsrc.prefetch(times);
+  }
+  function disposeVideoSource(img) {
+    if (!img || !img.__ggsVideo) return;
+    GlyphGrid.video.dispose(img.__ggsVideo);
+    try { img.remove(); } catch (_) {}
+  }
+  function cliLog(msg) {
+    console.log(msg);
+    try {
+      if (window.__TAURI__ && window.__TAURI__.core) {
+        Promise.resolve(window.__TAURI__.core.invoke('cli_log', { msg: msg })).catch(function () {});
+      }
+    } catch (_) {}
+  }
+  /* path + header probe → a p5.Graphics with frame 0 painted, ready for
+     acceptSourceImage (which validates and installs it).  The GUI importer
+     (glyph-studio.js) and _cliLoadSource both come through here. */
+  async function openVideoSource(path, probe, decodeOverride, headless) {
+    const core = window.__TAURI__.core;
+    const decode = decodeOverride || (CONFIG_BASE.video && CONFIG_BASE.video.decode) || 'auto';
+    const vs = await GlyphGrid.video.open({
+      path: path,
+      url: (typeof core.convertFileSrc === 'function') ? core.convertFileSrc(path) : '',
+      probe: probe, decode: decode, preview: !headless,
+      invoke: __videoHooks.invoke, log: cliLog,
+    });
+    const g = createGraphics(vs.width, vs.height);
+    g.pixelDensity(1);
+    g.__ggsVideo = vs;
+    g.numFrames = function () { return vs.frames; };
+    try {
+      const f0 = await GlyphGrid.video.load(vs, 0, __videoHooks.invoke);
+      g.drawingContext.putImageData(f0, 0, 0);
+      vs.painted = 0;
+      vs.epoch = 1;
+    } catch (e) {
+      GlyphGrid.video.dispose(vs);
+      try { g.remove(); } catch (_) {}
+      throw e;
+    }
+    vs.onPresent = function () { if (!recState && __idleParked) { try { loop(); } catch (_) {} } };
+    cliLog('video: ' + String(path).split('/').pop() + ' ' + vs.width + 'x' + vs.height + ', ' + vs.frames
+      + ' frames @ ' + vs.fps + ' fps, ' + (vs.codec || '?') + ' via '
+      + (vs.backend === 'rust' ? 'Rust openh264' : 'WebView <video>'));
+    return g;
+  }
+  window.__ggsOpenVideo = openVideoSource;
+  /* GUI Video folder: camera on → the webcam is the source; the previous
+     source comes back when it goes off.  Experimental: the WKWebView
+     media-capture permission path is not verified headlessly. */
+  let __cameraPrev = null;
+  window.__videoCameraKick = async function () {
+    const want = !!(CONFIG_BASE.video && CONFIG_BASE.video.camera);
+    const live = !!(sourceImg && sourceImg.__ggsVideo && sourceImg.__ggsVideo.camera);
+    if (want && !live) {
+      try {
+        const vs = await GlyphGrid.video.openCamera({ mirror: CONFIG_BASE.video.mirror });
+        const g = createGraphics(vs.width, vs.height);
+        g.pixelDensity(1);
+        g.__ggsVideo = vs;
+        g.numFrames = function () { return 1; };
+        const prev = sourceImg;
+        if (acceptSourceImage(g, { keepPrevious: true })) __cameraPrev = prev;
+        else { GlyphGrid.video.dispose(vs); try { g.remove(); } catch (_) {} }
+      } catch (e) {
+        CONFIG_BASE.video.camera = false;
+        statusEl().textContent = 'Camera unavailable: ' + ((e && e.message) || e);
+      }
+    } else if (!want && live) {
+      const prev = __cameraPrev;
+      __cameraPrev = null;
+      acceptSourceImage(prev || null);
+    } else if (live) {
+      sourceImg.__ggsVideo.mirror = !!CONFIG_BASE.video.mirror;
+    }
+  };
 
   /* ITER-076 (R3): text source.  While CONFIG.textSource.enabled, a
      p5.Graphics text raster IS sourceImg (tagged __ggsTextSource), so the
@@ -1716,7 +1867,7 @@
     const inner = __textBase ? makeFrameSource(__textBase, revision) : null;
     return {
       kind: 'text', img: img, revision: revision, durationMs: 0, index: -1,
-      key: null, dynamic: true, strokeCells: Infinity,
+      key: null, dynamic: true, strokeCells: Infinity, inner: inner,
       frameAt(tMs) {
         const ts = CONFIG.textSource;
         const composite = !!inner && ts.blend !== 'replace';
@@ -1730,7 +1881,7 @@
           this.index = ++__textEpoch;
         }
         this.durationMs = GlyphGrid.text.lastEnd(ts.lines) * 1000;
-        this.dynamic = GlyphGrid.text.isDynamic(ts) || (composite && inner.kind === 'gif');
+        this.dynamic = GlyphGrid.text.isDynamic(ts) || (composite && (inner.kind === 'gif' || inner.kind === 'video'));
         this.strokeCells = GlyphGrid.text.minStrokeCells(ts, img.width, img.height,
           CONFIG.canvas.w, CONFIG.grid.cols);
         return img;
@@ -1843,6 +1994,8 @@
        stability), so that stray draw shifted every later frame.  Priming
        passes (__primeOnly) run with recState set but never while capturing. */
     if (recState && recState._capturing && !__primeOnly) return;
+    /* ITER-077: a video frame this capture needs is still decoding. */
+    if (recState && recState._srcWait && !__primeOnly) return;
     if (!CONFIG.animation.loop && !recState && frameCount > 1) { noLoop(); return; }
 
     const t = recState
@@ -1888,6 +2041,15 @@
        `__sourceFrameIdx` watcher (scenes that compare against this
        reset their cache when the source frame changes).  ITER-073: the
        selection itself lives in the FrameSource adapter (makeFrameSource). */
+    /* ITER-077 (R4): frame-exact video.  frameAt() only paints decoded
+       frames, so a captured draw whose frame is not cached yet is skipped
+       — the loop pauses until the decode lands, then this frame draws.
+       Nothing above mutates cross-frame state, so the skip is invisible. */
+    const _vsrc = videoAdapterOf(frameSourceFor(sourceImg));
+    if (_vsrc && recState && !__primeOnly && !_vsrc.ready(t * 1000)) {
+      awaitVideoFrame(_vsrc, t * 1000, recState);
+      return;
+    }
     const _fsrc = frameSourceFor(sourceImg);
     _fsrc.frameAt(t * 1000);
     window.__sourceFrameIdx = _fsrc.index;
@@ -2008,6 +2170,12 @@
         const idx = (typeof window.__sourceFrameIdx === 'number' && window.__sourceFrameIdx >= 0)
           ? window.__sourceFrameIdx : sourceImg.gifProperties.displayIndex;
         animTag = ` | gif=${idx + 1}/${sourceImg.numFrames()}`;
+      }
+      /* ITER-077: video frame + which decoder is serving it. */
+      if (_fsrc.kind === 'video') {
+        const vs = _fsrc.video;
+        animTag = vs.camera ? ' | camera'
+          : ` | video=${typeof vs.painted === 'number' ? vs.painted + 1 : 'live'}/${vs.frames} (${vs.backend === 'rust' ? 'openh264' : 'webview'})`;
       }
       /* ITER-076: legibility floor — a stem under MIN_STROKE_CELLS glyph
          cells tends to dissolve.  Warned here and once per state on the CLI. */
@@ -4958,6 +5126,23 @@
          when the previous job's noLoop() is still in effect, and recState is
          already installed above, so that draw would have been captured as
          frame 0 from un-primed state. */
+      /* ITER-077: a video source decodes the priming frames + frame 0
+         first (the priming redraws are synchronous); the loop stays parked
+         (_srcWait) until they are in, then primes and starts as below. */
+      const _prefetch = prefetchCaptureFrames(total);
+      if (_prefetch) {
+        const state = recState;
+        state._srcWait = true;
+        try { noLoop(); } catch (_) {}
+        _prefetch.then(function () {
+          if (recState !== state || state.cancelled) return;
+          state._srcWait = false;
+          primeTemporalState(total);
+          if (__pfLastChange) __pfLastChange.t = performance.now();
+          try { loop(); } catch (e) {}
+        }, function (e) { failRecording(state, e); });
+        return recState.jobId;
+      }
       primeTemporalState(total);
       /* ITER-049: the perf switch-point stamp (__markChange in startCapture)
          predates the priming passes; re-stamp it so switch_ms measures the
@@ -5174,11 +5359,14 @@
            Keeps the batch in ONE Tauri session even when N source
            images need exercising (autonomous loop bench: 4 sources × 5
            configs in a single studio process, not 4). */
-        const wantSrc = job.inPath || null;
-        if (wantSrc && wantSrc !== __cliCurrentSource
+        /* ITER-077: a clip re-opens when the job asks for another decoder. */
+        const wantDecode = _jobVideoDecode(job.config, baselineConfig);
+        const decodeSwap = __cliCurrentDecode !== null && wantDecode !== __cliCurrentDecode;
+        const wantSrc = job.inPath || (decodeSwap ? __cliCurrentSource : null);
+        if (wantSrc && (wantSrc !== __cliCurrentSource || decodeSwap)
             && typeof _cliLoadSource === 'function'
             && window.__TAURI__ && window.__TAURI__.core) {
-          _cliLoadSource(wantSrc).then(function () {
+          _cliLoadSource(wantSrc, wantDecode).then(function () {
             _runJob();
           }).catch(function (e) {
             console.warn('batch: source swap failed for', job.name, e);
@@ -5925,23 +6113,49 @@
      heterogeneous `in` fields). Awaits decode + fit (ITER-047 dropped
      the settle sleep) so the caller can apply config and begin recording. */
   let __cliCurrentSource = null;
-  async function _cliLoadSource(inPath) {
+  let __cliCurrentDecode = null;   // ITER-077: video.decode the open clip used (null = not a video)
+  /* A job's video.decode — the source is loaded before the job's config is
+     applied, so the decoder choice is read off the config up front. */
+  function _jobVideoDecode(cfg, base) {
+    if (cfg && cfg.video && typeof cfg.video.decode === 'string') return cfg.video.decode;
+    if (base && base.video && typeof base.video.decode === 'string') return base.video.decode;
+    return 'auto';
+  }
+  /* ITER-077 (R4): the video FrameSource (Rust openh264 for H.264, else
+     the WebView <video>), installed through the same acceptSourceImage. */
+  async function _cliLoadVideo(inPath, probe, decode, importGeneration, sourceBytes) {
+    if (CONFIG_BASE.video && CONFIG_BASE.video.camera) {
+      cliLog('video: warn: video.camera is GUI-only; ignored headless');
+    }
+    const g = await openVideoSource(inPath, probe, decode, true);
+    if (!acceptSourceImage(g, { generation: importGeneration, sizeBytes: sourceBytes })) {
+      disposeVideoSource(g);
+      throw new Error((window.__glyphLastImportError && window.__glyphLastImportError.reason)
+        || 'source load was superseded');
+    }
+    __cliCurrentSource = inPath;
+    __cliCurrentDecode = decode || 'auto';
+  }
+  async function _cliLoadSource(inPath, decode) {
     const importGeneration = beginSourceImport(inPath);
     const core = window.__TAURI__.core;
     /* ITER-064 (F18): probe the file headers first so an over-limit
        animation/still is rejected before p5 allocates any frame. */
     const probe = await core.invoke('probe_image_file', { path: inPath });
     const sourceBytes = (probe && probe.sizeBytes) || 0;
+    const isVideo = !!(probe && probe.kind === 'video');
     if (probe && probe.probed) {
       const checked = validateSourceMetadata({
         width: probe.width, height: probe.height,
         numFrames: function () { return probe.frames; },
-      }, { sizeBytes: sourceBytes });
+      }, { sizeBytes: sourceBytes, video: isVideo });
       if (!checked.ok) {
         window.__glyphLastImportError = checked;
         throw new Error('source rejected before decode: ' + checked.reason);
       }
     }
+    /* ITER-077 (R4): mp4 / mov / m4v / webm → the video FrameSource. */
+    if (isVideo) return _cliLoadVideo(inPath, probe, decode, importGeneration, sourceBytes);
     /* The webview streams the file from disk via the asset protocol (no
        base64 data URL across IPC).  Fallback: inline data URL. */
     let sourceUrl = '';
@@ -5966,6 +6180,7 @@
       });
     });
     __cliCurrentSource = inPath;
+    __cliCurrentDecode = null;
     /* ITER-047: no settle sleep — acceptSourceImage already fitted the canvas
        and painted once, and beginRecord primes the temporal state itself
        (ITER-046), so pre-capture live draws no longer influence output. */
@@ -6031,7 +6246,10 @@
     await __assetsReady();
 
     try {
-      if (!textOnly) await _cliLoadSource(initialSource);
+      if (!textOnly) {
+        const firstCfg = (job.batch && Array.isArray(job.jobs) && job.jobs.length) ? job.jobs[0].config : job.config;
+        await _cliLoadSource(initialSource, _jobVideoDecode(firstCfg, CONFIG_BASE));
+      }
     } catch (e) {
       console.error('CLI: initial loadImage failed:', e);
       try { await window.__TAURI__.core.invoke('cli_log', { msg: 'source load failed: ' + ((e && e.message) || e) }); } catch (_) {}

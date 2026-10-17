@@ -143,6 +143,8 @@
       /* BUG-011 (v0.1.8): these are live panel inputs but were missing
          from the preset whitelist, so save → reload silently dropped them. */
       'invertSignal', 'bgThreshold', 'dispersal', 'scene',
+      /* ITER-077: video decode path (camera is stripped below). */
+      'video',
       /* ITER-075: keyframe tracks (CONFIG.timeline). */
       'timeline',
       /* ITER-076: kinetic typography (CONFIG.textSource). */
@@ -154,6 +156,8 @@
       var k = keys[i];
       if (config[k] !== undefined) out[k] = JSON.parse(JSON.stringify(config[k]));
     }
+    /* A preset must not switch a webcam on when someone loads it. */
+    if (out.video) delete out.video.camera;
     return out;
   }
   /* F24 (ITER-057): THE config merge — objects merge key by key, every
@@ -253,7 +257,7 @@
   var _sourceLoadGeneration = 0;
   var MAX_SOURCE_BYTES = 64 * 1024 * 1024;
   var WARN_SOURCE_BYTES = 24 * 1024 * 1024;
-  var SUPPORTED_IMAGE_MIME = /^image\/(png|jpe?g|webp|gif|bmp|tiff?|avif)$/i;
+  var SUPPORTED_IMAGE_MIME = /^(image\/(png|jpe?g|webp|gif|bmp|tiff?|avif)|video\/(mp4|quicktime|webm))$/i;  // ITER-077: + video
 
   function beginSourceLoad() { return ++_sourceLoadGeneration; }
   function isCurrentSourceLoad(token) { return token === _sourceLoadGeneration; }
@@ -298,6 +302,8 @@
     return validateSourceMeta({ sizeBytes: file.size || 0, mimeType: file.type || '' }, file.name);
   }
   function discardStaleImage(img) {
+    /* ITER-077: a video source also owns a <video> + decode cache. */
+    try { if (img && img.__ggsVideo && window.GlyphGrid && window.GlyphGrid.video) window.GlyphGrid.video.dispose(img.__ggsVideo); } catch (e) {}
     try { if (img && typeof img.remove === 'function') img.remove(); } catch (e) {}
   }
   function loadImageLatest(source, token, onSuccess, onError) {
@@ -321,15 +327,27 @@
     var core = window.__TAURI__.core;
     core.invoke('probe_image_file', { path: path }).then(function (probe) {
       if (!isCurrentSourceLoad(token)) return null;
+      var isVideo = !!(probe && probe.kind === 'video');
       if (probe && probe.probed && imageRef && typeof imageRef.validate === 'function') {
         var checked = imageRef.validate({
           width: probe.width, height: probe.height,
           numFrames: function () { return probe.frames; },
-        }, { sizeBytes: probe.sizeBytes || 0 });
+        }, { sizeBytes: probe.sizeBytes || 0, video: isVideo });
         if (checked && !checked.ok) {
-          exportFeedback('Image rejected: ' + label + ' — ' + checked.reason + '.', true);
+          exportFeedback((isVideo ? 'Video' : 'Image') + ' rejected: ' + label + ' — ' + checked.reason + '.', true);
           return null;
         }
+      }
+      /* ITER-077 (R4): a clip becomes a video FrameSource (index.html
+         openVideoSource: Rust openh264 for H.264, else a hidden <video>). */
+      if (isVideo) {
+        if (typeof window.__ggsOpenVideo !== 'function') throw new Error('video sources need the studio page');
+        exportFeedback('Opening video ' + label + '…');
+        return window.__ggsOpenVideo(path, probe).then(function (g) {
+          if (!isCurrentSourceLoad(token)) { discardStaleImage(g); return null; }
+          onSuccess(g);
+          return null;
+        });
       }
       if (typeof core.convertFileSrc === 'function') return core.convertFileSrc(path);
       return core.invoke('read_image_file', { path: path, inline: true }).then(function (r) {
@@ -453,7 +471,7 @@
             } catch (e) {}
           }, function (err) {
             console.warn('glyph-studio: image decode failed', err);
-            try { exportFeedback('Not a readable image: ' + String(absPath).split('/').pop(), true); } catch (e) {}
+            try { exportFeedback('Not a readable image: ' + String(absPath).split('/').pop() + ((err && err.message) ? ' — ' + err.message : ''), true); } catch (e) {}
           });
         })
         .catch(function (e) {
@@ -961,8 +979,8 @@
               if (loadIntoP5(img, meta) !== false) {
                 try { addRecentSource(result.path); } catch (e) {}
               }
-            }, function () {
-              exportFeedback('Could not decode ' + basename(result && result.path) + '.', true);
+            }, function (err) {
+              exportFeedback('Could not decode ' + basename(result && result.path) + ((err && err.message) ? ' — ' + err.message : '.'), true);
             });
           }
         })
@@ -1916,6 +1934,23 @@
         area.value = '';
         kickText();
       });
+    }
+
+    /* Video (ITER-077, R4).  Clips load like images (Pick image… or
+       drag-drop an mp4 / mov / m4v / webm).  decode picks the decoder for
+       the NEXT clip opened; camera swaps the webcam in as the source while
+       it is on (experimental — needs the macOS camera permission). */
+    if (window.GlyphGrid && window.GlyphGrid.video && config.video) {
+      var fVideo = pane.addFolder({ title: 'Video', expanded: false });
+      var kickCam = function () { if (window.__videoCameraKick) window.__videoCameraKick(); };
+      var vOpts = {};
+      window.GlyphGrid.video.DECODERS.forEach(function (d) { vOpts[d] = d; });
+      tip(fVideo.addInput(config.video, 'decode', { options: vOpts }),
+          'auto: H.264 MP4/MOV decode frame-exactly in Rust (openh264); other codecs (HEVC, WebM) use the WebView. native: Rust only. webview: always the WebView seek path. Applies to the next clip you open.');
+      tip(fVideo.addInput(config.video, 'camera', { label: 'camera (beta)' }).on('change', kickCam),
+          'Use the webcam as the source (GUI only, experimental). Turning it off restores the previous source. Live camera exports are not frame-reproducible.');
+      tip(fVideo.addInput(config.video, 'mirror').on('change', kickCam),
+          'Mirror the camera image horizontally (selfie view).');
     }
 
     /* Perf — Phase 0 instrumentation. Live rolling averages of per-stage

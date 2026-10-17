@@ -50,6 +50,7 @@ The selected glyph is typeset into the cell, in a chosen palette and color mode.
 | Glyph sets (7) | ASCII, asciiDense, blockElements, braille, sextant, octant, ramp-only |
 | Postprocess (8) | vignette, bloom, halation, scanlines, chromaticAberration, phosphorDecay, depthFog, **CRT-beam** (Lottes / Blur Busters 2024) |
 | Animation | breathing-cell EMA, per-frame gain pulse, per-cell jitter — runtime-tunable · keyframe timeline on any CONFIG path (OKLab palette morphs) |
+| Video source | MP4 / MOV / M4V / WebM as the input. H.264 decodes frame-exactly in Rust (openh264), so headless renders of a clip are deterministic. HEVC, VP9 and other codecs go through the WebView `<video>` with a seek per frame. Webcam source in the GUI (beta) |
 | Text source | kinetic typography (typewriter / rise / fade / scale) and `.srt` / `.lrc` lyric cues rendered as the source, alone or composited onto the image (multiply / screen / mask) |
 | Export | PNG snapshot · animated GIF89a · MP4 (H.264) · preset JSON · share URL |
 
@@ -155,6 +156,13 @@ glyph-grid-studio render --in a.png --out a.mp4 --frames auto \
 glyph-grid-studio render --text 'DROP' --text-anim typewriter --out drop.gif
 glyph-grid-studio render --srt lyrics.lrc --text-anim rise --frames auto --out lyrics.mp4
 glyph-grid-studio render --in photo.jpg --text 'HELLO' --text-blend mask --out hello.gif
+
+# Video as the source (ITER-077): --in takes .mp4 / .mov / .m4v / .webm.
+# The loop is the clip's length (--frames auto = all of it at the output fps).
+# --video-decode auto (default: H.264 in Rust, other codecs in the WebView) |
+# native (Rust only, non-H.264 is an error) | webview.  JSON: `video.decode`.
+# Limits are the image ones: <= 480 frames, <= 64 MB; trim longer clips first.
+glyph-grid-studio render --in clip.mp4 --frames auto --out clip-glyphs.mp4
 
 # Help
 glyph-grid-studio render --help

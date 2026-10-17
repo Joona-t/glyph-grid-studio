@@ -37,8 +37,9 @@ use tokio::process::Command;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RenderParams {
-    /// Absolute path to the source image (PNG / JPG / WebP / GIF / BMP / TIFF).
-    /// Optional when `text`, `srt_path` or `text_options.enabled` gives a
+    /// Absolute path to the source image (PNG / JPG / WebP / GIF / BMP / TIFF)
+    /// or video (MP4 / MOV / M4V / WebM; R4 — H.264 decodes frame-exactly
+    /// in Rust, other codecs through the WebView).  Optional when `text`, `srt_path` or `text_options.enabled` gives a
     /// text source (the text is rendered as the source raster).
     #[serde(default)]
     pub in_path: Option<String>,
@@ -120,6 +121,12 @@ pub struct RenderParams {
     /// w, h, lines:[{text, start, end, ...}]}`.  Deep-merges onto `config`.
     #[serde(default)]
     pub text_options: Option<serde_json::Value>,
+    /// Video sources (R4): `auto` (default — H.264 MP4/MOV decoded in Rust,
+    /// anything else through the WebView `<video>` path), `native` (Rust
+    /// only; a non-H.264 clip is an error) or `webview` (always the
+    /// `<video>` path).  Ignored for image sources.
+    #[serde(default)]
+    pub video_decode: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -362,7 +369,7 @@ fn render_error_path(p: &RenderParams, path: Option<String>) -> Option<String> {
     let Some(ptr) = path.strip_prefix("/config") else {
         return Some(path);
     };
-    let named: [(&str, bool, &str); 9] = [
+    let named: [(&str, bool, &str); 10] = [
         ("/palette", p.palette.is_some(), "/palette"),
         ("/colorMode", p.color_mode.is_some(), "/color_mode"),
         ("/ramp", p.ramp.is_some(), "/ramp"),
@@ -372,6 +379,7 @@ fn render_error_path(p: &RenderParams, path: Option<String>) -> Option<String> {
         ("/samplingStrategy", p.sampling_strategy.is_some(), "/sampling_strategy"),
         ("/grid/cols", p.cols.is_some(), "/cols"),
         ("/grid/rows", p.rows.is_some(), "/rows"),
+        ("/video/decode", p.video_decode.is_some(), "/video_decode"),
     ];
     for (at, sent, arg) in named {
         if sent && (ptr == at || ptr.starts_with(&format!("{}/", at))) {
@@ -561,6 +569,7 @@ impl GlyphGridServer {
                 set: Vec::new(),
                 timeline: Vec::new(),
                 text: p.text.clone(),
+                video_decode: p.video_decode.clone(),
                 ..Default::default()
             },
             format: p.format.clone(),
@@ -655,6 +664,9 @@ impl GlyphGridServer {
         }
         if let Some(v) = &p.mp4_quality {
             cmd.arg("--mp4-quality").arg(v);
+        }
+        if let Some(v) = &p.video_decode {
+            cmd.arg("--video-decode").arg(v);
         }
         if let Some(v) = p.timeout_s {
             cmd.arg("--timeout").arg(v.to_string());

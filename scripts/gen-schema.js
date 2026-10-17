@@ -122,6 +122,8 @@ for (const m of studioSrc.matchAll(/config\.postprocess\.(\w+) = \{/g)) {
 const TIMELINE = require(path.join(ROOT, 'src', 'lib', 'glyph-timeline.js'));
 /* ---- 6. text-source enums (ITER-076) ---- */
 const TEXT = require(path.join(ROOT, 'src', 'lib', 'glyph-text-source.js'));
+/* ---- 7. video decoders (ITER-077) ---- */
+const VIDEO = require(path.join(ROOT, 'src', 'lib', 'glyph-video-source.js'));
 
 const compatSrc = read('src/lib/glyph-compat.js');
 const COMPAT = literalAfter(compatSrc, 'COMPAT_VERSIONS = Object.freeze(', 'COMPAT_VERSIONS');
@@ -169,6 +171,7 @@ const DESCRIPTIONS = {
   depth: 'Depth-map fog zones.',
   paletteMorph: 'OKLab palette interpolation over time; null = off.',
   textSource: 'Kinetic typography: text (or SRT/LRC cues) rendered per frame as the source raster.',
+  video: 'Video sources (mp4 / mov / m4v / webm as the input): decoder choice and the GUI camera.',
   timeline: 'Keyframe tracks on dotted CONFIG paths, evaluated per frame (u = t / animation.duration).',
   temporalStability: 'Anti-flicker Schmitt trigger on the ramp index.',
   flow: 'ETF tuning for selectionMode "flow".',
@@ -296,6 +299,19 @@ for (const k of Object.keys(CONFIG)) {
       }, style(D), {
         lines: { type: 'array', items: line, default: D.lines },
       }),
+      additionalProperties: false,
+    };
+  }
+  if (k === 'video') {
+    const D = CONFIG.video;
+    p = {
+      type: 'object',
+      properties: {
+        decode: { type: 'string', enum: VIDEO.DECODERS.slice(), default: D.decode,
+          description: 'auto = H.264 MP4/MOV via the Rust openh264 decoder (frame-exact), other codecs via the WebView <video>; native = Rust only (non-H.264 is an error); webview = always the <video> seek path.' },
+        camera: { type: 'boolean', default: D.camera, description: 'GUI only (experimental): the webcam is the source while on. Ignored headless.' },
+        mirror: { type: 'boolean', default: D.mirror, description: 'Mirror the camera image.' },
+      },
       additionalProperties: false,
     };
   }
