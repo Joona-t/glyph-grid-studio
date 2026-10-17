@@ -24,7 +24,7 @@
 
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::ProgressNotificationParam,
+    model::{CallToolResult, Content, ProgressNotificationParam},
     schemars,
     service::{RequestContext, RoleServer},
     tool, tool_router,
@@ -89,6 +89,11 @@ pub struct RenderParams {
     /// deep-merges onto it, then the named params on top.
     #[serde(default)]
     pub preset: Option<String>,
+    /// Give up after this many seconds (the render child exits 3 → error
+    /// code `timeout`).  Default: no overall limit; a render with no
+    /// progress for 300 s still times out.
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -109,6 +114,11 @@ pub struct BatchParams {
     /// — the same shape as a `batch --manifest` file. `out` must be an
     /// absolute path.
     pub jobs: Vec<serde_json::Value>,
+    /// Give up on the whole batch after this many seconds (error code
+    /// `timeout`).  Default: no overall limit (300 s without progress
+    /// still times out).
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
 }
 
 /// Temp JSON file (a preset for `config`, a manifest for `glyph_grid_batch`);
@@ -206,6 +216,78 @@ async fn run_child(mut cmd: Command, ctx: &RequestContext<RoleServer>) -> Result
     Ok(ChildEnd::Exited(status, stderr))
 }
 
+/* ---------- F25 (ITER-059): machine-readable errors ----------
+ *
+ * Every failure is an `isError: true` result whose text (and
+ * `structuredContent`) is one JSON object:
+ *   {code, path, message, exit_code?, stderr_tail?}
+ * code: invalid_arguments (child exit 2 / rejected in-process) · timeout
+ * (exit 3) · render_failed (exit 1) · no_output (exit 0, no file) ·
+ * interrupted (killed by a signal) · cancelled · internal.
+ * path: JSON pointer into this tool's arguments when the culprit is known
+ * (`/config/dither/mode`, `/jobs/1/config/selectionMode`, `/in_path`),
+ * else null. */
+
+fn tool_error(code: &str, path: Option<String>, message: String) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "code": code,
+        "path": path,
+        "message": message,
+    }))
+}
+
+/// The argument a CLI / validator message blames, as a JSON pointer.
+fn error_path(text: &str, batch: bool) -> Option<String> {
+    for line in text.lines() {
+        let t = line.trim();
+        // render: "invalid config:\n  config/dither/mode: ..." (build_js_config)
+        if let Some(rest) = t.strip_prefix("config/") {
+            let p = rest.split(':').next().unwrap_or("");
+            return Some(format!("/config/{}", p));
+        }
+        // batch: `batch: job 1 ("typo") config /selectionMode: ...`
+        if let Some(i) = t.find("batch: job ") {
+            let rest = &t[i + "batch: job ".len()..];
+            let idx = rest.split_whitespace().next().unwrap_or("");
+            if idx.parse::<usize>().is_ok() {
+                if let Some(c) = rest.find(" config /") {
+                    let p = rest[c + " config ".len()..].split(':').next().unwrap_or("");
+                    return Some(format!("/jobs/{}/config{}", idx, p));
+                }
+                return Some(format!("/jobs/{}", idx));
+            }
+        }
+        if t.contains("cannot resolve --in") || t.contains("cannot resolve manifest `in`") {
+            return Some(if batch { "/in" } else { "/in_path" }.to_string());
+        }
+        if t.contains("--preset") {
+            return Some("/preset".to_string());
+        }
+    }
+    None
+}
+
+/// A child that exited non-zero → the structured error for its exit code.
+fn child_error(what: &str, status: std::process::ExitStatus, stderr: &str, batch: bool) -> CallToolResult {
+    let code = match status.code() {
+        Some(crate::EXIT_USAGE) => "invalid_arguments",
+        Some(crate::EXIT_TIMEOUT) => "timeout",
+        Some(130) | Some(143) | None => "interrupted",
+        _ => "render_failed",
+    };
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    let last = lines.last().copied().unwrap_or("");
+    let path = if code == "invalid_arguments" { error_path(stderr, batch) } else { None };
+    CallToolResult::structured_error(serde_json::json!({
+        "code": code,
+        "path": path,
+        "message": format!("{} failed: exit {} | {}", what, status.code().unwrap_or(-1), last),
+        "exit_code": status.code(),
+        "stderr_tail": tail,
+    }))
+}
+
 /* ---------- Server handler ---------- */
 
 #[derive(Debug, Clone)]
@@ -221,7 +303,7 @@ impl GlyphGridServer {
         &self,
         Parameters(p): Parameters<RenderParams>,
         ctx: RequestContext<RoleServer>,
-    ) -> String {
+    ) -> CallToolResult {
         // F24 (ITER-057): a `config` object travels as a temp preset file —
         // the CLI already layers flags onto `--preset`, so no new CLI
         // surface is needed.  Removed when this call returns.
@@ -229,9 +311,19 @@ impl GlyphGridServer {
         // `config` too, the config deep-merges onto the file's contents
         // (the CLI takes one --preset).
         if let Some(other) = p.config.as_ref().filter(|c| !c.is_object()) {
-            return format!(
-                "Render failed: exit 2 | invalid arguments: `config` must be a JSON object, got {}",
-                other
+            return tool_error(
+                "invalid_arguments",
+                Some("/config".into()),
+                format!("invalid arguments: `config` must be a JSON object, got {}", other),
+            );
+        }
+        // F25 (ITER-059): the CLI would exit 2 on this after ~0.1 s; answer
+        // in-process with the argument path instead.
+        if !std::path::Path::new(&p.in_path).is_file() {
+            return tool_error(
+                "invalid_arguments",
+                Some("/in_path".into()),
+                format!("invalid arguments: in_path {} is not a readable file", p.in_path),
             );
         }
         let mut temp = None;
@@ -247,15 +339,17 @@ impl GlyphGridServer {
                     {
                         Ok(v @ serde_json::Value::Object(_)) => merged = v,
                         Ok(other) => {
-                            return format!(
-                                "Render failed: exit 2 | invalid arguments: preset {} must be a JSON object, got {}",
-                                path, other
+                            return tool_error(
+                                "invalid_arguments",
+                                Some("/preset".into()),
+                                format!("invalid arguments: preset {} must be a JSON object, got {}", path, other),
                             )
                         }
                         Err(e) => {
-                            return format!(
-                                "Render failed: exit 2 | invalid arguments: cannot read preset {}: {}",
-                                path, e
+                            return tool_error(
+                                "invalid_arguments",
+                                Some("/preset".into()),
+                                format!("invalid arguments: cannot read preset {}: {}", path, e),
                             )
                         }
                     }
@@ -267,7 +361,7 @@ impl GlyphGridServer {
                         temp = Some(t);
                         Some(path)
                     }
-                    Err(e) => return e,
+                    Err(e) => return tool_error("internal", None, e),
                 }
             }
         };
@@ -295,14 +389,19 @@ impl GlyphGridServer {
                 set: Vec::new(),
             },
             format: p.format.clone(),
+            timeout_secs: p.timeout_s,
         };
         if let Err(e) = probe.build_js_config() {
-            return format!("Render failed: exit 2 | invalid arguments: {}", e);
+            return tool_error(
+                "invalid_arguments",
+                error_path(&e, false),
+                format!("invalid arguments: {}", e),
+            );
         }
 
         let exe = match std::env::current_exe() {
             Ok(p) => p,
-            Err(e) => return format!("error: cannot locate own binary: {}", e),
+            Err(e) => return tool_error("internal", None, format!("cannot locate own binary: {}", e)),
         };
 
         let mut cmd = Command::new(&exe);
@@ -350,6 +449,9 @@ impl GlyphGridServer {
         if let Some(v) = &p.format {
             cmd.arg("--format").arg(v);
         }
+        if let Some(v) = p.timeout_s {
+            cmd.arg("--timeout").arg(v.to_string());
+        }
 
         let end = run_child(cmd, &ctx).await;
         drop(temp);
@@ -357,24 +459,22 @@ impl GlyphGridServer {
             Ok(ChildEnd::Exited(status, _)) if status.success() => {
                 // Verify the output file exists and report size.
                 match std::fs::metadata(&p.out_path) {
-                    Ok(meta) => format!(
+                    Ok(meta) => CallToolResult::success(vec![Content::text(format!(
                         "Rendered {} ({} KB)",
                         p.out_path,
                         meta.len() / 1024
-                    ),
-                    Err(_) => format!(
-                        "Rendered (no output file at {} — check stderr)",
-                        p.out_path
+                    ))]),
+                    // F25: exit 0 without the file is a failure, not a success.
+                    Err(_) => tool_error(
+                        "no_output",
+                        Some("/out_path".into()),
+                        format!("render exited 0 but wrote no file at {}", p.out_path),
                     ),
                 }
             }
-            Ok(ChildEnd::Exited(status, stderr)) => format!(
-                "Render failed: exit {} | stderr: {}",
-                status.code().unwrap_or(-1),
-                stderr
-            ),
-            Ok(ChildEnd::Cancelled) => "Render cancelled (subprocess killed)".to_string(),
-            Err(e) => format!("Render {}", e),
+            Ok(ChildEnd::Exited(status, stderr)) => child_error("Render", status, &stderr, false),
+            Ok(ChildEnd::Cancelled) => tool_error("cancelled", None, "Render cancelled (subprocess killed)".into()),
+            Err(e) => tool_error("internal", None, format!("Render {}", e)),
         }
     }
 
@@ -389,7 +489,7 @@ impl GlyphGridServer {
         &self,
         Parameters(p): Parameters<BatchParams>,
         ctx: RequestContext<RoleServer>,
-    ) -> String {
+    ) -> CallToolResult {
         // F22 Tier A (ITER-058): the manifest travels as a temp file to
         // `batch --manifest`, which validates every job (exit 2, before
         // Tauri starts) exactly like the CLI.
@@ -402,14 +502,17 @@ impl GlyphGridServer {
         }
         let temp = match TempPreset::write("manifest", &manifest) {
             Ok(t) => t,
-            Err(e) => return e,
+            Err(e) => return tool_error("internal", None, e),
         };
         let exe = match std::env::current_exe() {
             Ok(p) => p,
-            Err(e) => return format!("error: cannot locate own binary: {}", e),
+            Err(e) => return tool_error("internal", None, format!("cannot locate own binary: {}", e)),
         };
         let mut cmd = Command::new(&exe);
         cmd.arg("batch").arg("--manifest").arg(&temp.0);
+        if let Some(v) = p.timeout_s {
+            cmd.arg("--timeout").arg(v.to_string());
+        }
 
         let end = run_child(cmd, &ctx).await;
         drop(temp);
@@ -427,18 +530,21 @@ impl GlyphGridServer {
                     });
                 }
                 if status.success() {
-                    format!("Batch complete: {} jobs\n{}", p.jobs.len(), report.join("\n"))
+                    CallToolResult::success(vec![Content::text(format!(
+                        "Batch complete: {} jobs\n{}",
+                        p.jobs.len(),
+                        report.join("\n")
+                    ))])
                 } else {
-                    format!(
-                        "Batch failed: exit {}\n{}\n| stderr: {}",
-                        status.code().unwrap_or(-1),
-                        report.join("\n"),
-                        stderr
-                    )
+                    // Structured error first; the per-job report (which
+                    // outputs do exist after a partial failure) second.
+                    let mut r = child_error("Batch", status, &stderr, true);
+                    r.content.push(Content::text(report.join("\n")));
+                    r
                 }
             }
-            Ok(ChildEnd::Cancelled) => "Batch cancelled (subprocess killed)".to_string(),
-            Err(e) => format!("Batch {}", e),
+            Ok(ChildEnd::Cancelled) => tool_error("cancelled", None, "Batch cancelled (subprocess killed)".into()),
+            Err(e) => tool_error("internal", None, format!("Batch {}", e)),
         }
     }
 
@@ -471,7 +577,28 @@ pub async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_batch_progress;
+    use super::{error_path, parse_batch_progress};
+
+    #[test]
+    fn error_paths_point_at_the_argument() {
+        assert_eq!(
+            error_path("invalid config:\n  config/dither/mode: \"STBN\" is not one of [..]", false).as_deref(),
+            Some("/config/dither/mode")
+        );
+        assert_eq!(
+            error_path("batch: job 1 (\"typo\") config /selectionMode: \"shapes\" is not one of", true).as_deref(),
+            Some("/jobs/1/config/selectionMode")
+        );
+        assert_eq!(
+            error_path("batch: job 0 (\"?\") has no `out` path — refusing", true).as_deref(),
+            Some("/jobs/0")
+        );
+        assert_eq!(
+            error_path("render: cannot resolve --in \"x\": No such file", false).as_deref(),
+            Some("/in_path")
+        );
+        assert_eq!(error_path("glyph-grid-studio: render reported failure", false), None);
+    }
 
     #[test]
     fn batch_progress_lines_are_parsed() {

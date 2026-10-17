@@ -4,6 +4,27 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-059 — 2026-10-17 — v0.2 Phase 3: machine-readable errors, exit codes 0/1/2/3, `--timeout` + stall watchdog (F25)
+
+**Problem:** MCP failures came back as *successful* tool calls whose text began "Render failed: …" (tool fns returned `String`; rmcp only sets `isError` for `Err`/`CallToolResult::error`), and "exit 0 but no file" was reported as "Rendered (no output file …)". The CLI had 0 / 1 / 2 with every in-WebView failure collapsing to 1 and nothing documented. A stalled WebView never exited — tests/run-all.sh wraps every call in `timeout 180` because of a 35-min hang; an MCP client inherited that hang.
+
+**Root cause:** the error surface was prose for humans; there was no liveness signal in the headless path at all (grep watchdog/liveness: 0 hits).
+
+**Fix:**
+- Exit codes `EXIT_OK/FAILED/USAGE/TIMEOUT` = 0/1/2/3 (lib.rs), documented in README and `render --help`.
+- `--timeout <s>` on `render` and `batch`, plus an always-on stall guard (`STALL_SECS` = 300 s without a liveness touch). One watchdog thread (100 ms tick) started before `run_tauri`; liveness is touched by `stage_export_frame`, `ExportControl::emit` (every gifski/openh264 progress tick), `cli_log` and `get_cli_render_job`. On expiry `abort_headless` removes the `.part` files this process is writing (`LIVE_PARTS`, maintained by `atomic_write_output`) and `std::process::exit(3)`.
+- MCP: both render tools return `CallToolResult`; failures are `CallToolResult::structured_error({code, path, message, exit_code?, stderr_tail?})` (text and `structuredContent` both carry it). Codes: `invalid_arguments` (exit 2 / rejected in-process), `timeout` (exit 3), `render_failed`, `no_output`, `interrupted`, `cancelled`, `internal`. `path` is a JSON pointer into the tool arguments, recovered from the validator/CLI message (`/config/dither/mode`, `/jobs/1/config/selectionMode`, `/in_path`, `/preset`). A missing `in_path` is now rejected in-process (0.0 s) instead of after a spawn. New `timeout_s` argument on both tools, forwarded as `--timeout`. Success text unchanged.
+
+**Measured:**
+- `render --frames 120 --timeout 2` → exit 3 at **2.6 s**, no output, no `.part`; the 4 WebKit XPC pids spawned for it (WebContent/GPU/Networking) were all gone 1 s after exit.
+- MCP `timeout_s: 2` → `isError`, `code: timeout`, `exit_code: 3` in 2.1 s.
+- Output gate (render path untouched): worm-move 120 f / `pB.json` md5 `96fc9327…` == the ITER-057/058 output; vs `golden-p3.mp4` **37.62 dB**.
+- Timing (perf-sample, two runs, **under parallel load**, load avg ~14–16, `suspect_foreign_xpc: true`): wall 20.67 / 20.01 s, host 3.27 / 3.00 s (WebContent/GPU sums include other phases' pids).
+
+**Gate:** cargo build 0 errors · cargo test **24/24** (+1 `error_paths_point_at_the_argument`) · npm test ok · run-all **PASS 33 / FAIL 0** (`TEST_TIMEOUT=400`; +B19 timeout) · byte-identity **7/7** · MCP **20/20** (+C13 ×2 isError shape, +C13c timeout).
+
+**Gotchas:** (a) The watchdog only runs in headless `render`/`batch`, never in the GUI. (b) `--timeout` is the overall budget measured from before Tauri starts, not per job; the 300 s stall guard is per-gap and not configurable. (c) A failed `glyph_grid_batch` result has two content items: the JSON error, then the per-job report. (d) tests/run-all.sh B19 is **uncommitted** (pre-commit deny-list), like ITER-056/057's run-all edits.
+
 ### ITER-058 — 2026-10-17 — v0.2 Phase 3: MCP `glyph_grid_batch`, `preset` passthrough, async tools with progress + cancel (F22 Tier A + B)
 
 **Problem:** MCP was one cold app launch per render (~5 s spawn + Tauri start-up each, mcp.rs header) with no way to reach the single-session batch driver (`run_headless_batch`, ITER-024: 6.2 s/job in one session vs ~3 s start-up per spawn) — an agent trying three palettes paid three launches. `glyph_grid_render` could take an inline `config` (ITER-057) but not a preset file the GUI exported. The tool fn was sync around `std::process::Command::output()`: it blocked a tokio worker for the whole render, so pings and `notifications/cancelled` went unserviced and a cancelled render ran to completion; rmcp's progress tokens were unused.

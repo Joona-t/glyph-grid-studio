@@ -324,6 +324,47 @@ if "invalid arguments" in t12 and "/dither/mode" in t12 and time.time() - t0 < 5
 else:
     bad("C12 invalid preset file rejected", t12[:160])
 
+# --- Test C13 (F25/ITER-059): failures are isError results with {code, path, message} ---
+def tool_result(resp):
+    res = resp.get("result", {}) if resp else {}
+    text = (res.get("content") or [{}])[0].get("text", "")
+    try:
+        body = json.loads(text)
+    except Exception:
+        body = None
+    return res, body
+
+for rid, args, want_code, want_path in [
+    (12, {"in_path": TEST_IMG, "out_path": os.path.join(SCRATCH, "c13a.gif"),
+          "config": {"dither": {"mode": "STBN"}}}, "invalid_arguments", "/config/dither/mode"),
+    (13, {"in_path": "/tmp/__nonexistent_test_image__.png",
+          "out_path": os.path.join(SCRATCH, "c13b.gif")}, "invalid_arguments", "/in_path"),
+]:
+    send(proc, {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                "params": {"name": "glyph_grid_render", "arguments": args}})
+    res, body = tool_result(recv(proc, timeout=10))
+    if res.get("isError") is True and isinstance(body, dict) \
+            and body.get("code") == want_code and body.get("path") == want_path \
+            and body.get("message") and res.get("structuredContent") == body:
+        ok("C13 isError + {code: %s, path: %s}" % (want_code, want_path))
+    else:
+        bad("C13 structured error %s" % want_path, str(res)[:200])
+
+# C13c: a child that times out → code "timeout" (exit 3), bounded wall time.
+t0 = time.time()
+send(proc, {"jsonrpc": "2.0", "id": 14, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TEST_IMG, "out_path": os.path.join(SCRATCH, "c13c.gif"),
+                  "frames": 120, "timeout_s": 2},
+}})
+res, body = tool_result(recv(proc, timeout=60))
+if res.get("isError") is True and isinstance(body, dict) and body.get("code") == "timeout" \
+        and body.get("exit_code") == 3 and time.time() - t0 < 20 \
+        and not os.path.exists(os.path.join(SCRATCH, "c13c.gif")):
+    ok("C13c timeout_s → isError code=timeout exit_code=3 (%.1fs)" % (time.time() - t0))
+else:
+    bad("C13c timeout_s", str(res)[:200])
+
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")
 sys.exit(0 if FAIL == 0 else 1)

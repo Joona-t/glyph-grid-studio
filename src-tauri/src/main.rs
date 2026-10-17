@@ -21,6 +21,8 @@ enum Command {
     Studio,
 
     /// Render a single image to an animated GIF, headlessly.
+    /// Exit codes: 0 ok, 1 render/encode failed, 2 bad input (usage, preset,
+    /// config, source path), 3 timed out (`--timeout` or 300 s stalled).
     Render(RenderArgs),
 
     /// Render many variants of the SAME source in ONE Tauri session.  Reads a
@@ -127,6 +129,12 @@ struct RenderArgs {
     /// to stdout and exit — no window, no render.
     #[arg(long)]
     dry_run: bool,
+
+    /// Give up after this many seconds: the render is killed, its `.part`
+    /// files removed, exit code 3.  Default: no overall limit (a render
+    /// with no progress for 300 s still exits 3).
+    #[arg(long, value_name = "SECONDS")]
+    timeout: Option<u64>,
 }
 
 /// `--frames` value: `None` = auto.
@@ -154,6 +162,12 @@ struct BatchArgs {
     /// Show the rendering window during the headless batch (debug aid).
     #[arg(long)]
     show_window: bool,
+
+    /// Give up on the whole batch after this many seconds (exit 3, `.part`
+    /// files removed).  Default: no overall limit (300 s without progress
+    /// still exits 3).
+    #[arg(long, value_name = "SECONDS")]
+    timeout: Option<u64>,
 }
 
 fn main() {
@@ -198,6 +212,7 @@ fn main() {
                     set: args.set,
                 },
                 format: args.format,
+                timeout_secs: args.timeout,
             };
             if args.dry_run {
                 match app_lib::headless_render_json(&job) {
@@ -219,7 +234,7 @@ fn main() {
             std::process::exit(code);
         }
         Some(Command::Batch(args)) => {
-            let code = app_lib::run_headless_batch(args.manifest, args.show_window);
+            let code = app_lib::run_headless_batch(args.manifest, args.show_window, args.timeout);
             std::process::exit(code);
         }
         Some(Command::Catalog) => {

@@ -10,8 +10,8 @@ Exposes Glyph Grid Studio's rendering pipeline as MCP tools over stdio JSON-RPC.
 
 | Tool | Description | Required args | Optional args |
 |---|---|---|---|
-| `glyph_grid_render` | Render an image to an animated GIF (or MP4) | `in_path`, `out_path` | `frames`, `palette`, `color_mode`, `ramp`, `dither`, `selection_mode`, `glyph_set`, `sampling_strategy`, `postprocess[]`, `cols`, `rows`, `format`, `config`, `preset` |
-| `glyph_grid_batch` | Render N jobs in **one** app session (start-up paid once). Arguments are a `batch --manifest` object. Sends progress per finished job. | `in`, `jobs[]` | `frames`, `perf` |
+| `glyph_grid_render` | Render an image to an animated GIF (or MP4) | `in_path`, `out_path` | `frames`, `palette`, `color_mode`, `ramp`, `dither`, `selection_mode`, `glyph_set`, `sampling_strategy`, `postprocess[]`, `cols`, `rows`, `format`, `config`, `preset`, `timeout_s` |
+| `glyph_grid_batch` | Render N jobs in **one** app session (start-up paid once). Arguments are a `batch --manifest` object. Sends progress per finished job. | `in`, `jobs[]` | `frames`, `perf`, `timeout_s` |
 | `glyph_grid_catalog` | List every available palette / ramp / dither / glyph set / postprocess stage. Returns JSON. | — | — |
 
 **Config layering (`glyph_grid_render`)**, lowest to highest priority: `preset` (absolute path to a preset JSON file, e.g. one exported from the GUI) → `config` (any partial CONFIG object, same shape as a preset — see `src/glyph-grid.schema.json`) → the named params. Objects deep-merge, so `config: {postprocess: {vignette: {strength: 0.9}}}` keeps the other vignette fields. Arguments are validated against the schema in-process, so a typo'd enum fails in milliseconds with a JSON path (`/dither/mode: ...`) instead of after a ~5 s app launch.
@@ -34,6 +34,24 @@ Exposes Glyph Grid Studio's rendering pipeline as MCP tools over stdio JSON-RPC.
 Per job: `name`, `out` (absolute), optional `format` (`gif`/`mp4`, else from the extension), `in` (per-job source), `frames` (integer or `"auto"`), `capWidth`, `targetMaxBytes`, `border {width, bgColor?, style?, inkColor?}`, `config`. Every job config is validated before the app starts; one bad job refuses the whole batch (exit 2). The result has one line per job (`job 0 (spice): /abs/out/spice.gif (1493 KB)`).
 
 **Progress.** Send `_meta: {"progressToken": <token>}` in the `tools/call` params and the server emits `notifications/progress` with `progress: N, total: M` as each batch job finishes (`message` carries the job's `batch: N/M name → path` line). `glyph_grid_render` is a single job and sends none.
+
+**Errors.** A failed call is a tool result with `isError: true`; its text (and `structuredContent`) is one JSON object:
+
+```json
+{"code": "invalid_arguments", "path": "/config/dither/mode",
+ "message": "invalid arguments: invalid config: ... \"STBN\" is not one of [...]"}
+```
+
+| `code` | When |
+|---|---|
+| `invalid_arguments` | Rejected before or by the CLI (exit 2): schema violation, missing `in_path`, unreadable `preset`, bad manifest. `path` is a JSON pointer into the tool arguments (`/config/dither/mode`, `/jobs/1/config/selectionMode`, `/in_path`) when known. |
+| `timeout` | `timeout_s` elapsed, or the render made no progress for 300 s (exit 3). |
+| `render_failed` | The render or encode failed (exit 1). |
+| `no_output` | The CLI exited 0 but `out_path` does not exist. |
+| `interrupted` / `cancelled` | The child was killed by a signal / the call was cancelled. |
+| `internal` | The server could not spawn its render subprocess. |
+
+Child failures also carry `exit_code` and `stderr_tail` (last 20 stderr lines). A failed `glyph_grid_batch` adds a second content item with the per-job report (which outputs exist). Success results stay plain text (`Rendered /abs/out.gif (1493 KB)`).
 
 **Cancellation.** A `notifications/cancelled` for an in-flight call kills its render subprocess; the server keeps answering (pings, other calls) while renders run.
 

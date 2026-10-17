@@ -93,10 +93,22 @@ glyph-grid-studio catalog | jq
 # capWidth 720 auto-targets Twitter's 15 MB cap (adaptive shrink ladder).
 glyph-grid-studio batch --manifest variants.json
 
+# Bound the wall time: past --timeout the render is killed (exit 3)
+glyph-grid-studio render --in a.png --out a.gif --timeout 120
+
 # Help
 glyph-grid-studio render --help
 glyph-grid-studio batch --help
 ```
+
+**Exit codes** (`render` and `batch`):
+
+| Code | Meaning |
+|---|---|
+| `0` | Success — every output written. |
+| `1` | Render or encode failed (for `batch`: at least one job failed; the others are still written). |
+| `2` | Bad input: usage error, unreadable source / preset / manifest, config that fails the schema. Exits before the app window starts. |
+| `3` | Timed out: `--timeout <seconds>` elapsed, or no render progress for 300 s (a stalled WebView). The render is killed and its `.part` temp files removed. |
 
 ### As a Claude / Cursor tool — MCP server
 
@@ -117,7 +129,7 @@ Restart Claude Desktop. Then in any chat:
 
 > *"Render the image at ~/Pictures/sunset.jpg as a cream-paper monochrome glyph drawing using shape-edge-aware octant selection. Save it next to the original."*
 
-Tools exposed: `glyph_grid_render`, `glyph_grid_catalog`. Full setup + agentic-exploration examples in [docs/mcp.md](docs/mcp.md).
+Tools exposed: `glyph_grid_render`, `glyph_grid_batch`, `glyph_grid_catalog`. Failures come back as `isError` results carrying `{code, path, message}`. Full setup + agentic-exploration examples in [docs/mcp.md](docs/mcp.md).
 
 ## Build
 

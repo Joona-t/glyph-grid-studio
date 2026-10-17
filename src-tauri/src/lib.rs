@@ -53,6 +53,10 @@ pub struct HeadlessRenderJob {
     /// Output format. `"gif"` (default) → gifski; `"mp4"` → openh264 + mp4.
     /// When None, derived from `out_path`'s extension.
     pub format: Option<String>,
+    /// F25 (ITER-059): overall wall-clock budget in seconds (`--timeout`);
+    /// past it the process exits 3.  None = no budget (the stall guard
+    /// still applies).
+    pub timeout_secs: Option<u64>,
 }
 
 impl HeadlessRenderJob {
@@ -465,6 +469,7 @@ struct CliJobState {
 /// Returns the CLI render job to JS, or null in GUI mode.
 #[tauri::command]
 fn get_cli_render_job(state: tauri::State<CliJobState>) -> Option<serde_json::Value> {
+    touch_liveness();
     state.job.lock().ok().and_then(|g| g.clone())
 }
 
@@ -472,7 +477,90 @@ fn get_cli_render_job(state: tauri::State<CliJobState>) -> Option<serde_json::Va
 /// `console.log` doesn't reach stderr.  Useful for surfacing batch errors.
 #[tauri::command]
 fn cli_log(msg: String) {
+    touch_liveness();
     eprintln!("glyph-grid-studio[js]: {}", msg);
+}
+
+/* ---------- F25 (ITER-059): exit codes + the headless watchdog ----------
+ *
+ * Headless `render` / `batch` exit codes (documented in README):
+ *   0 ok · 1 render/encode failed · 2 bad input (usage, preset, manifest,
+ *   config, source path) · 3 timed out (`--timeout`, or no progress for
+ *   STALL_SECS).
+ *
+ * The render runs inside this process's WebView, so the watchdog is a plain
+ * thread: on expiry it removes the `.part` files this process owns and
+ * `std::process::exit`s — the WebKit WebContent/GPU XPC children die with
+ * their host.  Liveness is touched by every staged frame, every encode
+ * progress tick and every `cli_log`, so a legitimately slow job (throttled
+ * capture ~400 ms/frame, a 25 s gifski encode — both tick) never trips it. */
+
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAILED: i32 = 1;
+pub const EXIT_USAGE: i32 = 2;
+pub const EXIT_TIMEOUT: i32 = 3;
+
+/// No liveness touch for this long = a stalled WebView (the 35-min hang
+/// class tests/run-all.sh used to need `timeout` for).
+const STALL_SECS: u64 = 300;
+
+static WATCHDOG_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+/// Milliseconds since WATCHDOG_EPOCH of the last liveness touch.
+static LAST_LIVENESS_MS: AtomicU64 = AtomicU64::new(0);
+/// `.part` files this process is writing (atomic_write_output) — removed
+/// by `abort_headless` so a timeout / Ctrl-C leaves no strays.
+static LIVE_PARTS: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+
+fn watchdog_now_ms() -> u64 {
+    WATCHDOG_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+fn touch_liveness() {
+    LAST_LIVENESS_MS.store(watchdog_now_ms(), Ordering::Relaxed);
+}
+
+fn live_parts() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    LIVE_PARTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Remove this process's in-flight `.part` files and exit with `code`.
+fn abort_headless(code: i32, why: &str) -> ! {
+    eprintln!("glyph-grid-studio: {} (exit {})", why, code);
+    if let Ok(parts) = live_parts().lock() {
+        for p in parts.iter() {
+            let _ = fs::remove_file(p);
+        }
+    }
+    std::process::exit(code);
+}
+
+/// Spawn the watchdog for a headless run.  `timeout_secs` = the overall
+/// `--timeout` budget (None/0 = none); the stall guard always applies.
+fn start_watchdog(timeout_secs: Option<u64>) {
+    touch_liveness();
+    let deadline_ms = timeout_secs.filter(|s| *s > 0).map(|s| s * 1000);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = watchdog_now_ms();
+        if let Some(d) = deadline_ms {
+            if now >= d {
+                abort_headless(
+                    EXIT_TIMEOUT,
+                    &format!("timed out: --timeout {} s elapsed", d / 1000),
+                );
+            }
+        }
+        let idle = now.saturating_sub(LAST_LIVENESS_MS.load(Ordering::Relaxed));
+        if idle >= STALL_SECS * 1000 {
+            abort_headless(
+                EXIT_TIMEOUT,
+                &format!("stalled: no render progress for {} s", idle / 1000),
+            );
+        }
+    });
 }
 
 /// JS calls this when the headless render is finished. Logs to stderr so
@@ -487,7 +575,7 @@ fn cli_log(msg: String) {
 /// that's about to terminate anyway, that's acceptable.
 #[tauri::command]
 fn exit_with_status(_app: tauri::AppHandle, state: tauri::State<CliJobState>, ok: bool) {
-    let code = if ok { 0 } else { 1 };
+    let code = if ok { EXIT_OK } else { EXIT_FAILED };
     if let Ok(mut guard) = state.exit_code.lock() {
         *guard = code;
     }
@@ -505,7 +593,7 @@ fn exit_with_status(_app: tauri::AppHandle, state: tauri::State<CliJobState>, ok
 /// side via `CliJobState`.  The JS hook (`tryHeadlessRender`) detects the
 /// `batch: true` discriminator and runs `runBatchExport` with all jobs in
 /// a single Tauri session — no per-variant Tauri restarts.  See ITER-024.
-pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
+pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool, timeout_secs: Option<u64>) -> i32 {
     let raw = match fs::read_to_string(&manifest_path) {
         Ok(s) => s,
         Err(e) => {
@@ -730,6 +818,7 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
         job: Mutex::new(Some(batch_json)),
         exit_code: exit_code.clone(),
     };
+    start_watchdog(timeout_secs);
     run_tauri(state, !show_window);
     let code = *exit_code.lock().unwrap();
     code
@@ -772,6 +861,7 @@ pub fn run_headless_render(job: HeadlessRenderJob) -> i32 {
         job: Mutex::new(Some(job_json)),
         exit_code: exit_code.clone(),
     };
+    start_watchdog(job.timeout_secs);
     run_tauri(state, !job.show_window);
     // In practice we should never reach here — exit_with_status calls
     // std::process::exit() directly. This is a fallback for the "Tauri
@@ -892,6 +982,7 @@ impl ExportControl {
     }
 
     fn emit(&self, phase: &str, completed: usize, total: usize) {
+        touch_liveness();
         if let (Some(app), Some(job_id)) = (&self.app, &self.job_id) {
             let _ = app.emit(
                 "export-progress",
@@ -961,6 +1052,9 @@ fn atomic_write_output(
         sequence
     ));
 
+    if let Ok(mut parts) = live_parts().lock() {
+        parts.insert(part_path.clone());
+    }
     let result = (|| -> Result<(), String> {
         control.emit("write", 0, 1);
         let mut file = fs::OpenOptions::new()
@@ -993,6 +1087,9 @@ fn atomic_write_output(
 
     if result.is_err() {
         let _ = fs::remove_file(&part_path);
+    }
+    if let Ok(mut parts) = live_parts().lock() {
+        parts.remove(&part_path);
     }
     result
 }
@@ -1200,6 +1297,7 @@ async fn push_export_frame_raw(request: tauri::ipc::Request<'_>) -> Result<(), S
 /// total, consistent dimensions, pixel + byte budgets) and retain it.  Shared
 /// by the base64 and raw-body push commands.
 fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), String> {
+    touch_liveness();
     let dimensions = png_dimensions(&bytes, index)?;
     let mut captures = EXPORT_CAPTURES
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -3073,6 +3171,7 @@ mod preset_schema_tests {
             preset_path: preset,
             config_overrides: overrides,
             format: None,
+            timeout_secs: None,
         }
     }
 
