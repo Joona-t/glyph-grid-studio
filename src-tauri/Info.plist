@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- ITER-077 (R4): the Video › camera (beta) toggle uses getUserMedia;
+       macOS needs this string before it will show the camera prompt.
+       Tauri merges src-tauri/Info.plist into the bundle's Info.plist. -->
+  <key>NSCameraUsageDescription</key>
+  <string>Glyph Grid Studio uses the camera only when you turn on Video › camera, to render the live picture as glyph art. Nothing is recorded or sent anywhere.</string>
+</dict>
+</plist>

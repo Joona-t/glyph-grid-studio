@@ -1,6 +1,6 @@
 # plan.md — Glyph Grid Studio v0.2 "SOTA" plan
 
-**Status: DRAFT — do not implement yet.** Built from `research.md` (27 verified findings F1–F27, 13 ranked features R1–R13). Joona annotates inline; implementation starts only on "implement it all".
+**Status: IMPLEMENTED on `v2/integration` (ITER-045..084, 2026-10-17/18).** Per-phase version bumps were replaced by one v0.2.0 bump at release time (hook-protected files are the owner's commit); GPU-process-canvas-off (F2 step 1) stays deferred because the WebContent process, not the GPU process, was the bottleneck; WASM/SIMD stays unscheduled. Built from `research.md` (27 verified findings F1–F27, 13 ranked features R1–R13). Joona annotates inline; implementation starts only on "implement it all".
 
 **Target:** v0.2.0. Six phases, each shippable on its own and gated green (cargo test · npm test · `tests/run-all.sh` 24/24 + MCP 10/10 · PSNR gate · XPC-aware perf sampler). Branch-first, every commit carries the `Co-Authored-By` trailer, patch bump per landed phase. No paid LLM API anywhere (rule #10) — the only LLM touchpoint stays the existing MCP server driven by the user's local CLI.
 
@@ -20,10 +20,10 @@
 
 Goal: no perf number is ever reported without XPC CPU again; a reusable PSNR gate; a memory probe.
 
-- [ ] `tests/perf-sample.sh <out.ndjson> -- <args>`: pgrep-diff the `WebKit.WebContent`/`WebKit.GPU` XPC pids, sample `ps -o pid,%cpu,time,state,pri,ni` at 1 Hz, emit `{wall_s, app_cpu_s, webcontent_cpu_s, gpu_cpu_s, frames}`. Wire into `run-all.sh` B10 and the `PERF-*.md` tables. (F1)
-- [ ] `tests/psnr-gate.sh <new> <baseline> [min_db]` wrapping the ffmpeg PSNR command used today by hand; exits non-zero below threshold; prints per-frame min. (F7, F5 both ask for it)
-- [ ] `GlyphGrid.memProbe()` dev call returning retained bytes by cache category (`_atlasCache`, `__sourceSignalCache`, sprite caches, recState). Caches are bounded (F20) — this closes the question with a number. (F20)
-- [ ] Re-baseline the ITER-041 760×1024 / 120-frame run with the sampler; record WebContent vs GPU split in `tests/PERF-V0.2-BASELINE.md`. Decide from the split whether Phase 2's first lever is readback (GPU) or scene JS (WebContent).
+- [x] `tests/perf-sample.sh <out.ndjson> -- <args>`: pgrep-diff the `WebKit.WebContent`/`WebKit.GPU` XPC pids, sample `ps -o pid,%cpu,time,state,pri,ni` at 1 Hz, emit `{wall_s, app_cpu_s, webcontent_cpu_s, gpu_cpu_s, frames}`. Wire into `run-all.sh` B10 and the `PERF-*.md` tables. (F1)
+- [x] `tests/psnr-gate.sh <new> <baseline> [min_db]` wrapping the ffmpeg PSNR command used today by hand; exits non-zero below threshold; prints per-frame min. (F7, F5 both ask for it)
+- [x] `GlyphGrid.memProbe()` dev call returning retained bytes by cache category (`_atlasCache`, `__sourceSignalCache`, sprite caches, recState). Caches are bounded (F20) — this closes the question with a number. (F20)
+- [x] Re-baseline the ITER-041 760×1024 / 120-frame run with the sampler; record WebContent vs GPU split in `tests/PERF-V0.2-BASELINE.md`. Decide from the split whether Phase 2's first lever is readback (GPU) or scene JS (WebContent).
 
 ## Phase 1 — Determinism (effort M, ~2 days)
 
@@ -45,11 +45,11 @@ Quick wins first:
 - [x] **Twitter-fit ladder predictor** (F14, S): first full pass → size/pixel ratio → one-shot width estimate, then at most one correction rung. — ITER-051 (≤3 passes instead of ≤6; 2 passes on cream-paper/worm-move/B12 vs 3/4/5; width within 1 % of the ladder on real sources because B/px rises 2-6 % as width shrinks; GUI estimate calibration not done)
 
 Then the capture path:
-- [ ] **Raw RGBA capture** (F2 step 2, S→M): replace `canvas.toBlob('image/png')` with `getImageData` and ship RGBA over the existing raw-body IPC; Rust preprocess accepts RGBA (skips PNG decode). Measure with the sampler; PSNR gate vs Phase-1 goldens.
+- [x] **Raw RGBA capture** (F2 step 2, S→M): replace `canvas.toBlob('image/png')` with `getImageData` and ship RGBA over the existing raw-body IPC; Rust preprocess accepts RGBA (skips PNG decode). Measure with the sampler; PSNR gate vs Phase-1 goldens.
 - [ ] **GPU-process canvas off for headless** (F2 step 1, M, behind `--gpu-canvas` flag, private WebKit prefs via objc2, degrade silently). Only if Phase 0's split shows the GPU process dominant.
-- [ ] **Streaming GIF encode** (F12, L): gifski collector fed during capture, `.part` file, ladder re-decodes from retained PNG only on overshoot, cancel = `Error::Aborted`. Expected −35 % wall on GIF.
-- [ ] **Bounded decode-ahead for GIF** (F13, M) with the ITER-040 reorder-buffer pattern; drop `MAX_CAPTURE_PIXELS`/`MAX_TOTAL_DECODED_PIXELS`, keep `MAX_EXPORT_FRAMES=600` + the 256 MB compressed cap. Peak RSS 930 MB → ~500 MB. **This closes the open owner question about the 100M-pixel cap: the cap goes away because the reason for it goes away.**
-- [ ] **`batch --jobs N`** (F4, M): fork N CLI children over the manifest; expected ~3× on 20-job benches. Bench first on the Ghost manifest.
+- [x] **Streaming GIF encode** (F12, L): gifski collector fed during capture, `.part` file, ladder re-decodes from retained PNG only on overshoot, cancel = `Error::Aborted`. Expected −35 % wall on GIF.
+- [x] **Bounded decode-ahead for GIF** (F13, M) with the ITER-040 reorder-buffer pattern; drop `MAX_CAPTURE_PIXELS`/`MAX_TOTAL_DECODED_PIXELS`, keep `MAX_EXPORT_FRAMES=600` + the 256 MB compressed cap. Peak RSS 930 MB → ~500 MB. **This closes the open owner question about the 100M-pixel cap: the cap goes away because the reason for it goes away.**
+- [x] **`batch --jobs N`** (F4, M): fork N CLI children over the manifest; expected ~3× on 20-job benches. Bench first on the Ghost manifest.
 - [ ] Bump → v0.1.12.
 
 Deferred from this phase: APNG chunk-copy export (F15, M) — nice but no user asked; VideoToolbox (F16) — speed gain is 1–7 % of wall, not worth it; revisit only for HEVC.
@@ -58,13 +58,13 @@ Deferred from this phase: APNG chunk-copy export (F15, M) — nice but no user a
 
 Goal: CLI/MCP/batch expose everything the GUI can do, validate inputs, report errors and progress like a real tool.
 
-- [ ] **Schema as single source of truth** (R7): `scripts/gen-schema.js` reads live CONFIG defaults/enums → `src/glyph-grid.schema.json` (JSON Schema 2020-12). Rust validates `--preset`, batch job `config` and MCP args with path-qualified errors; `catalog_json()` becomes a projection of the schema; `validate <preset>` and `render --dry-run` subcommands; run-all Phase A gains a "schema up to date" check.
-- [ ] **One config merger** (F24): `json_deep_merge` in Rust, `GlyphStudio.deepMerge` shared by `setConfig`/`applyConfig`; `--set <dotted.path>=<json>` repeatable; `--frames auto` (= duration×fps like the GUI); per-job `frames`/`border` in manifests; unreadable preset → exit 2, never silent defaults.
-- [ ] **MCP tools** (F22 Tier A+B): `glyph_grid_batch` (inline manifest), `preset`/`config` object on `glyph_grid_render`, async tools with `tokio::process`, stderr `batch: N/M` → `notify_progress`. Tier C (resident warm worker) deferred until Phase 2 numbers say startup still dominates.
-- [ ] **Machine-readable errors + bounded time** (F25): MCP sets `isError`, structured `{code, path, message}`; CLI exit codes 0/1/2/3 + `--timeout`.
-- [ ] **Progress + cancel** (F26): NDJSON progress on stderr for CLI, SIGINT kills the WebKit child cleanly, MCP cancel kills the render child.
-- [ ] **Manifest versioning + resume** (F27): `version`, schema validation before launch, `--resume` skips jobs whose output exists and matches.
-- [ ] Update `docs/mcp.md`, README CLI section, `tests/mcp.py` (tool count, batch test, error test).
+- [x] **Schema as single source of truth** (R7): `scripts/gen-schema.js` reads live CONFIG defaults/enums → `src/glyph-grid.schema.json` (JSON Schema 2020-12). Rust validates `--preset`, batch job `config` and MCP args with path-qualified errors; `catalog_json()` becomes a projection of the schema; `validate <preset>` and `render --dry-run` subcommands; run-all Phase A gains a "schema up to date" check.
+- [x] **One config merger** (F24): `json_deep_merge` in Rust, `GlyphStudio.deepMerge` shared by `setConfig`/`applyConfig`; `--set <dotted.path>=<json>` repeatable; `--frames auto` (= duration×fps like the GUI); per-job `frames`/`border` in manifests; unreadable preset → exit 2, never silent defaults.
+- [x] **MCP tools** (F22 Tier A+B): `glyph_grid_batch` (inline manifest), `preset`/`config` object on `glyph_grid_render`, async tools with `tokio::process`, stderr `batch: N/M` → `notify_progress`. Tier C (resident warm worker) deferred until Phase 2 numbers say startup still dominates.
+- [x] **Machine-readable errors + bounded time** (F25): MCP sets `isError`, structured `{code, path, message}`; CLI exit codes 0/1/2/3 + `--timeout`.
+- [x] **Progress + cancel** (F26): NDJSON progress on stderr for CLI, SIGINT kills the WebKit child cleanly, MCP cancel kills the render child.
+- [x] **Manifest versioning + resume** (F27): `version`, schema validation before launch, `--resume` skips jobs whose output exists and matches.
+- [x] Update `docs/mcp.md`, README CLI section, `tests/mcp.py` (tool count, batch test, error test).
 - [ ] Bump → v0.1.13.
 
 ## Phase 4 — Interactive + GPU (effort M–L, ~4 days)
@@ -74,7 +74,7 @@ Goal: the GUI is cheap when idle, starts offline, imports big GIFs without copyi
 - [x] **Static-frame detector** (F17 part 2, S): `frameIsTimeDependent()` after paint; `noLoop()` when false and EMA converged; unknown ⇒ dynamic; config changes already re-arm. — ITER-062
 - [x] **Vendor the 4 CDN scripts** (F19, M): p5, Tweakpane, JSZip, fflate into `src/vendor/` pinned, with licences; collapse the 3-stage font wait. App and CLI boot offline. — ITER-063 (CSP still open: tauri.conf.json is hook-protected)
 - [x] **Import via asset protocol** (F18 steps 1+2, S+M): `read_image_file` returns metadata only, `loadImage(convertFileSrc(path))`; Rust `probe_image_file` rejects over-limit GIFs before p5 allocates (closes BUGS backlog #1). Spike: confirm `asset://` doesn't taint the canvas. — ITER-064 (spike: no taint, inf dB; step 3 still deferred)
-- [ ] **p5 GIF autoplay off** (F21, S) so `setFrame()` can't race wall-clock advance.
+- [x] **p5 GIF autoplay off** (F21, S) so `setFrame()` can't race wall-clock advance.
 - [x] **GL path, step 0 → 1** (F6): instrument `wave6.draw`/`drawImage`/`toBlob` split at 240×120 and 400×300; then move per-cell placement + gamma into the vertex shader (per-instance `signal`/`cellIndex` bytes). Make the shader output-equivalent to the sprite path (F7) and gate it with the PSNR script. Steps 2–3 (GL as presented surface, FBO postprocess) only if step 0 shows ≥5 ms on the fill loop at default. — ITER-065 (step 0 measured in tests/PERF-V0.2-GL.md: fill loop 0.1–1.0 ms ⇒ step 1 not done; path was dead since v0.1.6, now ≥51 dB vs CPU)
 - [x] **GPU source preprocess, Phase A** (F8, M): three fragment passes replacing the ~10 JS passes for animated sources; JS fallback when no webgl2; keyed by `_processedKey`. — ITER-066 (preprocess 29.7 → 7.4 ms/frame; worm 40.07 dB vs golden, default on)
 - [x] **imgData postproc Tier A** (F10, S): skip the full-canvas readback for scanlines/kawaii-only stacks. — ITER-067 (postprocess 32–35 → 0.6–1.3 ms on those stacks; ≥64 dB lossless)
