@@ -4,6 +4,26 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-083 — 2026-10-18 — video: no crate frame_rate(), child boxes of size 0 refused, stsz totals bounded, data box bodies checked
+
+**Problem:** four more crate trust paths in `video.rs`. (25) With no usable stts, `track_fps` fell back to the crate's `frame_rate()`, whose `duration()` does `mdhd.duration * 1_000_000 / mdhd.timescale` unchecked: timescale 0 panics (repro: tiny.mp4 with mdhd.timescale = 0 and stts entry_count = 0), a huge duration overflows. (26) `box_header` took size 0 (and largesize 0) as "to the end of the parent" for child boxes, but the crate honours size 0 at the top level only; inside a container `skip_box(0)` seeks back to the box start and `read_header` loops forever, holding the open slot lock (repro: a size-0 `free` at the end of the moov). (27) `sample_tables_fit` bounded each stsz entry, not the per-chunk running sum `sample_offset` accumulates in a u32. (28) The ITER-082 ilst `data` check compared the total size to 16, so a largesize data box of total 16 (16-byte header, empty body) passed.
+
+**Root cause:** the box walk and the table checks copied the crate's general rules instead of what each crate code path actually does with the value (top-level-only size 0, u32 sums, a header length that is not always 8).
+
+**Fix:**
+1. `track_fps` never calls `frame_rate()` / `duration()`. The fallback is `sample_count * timescale / duration` in f64, and 0.0 when timescale or duration is 0. `open` then returns its existing "cannot determine the frame rate"; the probe reports fps 0.0.
+2. `box_header(b, room, top)`: size 0 / largesize 0 means to EOF only when `top` (`check_box_tree`). In `walk_boxes` it is refused ("box '<type>' has size 0 (to the end) inside a container").
+3. `sample_tables_fit` also requires the stsz total (constant × sample_count, or the sum of the entries) to be <= the file length and <= u32::MAX ("stsz sample sizes total N bytes, more than the file holds"). Every per-chunk sum is part of that total, so it can no longer wrap.
+4. The ilst `data` check now tests the body: `size - hdr < 8` is refused.
+
+**Tests (cargo 71 → 72):** `zero_timescale_child_size_zero_stsz_total_and_largesize_data`: tiny.mp4 with mdhd.timescale = 0 and stts entry_count = 0 gives the open reason "cannot determine the frame rate" and probe `Ok(Some)` with fps 0.0, no panic. On both fixtures, a size-0 and a largesize-0 `free` spliced at the end of the moov are refused and the probe returns None. This runs in a thread with a 20 s `recv_timeout`, so a regression fails instead of hanging. Two stsz entries of file_len − 100 (each passes alone), and a constant size of file_len / 4 × 12 samples, are refused on the total. A largesize data box of total size 16 is refused on both fixtures. The `ilst_meta` builder moved out of the ITER-082 test so both tests share it. The ITER-080 FNV-1a pins for tiny.mp4 / tiny-bframes.mp4 still pass.
+
+**Measured:** golden render (worm-move.gif, 120 frames, pB, `--mp4-quality archive`) vs golden-p3-iter057.mp4: PSNR inf over 120/120 frames, real 17.55 s, user 2.03 s. Gate: cargo build --release 0 errors (1 pre-existing `Shell::open` deprecation), cargo 72/72, npm test ok, run-all PASS 49 / FAIL 0 (`TEST_TIMEOUT=400`), MCP 34/34, byte-identity 9/9.
+
+**Gotchas:** a clip whose sample data totals more than 4 GiB is now refused by the Rust decoder and goes to the WebView path. The real cap is lower anyway: at most 480 frames and 64 MiB per sample. The fps fallback is no longer integer-truncated the way the crate's was. That only matters for files with an empty or zero-tick stts, which used to panic or read as 0.
+
+---
+
 ### ITER-082 — 2026-10-18 — video: top-level moof / emsg refused, ilst data boxes need their fixed fields
 
 **Problem:** three crate parse paths left open by ITER-081's box walk. (22) `Mp4Reader::read_header` parses every top-level `moof` into `track.trafs`, and the crate's fragment paths trust it: `sample_count()` sums trun counts with `expect()` (an overflow panics), trun `sample_size` feeds `vec![0; n]`, and `is_sync_sample` divides by `sample_count / trafs.len()` (zero when the truns are empty). (23) `EmsgBox::read_box` does an unchecked `size - size_without_message` and `Vec::with_capacity` on it, and reads its NUL-terminated strings with no box bound. (24) `walk_boxes` only required size >= 8; `DataBox::read_box` reads 8 fixed bytes past the header, then allocates `start + size - current`, so a 12-byte ilst item `data` box wraps to a huge allocation.

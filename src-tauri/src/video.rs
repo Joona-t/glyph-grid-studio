@@ -338,23 +338,28 @@ pub struct VideoInfo {
 
 /// One box header in `b` with `room` bytes left in its parent (or the
 /// file): (type, header length, total size).  size 1 = 64-bit largesize,
-/// size 0 = to the end of the parent.
-fn box_header(b: &[u8], room: u64) -> Result<([u8; 4], u64, u64), String> {
+/// size 0 = to the end of the file — `top` level only.  ITER-083: the mp4
+/// crate honours size 0 at the top level alone; inside a container its
+/// skip_box(0) seeks back to the box start and read_header spins forever
+/// (holding the open slot lock), so a child of size 0 is refused.
+fn box_header(b: &[u8], room: u64, top: bool) -> Result<([u8; 4], u64, u64), String> {
     if b.len() < 8 {
         return Err("truncated box header".into());
     }
     let typ: [u8; 4] = b[4..8].try_into().unwrap();
     let name = String::from_utf8_lossy(&typ).into_owned();
     let (hdr, size) = match u32::from_be_bytes(b[0..4].try_into().unwrap()) {
-        0 => (8, room),
+        0 => (8, 0),
         1 => {
             let l = b.get(8..16).ok_or("truncated box header")?;
-            match u64::from_be_bytes(l.try_into().unwrap()) {
-                0 => (16, room),
-                l => (16, l),
-            }
+            (16, u64::from_be_bytes(l.try_into().unwrap()))
         }
         s => (8, s as u64),
+    };
+    let size = match size {
+        0 if top => room,
+        0 => return Err(format!("box '{}' has size 0 (to the end) inside a container", name)),
+        s => s,
     };
     if size < hdr {
         return Err(format!("box '{}' is smaller than its header", name));
@@ -380,11 +385,13 @@ fn walk_boxes(b: &[u8], depth: u32, in_ilst: bool, in_item: bool) -> Result<(), 
         if rest.len() < 8 && rest.iter().all(|&x| x == 0) {
             break;
         }
-        let (typ, hdr, size) = box_header(rest, rest.len() as u64)?;
+        let (typ, hdr, size) = box_header(rest, rest.len() as u64, false)?;
         let body = &rest[hdr as usize..size as usize];
         // ITER-082: DataBox::read_box reads 8 fixed bytes past the header,
         // then allocates `start + size - current` unchecked (size 12 wraps).
-        if in_item && &typ == b"data" && size < 16 {
+        // ITER-083: the body, not the total — a 16-byte largesize header
+        // leaves no room for them.
+        if in_item && &typ == b"data" && body.len() < 8 {
             return Err("box data is smaller than its fixed fields".into());
         }
         let skip = match &typ {
@@ -415,7 +422,7 @@ fn check_box_tree<R: Read + Seek>(r: &mut R, len: u64) -> Result<(), String> {
         let n = (len - off).min(16) as usize;
         r.seek(SeekFrom::Start(off)).map_err(io)?;
         r.read_exact(&mut head[..n]).map_err(io)?;
-        let (typ, hdr, size) = box_header(&head[..n], len - off)?;
+        let (typ, hdr, size) = box_header(&head[..n], len - off, true)?;
         // ITER-082: the crate parses these into structures it then trusts
         // (trun counts summed with expect(), trun sizes fed to vec![0; n],
         // emsg's unchecked size subtraction and unbounded strings).  The
@@ -457,13 +464,23 @@ fn read_mp4(path: &Path) -> Result<(Mp4Reader<BufReader<File>>, u64), String> {
 /// allocates `vec![0; sample_size]` before read_exact (one 0xFFFFFFFF entry
 /// = a 4 GiB zeroed allocation, an abort if it fails), divides by
 /// samples_per_chunk (0 = a panic, even in release) and subtracts 1 from
-/// first_chunk (0 underflows).
+/// first_chunk (0 underflows).  ITER-083: sample_offset sums the sizes
+/// before a sample in its chunk in a u32, so the total of all of them must
+/// fit the file (and a u32) too — each entry passing is not enough.
 fn sample_tables_fit(track: &mp4::Mp4Track, file_len: u64) -> Result<(), String> {
     let stbl = &track.trak.mdia.minf.stbl;
     let stsz = &stbl.stsz;
     let big = |s: u32| s > MAX_SAMPLE_BYTES || s as u64 > file_len;
     if big(stsz.sample_size) || stsz.sample_sizes.iter().any(|&s| big(s)) {
         return Err(format!("stsz sample size exceeds the file or {} bytes", MAX_SAMPLE_BYTES));
+    }
+    let total = if stsz.sample_size != 0 {
+        stsz.sample_size as u64 * stsz.sample_count as u64
+    } else {
+        stsz.sample_sizes.iter().map(|&s| s as u64).sum()
+    };
+    if total > file_len.min(u32::MAX as u64) {
+        return Err(format!("stsz sample sizes total {} bytes, more than the file holds ({})", total, file_len));
     }
     if !stsc_fits(stbl.stsc.entries.iter().map(|e| (e.first_chunk, e.samples_per_chunk))) {
         return Err("stsc has a zero or decreasing chunk entry (corrupt or crafted sample tables)".into());
@@ -947,7 +964,14 @@ fn track_fps(track: &mp4::Mp4Track) -> f64 {
         ticks = ticks.saturating_add(e.sample_count as u64 * e.sample_delta as u64);
     }
     if n == 0 || ticks == 0 {
-        return track.frame_rate();
+        // ITER-083: not track.frame_rate() — its duration() divides by
+        // mdhd.timescale unchecked (0 = a panic) and multiplies
+        // mdhd.duration by 1e6 in u64 (overflows).  0.0 = unknown.
+        let mdhd = &track.trak.mdia.mdhd;
+        if mdhd.timescale == 0 || mdhd.duration == 0 {
+            return 0.0;
+        }
+        return track.sample_count() as f64 * mdhd.timescale as f64 / mdhd.duration as f64;
     }
     n as f64 * track.timescale().max(1) as f64 / ticks as f64
 }
@@ -1739,8 +1763,8 @@ mod tests {
             ok.extend_from_slice(&[1, 2, 3, 4]);
             assert!(VideoDecoder::open(&with_extra(name, true, &ok, "moov-free")).is_ok(), "{}", name);
         }
-        assert!(box_header(&[0, 0, 0, 4, b'f', b'r', b'e', b'e'], 100).unwrap_err().contains("smaller than its header"));
-        assert_eq!(box_header(&[0, 0, 0, 0, b'm', b'd', b'a', b't'], 100), Ok((*b"mdat", 8, 100)));
+        assert!(box_header(&[0, 0, 0, 4, b'f', b'r', b'e', b'e'], 100, true).unwrap_err().contains("smaller than its header"));
+        assert_eq!(box_header(&[0, 0, 0, 0, b'm', b'd', b'a', b't'], 100, true), Ok((*b"mdat", 8, 100)));
         let mut cap = vec![0, 0, 0, 1];
         cap.extend_from_slice(b"moov");
         cap.extend_from_slice(&(MAX_MOOV_BYTES + 16).to_be_bytes());
@@ -1754,6 +1778,15 @@ mod tests {
         b.extend_from_slice(typ);
         b.extend_from_slice(body);
         b
+    }
+
+    /// meta(mdir)/ilst/(c)nam holding `data` (the item's children).
+    fn ilst_meta(data: &[u8]) -> Vec<u8> {
+        let mut hdlr = vec![0; 8];
+        hdlr.extend_from_slice(b"mdir");
+        hdlr.extend_from_slice(&[0; 13]);
+        let ilst = mp4_box(b"ilst", &mp4_box(&[0xA9, b'n', b'a', b'm'], data));
+        mp4_box(b"meta", &[&[0, 0, 0, 0][..], &mp4_box(b"hdlr", &hdlr), &ilst].concat())
     }
 
     /// ITER-082 (22-24): top-level moof / emsg and an ilst `data` box too
@@ -1770,15 +1803,8 @@ mod tests {
         let mut emsg = mp4_box(b"emsg", &[0, 0, 0, 0, b'a', b'b', b'c', b'd']);
         emsg.extend_from_slice(b"efghijkl");
         // meta(mdir)/ilst/(c)nam/data with data size 12 (< 16 fixed bytes).
-        let mut hdlr = vec![0; 8];
-        hdlr.extend_from_slice(b"mdir");
-        hdlr.extend_from_slice(&[0; 13]);
-        let meta_with = |data: &[u8]| {
-            let ilst = mp4_box(b"ilst", &mp4_box(&[0xA9, b'n', b'a', b'm'], data));
-            mp4_box(b"meta", &[&[0, 0, 0, 0][..], &mp4_box(b"hdlr", &hdlr), &ilst].concat())
-        };
-        let short = meta_with(&[0, 0, 0, 12, b'd', b'a', b't', b'a', 0, 0, 0, 1]);
-        let good = meta_with(&mp4_box(b"data", &[0, 0, 0, 1, 0, 0, 0, 0, b'a', b'b', b'c']));
+        let short = ilst_meta(&[0, 0, 0, 12, b'd', b'a', b't', b'a', 0, 0, 0, 1]);
+        let good = ilst_meta(&mp4_box(b"data", &[0, 0, 0, 1, 0, 0, 0, 0, b'a', b'b', b'c']));
         for name in ["tiny.mp4", "tiny-bframes.mp4"] {
             let p = with_extra(name, false, &moof, "moof");
             let r = open_reason(&p);
@@ -1791,6 +1817,61 @@ mod tests {
             let r = open_reason(&with_extra(name, true, &short, "data12"));
             assert!(r.contains("box data is smaller than its fixed fields"), "{}: {}", name, r);
             assert!(VideoDecoder::open(&with_extra(name, true, &good, "data-ok")).is_ok(), "{}", name);
+        }
+    }
+
+    /// A copy of `name` with several (box, offset, u32) patches (last box match).
+    fn patched_many(name: &str, edits: &[(&[u8; 4], usize, u32)], tag: &str) -> PathBuf {
+        let mut b = std::fs::read(fixture(name)).unwrap();
+        for (typ, off, val) in edits {
+            let o = b.windows(4).rposition(|w| w == *typ).expect("box") - 4 + off;
+            b[o..o + 4].copy_from_slice(&val.to_be_bytes());
+        }
+        let dir = std::env::temp_dir().join(format!("ggs-video-patch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("{}-{}", tag, name));
+        std::fs::write(&out, b).unwrap();
+        out
+    }
+
+    /// ITER-083 (25-28): mdhd timescale 0, a child box of size 0, stsz
+    /// totals past the file and a largesize data box with an empty body.
+    #[test]
+    fn zero_timescale_child_size_zero_stsz_total_and_largesize_data() {
+        // 25: no stts entries + mdhd.timescale (+20) = 0 — the crate's
+        // frame_rate() divided by zero.
+        let p = patched_many("tiny.mp4", &[(b"mdhd", 20, 0), (b"stts", 12, 0)], "ts0");
+        assert_eq!(open_reason(&p), "cannot determine the frame rate");
+        let info = probe_mp4(&p).unwrap().expect("still a parseable MP4");
+        assert_eq!(info.fps, 0.0);
+        // 26: a size-0 box at the end of the moov — read_header spun forever.
+        // A timeout thread, so a regression fails instead of hanging.
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            for (zero, tag) in [(&[0u8, 0, 0, 0, b'f', b'r', b'e', b'e'][..], "free0"), (&[0, 0, 0, 1, b'f', b'r', b'e', b'e', 0, 0, 0, 0, 0, 0, 0, 0][..], "free0l")] {
+                let p = with_extra(name, true, zero, tag);
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send((open_reason(&p), probe_mp4(&p)));
+                });
+                let (r, probe) = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("open hung on a size-0 child box");
+                assert!(r.contains("box 'free' has size 0 (to the end) inside a container"), "{} {}: {}", name, tag, r);
+                assert_eq!(probe.unwrap(), None, "the probe hands it to the WebView");
+            }
+        }
+        assert!(box_header(&[0, 0, 0, 0, b'f', b'r', b'e', b'e'], 100, false).unwrap_err().contains("size 0"));
+        // 27: every entry fits the file (2242 bytes), their total does not.
+        let len = std::fs::metadata(fixture("tiny.mp4")).unwrap().len() as u32;
+        let p = patched_many("tiny.mp4", &[(b"stsz", 20, len - 100), (b"stsz", 24, len - 100)], "stsz-sum");
+        assert!(open_reason(&p).contains("stsz sample sizes total"), "{}", open_reason(&p));
+        let p = patched_many("tiny.mp4", &[(b"stsz", 12, len / 4)], "stsz-const-sum");
+        assert!(open_reason(&p).contains("stsz sample sizes total"), "{}", open_reason(&p));
+        // 28: a largesize data box of total size 16 (no fixed fields).
+        let mut data16 = vec![0, 0, 0, 1];
+        data16.extend_from_slice(b"data");
+        data16.extend_from_slice(&16u64.to_be_bytes());
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            let r = open_reason(&with_extra(name, true, &ilst_meta(&data16), "data16l"));
+            assert!(r.contains("box data is smaller than its fixed fields"), "{}: {}", name, r);
         }
     }
 }
