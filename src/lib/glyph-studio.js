@@ -136,15 +136,21 @@
     }
     return out;
   }
-  function applyPreset(config, preset) {
-    function deepMerge(t, s) {
-      for (var k in s) {
-        if (s[k] !== null && typeof s[k] === 'object' && !Array.isArray(s[k])) {
-          if (!t[k] || typeof t[k] !== 'object') t[k] = {};
-          deepMerge(t[k], s[k]);
-        } else { t[k] = s[k]; }
-      }
+  /* F24 (ITER-057): THE config merge — objects merge key by key, every
+     other value (scalar, array, null) replaces.  Shared by the GUI preset
+     path, the CLI's setConfig and the batch driver's applyConfig (they were
+     three mergers, two of them one level deep, so `--postprocess vignette`
+     dropped vignette.strength), and mirrored by json_deep_merge in Rust. */
+  function deepMerge(t, s) {
+    for (var k in s) {
+      if (s[k] !== null && typeof s[k] === 'object' && !Array.isArray(s[k])) {
+        if (!t[k] || typeof t[k] !== 'object') t[k] = {};
+        deepMerge(t[k], s[k]);
+      } else { t[k] = s[k]; }
     }
+    return t;
+  }
+  function applyPreset(config, preset) {
     if (!preset || typeof preset !== 'object') return;
     /* R7 (ITER-056): $schema / version are preset metadata, not CONFIG.
        Unknown top-level keys are applied as before (schema policy
@@ -2318,6 +2324,7 @@
     init: init,
     snapshotConfig: snapshotConfig,
     applyPreset: applyPreset,
+    deepMerge: deepMerge,
     presetSchemaId: PRESET_SCHEMA_ID,
     presetSchemaVersion: PRESET_SCHEMA_VERSION,
     listPresets: listPresets,

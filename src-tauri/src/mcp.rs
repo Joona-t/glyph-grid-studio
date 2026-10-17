@@ -62,6 +62,21 @@ pub struct RenderParams {
     /// from `out_path`'s extension.
     #[serde(default)]
     pub format: Option<String>,
+    /// Any partial CONFIG object (see src/glyph-grid.schema.json — the same
+    /// shape as a preset file).  Lowest priority: the named params above
+    /// deep-merge on top of it.  Reaches every CONFIG key (seed,
+    /// animation.fps/duration, dispersal, temporalStability, ...).
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
+}
+
+/// Temp preset written for a `config` argument; deleted on drop.
+struct TempPreset(std::path::PathBuf);
+
+impl Drop for TempPreset {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /* ---------- Server handler ---------- */
@@ -79,15 +94,42 @@ impl GlyphGridServer {
         &self,
         Parameters(p): Parameters<RenderParams>,
     ) -> String {
+        // F24 (ITER-057): a `config` object travels as a temp preset file —
+        // the CLI already layers flags onto `--preset`, so no new CLI
+        // surface is needed.  Removed when this call returns.
+        let preset = match &p.config {
+            None => None,
+            Some(cfg) if cfg.is_object() => {
+                let path = std::env::temp_dir().join(format!(
+                    "glyph-grid-mcp-{}-{}.json",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ));
+                if let Err(e) = std::fs::write(&path, cfg.to_string()) {
+                    return format!("error: cannot write temp preset {}: {}", path.display(), e);
+                }
+                Some(TempPreset(path))
+            }
+            Some(other) => {
+                return format!(
+                    "Render failed: exit 2 | invalid arguments: `config` must be a JSON object, got {}",
+                    other
+                )
+            }
+        };
+
         // R7 (ITER-056): validate the arguments against the preset schema
         // in-process, before paying ~5 s of Tauri start-up for a render the
         // CLI would reject anyway.  Same resolver as `render`.
         let probe = crate::HeadlessRenderJob {
             in_path: std::path::PathBuf::from(&p.in_path),
             out_path: std::path::PathBuf::from(&p.out_path),
-            frames: p.frames.unwrap_or(24),
+            frames: Some(p.frames.unwrap_or(24)),
             show_window: false,
-            preset_path: None,
+            preset_path: preset.as_ref().map(|t| t.0.clone()),
             config_overrides: crate::ConfigOverrides {
                 palette: p.palette.clone(),
                 color_mode: p.color_mode.clone(),
@@ -99,6 +141,7 @@ impl GlyphGridServer {
                 postprocess: p.postprocess.clone(),
                 cols: p.cols,
                 rows: p.rows,
+                set: Vec::new(),
             },
             format: p.format.clone(),
         };
@@ -119,6 +162,9 @@ impl GlyphGridServer {
             .arg(&p.out_path);
         if let Some(f) = p.frames {
             cmd.arg("--frames").arg(f.to_string());
+        }
+        if let Some(t) = &preset {
+            cmd.arg("--preset").arg(&t.0);
         }
         if let Some(v) = &p.palette {
             cmd.arg("--palette").arg(v);

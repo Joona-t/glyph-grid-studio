@@ -43,6 +43,12 @@ const contracts = [
   /* ITER-048 (F17 part 1): reduced motion pins the frame-hashed seed + dither phase for stills */
   ['reduced motion pins frame index for still sources', /const _rmPinned = _rmStill && window\.__sourceFrameIdx === -1;\s*const _frameIdx = _rmPinned \? 0 :/],
   ['reduced motion pins the temporal dither phase', /_persistentDitherOpts\.frameIdx = _rmPinned \? 0 : frameIdx;/],
+  /* ITER-057 (F24): one config merger for GUI / CLI / batch */
+  ['CLI setConfig uses the shared deep merge', /setConfig: \(overrides\) => \{[\s\S]{0,400}window\.GlyphStudio\.deepMerge\(CONFIG, overrides \|\| \{\}\);/],
+  ['batch applyConfig uses the shared deep merge', /function applyConfig\(cfg\) \{\s*if \(!cfg\) return;\s*window\.GlyphStudio\.deepMerge\(CONFIG, cfg\);/],
+  ['frames "auto" follows the GUI export plan', /job\.frames === 'auto'\s*\? Math\.max\(2, Math\.round\(\(\(CONFIG\.animation && CONFIG\.animation\.duration\) \|\| 6\) \* effFps\)\)/],
+  ['per-job border reaches both encoders', /fps: Math\.round\(effFps\),[\s\S]{0,200}border: jobBorder,[\s\S]{0,300}delayMs: delayMs,[\s\S]{0,200}border: jobBorder,/],
+  ['batch jobs carry per-job frames and border', /frames:\s+j\.frames \|\| job\.frames \|\| 24,[\s\S]{0,120}border:\s+j\.border \|\| null,/],
 ];
 
 for (const [name, pattern] of contracts) {
@@ -51,6 +57,7 @@ for (const [name, pattern] of contracts) {
 
 /* Negative contracts: the wall-clock sleeps ITER-047 removed must not come back. */
 const banned = [
+  ['one-level Object.assign config merge (F24)', /Object\.assign\(CONFIG\[k\], v\)/],
   ['headless start-up sleep', /setTimeout\(tryHeadlessRender,\s*\d+\)/],
   ['post-load / post-config settle sleeps', /await new Promise\(function \(r\) \{ setTimeout\(r, (300|200|1500)\); \}\);/],
   ['batch settle timer', /opts\.settleMs/],

@@ -24,7 +24,7 @@ enum Command {
     Render(RenderArgs),
 
     /// Render many variants of the SAME source in ONE Tauri session.  Reads a
-    /// manifest JSON with `{in, frames, jobs:[{name,out,format?,config}, ...]}`
+    /// manifest JSON with `{in, frames, jobs:[{name,out,format?,frames?,border?,config}, ...]}`
     /// and runs all jobs back-to-back without re-launching the app per variant.
     /// ~10× faster than calling `render` repeatedly because Tauri startup +
     /// source-image decode happens once.  See ITER-024 in BUGS_AND_ITERATIONS.md.
@@ -58,9 +58,10 @@ struct RenderArgs {
     #[arg(short = 'o', long = "out", value_name = "PATH")]
     out_path: PathBuf,
 
-    /// Number of frames in the output animation. Default 24.
-    #[arg(long, default_value_t = 24)]
-    frames: u32,
+    /// Number of frames in the output animation, or `auto` = the resolved
+    /// `animation.duration` x effective fps (what the GUI exports). Default 24.
+    #[arg(long, default_value = "24", value_name = "N|auto", value_parser = parse_frames)]
+    frames: FramesArg,
 
     /// Palette name. See `glyph-grid-studio catalog` for the full list.
     #[arg(long)]
@@ -106,6 +107,13 @@ struct RenderArgs {
     #[arg(long, value_name = "PATH")]
     preset: Option<PathBuf>,
 
+    /// Set any CONFIG value: `--set grid.cols=200 --set palette=spice
+    /// --set 'postprocess.bloom={"enabled":true,"radius":4}'`.  Value is
+    /// JSON when it parses, else a string.  Repeatable; applied last and
+    /// deep-merged.  Keys: see src/glyph-grid.schema.json.
+    #[arg(long = "set", value_name = "PATH=VALUE")]
+    set: Vec<String>,
+
     /// Show the rendering window during the headless render (debug aid).
     #[arg(long)]
     show_window: bool,
@@ -121,10 +129,25 @@ struct RenderArgs {
     dry_run: bool,
 }
 
+/// `--frames` value: `None` = auto.
+#[derive(Debug, Clone)]
+struct FramesArg(Option<u32>);
+
+fn parse_frames(s: &str) -> Result<FramesArg, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(FramesArg(None));
+    }
+    match s.parse::<u32>() {
+        Ok(n) if n >= 1 => Ok(FramesArg(Some(n))),
+        _ => Err(format!("expected a positive integer or `auto`, got {:?}", s)),
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 struct BatchArgs {
     /// Path to a JSON manifest. Shape:
-    /// `{"in":"<source>","frames":<N>,"jobs":[{"name":"...","out":"...","format":"gif|mp4","config":{...}}, ...]}`
+    /// `{"in":"<source>","frames":<N|"auto">,"jobs":[{"name":"...","out":"...","format":"gif|mp4",
+    /// "frames":<N|"auto">,"border":{"width":32,"bgColor":"auto"},"config":{...}}, ...]}`
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
 
@@ -158,7 +181,7 @@ fn main() {
             let job = app_lib::HeadlessRenderJob {
                 in_path,
                 out_path: args.out_path,
-                frames: args.frames,
+                frames: args.frames.0,
                 show_window: args.show_window,
                 preset_path: args.preset,
                 config_overrides: app_lib::ConfigOverrides {
@@ -172,6 +195,7 @@ fn main() {
                     postprocess: args.postprocess,
                     cols: args.cols,
                     rows: args.rows,
+                    set: args.set,
                 },
                 format: args.format,
             };

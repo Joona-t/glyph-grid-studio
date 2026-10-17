@@ -4310,18 +4310,12 @@
     },
     getConfig: () => JSON.parse(JSON.stringify(CONFIG)),
     setConfig: (overrides) => {
-      /* Deep-merge object values so partial overrides like
-         { dither: { mode: 'stbn' } } don't blow away the rest of dither.* */
-      for (const k in overrides) {
-        const v = overrides[k];
-        if (v && typeof v === 'object' && !Array.isArray(v)
-            && CONFIG[k] && typeof CONFIG[k] === 'object' && !Array.isArray(CONFIG[k])) {
-          Object.assign(CONFIG[k], v);
-        } else {
-          CONFIG[k] = v;
-        }
-      }
-      scheduleConfigRender(Object.keys(overrides).join(','));
+      /* F24 (ITER-057): the shared recursive merge (GlyphStudio.deepMerge,
+         same as the GUI preset path).  The old one-level Object.assign
+         replaced nested blocks: { postprocess: { vignette: { enabled } } }
+         dropped vignette.strength. */
+      window.GlyphStudio.deepMerge(CONFIG, overrides || {});
+      scheduleConfigRender(Object.keys(overrides || {}).join(','));
     },
     getRecState: () => recState,
     getSourceLimits: () => Object.assign({}, SOURCE_LIMITS),
@@ -4508,17 +4502,24 @@
         };
       }
 
+      /* F24 (ITER-057): same merge as setConfig and the GUI presets. */
       function applyConfig(cfg) {
         if (!cfg) return;
-        for (const k in cfg) {
-          const v = cfg[k];
-          if (v && typeof v === 'object' && !Array.isArray(v)
-              && CONFIG[k] && typeof CONFIG[k] === 'object' && !Array.isArray(CONFIG[k])) {
-            Object.assign(CONFIG[k], v);
-          } else {
-            CONFIG[k] = v;
-          }
-        }
+        window.GlyphStudio.deepMerge(CONFIG, cfg);
+      }
+
+      /* ITER-057: manifest `border` → the BorderConfig the encoders take.
+         bgColor "auto"/absent = this job's palette bg (the GUI default). */
+      function resolveJobBorder(b) {
+        if (!b || b.enabled === false || !b.width) return null;
+        const pal = PALETTES[CONFIG.palette] || {};
+        return {
+          enabled: true,
+          width: Math.round(b.width),
+          style: b.style || 'solid',
+          bgColor: (!b.bgColor || b.bgColor === 'auto') ? (pal.bg || '#E8DDC8') : b.bgColor,
+          inkColor: b.inkColor || (pal.inks && pal.inks[0]) || '#0E0805',
+        };
       }
 
       /* Audit 2026-06-10: jobs with PARTIAL configs used to inherit
@@ -4584,7 +4585,13 @@
         const effFps = 1000 / delayMs;
         const savedFps = CONFIG.animation.fps;
         CONFIG.animation.fps = effFps;
-        const requestedFrames = job.frames || 24;
+        /* ITER-057: frames "auto" = the GUI export plan — this job's
+           resolved duration × effective fps (exportPlan in glyph-studio.js),
+           so the output lasts exactly animation.duration. */
+        const requestedFrames = job.frames === 'auto'
+          ? Math.max(2, Math.round(((CONFIG.animation && CONFIG.animation.duration) || 6) * effFps))
+          : (job.frames || 24);
+        const jobBorder = resolveJobBorder(job.border);
         let captureFailureHandled = false;
 
         function advanceCaptureFailure(error, budget, phase) {
@@ -4709,12 +4716,14 @@
                     fps: Math.round(effFps),
                     path: job.path,
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+                    border: jobBorder,
                   }
                 : {
                     jobId: jobId,
                     delayMs: delayMs,
                     path: job.path,
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+                    border: jobBorder,
                     targetMaxBytes: (typeof job.targetMaxBytes === 'number' && job.targetMaxBytes > 0) ? job.targetMaxBytes : null,
                   };
               /* Sutskever B3 — export wall-time is the dominant real cost
@@ -4733,7 +4742,7 @@
                    parses this from the studio's stderr. */
                 if (perfMode) {
                   try {
-                    const snap = snapshotPerf(job.name, job.frames || 24, anchorFrames);
+                    const snap = snapshotPerf(job.name, requestedFrames, anchorFrames);
                     if (snap) {
                       snap.encode_ms = _encMs;
                       tauri('cli_log', { msg: 'PERF_JOB ' + JSON.stringify(snap) }).catch(()=>{});
@@ -5272,7 +5281,8 @@
           name:           j.name || 'job',
           path:           j.outPath,
           inPath:         j.inPath || null,
-          frames:         job.frames || 24,
+          frames:         j.frames || job.frames || 24,   // ITER-057: per-job, number or 'auto'
+          border:         j.border || null,
           format:         j.format,
           config:         j.config || {},
           capWidth:       (j.capWidth && j.capWidth > 0) ? j.capWidth : 0,
@@ -5314,7 +5324,7 @@
     __glyphGridTest.runBatchExport([{
       name: 'cli',
       path: job.outPath,
-      frames: job.frames || 24,
+      frames: job.frames || 24,   // number, or 'auto' (resolved per job, ITER-057)
       format: job.format,  // 'gif' (default) | 'mp4' — Rust pre-resolves
       config: {},  // already applied above
     }], {

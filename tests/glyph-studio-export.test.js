@@ -472,8 +472,26 @@ function presetSchemaStampAndUnknownKeys() {
   assert.strictEqual(config.palete, 'typo', 'unknown keys still apply (warn policy)');
 }
 
+/* ITER-057 (F24): the merge the CLI, batch and GUI now share. */
+function sharedDeepMerge() {
+  const { studio } = loadStudio(() => Promise.resolve());
+  const cfg = { grid: { cols: 240, rows: 120 }, glyphSet: null, inks: [1, 2],
+    postprocess: { vignette: { enabled: true, strength: 0.55 } } };
+  const out = studio.deepMerge(cfg, { grid: { cols: 80 }, inks: [3], glyphSet: 'octant',
+    postprocess: { vignette: { enabled: false }, bloom: { enabled: true } } });
+  assert.strictEqual(out, cfg, 'merges in place');
+  assert.strictEqual(JSON.stringify(cfg.grid), JSON.stringify({ cols: 80, rows: 120 }));
+  assert.strictEqual(JSON.stringify(cfg.postprocess.vignette), JSON.stringify({ enabled: false, strength: 0.55 }));
+  assert.strictEqual(JSON.stringify(cfg.postprocess.bloom), JSON.stringify({ enabled: true }));
+  assert.strictEqual(JSON.stringify(cfg.inks), JSON.stringify([3]));
+  assert.strictEqual(cfg.glyphSet, 'octant');
+  studio.deepMerge(cfg, { glyphSet: null });
+  assert.strictEqual(cfg.glyphSet, null);
+}
+
 (async function run() {
   presetSchemaStampAndUnknownKeys();
+  sharedDeepMerge();
   await nativeSuccessSkipsZip();
   await nativeFailureBuildsFallbackOnce();
   await stagedUiFlowStreamsWithoutRetainingFrames();

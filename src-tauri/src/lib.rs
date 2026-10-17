@@ -35,13 +35,18 @@ pub struct ConfigOverrides {
     pub postprocess: Vec<String>,
     pub cols: Option<u32>,
     pub rows: Option<u32>,
+    /// `--set <dotted.path>=<json>` overrides, applied last (ITER-057).
+    #[serde(default)]
+    pub set: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct HeadlessRenderJob {
     pub in_path: PathBuf,
     pub out_path: PathBuf,
-    pub frames: u32,
+    /// `None` = `--frames auto`: the JS side derives the count from the
+    /// resolved `animation.duration` x effective fps, like the GUI export.
+    pub frames: Option<u32>,
     pub show_window: bool,
     pub preset_path: Option<PathBuf>,
     pub config_overrides: ConfigOverrides,
@@ -82,18 +87,14 @@ impl HeadlessRenderJob {
     /// (unknown top-level keys — passed through, per the schema's
     /// `x-unknown-key-policy: warn`).
     pub fn build_js_config(&self) -> Result<(serde_json::Value, Vec<String>), String> {
-        let mut config = serde_json::Map::new();
+        let mut config = serde_json::Value::Object(serde_json::Map::new());
 
         // 1. Lay the preset (lowest priority)
         if let Some(preset_path) = &self.preset_path {
             let json_str = fs::read_to_string(preset_path)
                 .map_err(|e| format!("cannot read --preset {}: {}", preset_path.display(), e))?;
             match serde_json::from_str::<serde_json::Value>(&json_str) {
-                Ok(serde_json::Value::Object(obj)) => {
-                    for (k, v) in obj {
-                        config.insert(k, v);
-                    }
-                }
+                Ok(obj @ serde_json::Value::Object(_)) => config = obj,
                 Ok(other) => {
                     return Err(format!(
                         "--preset {} must be a JSON object (a partial CONFIG), got {}",
@@ -111,25 +112,31 @@ impl HeadlessRenderJob {
             }
         }
 
-        // 2. Layer flag overrides on top
+        // 2. Layer flag overrides on top.  F24 (ITER-057): the flags form a
+        // patch that is DEEP-merged onto the preset — they used to replace
+        // whole nested blocks (`--cols` dropped the preset's rows,
+        // `--postprocess vignette` dropped `vignette.strength`).
         let o = &self.config_overrides;
+        let mut config_patch = serde_json::Map::new();
         if let Some(v) = &o.palette {
-            config.insert("palette".into(), serde_json::Value::String(v.clone()));
+            config_patch.insert("palette".into(), serde_json::Value::String(v.clone()));
         }
         if let Some(v) = &o.color_mode {
-            config.insert("colorMode".into(), serde_json::Value::String(v.clone()));
+            config_patch.insert("colorMode".into(), serde_json::Value::String(v.clone()));
         }
         if let Some(v) = &o.ramp {
-            config.insert("ramp".into(), serde_json::Value::String(v.clone()));
+            config_patch.insert("ramp".into(), serde_json::Value::String(v.clone()));
         }
         if let Some(v) = &o.dither_mode {
-            config.insert(
+            config_patch.insert(
                 "dither".into(),
-                serde_json::json!({ "mode": v, "asSourcePrefilter": true, "levels": 16 }),
+                // Mode only: the preset's asSourcePrefilter survives
+                // (CONFIG.dither.levels is never read; levels follow the ramp).
+                serde_json::json!({ "mode": v }),
             );
         }
         if let Some(v) = &o.selection_mode {
-            config.insert("selectionMode".into(), serde_json::Value::String(v.clone()));
+            config_patch.insert("selectionMode".into(), serde_json::Value::String(v.clone()));
         }
         if let Some(v) = &o.glyph_set {
             let val = if v == "null" || v == "none" {
@@ -137,18 +144,20 @@ impl HeadlessRenderJob {
             } else {
                 serde_json::Value::String(v.clone())
             };
-            config.insert("glyphSet".into(), val);
+            config_patch.insert("glyphSet".into(), val);
         }
         if let Some(v) = &o.sampling_strategy {
-            config.insert(
+            config_patch.insert(
                 "samplingStrategy".into(),
                 serde_json::Value::String(v.clone()),
             );
         }
         if !o.postprocess.is_empty() {
-            // Build a postprocess block enabling exactly the listed stages,
-            // disabling everything else explicitly so we don't inherit any
-            // scene defaults.  The stage list is the schema's (ITER-056).
+            // Enable exactly the listed stages, disable every other one
+            // explicitly so we don't inherit any scene defaults (the "listed
+            // stages only" contract).  Only `enabled` is written, so nested
+            // params (vignette.strength, bloom.radius) survive the merge.
+            // The stage list is the schema's (ITER-056).
             let enabled: std::collections::HashSet<&str> =
                 o.postprocess.iter().map(|s| s.as_str()).collect();
             let mut pp = serde_json::Map::new();
@@ -165,7 +174,7 @@ impl HeadlessRenderJob {
                     ));
                 }
             }
-            config.insert("postprocess".into(), serde_json::Value::Object(pp));
+            config_patch.insert("postprocess".into(), serde_json::Value::Object(pp));
         }
         if o.cols.is_some() || o.rows.is_some() {
             let mut grid = serde_json::Map::new();
@@ -175,10 +184,17 @@ impl HeadlessRenderJob {
             if let Some(r) = o.rows {
                 grid.insert("rows".into(), serde_json::Value::from(r));
             }
-            config.insert("grid".into(), serde_json::Value::Object(grid));
+            config_patch.insert("grid".into(), serde_json::Value::Object(grid));
         }
 
-        let mut config = serde_json::Value::Object(config);
+        json_deep_merge(&mut config, serde_json::Value::Object(config_patch));
+
+        // 3. `--set a.b.c=<json>` last, through the same merge.
+        for spec in &o.set {
+            let patch = parse_set_override(spec)?;
+            json_deep_merge(&mut config, patch);
+        }
+
         let warnings = validate_config(&config)
             .map_err(|errs| format!("invalid config:\n  config{}", errs.join("\n  config")))?;
         strip_preset_meta(&mut config);
@@ -194,6 +210,87 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
         serde_json::Value::String(_) => "a string",
         serde_json::Value::Array(_) => "an array",
         serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// F24 (ITER-057): recursive JSON merge.  Objects merge key by key; every
+/// other value (scalar, array, null) replaces.  Same rule as
+/// `GlyphStudio.deepMerge` on the JS side, so preset + flags resolve the way
+/// the GUI applies a preset.
+pub fn json_deep_merge(target: &mut serde_json::Value, patch: serde_json::Value) {
+    match (target, patch) {
+        (serde_json::Value::Object(t), serde_json::Value::Object(p)) => {
+            for (k, v) in p {
+                match t.get_mut(&k) {
+                    Some(slot) if slot.is_object() && v.is_object() => json_deep_merge(slot, v),
+                    _ => {
+                        t.insert(k, v);
+                    }
+                }
+            }
+        }
+        (t, p) => *t = p,
+    }
+}
+
+/// `--set grid.cols=200` → `{"grid":{"cols":200}}`.  The value is JSON when
+/// it parses (`200`, `true`, `null`, `{"x":1}`, `"quoted"`), otherwise the
+/// raw text as a string (`--set palette=spice`).
+pub fn parse_set_override(spec: &str) -> Result<serde_json::Value, String> {
+    let (path, raw) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--set {:?}: expected <dotted.path>=<value>", spec))?;
+    let keys: Vec<&str> = path.trim().split('.').collect();
+    if keys.iter().any(|k| k.is_empty()) {
+        return Err(format!("--set {:?}: empty key in path {:?}", spec, path));
+    }
+    let mut value = serde_json::from_str::<serde_json::Value>(raw)
+        .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+    for k in keys.iter().rev() {
+        let mut m = serde_json::Map::new();
+        m.insert((*k).to_string(), value);
+        value = serde_json::Value::Object(m);
+    }
+    Ok(value)
+}
+
+/// Manifest `frames`: a positive integer or `"auto"`.  `None` = absent.
+fn manifest_frames(v: Option<&serde_json::Value>, what: &str) -> Result<Option<serde_json::Value>, String> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) if s == "auto" => Ok(Some(serde_json::Value::from("auto"))),
+        Some(n) if n.as_u64().map(|f| f >= 1).unwrap_or(false) => Ok(Some(n.clone())),
+        Some(other) => Err(format!(
+            "{} `frames` must be a positive integer or \"auto\", got {}",
+            what, other
+        )),
+    }
+}
+
+/// Manifest `border`: `{width, bgColor?, style?, inkColor?, enabled?}` →
+/// the `BorderConfig` shape the encoders take (`enabled` defaults to true
+/// when a border object is given; `bgColor` "auto"/absent is resolved to
+/// the job's palette bg by the JS driver).
+fn manifest_border(v: Option<&serde_json::Value>, what: &str) -> Result<serde_json::Value, String> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(serde_json::Value::Null),
+        Some(serde_json::Value::Object(b)) => {
+            let mut b = b.clone();
+            match b.get("width").and_then(|w| w.as_u64()) {
+                Some(w) if w <= 1024 => {}
+                _ => {
+                    return Err(format!(
+                        "{} `border.width` must be an integer 0..=1024 (px), got {}",
+                        what,
+                        b.get("width").map(|w| w.to_string()).unwrap_or_else(|| "nothing".into())
+                    ))
+                }
+            }
+            b.entry("enabled").or_insert(serde_json::Value::Bool(true));
+            b.entry("style").or_insert(serde_json::Value::from("solid"));
+            Ok(serde_json::Value::Object(b))
+        }
+        Some(other) => Err(format!("{} `border` must be an object, got {}", what, other)),
     }
 }
 
@@ -429,10 +526,15 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
         .get("in")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let frames = manifest
-        .get("frames")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(24) as u32;
+    // ITER-057: `frames` is a positive integer or "auto" (default 24); a
+    // malformed value used to be silently replaced by 24.
+    let frames = match manifest_frames(manifest.get("frames"), "manifest") {
+        Ok(f) => f.unwrap_or_else(|| serde_json::Value::from(24)),
+        Err(e) => {
+            eprintln!("batch: {}", e);
+            return 2;
+        }
+    };
     // Optional manifest-level "perf": true — when set, the JS side emits
     // PERF_JOB NDJSON via cli_log per finished job (parsed by the
     // optimization-loop orchestrator). Default false (no overhead for
@@ -497,6 +599,13 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
     let mut config_errors = 0usize;
     for (i, j) in jobs_arr.iter().enumerate() {
         let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let what = format!("job {} ({:?})", i, name);
+        if let Err(e) = manifest_frames(j.get("frames"), &what)
+            .and_then(|_| manifest_border(j.get("border"), &what))
+        {
+            eprintln!("batch: {}", e);
+            config_errors += 1;
+        }
         let cfg = j.get("config").cloned().unwrap_or(serde_json::json!({}));
         match validate_config(&cfg) {
             Ok(warnings) => {
@@ -514,7 +623,7 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
     }
     if config_errors > 0 {
         eprintln!(
-            "batch: {} job config(s) invalid — refusing manifest before any render runs",
+            "batch: {} job(s) invalid — refusing manifest before any render runs",
             config_errors
         );
         return 2;
@@ -576,11 +685,21 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool) -> i32 {
                     None
                 }
             });
+            // ITER-057: per-job `frames` (else the manifest's) and `border`
+            // — both were manifest-top-level-only / GUI-only before.
+            // Validated above, so the fallbacks never fire.
+            let job_frames = manifest_frames(j.get("frames"), "")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| frames.clone());
+            let border = manifest_border(j.get("border"), "").unwrap_or(serde_json::Value::Null);
             serde_json::json!({
                 "name": name,
                 "outPath": out_path,
                 "inPath": in_path_job,
                 "format": format,
+                "frames": job_frames,
+                "border": border,
                 "config": config,
                 "capWidth": cap_width,
                 "targetMaxBytes": target_max_bytes,
@@ -627,7 +746,10 @@ pub fn headless_render_json(job: &HeadlessRenderJob) -> Result<serde_json::Value
     Ok(serde_json::json!({
         "inPath": job.in_path.to_string_lossy().to_string(),
         "outPath": job.out_path.to_string_lossy().to_string(),
-        "frames": job.frames,
+        "frames": match job.frames {
+            Some(n) => serde_json::Value::from(n),
+            None => serde_json::Value::from("auto"),
+        },
         "format": job.resolved_format(),
         "config": config,
     }))
@@ -2946,7 +3068,7 @@ mod preset_schema_tests {
         HeadlessRenderJob {
             in_path: PathBuf::from("/tmp/in.png"),
             out_path: PathBuf::from("/tmp/out.gif"),
-            frames: 24,
+            frames: Some(24),
             show_window: false,
             preset_path: preset,
             config_overrides: overrides,
@@ -3042,5 +3164,103 @@ mod preset_schema_tests {
         for p in [bad_json, not_obj, bad_enum, ok] {
             let _ = fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn deep_merge_layers_objects_and_replaces_everything_else() {
+        let mut t = serde_json::json!({
+            "grid": { "cols": 240, "rows": 120 },
+            "postprocess": { "vignette": { "enabled": true, "strength": 0.55 } },
+            "glyphSet": null,
+            "inks": [1, 2]
+        });
+        json_deep_merge(
+            &mut t,
+            serde_json::json!({
+                "grid": { "cols": 80 },
+                "postprocess": { "vignette": { "enabled": false }, "bloom": { "enabled": true } },
+                "glyphSet": { "x": 1 },
+                "inks": [3]
+            }),
+        );
+        assert_eq!(t["grid"], serde_json::json!({ "cols": 80, "rows": 120 }));
+        assert_eq!(t["postprocess"]["vignette"], serde_json::json!({ "enabled": false, "strength": 0.55 }));
+        assert_eq!(t["postprocess"]["bloom"]["enabled"], true);
+        assert_eq!(t["glyphSet"], serde_json::json!({ "x": 1 }));
+        assert_eq!(t["inks"], serde_json::json!([3]));
+    }
+
+    #[test]
+    fn flags_and_set_layer_onto_the_preset_instead_of_replacing_blocks() {
+        let preset = temp_preset(
+            "layer",
+            r#"{"grid":{"cols":150,"rows":200},"dither":{"mode":"temporal","asSourcePrefilter":false},
+               "postprocess":{"vignette":{"enabled":false,"strength":0.4},"bloom":{"enabled":true,"radius":3}}}"#,
+        );
+        let job = job_with(
+            Some(preset.clone()),
+            ConfigOverrides {
+                cols: Some(80),
+                dither_mode: Some("stbn".into()),
+                postprocess: vec!["vignette".into()],
+                set: vec![
+                    "grid.cols=99".into(),
+                    "palette=spice".into(),
+                    "seed=7".into(),
+                    "animation.fps=25".into(),
+                    "glyphSet=null".into(),
+                ],
+                ..Default::default()
+            },
+        );
+        let (cfg, _) = job.build_js_config().unwrap();
+        assert_eq!(cfg["grid"], serde_json::json!({ "cols": 99, "rows": 200 }), "--set wins, rows survive");
+        assert_eq!(cfg["dither"], serde_json::json!({ "mode": "stbn", "asSourcePrefilter": false }));
+        assert_eq!(cfg["postprocess"]["vignette"], serde_json::json!({ "enabled": true, "strength": 0.4 }));
+        assert_eq!(cfg["postprocess"]["bloom"], serde_json::json!({ "enabled": false, "radius": 3 }));
+        assert_eq!(cfg["postprocess"]["kawaii"]["enabled"], false, "unlisted stages disabled");
+        assert_eq!(cfg["palette"], "spice");
+        assert_eq!(cfg["seed"], 7);
+        assert_eq!(cfg["animation"]["fps"], 25);
+        assert!(cfg["glyphSet"].is_null());
+        let _ = fs::remove_file(preset);
+    }
+
+    #[test]
+    fn set_override_parsing() {
+        assert_eq!(parse_set_override("a.b=1").unwrap(), serde_json::json!({ "a": { "b": 1 } }));
+        assert_eq!(parse_set_override("p=spice").unwrap(), serde_json::json!({ "p": "spice" }));
+        assert_eq!(parse_set_override("p=\"1\"").unwrap(), serde_json::json!({ "p": "1" }));
+        assert_eq!(parse_set_override("p=a=b").unwrap(), serde_json::json!({ "p": "a=b" }));
+        assert_eq!(
+            parse_set_override(r#"postprocess.bloom={"enabled":true}"#).unwrap(),
+            serde_json::json!({ "postprocess": { "bloom": { "enabled": true } } })
+        );
+        assert!(parse_set_override("novalue").is_err());
+        assert!(parse_set_override("a..b=1").is_err());
+        assert!(parse_set_override("=1").is_err());
+        // A --set that breaks the schema is rejected like any other config.
+        let job = job_with(None, ConfigOverrides { set: vec!["palette=cream".into()], ..Default::default() });
+        assert!(job.build_js_config().unwrap_err().contains("config/palette:"));
+    }
+
+    #[test]
+    fn manifest_frames_and_border_are_validated_and_normalised() {
+        assert_eq!(manifest_frames(None, "m").unwrap(), None);
+        assert_eq!(manifest_frames(Some(&serde_json::json!(12)), "m").unwrap(), Some(serde_json::json!(12)));
+        assert_eq!(manifest_frames(Some(&serde_json::json!("auto")), "m").unwrap(), Some(serde_json::json!("auto")));
+        for bad in [serde_json::json!(0), serde_json::json!(-3), serde_json::json!("lots"), serde_json::json!(2.5)] {
+            assert!(manifest_frames(Some(&bad), "m").is_err(), "{}", bad);
+        }
+        assert!(manifest_border(None, "j").unwrap().is_null());
+        let b = manifest_border(Some(&serde_json::json!({ "width": 16 })), "j").unwrap();
+        assert_eq!(b, serde_json::json!({ "width": 16, "enabled": true, "style": "solid" }));
+        let off = manifest_border(Some(&serde_json::json!({ "width": 16, "enabled": false })), "j").unwrap();
+        assert_eq!(off["enabled"], false);
+        assert!(manifest_border(Some(&serde_json::json!({ "width": "wide" })), "j").is_err());
+        assert!(manifest_border(Some(&serde_json::json!(32)), "j").is_err());
+        // The normalised object deserialises into the encoders' BorderConfig.
+        let bc: BorderConfig = serde_json::from_value(b).unwrap();
+        assert!(bc.enabled && bc.width == 16);
     }
 }

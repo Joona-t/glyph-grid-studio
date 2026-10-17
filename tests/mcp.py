@@ -210,6 +210,40 @@ if seq_resp and os.path.exists(out2):
 else:
     bad("C7 server handles 2 sequential renders", "second render failed")
 
+# --- Test C8 (ITER-057): `config` object reaches every CONFIG key ---
+out8 = os.path.join(SCRATCH, "c8_config.gif")
+if os.path.exists(out8):
+    os.remove(out8)
+send(proc, {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TEST_IMG, "out_path": out8, "frames": 2,
+                  "config": {"seed": 7, "palette": "phosphor",
+                             "postprocess": {"vignette": {"enabled": True, "strength": 0.9}}},
+                  "palette": "spice"},
+}})
+print("    (waiting up to 90s for config-object render…)")
+r8 = recv(proc, timeout=90)
+t8 = r8.get("result", {}).get("content", [{}])[0].get("text", "") if r8 else ""
+if "Rendered" in t8 and os.path.exists(out8):
+    ok("C8 render with a `config` object (%d KB)" % (os.path.getsize(out8) // 1024))
+else:
+    bad("C8 render with a `config` object", t8[:160])
+
+# --- Test C9 (ITER-056/057): invalid args fail in-process with a JSON path ---
+t0 = time.time()
+send(proc, {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"in_path": TEST_IMG, "out_path": os.path.join(SCRATCH, "c9.gif"),
+                  "config": {"dither": {"mode": "STBN"}}},
+}})
+r9 = recv(proc, timeout=10)
+t9 = r9.get("result", {}).get("content", [{}])[0].get("text", "") if r9 else ""
+if "invalid arguments" in t9 and "/dither/mode" in t9 and time.time() - t0 < 5 \
+        and not os.path.exists(os.path.join(SCRATCH, "c9.gif")):
+    ok("C9 invalid config rejected before spawning (%.1fs)" % (time.time() - t0))
+else:
+    bad("C9 invalid config rejected before spawning", t9[:160])
+
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")
 sys.exit(0 if FAIL == 0 else 1)
