@@ -38,6 +38,10 @@ pub struct ConfigOverrides {
     /// `--set <dotted.path>=<json>` overrides, applied last (ITER-057).
     #[serde(default)]
     pub set: Vec<String>,
+    /// `--timeline <path>=<u>:(<v>),...` keyframe tracks, applied after
+    /// `--set` (ITER-075).
+    #[serde(default)]
+    pub timeline: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +234,11 @@ impl HeadlessRenderJob {
             let patch = parse_set_override(spec)?;
             json_deep_merge(&mut config, patch);
         }
+        // 4. `--timeline` tracks (ITER-075): each one also turns the timeline
+        // on.  Tracks merge by path; the same path twice → the last wins.
+        for spec in &o.timeline {
+            json_deep_merge(&mut config, parse_timeline_spec(spec)?);
+        }
 
         let warnings = validate_config(&config)
             .map_err(|errs| format!("invalid config:\n  config{}", errs.join("\n  config")))?;
@@ -288,6 +297,112 @@ pub fn parse_set_override(spec: &str) -> Result<serde_json::Value, String> {
         value = serde_json::Value::Object(m);
     }
     Ok(value)
+}
+
+/// R2 (ITER-075): Deforum-style keyframe string →
+/// `{"timeline":{"enabled":true,"tracks":{<path>:[{u, v, ease?}, ...]}}}`.
+///
+///   `studio.breathing.gainSwing=0:(0.1), 0.5:(0.6):inOutSine`
+///   `palette=0:(cream-paper),1:(spice)`
+///
+/// Keys are `<u>:(<value>)[:<ease>]`, comma-separated, u in [0, 1].  The
+/// value is JSON when it parses, else the raw text as a string (palette
+/// names), like `--set`.  Ease names are checked by the schema.
+pub fn parse_timeline_spec(spec: &str) -> Result<serde_json::Value, String> {
+    let err = |m: String| format!("--timeline {:?}: {}", spec, m);
+    let (path, body) = spec
+        .split_once('=')
+        .ok_or_else(|| err("expected <dotted.path>=<u>:(<value>),...".into()))?;
+    let path = path.trim();
+    if path.is_empty() || path.split('.').any(|k| k.is_empty()) {
+        return Err(err(format!("empty key in path {:?}", path)));
+    }
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    let mut keys = Vec::new();
+    let skip_ws = |i: &mut usize| {
+        while *i < chars.len() && chars[*i].is_whitespace() {
+            *i += 1;
+        }
+    };
+    loop {
+        skip_ws(&mut i);
+        if i >= chars.len() {
+            break;
+        }
+        // u
+        let start = i;
+        while i < chars.len() && chars[i] != ':' {
+            i += 1;
+        }
+        let u_text: String = chars[start..i].iter().collect();
+        let u: f64 = u_text
+            .trim()
+            .parse()
+            .map_err(|_| err(format!("key {} has no numeric u (got {:?})", keys.len() + 1, u_text.trim())))?;
+        if !(0.0..=1.0).contains(&u) {
+            return Err(err(format!("u {} is outside [0, 1]", u)));
+        }
+        i += 1; // ':'
+        skip_ws(&mut i);
+        if i >= chars.len() || chars[i] != '(' {
+            return Err(err(format!("expected `(` after `{}:`", u_text.trim())));
+        }
+        // value: up to the matching `)`
+        let vstart = i + 1;
+        let mut depth = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if i >= chars.len() {
+            return Err(err(format!("unclosed `(` at u {}", u)));
+        }
+        let raw: String = chars[vstart..i].iter().collect();
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(err(format!("empty value at u {}", u)));
+        }
+        let v = serde_json::from_str::<serde_json::Value>(raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+        i += 1; // ')'
+        let mut kf = serde_json::Map::new();
+        kf.insert("u".into(), serde_json::json!(u));
+        kf.insert("v".into(), v);
+        skip_ws(&mut i);
+        if i < chars.len() && chars[i] == ':' {
+            i += 1;
+            let estart = i;
+            while i < chars.len() && chars[i] != ',' {
+                i += 1;
+            }
+            let ease: String = chars[estart..i].iter().collect();
+            kf.insert("ease".into(), serde_json::Value::String(ease.trim().to_string()));
+        }
+        keys.push(serde_json::Value::Object(kf));
+        skip_ws(&mut i);
+        if i < chars.len() {
+            if chars[i] != ',' {
+                return Err(err(format!("expected `,` between keys, got {:?}", chars[i])));
+            }
+            i += 1;
+        }
+    }
+    if keys.is_empty() {
+        return Err(err("no keyframes".into()));
+    }
+    let mut tracks = serde_json::Map::new();
+    tracks.insert(path.to_string(), serde_json::Value::Array(keys));
+    Ok(serde_json::json!({ "timeline": { "enabled": true, "tracks": tracks } }))
 }
 
 /// Manifest `frames`: a positive integer or `"auto"`.  `None` = absent.
@@ -5588,6 +5703,33 @@ mod preset_schema_tests {
         // A --set that breaks the schema is rejected like any other config.
         let job = job_with(None, ConfigOverrides { set: vec!["palette=cream".into()], ..Default::default() });
         assert!(job.build_js_config().unwrap_err().contains("config/palette:"));
+    }
+
+    #[test]
+    fn timeline_spec_parsing() {
+        assert_eq!(
+            parse_timeline_spec("studio.breathing.gainSwing=0:(0.1), 0.5:(0.6):inOutSine").unwrap(),
+            serde_json::json!({ "timeline": { "enabled": true, "tracks": { "studio.breathing.gainSwing": [
+                { "u": 0.0, "v": 0.1 }, { "u": 0.5, "v": 0.6, "ease": "inOutSine" } ] } } })
+        );
+        assert_eq!(
+            parse_timeline_spec("palette=0:(cream-paper),1:(spice)").unwrap()["timeline"]["tracks"]["palette"],
+            serde_json::json!([{ "u": 0.0, "v": "cream-paper" }, { "u": 1.0, "v": "spice" }])
+        );
+        for bad in ["nopath", "=0:(1)", "a..b=0:(1)", "x=", "x=0:1", "x=0:(1", "x=2:(1)", "x=a:(1)", "x=0:()", "x=0:(1) 1:(2)"] {
+            assert!(parse_timeline_spec(bad).is_err(), "{}", bad);
+        }
+        // Through the job: schema-valid, enabled, tracks merged by path.
+        let job = job_with(None, ConfigOverrides {
+            timeline: vec!["grid.cols=0:(60),0.5:(120)".into(), "palette=0:(cream-paper),1:(spice)".into()],
+            ..Default::default()
+        });
+        let (cfg, _) = job.build_js_config().unwrap();
+        assert_eq!(cfg["timeline"]["enabled"], true);
+        assert_eq!(cfg["timeline"]["tracks"].as_object().unwrap().len(), 2);
+        // A bad ease or a u outside [0,1] in JSON form is a schema error.
+        let job = job_with(None, ConfigOverrides { timeline: vec!["seed=0:(1):bouncy".into()], ..Default::default() });
+        assert!(job.build_js_config().unwrap_err().contains("config/timeline/tracks/seed/0/ease"));
     }
 
     #[test]

@@ -142,7 +142,9 @@
       'temporalStability', 'flow',
       /* BUG-011 (v0.1.8): these are live panel inputs but were missing
          from the preset whitelist, so save → reload silently dropped them. */
-      'invertSignal', 'bgThreshold', 'dispersal', 'scene'];
+      'invertSignal', 'bgThreshold', 'dispersal', 'scene',
+      /* ITER-075: keyframe tracks (CONFIG.timeline). */
+      'timeline'];
     /* R7: stamp the schema so editors autocomplete and `validate` knows
        which preset format it is reading. */
     var out = { $schema: PRESET_SCHEMA_ID, version: PRESET_SCHEMA_VERSION };
@@ -1788,6 +1790,36 @@
         'Anti-flicker: a cell only swaps characters when its brightness clearly crosses into another bucket. Kills shimmer in animated exports; breathing alpha is unaffected.');
     tip(fAnim.addInput(config.temporalStability, 'strength', { min: 0, max: 2, step: 0.05 }),
         'Hysteresis width. Higher = steadier glyphs, slower to react to real changes.');
+
+    /* Timeline (ITER-075, R2) — keyframe tracks on CONFIG paths, evaluated
+       per frame into a shadow config (index.html draw()), so the sliders
+       above keep showing base values.  Tracks come from presets, the CLI
+       (`--timeline`), batch manifests and MCP; v1 UI is enable + a u scrub
+       that pauses the loop, no canvas timeline yet. */
+    if (!config.timeline) config.timeline = { enabled: false, tracks: {} };
+    if (!config.timeline.tracks) config.timeline.tracks = {};
+    var fTl = pane.addFolder({ title: 'Timeline', expanded: false });
+    tip(fTl.addInput(config.timeline, 'enabled'),
+        'Play the keyframe tracks loaded from a preset or the CLI. Off = the panel values render as-is.');
+    var tlState = {
+      u: 0,
+      get tracks() {
+        var t = config.timeline.tracks || {};
+        var ks = Object.keys(t);
+        return ks.length ? ks.map(function (k) {
+          return k + ' (' + ((t[k] && t[k].length) || 0) + ')';
+        }).join(', ') : 'none';
+      },
+    };
+    fTl.addMonitor(tlState, 'tracks', { label: 'tracks', interval: 1000 });
+    var tlScrub = fTl.addInput(tlState, 'u', { min: 0, max: 1, step: 0.001, label: 'scrub u' });
+    tlScrub.on('change', function (e) {
+      if (window.__timelineScrub) window.__timelineScrub(e.value);
+    });
+    tip(tlScrub, 'Preview the timeline at this loop position (0 = start, 1 = end). Pauses playback until Resume.');
+    fTl.addButton({ title: 'Resume loop' }).on('click', function () {
+      if (window.__timelineScrub) window.__timelineScrub(null);
+    });
 
     /* Perf — Phase 0 instrumentation. Live rolling averages of per-stage
        frame time + last switch latency. Click "Report (console)" to

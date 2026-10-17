@@ -514,6 +514,7 @@ impl GlyphGridServer {
                 cols: p.cols,
                 rows: p.rows,
                 set: Vec::new(),
+                timeline: Vec::new(),
             },
             format: p.format.clone(),
             timeout_secs: p.timeout_s,

@@ -529,6 +529,57 @@
       ],
       "default": null
     },
+    "timeline": {
+      "description": "Keyframe tracks on dotted CONFIG paths, evaluated per frame (u = t / animation.duration).",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "tracks": {
+          "type": "object",
+          "description": "Dotted CONFIG path -> keyframes.",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_$][\\w$]*(\\.[A-Za-z_$][\\w$]*)*$"
+          },
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "u",
+                "v"
+              ],
+              "properties": {
+                "u": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "description": "Loop position of this key."
+                },
+                "v": {
+                  "description": "Value at u: a number (lerped), a palette name on the `palette` track (OKLab blend), anything else steps."
+                },
+                "ease": {
+                  "type": "string",
+                  "enum": [
+                    "linear",
+                    "inOutSine",
+                    "step"
+                  ],
+                  "default": "linear",
+                  "description": "Shape of the segment arriving at this key. Forced to step on grid.cols, grid.rows, glyphSet, selectionMode, dither.mode."
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
     "temporalStability": {
       "description": "Anti-flicker Schmitt trigger on the ramp index.",
       "type": "object",

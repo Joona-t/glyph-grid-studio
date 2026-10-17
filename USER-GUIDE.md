@@ -346,6 +346,14 @@ Whether the exported GIF loops. MP4 always plays once per cycle (IG / X auto-loo
 > **Under the hood**
 > `exportPlan()` in glyph-studio.js computes `delayMs = max(20, round(1000/fps/10) × 10)` (centisecond floor), `effFps = 1000/delayMs`, `frames = max(2, round(duration × effFps))`, `dur = frames × delayMs / 1000`. The Export GIF and Export MP4 buttons override `CONFIG.animation.fps` to `effFps` for the duration of the recording so studio frame timing matches encoded frame timestamps — without this, GIFs stutter at the loop wrap because the encoded fps and the studio's playback fps disagree.
 
+#### Timeline (collapsed by default)
+Keyframe tracks that change settings over the loop: a palette that morphs from cream-paper to spice, breathing that swells halfway through, a grid that sharpens from 80 to 200 columns. Tracks come from a preset (`"timeline"` key), the CLI (`--timeline 'palette=0:(cream-paper),1:(spice)'`), a batch manifest or MCP. The sliders elsewhere keep showing your base values. The timeline is applied on top of them each frame, and exports use it too.
+- `enabled` plays the loaded tracks; off renders the panel values as-is.
+- `tracks` lists the keyed settings and how many keys each has.
+- `scrub u` previews one moment (0 = start, 1 = end) and pauses playback; `Resume loop` plays again.
+
+Numbers glide between keys (`linear` or `inOutSine`), the palette blends in OKLab, and grid size, glyph set, selection mode and dither mode jump at their key (`step`). Under reduced motion the live preview holds the start of the timeline; exports are unaffected.
+
 ---
 
 ### 5.10 Perf (collapsed by default)

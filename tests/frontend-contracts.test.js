@@ -73,6 +73,10 @@ const contracts = [
   ['text exports snapshot the IR at capture time', /state\.captureIr \? GlyphGrid\.textExport\.snapFromIr\(glyphFrame\)/],
   ['irOnly capture skips the pixel readback', /if \(state\.irOnly\) \{\s*blobReady = Promise\.resolve\(null\);/],
   ['text-export module is loaded before the app script', /<script src="lib\/glyph-text-export\.js"><\/script>/],
+  /* ITER-075: timeline loads after the palette morph it blends with, and
+     draw() renders through the shadow config. */
+  ['timeline module is loaded after palette-morph', /glyph-palette-morph\.js"><\/script>\s*<script src="lib\/glyph-timeline\.js"><\/script>/],
+  ['draw() swaps in the timeline shadow and restores the base', /CONFIG = fr\.config;\s*try \{\s*drawFrame\(\);\s*\} finally \{\s*CONFIG = CONFIG_BASE;/],
 ];
 
 for (const [name, pattern] of contracts) {
@@ -157,9 +161,11 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
       __prefersReducedMotion: () => false,
       usesAdvancedPipeline: () => true,
       _hasImgDataStages: () => false,
+      __tlScrubU: null,
     }, over && over.ctx);
     ctx.GlyphGrid = { compat: { isV2: () => true, gateDither: (c) => c.dither.mode !== 'none',
-      gatePostprocess: () => true } };
+      gatePostprocess: () => true },
+      timeline: { active: (c) => !!(c.timeline && c.timeline.enabled) } };
     ctx.window.GlyphGrid = ctx.GlyphGrid;
     vm.createContext(ctx);
     vm.runInContext(src + '\nthis.__f = frameIsTimeDependent;', ctx);
@@ -183,6 +189,7 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     ['atlas in flight', { ctx: { _atlasInflight: { octant: {} } } }],
     ['atlas missing', { CONFIG: { glyphSet: 'octant' } }],
     ['CRT pixel stage', { ctx: { _hasImgDataStages: () => true } }],
+    ['timeline playing', { CONFIG: { timeline: { enabled: true } } }],
   ];
   for (const [name, over] of dynamic) {
     assert.strictEqual(make(over), true, `frameIsTimeDependent must be true for: ${name}`);
@@ -191,6 +198,9 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   assert.strictEqual(make({ CONFIG: { studio: { breathing: {} }, dither: { mode: 'temporal' } },
     ctx: { __prefersReducedMotion: () => true } }), false, 'reduced motion still source must be static');
   assert.strictEqual(make({ CONFIG: { dither: { mode: 'bayer8' } } }), false, 'ordered dither is static');
+  /* ITER-075: a scrubbed (paused) timeline is a still frame. */
+  assert.strictEqual(make({ CONFIG: { timeline: { enabled: true } }, ctx: { __tlScrubU: 0.4 } }), false,
+    'scrubbed timeline must be static');
 }
 
 /* ITER-063: vendored files must match the pinned CDN hashes, ship a licence,
@@ -632,3 +642,5 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
 
 /* ITER-074: the terminal-export unit tests ride along with `npm test`. */
 require('./glyph-text-export.test.js');
+/* ITER-075: timeline evaluator unit tests. */
+require('./glyph-timeline.test.js');

@@ -75,9 +75,10 @@ function literalAfter(src, anchor, label) {
 /* ---- 1. index.html inline tables ---- */
 const html = read('src/index.html');
 const inline = Array.from(html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi))
-  .map((m) => m[1]).find((s) => s.includes('const CONFIG = {'));
+  .map((m) => m[1]).find((s) => s.includes('let CONFIG = {'));
 if (!inline) fail('src/index.html has no inline script defining CONFIG');
-const CONFIG = literalAfter(inline, 'const CONFIG =', 'CONFIG');
+/* `let` since ITER-075: draw() swaps in a per-frame timeline shadow. */
+const CONFIG = literalAfter(inline, 'let CONFIG =', 'CONFIG');
 const RAMPS = literalAfter(inline, 'const RAMPS =', 'RAMPS');
 const PALETTES = literalAfter(inline, 'const PALETTES =', 'PALETTES');
 const SCENES = literalAfter(inline, 'const SCENES =', 'SCENES');   // methods are defined, never run
@@ -116,6 +117,9 @@ const PANEL_STAGE_DEFAULTS = {};
 for (const m of studioSrc.matchAll(/config\.postprocess\.(\w+) = \{/g)) {
   PANEL_STAGE_DEFAULTS[m[1]] = evalLiteral(sliceBalanced(studioSrc, m.index + m[0].length - 1), m[1] + ' defaults');
 }
+
+/* ---- 5. timeline easings + structural keys (ITER-075) ---- */
+const TIMELINE = require(path.join(ROOT, 'src', 'lib', 'glyph-timeline.js'));
 
 const compatSrc = read('src/lib/glyph-compat.js');
 const COMPAT = literalAfter(compatSrc, 'COMPAT_VERSIONS = Object.freeze(', 'COMPAT_VERSIONS');
@@ -162,6 +166,7 @@ const DESCRIPTIONS = {
   postprocess: 'Per-stage post effects; each stage has `enabled` plus its params.',
   depth: 'Depth-map fog zones.',
   paletteMorph: 'OKLab palette interpolation over time; null = off.',
+  timeline: 'Keyframe tracks on dotted CONFIG paths, evaluated per frame (u = t / animation.duration).',
   temporalStability: 'Anti-flicker Schmitt trigger on the ramp index.',
   flow: 'ETF tuning for selectionMode "flow".',
   recording: 'Recording backend.',
@@ -221,6 +226,33 @@ for (const k of Object.keys(CONFIG)) {
       stages[s] = node(defaults, 'postprocess.' + s);
     }
     p = { type: 'object', properties: stages, additionalProperties: true };
+  }
+  if (k === 'timeline') {
+    const keyframe = {
+      type: 'object',
+      required: ['u', 'v'],
+      properties: {
+        u: { type: 'number', minimum: 0, maximum: 1, description: 'Loop position of this key.' },
+        v: { description: 'Value at u: a number (lerped), a palette name on the `palette` track (OKLab blend), anything else steps.' },
+        ease: { type: 'string', enum: TIMELINE.EASES.slice(), default: 'linear',
+          description: 'Shape of the segment arriving at this key. Forced to step on ' + TIMELINE.STRUCTURAL.join(', ') + '.' },
+      },
+      additionalProperties: false,
+    };
+    p = {
+      type: 'object',
+      properties: {
+        enabled: { type: 'boolean', default: CONFIG.timeline.enabled },
+        tracks: {
+          type: 'object',
+          description: 'Dotted CONFIG path -> keyframes.',
+          propertyNames: { pattern: '^[A-Za-z_$][\\w$]*(\\.[A-Za-z_$][\\w$]*)*$' },
+          additionalProperties: { type: 'array', items: keyframe },
+          default: CONFIG.timeline.tracks,
+        },
+      },
+      additionalProperties: false,
+    };
   }
   if (DESCRIPTIONS[k]) p = Object.assign({ description: DESCRIPTIONS[k] }, p);
   properties[k] = p;

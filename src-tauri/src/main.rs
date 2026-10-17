@@ -117,6 +117,15 @@ struct RenderArgs {
     #[arg(long = "set", value_name = "PATH=VALUE")]
     set: Vec<String>,
 
+    /// Keyframe a CONFIG path over the loop (Deforum-style):
+    /// `--timeline 'studio.breathing.gainSwing=0:(0.1),0.5:(0.6)'`,
+    /// `--timeline 'palette=0:(cream-paper),1:(spice)'` (OKLab blend).
+    /// Keys are `<u>:(<value>)[:linear|inOutSine|step]`, u in [0, 1] of
+    /// animation.duration.  Repeatable (one track each); turns
+    /// `timeline.enabled` on.  JSON form: the `timeline` preset key.
+    #[arg(long = "timeline", value_name = "PATH=KEYS")]
+    timeline: Vec<String>,
+
     /// Show the rendering window during the headless render (debug aid).
     #[arg(long)]
     show_window: bool,
@@ -246,6 +255,7 @@ fn main() {
                     cols: args.cols,
                     rows: args.rows,
                     set: args.set,
+                    timeline: args.timeline,
                 },
                 format: args.format,
                 timeout_secs: args.timeout,

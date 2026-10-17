@@ -49,7 +49,7 @@ The selected glyph is typeset into the cell, in a chosen palette and color mode.
 | Selection (4) | brightness, shape, shape-edge-aware, edge-directional |
 | Glyph sets (7) | ASCII, asciiDense, blockElements, braille, sextant, octant, ramp-only |
 | Postprocess (8) | vignette, bloom, halation, scanlines, chromaticAberration, phosphorDecay, depthFog, **CRT-beam** (Lottes / Blur Busters 2024) |
-| Animation | breathing-cell EMA, per-frame gain pulse, per-cell jitter — runtime-tunable |
+| Animation | breathing-cell EMA, per-frame gain pulse, per-cell jitter — runtime-tunable · keyframe timeline on any CONFIG path (OKLab palette morphs) |
 | Export | PNG snapshot · animated GIF89a · MP4 (H.264) · preset JSON · share URL |
 
 ## Algorithmic notes
@@ -134,6 +134,17 @@ glyph-grid-studio render --in a.png --out a.gif --progress
 # 24-frame loop: cast ~8 MB, html ~3 MB).
 glyph-grid-studio render --in portrait.jpg --out portrait.txt
 glyph-grid-studio render --in worm.gif --out worm.cast --frames 48 --glyph-set blockElements
+
+# Keyframes (ITER-075): animate any CONFIG path over the loop, Deforum-style
+# `<u>:(<value>)[:linear|inOutSine|step]`, u in [0,1] of animation.duration.
+# Numbers lerp, `palette` blends in OKLab, grid.cols/rows, glyphSet,
+# selectionMode and dither.mode step.  Repeat --timeline for more tracks.
+# Presets, batch manifests and MCP take the JSON form:
+#   {"timeline":{"enabled":true,"tracks":{"palette":[{"u":0,"v":"cream-paper"},{"u":1,"v":"spice"}]}}}
+glyph-grid-studio render --in a.png --out a.mp4 --frames auto \
+  --timeline 'palette=0:(cream-paper),1:(spice)' \
+  --timeline 'studio.breathing.gainSwing=0:(0.1),0.5:(0.6):inOutSine' \
+  --timeline 'grid.cols=0:(80),0.5:(200)'
 
 # Help
 glyph-grid-studio render --help

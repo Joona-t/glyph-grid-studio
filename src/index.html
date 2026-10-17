@@ -83,6 +83,7 @@
   <script src="lib/glyph-edge.js"></script>
   <script src="lib/glyph-xdog.js"></script>
   <script src="lib/glyph-palette-morph.js"></script>
+  <script src="lib/glyph-timeline.js"></script>
   <script src="lib/glyph-crt.js"></script>
   <!-- Wave 1 runtime (load AFTER all primitive libs; order-sensitive). -->
   <script src="lib/glyph-runtime.js"></script>
@@ -134,14 +135,18 @@
        - CONFIG.renderer — "cpu" (default) | "gpu".
        - CONFIG.zones — scene-contract v2 zone-variable pipeline.
        - CONFIG.paletteMorph — OKLab interpolation across palettes over time.
+       - CONFIG.timeline — keyframe tracks on any CONFIG path (lib/glyph-timeline.js).
        - CONFIG.recording — streaming output via File System Access API.
      ================================================================= */
 
   /* =================================================================
      CONFIG — defaults preserve v1 behavior. New v2 fields default to
      inactive (all gates return false).
+     ITER-075: `let`, not `const` — while a timeline is active draw() points
+     CONFIG at a per-frame shadow (see draw()) and back at CONFIG_BASE, the
+     object Tweakpane, presets and every setter hold.
      ================================================================= */
-  const CONFIG = {
+  let CONFIG = {
     /* --- v2 gate (single switch) --- */
     compat: 'v2',
 
@@ -269,6 +274,10 @@
     depth: { enabled: false },
 
     paletteMorph: null,
+    /* ITER-075 (R2): keyframe tracks keyed by dotted CONFIG path, evaluated
+       per frame into a shadow config.  tracks: { '<path>': [{u, v, ease}] },
+       u in [0,1] of animation.duration; ease linear | inOutSine | step. */
+    timeline: { enabled: false, tracks: {} },
     /* v0.1.6: anti-flicker Schmitt trigger on ramp index (off = legacy). */
     temporalStability: { enabled: false, strength: 0.75 },
     /* v0.1.6: ETF flow mode tuning (selectionMode: 'flow'). */
@@ -315,6 +324,7 @@
       },
     },
   };
+  const CONFIG_BASE = CONFIG;
 
   /* =================================================================
      RAMPS — v1 legacy density strings. v2's glyphSet supersedes this
@@ -1490,6 +1500,8 @@
   let __idleParked = false;   // true while the detector holds the loop stopped
   function frameIsTimeDependent() {
     if (recState || window.PIPELINE || __primeOnly) return true;
+    if (__tlScrubU === null && window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.active(CONFIG)
+        && !__prefersReducedMotion()) return true;               // ITER-075 timeline
     if (!sourceImg || !sourceImg.width) return true;
     if (window.__sourceFrameIdx !== -1) return true;              // animated source
     if (CONFIG.scene !== 'studio') return true;                    // generative scenes animate on t
@@ -1515,6 +1527,7 @@
     return false;
   }
   function idleCheck() {
+    if (__tlScrubU !== null) return;   /* ITER-075: a scrub owns the paused loop */
     if (__idleParked && isLooping()) { __idleParked = false; __idleStreak = 0; } // re-armed elsewhere
     if (frameIsTimeDependent() || !(__emaMaxDelta < IDLE_EMA_EPS)) {
       __idleStreak = 0;
@@ -1585,7 +1598,69 @@
     return __frameSource;
   }
 
+  /* ITER-075 (R2): timeline.  With CONFIG.timeline active, every draw —
+     live, captured, and the Phase-1 priming passes (primeTemporalState
+     redraws through here) — renders against a shadow config built by
+     GlyphGrid.timeline.frameConfig: copy-on-write along the tracked paths,
+     so the Tweakpane-bound CONFIG_BASE keeps the user's base values and is
+     never written.  u comes from the same t the frame uses (recording:
+     frameIdx / fps, so it is deterministic), or from the Timeline folder's
+     scrub (live only; the loop stays paused while scrubbing).  Structural
+     tracks (grid.cols/rows, glyphSet, selectionMode, dither.mode) step, and
+     drawGlyphGridV2's grid-resize branch carries the EMA across a cols/rows
+     change with its overlap copy, as it does for a slider scrub.  A palette
+     blend is registered as one synthetic PALETTES entry whose name encodes
+     its colours (the lum/cell caches key on the palette name); the previous
+     one is dropped.  Timeline off: draw() is drawFrame(), unchanged. */
+  let __tlScrubU = null;
+  let __tlPaletteName = null;
+  function timelineU(t) {
+    const d = CONFIG_BASE.animation.duration;
+    if (!(d > 0)) return 0;
+    const u = t / d;
+    return CONFIG_BASE.animation.loop ? (u - Math.floor(u)) : Math.min(1, u);
+  }
   function draw() {
+    if (!(window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.active(CONFIG_BASE))) {
+      drawFrame();
+      return;
+    }
+    const fps = CONFIG_BASE.animation.fps;
+    const t = recState
+      ? (recState.frameIdx / fps)
+      : ((frameCount - 1) / fps) % CONFIG_BASE.animation.duration;
+    const scrub = !recState && __tlScrubU !== null;
+    /* Reduced motion stills the live preview (as breathing does); captures
+       and an explicit scrub keep their u. */
+    const u = scrub ? __tlScrubU
+      : (!recState && __prefersReducedMotion()) ? 0 : timelineU(t);
+    const fr = GlyphGrid.timeline.frameConfig(CONFIG_BASE, u, PALETTES);
+    if (__tlPaletteName && __tlPaletteName !== fr.config.palette) delete PALETTES[__tlPaletteName];
+    __tlPaletteName = null;
+    if (fr.palette) {
+      PALETTES[fr.config.palette] = fr.palette;
+      __tlPaletteName = fr.config.palette;
+    }
+    CONFIG = fr.config;
+    try {
+      drawFrame();
+    } finally {
+      CONFIG = CONFIG_BASE;
+    }
+    if (scrub) noLoop();
+  }
+  /* Timeline folder scrub: a u in [0,1] pins the preview and pauses the
+     loop; null resumes playback. */
+  window.__timelineScrub = function (u) {
+    __tlScrubU = (typeof u === 'number' && isFinite(u)) ? Math.max(0, Math.min(1, u)) : null;
+    if (recState) return;
+    try {
+      if (__tlScrubU === null) loop();
+      else { noLoop(); redraw(); }
+    } catch (_) {}
+  };
+
+  function drawFrame() {
     /* CONFIG.animation.fps is live-mutated by Tweakpane and batch jobs.
        Keep p5's actual timer cadence in sync with the animation math. */
     syncAnimationFrameRate();
@@ -1778,7 +1853,7 @@
          GIF → …") survive on the bar while the draw loop runs underneath.
          finishRecording sets it; exportFeedback releases it. */
       if (!window.__statusHold) statusEl().textContent =
-        `${CONFIG.scene} | ${CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
+        `${CONFIG.scene} | ${__tlPaletteName === CONFIG.palette ? 'timeline blend' : CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
         `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag}${animTag}${fpsTag} | ` +
         `t=${t.toFixed(2)}s | compat=${CONFIG.compat}`;
     }
@@ -4073,6 +4148,19 @@
     for (const id in _atlasInflight) waits.push(_atlasInflight[id]);
     if (CONFIG.glyphSet && !_atlasCache[CONFIG.glyphSet] && !_atlasInflight[CONFIG.glyphSet]) {
       waits.push(loadAtlasAsync(CONFIG.glyphSet, { warmOnly: true }));
+    }
+    /* ITER-075: a glyphSet timeline track switches atlases mid-capture; a
+       cache miss there falls back to brightness for that frame, so every
+       keyed set must be loaded before frame 0. */
+    const _tlSets = GlyphGrid.timeline && GlyphGrid.timeline.active(CONFIG)
+      && CONFIG.timeline.tracks.glyphSet;
+    if (Array.isArray(_tlSets)) {
+      for (const kf of _tlSets) {
+        const id = kf && kf.v;
+        if (typeof id === 'string' && !_atlasCache[id] && !_atlasInflight[id]) {
+          waits.push(loadAtlasAsync(id, { warmOnly: true }));
+        }
+      }
     }
     return Promise.all(waits).then(function () {});
   }
