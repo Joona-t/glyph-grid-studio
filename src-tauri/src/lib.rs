@@ -463,6 +463,38 @@ const SIDECAR_VERSION: u64 = 1;
 static PENDING_SIDECARS: OnceLock<Mutex<HashMap<PathBuf, (serde_json::Value, String)>>> =
     OnceLock::new();
 
+/// Sidecars take the same temp-file + rename path as outputs so a
+/// pre-planted symlink at `<out>.ggs.json` is never followed.
+fn write_sidecar_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "sidecar destination has no valid file name".to_string())?;
+    let sequence = OUTPUT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let part_path = parent.join(format!(".{}.{}.{}.part", file_name, std::process::id(), sequence));
+    let result = (|| -> Result<(), String> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+            .map_err(|e| format!("create {:?}: {}", part_path, e))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("write {:?}: {}", part_path, e))?;
+        file.sync_all()
+            .map_err(|e| format!("sync {:?}: {}", part_path, e))?;
+        drop(file);
+        fs::rename(&part_path, path).map_err(|e| format!("rename {:?}: {}", part_path, e))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&part_path);
+    }
+    result
+}
+
 fn sidecar_path(out: &std::path::Path) -> PathBuf {
     let mut s = out.as_os_str().to_owned();
     s.push(".ggs.json");
@@ -527,7 +559,7 @@ fn write_resume_sidecar(out: &std::path::Path, bytes: u64) {
         "bytes": bytes,
         "finished_at": finished_at,
     });
-    if let Err(e) = fs::write(sidecar_path(out), format!("{}\n", body)) {
+    if let Err(e) = write_sidecar_atomic(&sidecar_path(out), format!("{}\n", body).as_bytes()) {
         eprintln!(
             "batch: warning: cannot write resume sidecar for {}: {}",
             out.display(),
