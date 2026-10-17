@@ -13,6 +13,16 @@ Running log of every defect found, every iteration that landed, and the why behi
 4. PRIVACY: `CONFIG.video.camera` was ordinary config. An imported preset, a share URL, a batch job, an MCP config or `--set` could switch the webcam on. Only `snapshotConfig` stripped it on the way out.
 5. ITER-075 UX: a `palette` timeline track under `colorMode: "preserve"` did nothing, and said nothing.
 
+6. `syncTextSource` / `acceptSourceImage`: when a new source replaced a text source whose base was a clip or the camera, the base was dropped without being disposed. Its `<video>` and camera stream leaked.
+7. `saveTextExport` and `exportGridAs`: cancelling the save dialog never called `exportFeedback`, so the status-bar hold stuck (the GIF path released it).
+8. Nothing ever freed the Rust decoder slot. A disposed clip kept its demuxer and ring alive until the next `video_open`.
+9. `open_video` decoded outside the slot lock and installed afterwards. Two overlapping opens could leave the older one installed.
+10. The `presentedAt` rVFC tick kept re-registering forever after the grace timer won.
+11. A DOM-dropped video `File` went to p5 `loadImage`.
+12. MCP passed `--text <v>` / `--srt <v>` / `--in <v>`. A value starting with "-" ("-5") failed in clap after the spawn.
+13. MCP `inline_text_body` keyed on the raw `format` (" TXT " never inlined).
+14. `frame()`: an end-of-GOP drain larger than RING evicted the frame being produced.
+
 **Root cause:** (1) the path was trusted because the only caller was our own batch driver. (2) the loop was written for well-formed files. (3) the SPS, which is what the decoder honours, was never parsed. (4) the camera switch lived in CONFIG, so every config merge path could set it. (5) no cross-key check existed.
 
 **Fix:**
@@ -29,7 +39,24 @@ Running log of every defect found, every iteration that landed, and the why behi
 - The mp4 crate itself `unwrap`s an overflowing stts sum in `read_sample`. The count guard keeps such files away from it; any other crate panic path stays unaudited.
 - A batch job's text path must match its `outPath` byte for byte. JS passes it back unchanged; a caller that re-normalises it would be refused.
 
+**Fix (commit B, items 6-14):**
+6. `acceptSourceImage` retires `__textBase` too when the outgoing source is the text canvas (`retireOne`: dispose, plus camera bookkeeping). `syncTextSource` disposes a replaced base.
+7. A cancel calls `exportFeedback('')` in both text paths.
+8. `video_close(handle)` (Tauri command, `close_video`) clears the slot only when the handle still owns it. `GlyphGrid.video.dispose` calls it for the rust backend (`vs.invoke` is kept from `open`).
+9. `open_video` holds the slot lock for the whole open. Handle order is install order and the newest open always wins.
+10. `presentedAt(v, i, fps, st)`: `st.done` is set on a match, when `seekGrab` settles, and when it times out. A done tick returns without re-registering.
+11. `drop()`: a `video/*` type or video extension never reaches `loadImage`. It goes through `loadFromFilePath(file.path)` when the webview exposes a path, otherwise it is refused with "open it with Pick image… / drop it on the app window". The native Tauri drop already routes clips through the probe.
+12. MCP spawns `--in=`, `--text=` and `--srt=`, and `TextArgs.text` has `allow_hyphen_values` (`render --text -5` works on the CLI too).
+13. `render_format()` (the CLI `parse_format_arg`, else the extension) feeds both `inline_text_body` and the A-side `/out_path` check.
+14. `emit(…, pin)` never evicts the pinned frame (the `frame()` target) when the ring is full.
+
+Tests: cargo `a_drain_larger_than_ring_keeps_the_requested_frame`, `concurrent_opens_leave_the_newest_handle_and_close_is_handle_scoped` (4 threads, plus a test-only slot mutex so the slot tests stop racing each other), `mcp::tests::inline_text_uses_the_canonical_format`. MCP **C20** (text "-5", format " TXT " → 20-row inline body). JS: dispose → `video_close` for the rust handle only, the `presentedAt` done flag, and contracts for 6 / 7 / 11.
+
+**Skipped (part of 14):** the clip-based drain test. openh264 (`welsDecoderExt.cpp` `ReleaseBufferedReadyPictureReorder`) releases about one picture per decode call once the buffered min POC is below the current picture's. Measured flush drains are 1 to 2 frames for x264 bframes 16 (with and without b-pyramid, GOP 20), bframes 1/3 with 60- and 120-frame GOPs, and VideoToolbox High with B-frames. ffmpeg cannot produce a drain larger than RING (8) for this decoder, so the pin is tested by driving `emit()` with a RING+5 drain directly.
+
 **Gate (commit A, items 1-5):** cargo build --release 0 errors (1 pre-existing `Shell::open` deprecation) · cargo test **59/59** (+4) · npm test ok · A9 schema up to date (31 CONFIG keys) · run-all **PASS 49 / FAIL 0** (`TEST_TIMEOUT=400`; the first run was 48/1 on A1, which flagged a `/Users/u/` literal in the new test) · MCP **33/33** · byte-identity **9/9** · worm-move 120 f `pB.json` `--mp4-quality archive` vs `golden-p3-iter057.mp4`: **PSNR inf** (120/120), real 16.9 s, user 2.3 s.
+
+**Gate (commit B, items 6-14):** cargo build --release 0 errors (same 1 deprecation) · cargo test **62/62** (+3) · npm test ok · A9 up to date · run-all **PASS 49 / FAIL 0** (`TEST_TIMEOUT=400`) · MCP **34/34** (+C20) · byte-identity **9/9** · golden **PSNR inf** (120/120), real 17.5 s, user 2.1 s.
 
 
 ### ITER-077 — 2026-10-17 — Phase 5.4 (R4): video sources — frame-exact H.264 in Rust, WebView fallback, camera (beta)

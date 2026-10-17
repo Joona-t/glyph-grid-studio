@@ -571,7 +571,11 @@ impl VideoDecoder {
         Ok(out)
     }
 
-    fn emit(&mut self, rgba: Vec<u8>, w: u32, h: u32) -> Result<(), String> {
+    /// Push the next presentation frame into the ring.  ITER-078: `pin`
+    /// (the frame a `frame()` call is producing) is never the one evicted,
+    /// so an end-of-GOP drain larger than RING cannot drop it before it
+    /// is returned.
+    fn emit(&mut self, rgba: Vec<u8>, w: u32, h: u32, pin: Option<u32>) -> Result<(), String> {
         if self.info.width == 0 {
             self.info.width = w;
             self.info.height = h;
@@ -582,7 +586,9 @@ impl VideoDecoder {
             ));
         }
         if self.ring.len() >= RING {
-            self.ring.pop_front();
+            if let Some(k) = self.ring.iter().position(|(i, _)| Some(*i) != pin) {
+                self.ring.remove(k);
+            }
         }
         self.ring.push_back((self.next_out, Arc::new(rgba)));
         self.next_out += 1;
@@ -617,7 +623,7 @@ impl VideoDecoder {
                     .map_err(|e| format!("decode sample {}: {}", sid, e))?
                     .map(|y| yuv_rgba(&y));
                 if let Some((rgba, w, h)) = out {
-                    self.emit(rgba, w, h)?;
+                    self.emit(rgba, w, h, Some(p))?;
                 }
             } else {
                 // End of this GOP: drain the reorder buffer, then start the
@@ -630,7 +636,7 @@ impl VideoDecoder {
                     .map(yuv_rgba)
                     .collect();
                 for (rgba, w, h) in rest {
-                    self.emit(rgba, w, h)?;
+                    self.emit(rgba, w, h, Some(p))?;
                 }
                 if self.next_out != self.gop_end {
                     return Err(format!(
@@ -741,16 +747,34 @@ fn open_slot() -> &'static Mutex<Option<VideoDecoder>> {
 /// Open (and replace) the process's video.  An unsupported stream is
 /// `Ok` with `supported: false` + `reason` (the WebView decodes it); a
 /// rejected one (limits, a lying header — ITER-078) is `Err`.
+///
+/// ITER-078: the slot lock is held for the whole open, so opens are
+/// serialised — the handle order is the install order, a later open
+/// always wins, and `frame_of` never sees a decoder newer than its
+/// handle or a handle older than the slot.
 pub fn open_video(path: &Path) -> Result<VideoInfo, String> {
+    let mut slot = open_slot().lock().unwrap_or_else(|e| e.into_inner());
     match VideoDecoder::open(path) {
         Ok(mut dec) => {
             dec.info.handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
             let info = dec.info.clone();
-            *open_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(dec);
+            *slot = Some(dec);
             Ok(info)
         }
         Err(info) if info.rejected => Err(format!("video rejected: {}", info.reason.unwrap_or_default())),
         Err(info) => Ok(info),
+    }
+}
+
+/// ITER-078: drop the open decoder if `handle` still owns the slot (the
+/// JS adapter's dispose).  `false` = a newer open already replaced it.
+pub fn close_video(handle: u64) -> bool {
+    let mut slot = open_slot().lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().map_or(false, |d| d.info.handle == handle) {
+        *slot = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -769,6 +793,12 @@ pub async fn video_open(path: String) -> Result<VideoInfo, String> {
     let p = std::path::PathBuf::from(&path);
     crate::source_file_size(&p)?;
     open_video(&p)
+}
+
+/// Free the decoder behind `handle` (no-op for a stale handle).
+#[tauri::command]
+pub async fn video_close(handle: u64) -> bool {
+    close_video(handle)
 }
 
 /// Frame `index` of the open video as raw RGBA (w·h·4 bytes) in the IPC
@@ -942,8 +972,66 @@ mod tests {
         assert!(check_limits(0, 64, 1).is_err());
     }
 
+    /// Tests that open / close the process-wide slot run one at a time.
+    fn slot_guard() -> std::sync::MutexGuard<'static, ()> {
+        static G: Mutex<()> = Mutex::new(());
+        G.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// ITER-078: an end-of-GOP drain larger than RING keeps the frame being
+    /// produced.  openh264 releases ~one picture per decode call once its
+    /// POC is below the current picture's, so no x264 / VideoToolbox clip
+    /// measured drains more than 2 (bframes 16, b-pyramid, 120-frame GOPs);
+    /// the drain is driven through emit() directly, as flush_remaining
+    /// would hand it over.
+    #[test]
+    fn a_drain_larger_than_ring_keeps_the_requested_frame() {
+        let mut d = VideoDecoder::open(&fixture("tiny.mp4")).unwrap();
+        let (w, h) = (d.info.width, d.info.height);
+        let px = |v: u8| vec![v; (w * h * 4) as usize];
+        for pin in [Some(3u32), None] {
+            d.ring.clear();
+            d.next_out = 3;
+            for k in 0..(RING as u8 + 5) {
+                d.emit(px(k), w, h, pin).unwrap();
+            }
+            assert_eq!(d.ring.len(), RING);
+            let kept = d.ring.iter().any(|(i, f)| *i == 3 && f[0] == 0);
+            assert_eq!(kept, pin.is_some(), "pin {:?}: ring {:?}", pin, d.ring.iter().map(|e| e.0).collect::<Vec<_>>());
+            assert_eq!(d.ring.back().unwrap().0, 3 + RING as u32 + 4, "the newest frame is always kept");
+        }
+    }
+
+    /// ITER-078: serialised opens — the slot always holds the newest
+    /// handle; video_close frees it only for its own handle.
+    #[test]
+    fn concurrent_opens_leave_the_newest_handle_and_close_is_handle_scoped() {
+        let _g = slot_guard();
+        let p = fixture("tiny.mp4");
+        let handles: Vec<u64> = (0..4)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || open_video(&p).unwrap().handle)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let newest = *handles.iter().max().unwrap();
+        for &h in &handles {
+            assert_eq!(frame_of(h, 1).is_ok(), h == newest, "handle {} of {:?}", h, handles);
+        }
+        let stale = *handles.iter().min().unwrap();
+        assert!(!close_video(stale), "a stale handle never closes the slot");
+        assert!(frame_of(newest, 0).is_ok());
+        assert!(close_video(newest));
+        assert!(frame_of(newest, 0).unwrap_err().contains("not open"));
+        assert!(!close_video(newest), "closing twice is a no-op");
+    }
+
     #[test]
     fn handles_go_stale_when_a_new_video_opens() {
+        let _g = slot_guard();
         let p = fixture("tiny.mp4");
         let a = open_video(&p).unwrap();
         let b = open_video(&p).unwrap();

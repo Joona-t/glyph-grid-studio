@@ -181,8 +181,9 @@ struct RenderArgs {
 #[derive(clap::Args, Debug, Clone)]
 struct TextArgs {
     /// Render this text as the source (one line over the whole loop; `\n`
-    /// stacks rows).  `--in` becomes optional.
-    #[arg(long, value_name = "TEXT")]
+    /// stacks rows).  `--in` becomes optional.  A value may start with
+    /// "-" (`--text -5`).
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
     text: Option<String>,
 
     /// Timed cues from a subtitle (.srt) or lyric (.lrc) file, appended to

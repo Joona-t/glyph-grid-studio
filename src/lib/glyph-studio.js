@@ -412,7 +412,21 @@
       overlay.style.borderColor = 'transparent';
       overlay.style.pointerEvents = 'none';
       var file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-      if (!file || !validateBrowserFile(file)) return;
+      if (!file) return;
+      /* ITER-078: a clip is never handed to p5 loadImage.  It needs the
+         Tauri video path (probe → Rust / <video> decoder), which works
+         from a file path — the native drop event gives one; a DOM File
+         only does when the webview exposes `file.path`. */
+      if (/^video\//.test(file.type || '') || (window.GlyphGrid && window.GlyphGrid.video && window.GlyphGrid.video.isVideoPath(file.name))) {
+        if (typeof file.path === 'string' && file.path && window.__TAURI__ && window.__TAURI__.core) {
+          loadFromFilePath(file.path);
+        } else {
+          exportFeedback('Video files cannot be dropped here: open ' + (file.name || 'the clip') +
+            ' with "Pick image…" (or drop it on the app window) so it decodes as a video.', true);
+        }
+        return;
+      }
+      if (!validateBrowserFile(file)) return;
       var token = beginSourceLoad();
       var url = URL.createObjectURL(file);
       loadImageLatest(url, token, function (img) {
@@ -2173,7 +2187,10 @@
         }).then(function (path) {
           if (path) exportFeedback('Saved ' + kind.toUpperCase() + ' → ' + path);
         }).catch(function (e) {
-          if (e !== 'cancelled') exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
+          /* ITER-078: a cancelled dialog still settles through
+             exportFeedback so the status-bar hold is released (as GIF). */
+          if (String(e) === 'cancelled') exportFeedback('');
+          else exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
         });
       } else {
         var blob = new Blob([body], { type: kind === 'svg' ? 'image/svg+xml' : 'text/plain' });
@@ -2202,7 +2219,10 @@
         }).then(function (path) {
           if (path) exportFeedback('Saved ' + kind.toUpperCase() + ' → ' + path);
         }).catch(function (e) {
-          if (e !== 'cancelled') exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
+          /* ITER-078: a cancelled dialog still settles through
+             exportFeedback so the status-bar hold is released (as GIF). */
+          if (String(e) === 'cancelled') exportFeedback('');
+          else exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
         });
       }
       saveBlobBrowser(new Blob([body], { type: kind === 'html' ? 'text/html' : 'text/plain' }), name);

@@ -1458,19 +1458,30 @@
 
     /* ITER-077: retire the outgoing video / camera (its <video>, decode
        cache, camera tracks) unless the camera toggle keeps it to restore. */
-    function retireVideo() {
-      const old = sourceImg;
+    function retireOne(old) {
       if (!old || old === img || !old.__ggsVideo) return;
-      if (options.keepPrevious) {
-        if (old.__ggsVideo.video) { try { old.__ggsVideo.video.pause(); } catch (_) {} }
-        return;
-      }
       if (old.__ggsVideo.camera && !(img && img === __cameraPrev)) {
         if (__cameraPrev && __cameraPrev !== img) disposeVideoSource(__cameraPrev);
         __cameraPrev = null;
         CAMERA.camera = false;
       }
       disposeVideoSource(old);
+    }
+    function retireVideo() {
+      const old = sourceImg;
+      if (options.keepPrevious) {
+        if (old && old !== img && old.__ggsVideo && old.__ggsVideo.video) { try { old.__ggsVideo.video.pause(); } catch (_) {} }
+        return;
+      }
+      /* ITER-078: under a text source the clip / camera is the text's
+         base, not sourceImg — retire it too, or its <video> / camera
+         stream outlives the swap. */
+      if (old && old === __textCanvas && __textBase && __textBase !== img) {
+        const base = __textBase;
+        __textBase = null;
+        retireOne(base);
+      }
+      retireOne(old);
     }
 
     if (!img) {
@@ -1824,6 +1835,9 @@
     const dims = textSourceDims(ts, base);
     if (!installed || __textCanvas.width !== dims[0] || __textCanvas.height !== dims[1]) {
       if (__textCanvas) { try { __textCanvas.remove(); } catch (_) {} }
+      /* ITER-078: a previous base the new one replaces (a video / camera)
+         is disposed, not dropped with its <video> still playing. */
+      if (__textBase && __textBase !== base && __textBase !== __cameraPrev) disposeVideoSource(__textBase);
       __textCanvas = createGraphics(dims[0], dims[1]);
       __textCanvas.pixelDensity(1);
       __textCanvas.__ggsTextSource = true;

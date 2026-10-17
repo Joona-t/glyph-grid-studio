@@ -135,7 +135,7 @@
       fps: 0, frames: 0, width: 0, height: 0, codec: probe.codec || '',
       cache: new Lru(CACHE), chain: Promise.resolve(), epoch: 0, painted: null,
       presented: 0, livePainted: -1, video: null, handle: 0, disposed: false,
-      fallbackReason: '',
+      fallbackReason: '', invoke: opts.invoke || null,
     };
     var tryRust = decode !== 'webview' && typeof opts.invoke === 'function';
     var start = tryRust
@@ -218,6 +218,11 @@
     if (!vs || vs.disposed) return;
     vs.disposed = true;
     vs.cache.clear();
+    /* ITER-078: free the Rust decoder slot (no-op when a newer
+       video_open already replaced this handle). */
+    if (vs.backend === 'rust' && vs.handle && typeof vs.invoke === 'function') {
+      try { Promise.resolve(vs.invoke('video_close', { handle: vs.handle })).catch(function () {}); } catch (_) {}
+    }
     if (vs.stream) { try { vs.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (_) {} }
     if (vs.video) {
       try { vs.video.pause(); } catch (_) {}
@@ -258,14 +263,19 @@
     return p;
   }
 
-  function presentedAt(v, i, fps) {
+  /* ITER-078: `st.done` (set by seekGrab once the seek settles either
+     way — matched frame or the grace timer) stops the rVFC tick from
+     re-registering forever on a frame whose mediaTime never maps to i. */
+  function presentedAt(v, i, fps, st) {
     if (typeof v.requestVideoFrameCallback !== 'function') return Promise.resolve();
+    st = st || { done: false };
     return new Promise(function (resolve) {
       var tick = function (_now, meta) {
+        if (st.done) return;
         /* round, not floor: WebM stores ms timestamps (frame 4 @ 30 fps
            = 0.133 s, i.e. 3.99 frames). */
         var at = meta && typeof meta.mediaTime === 'number' ? Math.round(meta.mediaTime * fps) : i;
-        if (at === i) resolve();
+        if (at === i) { st.done = true; resolve(); }
         else v.requestVideoFrameCallback(tick);
       };
       v.requestVideoFrameCallback(tick);
@@ -281,7 +291,8 @@
        still shows the previous picture (measured: exports repeated stale
        frames).  Also wait until a requestVideoFrameCallback reports a
        presented frame whose mediaTime is the target frame. */
-    var presented = presentedAt(v, i, vs.fps);
+    var pst = { done: false };
+    var presented = presentedAt(v, i, vs.fps, pst);
     var seeked = once(v, 'seeked', 'error');
     v.currentTime = target;
     /* A paused element presents one picture per seek; if its mediaTime
@@ -290,7 +301,9 @@
     var settled = seeked.then(function () {
       return Promise.race([presented, new Promise(function (r) { setTimeout(r, PRESENT_GRACE_MS); })]);
     });
+    var stop = function () { pst.done = true; };
     return withTimeout(settled, SEEK_TIMEOUT_MS, 'video seek to frame ' + i).then(function () {
+      stop();
       if (!vs.scratch) {
         vs.scratch = document.createElement('canvas');
         vs.scratch.width = vs.width; vs.scratch.height = vs.height;
@@ -300,7 +313,7 @@
       var img = ctx.getImageData(0, 0, vs.width, vs.height);
       vs.cache.set(i, img);
       return img;
-    });
+    }, function (e) { stop(); throw e; });
   }
 
   /* The FrameSource adapter.  g: the p5.Graphics (sourceImg).  hooks:
@@ -370,6 +383,7 @@
   var api = {
     DECODERS: DECODERS, CACHE: CACHE, VIDEO_EXT: VIDEO_EXT,
     frameIndexAt: frameIndexAt, primeTimes: primeTimes, Lru: Lru, isVideoPath: isVideoPath,
+    presentedAt: presentedAt,
     open: open, openCamera: openCamera, dispose: dispose, load: load, adapter: adapter,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

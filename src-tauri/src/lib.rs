@@ -4903,6 +4903,7 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             probe_image_file,
             video::video_open,
             video::video_frame,
+            video::video_close,
             kv_load_all,
             kv_save,
             save_preset_json,

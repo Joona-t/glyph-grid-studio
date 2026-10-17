@@ -548,6 +548,26 @@ if isinstance(body, dict) and body.get("code") == "invalid_arguments" and body.g
 else:
     bad("C19b video_decode error path", str(body)[:200])
 
+# --- Test C20 (ITER-078): text "-5" reaches clap as a value (--text=<v>),
+# and a padded / upper-case format (" TXT ") still inlines the body.
+out20 = os.path.join(SCRATCH, "c20_mcp.txt")
+if os.path.exists(out20):
+    os.remove(out20)
+send(proc, {"jsonrpc": "2.0", "id": 26, "method": "tools/call", "params": {
+    "name": "glyph_grid_render",
+    "arguments": {"out_path": out20, "format": " TXT ", "cols": 40, "rows": 20, "text": "-5",
+                  "text_options": {"size": 300}},
+}})
+print("    (waiting up to 90s for MCP text \"-5\" render…)")
+r20 = recv(proc, timeout=90)
+c20 = (r20 or {}).get("result", {}).get("content", []) or []
+body20 = c20[1].get("text", "") if len(c20) > 1 else ""
+if "Rendered" in (c20[0].get("text", "") if c20 else "") and os.path.exists(out20) \
+        and len(body20.split("\n")[:-1]) == 20 and sum(1 for ch in body20 if not ch.isspace()) > 20:
+    ok("C20 text \"-5\" renders; format \" TXT \" inlines the 20-row body")
+else:
+    bad("C20 hyphen text / padded format", str(r20)[:240])
+
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")
 sys.exit(0 if FAIL == 0 else 1)

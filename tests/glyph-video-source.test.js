@@ -79,6 +79,32 @@ assert.deepStrictEqual(V.DECODERS, ['auto', 'native', 'webview']);
   V.dispose(vs);
   await assert.rejects(V.load(vs, 5, invoke), /replaced/);
 
+  /* ITER-078: dispose frees the Rust decoder slot (rust backend only). */
+  const closed = [];
+  const closeInvoke = function (cmd, args) { closed.push([cmd, args.handle]); return Promise.resolve(true); };
+  V.dispose(Object.assign({}, vs, { disposed: false, cache: new V.Lru(1), invoke: closeInvoke, handle: 9 }));
+  V.dispose(Object.assign({}, vs, { disposed: false, cache: new V.Lru(1), invoke: closeInvoke, handle: 10, backend: 'element' }));
+  assert.deepStrictEqual(closed, [['video_close', 9]], 'video_close for the rust handle only');
+  assert(/invoke: opts\.invoke \|\| null,/.test(fs.readFileSync(path.join(__dirname, '../src/lib/glyph-video-source.js'), 'utf8')),
+    'open() keeps the invoke for dispose');
+
+  /* ITER-078: presentedAt's rVFC tick stops once the seek settled. */
+  const pending = [];
+  const fakeV = { requestVideoFrameCallback: function (cb) { pending.push(cb); } };
+  const st = { done: false };
+  let hit = false;
+  V.presentedAt(fakeV, 5, 25, st).then(function () { hit = true; });
+  pending.shift()(0, { mediaTime: 0.04 });          // frame 1 ≠ 5 → re-registers
+  assert.strictEqual(pending.length, 1, 'a mismatched frame keeps waiting');
+  st.done = true;                                   // seekGrab settled (grace timer won)
+  pending.shift()(0, { mediaTime: 0.04 });
+  assert.strictEqual(pending.length, 0, 'settled: the tick does not re-register');
+  const st2 = { done: false };
+  V.presentedAt(fakeV, 2, 25, st2).then(function () { hit = true; });
+  pending.shift()(0, { mediaTime: 0.08 });
+  await Promise.resolve();
+  assert(hit && st2.done && pending.length === 0, 'a match resolves and marks done');
+
   /* index.html + studio contracts. */
   const html = fs.readFileSync(path.join(__dirname, '../src/index.html'), 'utf8');
   assert(html.indexOf('<script src="lib/glyph-video-source.js"></script>') > html.indexOf('<script src="lib/glyph-text-source.js"></script>'),
@@ -107,5 +133,15 @@ assert.deepStrictEqual(V.DECODERS, ['auto', 'native', 'webview']);
   assert(/'video',\s*\/\*[^*]*\*\/\s*'timeline'/.test(studio), 'video is in the preset whitelist');
   assert(/if \(out\.video\) delete out\.video\.camera;/.test(studio), 'presets never carry camera:true');
   assert(/probe\.kind === 'video'[\s\S]{0,1500}window\.__ggsOpenVideo\(path, probe\)/.test(studio), 'GUI imports route clips to the video source');
+  /* ITER-078 review fixes: text-source bases are retired; text-export
+     cancel releases the status hold; a dropped clip never hits loadImage. */
+  assert(/old === __textCanvas && __textBase && __textBase !== img\) \{\s*const base = __textBase;\s*__textBase = null;\s*retireOne\(base\);/.test(html),
+    'acceptSourceImage retires a video / camera under the text source');
+  assert(/if \(__textBase && __textBase !== base && __textBase !== __cameraPrev\) disposeVideoSource\(__textBase\);/.test(html),
+    'syncTextSource disposes a replaced video base');
+  assert.strictEqual((studio.match(/if \(String\(e\) === 'cancelled'\) exportFeedback\(''\);/g) || []).length, 2,
+    'TXT/SVG and ANSI/cast/HTML cancels release the status hold');
+  assert(/function drop\(e\) \{[\s\S]{0,700}isVideoPath\(file\.name\)\)\) \{[\s\S]{0,500}return;\s*\}\s*if \(!validateBrowserFile\(file\)\) return;/.test(studio),
+    'a dropped video file is routed before loadImage');
   console.log('glyph-video-source: ok');
 })().catch(function (e) { console.error(e); process.exit(1); });

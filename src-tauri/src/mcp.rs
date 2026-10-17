@@ -625,15 +625,18 @@ impl GlyphGridServer {
 
         let mut cmd = Command::new(&exe);
         cmd.arg("render");
+        // ITER-078: `--flag=<value>` so a value starting with "-" (text
+        // "-5", a path like "-clip.mp4") is the flag's value, not a new
+        // flag clap rejects after the spawn.
         if let Some(in_path) = &p.in_path {
-            cmd.arg("--in").arg(in_path);
+            cmd.arg(format!("--in={}", in_path));
         }
         cmd.arg("--out").arg(&p.out_path);
         if let Some(v) = &p.text {
-            cmd.arg("--text").arg(v);
+            cmd.arg(format!("--text={}", v));
         }
         if let Some(v) = &p.srt_path {
-            cmd.arg("--srt").arg(v);
+            cmd.arg(format!("--srt={}", v));
         }
         if let Some(f) = p.frames {
             cmd.arg("--frames").arg(f.to_string());
@@ -700,7 +703,9 @@ impl GlyphGridServer {
                         ))];
                         // ITER-074 (R2): txt/ansi come back as text too, so
                         // a model without vision can judge the render.
-                        if let Some(body) = inline_text_body(&probe.resolved_format(), &p.out_path) {
+                        // ITER-078: the canonical format (" TXT " → txt),
+                        // the same parse the CLI's --format applies.
+                        if let Some(body) = inline_text_body(&render_format(p.format.as_deref(), &p.out_path), &p.out_path) {
                             content.push(Content::text(body));
                         }
                         CallToolResult::success(content)
@@ -823,7 +828,23 @@ pub async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{error_path, parse_batch_progress, parse_frame_progress, render_error_path, RenderParams};
+    use super::{error_path, inline_text_body, parse_batch_progress, parse_frame_progress, render_error_path, render_format, RenderParams};
+
+    /// ITER-078: the inline body keys on the canonical format, so " TXT "
+    /// or "Ansi" still inlines; gif / cast never do.
+    #[test]
+    fn inline_text_uses_the_canonical_format() {
+        assert_eq!(render_format(Some(" TXT "), "/o/a.gif"), "txt");
+        assert_eq!(render_format(Some("Ansi"), "/o/a.ans"), "ansi");
+        assert_eq!(render_format(None, "/o/a.HTML"), "html");
+        assert_eq!(render_format(Some("bogus"), "/o/a.txt"), "txt", "unparseable → inferred");
+        let p = std::env::temp_dir().join(format!("ggs-inline-{}.txt", std::process::id()));
+        std::fs::write(&p, "AB\nCD\n").unwrap();
+        let path = p.to_string_lossy().to_string();
+        assert_eq!(inline_text_body(&render_format(Some(" TXT "), &path), &path).as_deref(), Some("AB\nCD\n"));
+        assert_eq!(inline_text_body(&render_format(Some("cast"), &path), &path), None);
+        let _ = std::fs::remove_file(p);
+    }
 
     #[test]
     fn render_errors_blame_what_the_caller_sent() {
