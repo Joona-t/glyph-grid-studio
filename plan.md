@@ -41,8 +41,8 @@ Goal: headless output = pure function of (source, config, seed). Bit-identical a
 Goal: 120-frame CLI render from 18–56 s to a measured, reproducible number; exports stream; memory bounded by design not by a pixel cap.
 
 Quick wins first:
-- [ ] **MP4 rate control** (F11, S): `RateControlMode::Bitrate` + `skip_frames(false)` + `track_config.timescale` fix; `--mp4-quality upload|archive` (archive = today's QP-26 path). Cargo test on 120 synthetic frames asserting non-empty samples and size < 1.5× target. Expected 17 MB → ~3–4 MB.
-- [ ] **Twitter-fit ladder predictor** (F14, S): first full pass → size/pixel ratio → one-shot width estimate, then at most one correction rung.
+- [x] **MP4 rate control** (F11, S): `RateControlMode::Bitrate` + `skip_frames(false)` + `track_config.timescale` fix; `--mp4-quality upload|archive` (archive = today's QP-26 path). Cargo test on 120 synthetic frames asserting non-empty samples and size < 1.5× target. Expected 17 MB → ~3–4 MB. — ITER-050 (cream-paper 17.3 → 2.27 MB at 22.6 dB vs archive; worm-move gate 22.0 → 5.18 MB at 24.3 dB, RC overshoots 1.7× on temporal dither; archive = inf vs golden; psnr-gate now pairs frames by index)
+- [x] **Twitter-fit ladder predictor** (F14, S): first full pass → size/pixel ratio → one-shot width estimate, then at most one correction rung. — ITER-051 (≤3 passes instead of ≤6; 2 passes on cream-paper/worm-move/B12 vs 3/4/5; width within 1 % of the ladder on real sources because B/px rises 2-6 % as width shrinks; GUI estimate calibration not done)
 
 Then the capture path:
 - [ ] **Raw RGBA capture** (F2 step 2, S→M): replace `canvas.toBlob('image/png')` with `getImageData` and ship RGBA over the existing raw-body IPC; Rust preprocess accepts RGBA (skips PNG decode). Measure with the sampler; PSNR gate vs Phase-1 goldens.

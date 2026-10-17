@@ -317,6 +317,206 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 **Gotchas:** (a) The default config is time-dependent by design (temporal dither + breathing), so default users see no change — the win is reduced-motion users and explicit still presets. (b) A new time-dependent stage must be added to `frameIsTimeDependent()` or the preview freezes on the next static verdict; it self-heals on the next config change. (c) The perf/fps monitors stop updating while parked — the status bar says `idle` instead.
 
+### ITER-070 — 2026-10-17 — Audit fixes: private `--jobs` sub-manifests, bounded GIF stream queue, feeder panic release, out-path dedupe, GUI MP4 quality
+
+**Problem:** A review of ITER-050..055 found seven defects.
+1. **Security:** `run_batch_children` wrote sub-manifests to the predictable `temp_dir()/ggs-batch-<pid>-<i>.json` with `fs::write`. Another local user could pre-plant a symlink there (a TOCTOU / symlink clobber) or swap the manifest before the child read it.
+2. A streaming GIF job without a byte target sent frames over an unbounded channel, and their bytes counted against neither byte cap. If the encoder ran slower than the capture, memory grew without bound.
+3. In `encode_gif_gifski_frames`, the code that sets `stop` and calls `notify_all` ran inline at the end of the feeder. A feeder panic unwound past it and left decode workers parked on the condvar forever.
+4. `duplicate_out_path` compared raw strings, so `a.gif` and `./a.gif` slipped past the guard and raced across `--jobs` children.
+5. `--jobs` children could outlive the parent: a panic or early return skipped both the waits and the temp-file cleanup.
+6. The GUI never sent `mp4Quality`, so after ITER-050 every GUI MP4 was silently encoded in upload mode with no way to pick archive.
+7. `render --mp4-quality` used a clap value list that was case-sensitive. The manifest and MCP accept `Archive`, the CLI did not.
+
+**Root cause:** The ITER-055 fan-out was written for the happy path, and the ITER-053 stream accounting assumed "retains nothing" meant "holds nothing". The ITER-050 frontend and CLI wiring each grew their own copy of the validation.
+
+**Fix:**
+1. `BatchChildren::new` creates `temp_dir()/ggs-batch-<pid>-<16 hex>` with `DirBuilder::mode(0o700)` (plain `create`, which fails on any existing entry, symlinks included). The 16-hex suffix comes from hashing pid, attempt and clock through a per-process `RandomState`, with 8 retries on `AlreadyExists`. `write_private_file` opens each part `create_new(true)` with mode 0o600. No `tempfile` crate is in Cargo.lock and Cargo.toml is off-limits, so this is std only.
+2. `GifStream` gains `queued: Arc<AtomicU64>` and `queue_caps` (the compressed and raw export caps). For a non-retaining stream, `try_stage_export_frame` calls `stream_queue_admit`. It sends when `queued + len <= cap` and reserves the bytes. Otherwise it hands the frame back and `stage_export_frame` sleeps 2 ms outside the captures lock and retries. That is backpressure, not rejection, so a slow encoder throttles the capture instead of failing it. A frame larger than the cap on its own, or a stopped encoder (state not RUNNING or thread finished), errors out instead of waiting forever. A cancel drops the capture, so the retry fails as an unknown capture. The feeder subtracts each frame's bytes once gifski has it, and a failed send gives its reservation back.
+3. The release logic moved into the `ReleaseGifWorkers` Drop guard, built at the top of the feeder. It runs on unwind as well as on the normal path, and the normal path keeps its order: collector, then release, then rx.
+4. `normalize_out_path` applies `std::path::absolute`, then lexical `.`/`..` folding, then canonicalises the parent when that directory exists.
+5. The `BatchChildren` guard owns every child. Reaped children are set to `None` so a reused pid is never signalled. On drop the guard kills and reaps any child still running, then `remove_dir_all`s the private directory. This branch has no ITER-060 signal handler, so only the guard was added. A terminal Ctrl-C already reaches the whole process group.
+6. `glyph-studio.js` adds an `mp4 quality` select to the export panel (`upload` by default, or `archive`). `recordMP4` passes the value to `finish_mp4_export`, `save_mp4_to_path` and `save_mp4_real`.
+7. `--mp4-quality` now uses `value_parser = app_lib::parse_mp4_quality_arg`, a wrapper over `Mp4Quality::parse`. The CLI, the manifest and MCP now accept the same spellings, and a typo is still refused before any render runs.
+
+**Tests:**
+- New cargo tests (26 → 29):
+  - `streamed_gif_queue_is_byte_bounded_and_drains` sets the queue cap to one frame, so every push waits on the feeder. The test asserts the queue never exceeds the cap, the GIF is byte-identical to the staged encode, and the counter drains to 0. It also checks the admission table directly.
+  - `duplicate_out_path_normalises_relative_spellings`.
+  - `batch_children_dir_is_private_and_removed_on_drop` checks the 0700 directory and 0600 file modes, that `create_new` refuses an existing file, and that a live `sleep 30` child is dead and the directory gone after drop.
+- `parse_mp4_quality_arg` cases were added to the existing parse test.
+- New frontend test `mp4QualitySelectReachesFinish`: the select defaults to upload, and the `finish_mp4_export` args carry `upload` and `archive`.
+- run-all **B28** (from the ITER-050 B13 patch, renamed to avoid an id clash) checks that upload is smaller than archive, that both have a 1/fps timescale, and that a typo is refused. Like G8, it stays uncommitted in `tests/run-all.sh` because the hook deny-lists that file.
+
+**Measured:**
+- cargo test 29/29. npm test: both files ok. run-all PASS 27 / FAIL 0, including byte-identity 7/7, G8 batch-jobs 5/5 and B28 (upload 423 KB vs archive 950 KB, timescale 1/33). MCP 10/10.
+- Output gate: worm-move 120 frames, pB preset, `--mp4-quality ARCHIVE` (uppercase on purpose): `psnr-gate.sh` against golden.mp4 gives **inf dB** over 120/120 frames.
+- Timing: real 11.85 s and 12.30 s, user 1.74-1.75 s.
+
+**Gotchas:**
+- The queue wait polls every 2 ms instead of using a condvar. Waits only happen when gifski is behind, and polling keeps the captures lock out of the feeder.
+- `normalize_out_path` is lexical on purpose, because the output usually does not exist yet. A `..` through a symlinked directory can therefore still miss a collision. When it errs the other way, the batch just runs serially.
+
+### ITER-055 — 2026-10-17 — v0.2 Phase 3: `batch --jobs N` fans a manifest out over child processes (F4)
+
+**Problem:** `batch` renders every job, one after another, in one app + WebContent + GPU triple. F4 predicted ~3× wall at N=4 on a 20-job bench. That prediction assumed the v0.1 numbers: 2.7 s CPU against 18-56 s wall per render, with each webview throttled and mostly idle.
+
+**Root cause:** `run_headless_batch` hands the whole manifest to a single `run_tauri`, and `runBatchExport` advances jobs serially. WebKit's XPC processes belong to one app instance, so only separate processes give each job its own webview.
+
+**Fix:**
+- `BatchArgs` gains `--jobs N` (default 1 = today's single session, byte for byte the same code path). `run_headless_batch(manifest, show_window, jobs)` validates the manifest exactly as before. `batch_fan_out_count` then clamps N to min(N, job count, `available_parallelism` − 2), never below 1. When N > 1, `run_batch_children` writes N round-robin sub-manifests to `temp_dir()/ggs-batch-<pid>-<i>.json` (every top-level key is kept and `in` is canonical), spawns `current_exe() batch --manifest <part>` for each (`--show-window` is passed through), relays each child's stderr line by line, waits for all of them, removes the temp files, and exits with the worst child code (a signal counts as 1). PERF_JOB lines pass through verbatim, so NDJSON consumers need no change. Every other line is tagged `batch[i/N]: `.
+- Order dependence found while wiring it: `runBatchExport` only swaps the source when a job has `inPath`, so serially a job WITHOUT `in` renders whatever the previous job loaded, not the manifest `in`. `split_batch_manifest` pins each such job to that effective source, so a child cannot fall back to the manifest `in` where the serial batch would not. Manifests where two jobs share an `out` (serially, last one wins; across children they would race) log a warning and run serially.
+- `tests/perf-sample.sh` tracks the host's child pids as `app` (`pgrep -P`), so app CPU includes the children. `suspect_foreign_xpc` now allows one WebContent/GPU pair per child host. On timeout it also TERMs the children.
+- Tests: `batch_fan_out_clamps_and_split_pins_effective_sources` (clamp table, round-robin order, inherited-source pinning, duplicate-out detection). New run-all **G8** (`tests/batch-jobs-identity.sh`) renders a 5-job manifest serially and with `--jobs 4`: still and animated sources, GIF and MP4, phosphorDecay, and two jobs that inherit the previous job's source. It requires every output file to be md5-identical with the requested frame count. The `tests/run-all.sh` hunk that wires in G8 is **not in this commit**. The pre-commit hook deny-lists that file for agent commits, so the hunk stays in the worktree for a supervised `GLYPHLOOP_BYPASS=1` commit.
+
+**Measured** (Ghost manifest: 20 jobs × 77 frames, GIF, capWidth 720, 15 MB twitter-fit target; outputs redirected to scratch; `tests/perf-sample.sh`; interleaved. The machine was **heavily loaded** by other worktrees' builds and gates, with load average 20-75 on 8 cores, so absolute walls are noisy. Runs flagged `suspect_foreign_xpc` caught another worktree's webviews.):
+
+| run | N | wall s | app CPU s | WebContent s | GPU s | 1-min load at start |
+|---|---|---|---|---|---|---|
+| r1 | 4 | 138.0 | 138.5 | 330.7 | 259.4 | 75.8 |
+| r1 | 1 | 115.1 | 152.9 | 81.7 | 101.1 | 68.5 |
+| r2 | 4 | 147.8 | 141.7 | 292.6 | 333.3 | 28.5 |
+| r2 | 1 | 123.4 | 150.3 | 116.1 (suspect) | 128.8 | 46.3 |
+| r3 | **2** | **91.8** | 162.7 | 132.8 (suspect) | 124.7 | 20.0 |
+| r3 | 1 | 110.2 | 145.1 | 83.2 | 91.5 | 24.1 |
+
+- **N=4 is ~20 % slower than serial** (138/148 vs 115/123 s). **N=2 is ~17 % faster** (91.8 vs 110.2 s). F4's 3× does not hold any more. Since ITER-046..054 removed the sleeps, the PNG round trip and the post-capture gifski pass, a headless render is CPU-bound: the serial batch already keeps ~3 cores busy (≈ 336 CPU-s in 115 s). Four children ask for ~12 cores on an 8-core machine. WebContent+GPU CPU then triples (≈ 183 → 590-625 s) and gifski falls behind the captures: the post-capture encode tails summed 11.9 s over 20 jobs serially and **261 s** at N=4.
+- Output: all 20 GIFs are md5-identical across N=1 (×3), N=4 (×2) and N=2 (×1).
+
+**Gate:** cargo build 0 errors (1 pre-existing `Shell::open` deprecation warning) · cargo test 26/26 (was 25) · npm test ok (28 contracts + export tests) · run-all **PASS 26 / FAIL 0** (with the held G8 hunk applied), MCP 10/10, G1-G7 byte-identity green · psnr-gate (archive, worm-move pB 120 f) **inf** vs golden.mp4.
+
+**Gotchas:** (a) Use `--jobs 2` on 8 cores. The `cores − 2` cap from the brief lets N reach 6, which oversubscribes. A tighter cap (≈ cores/4) or a per-child gifski thread budget is the follow-up if fan-out should scale further. (b) A parent killed by a signal that hits only its pid (not its process group) leaves its children running to completion, and their temp sub-manifests stay behind. `timeout` and Ctrl-C signal the whole group. perf-sample's own timeout now TERMs the children. (c) While other worktrees run their gates, their `pkill -f "glyph-grid-studio batch"` also matches this binary and any shell or perf-sample whose command line contains that string. It killed one bench run here, leaving `.part` files from the 4 children. The benches ran a copy of the binary named `ggsbench`. The children still exec through `current_exe()`, and the copy's path does not contain the pattern either.
+
+### ITER-053 — 2026-10-17 — v0.2 Phase 2: headless GIF encode streams during capture (F12)
+
+**Problem:** A headless GIF ran capture first and gifski after it. The 120-frame gate job (worm-move, pB, 760×1024) spent ~6.4 s in gifski after the last frame, about a third of wall time, while the cores sat mostly idle during the rAF-throttled capture. The staged raw RGBA set (373 MB) also stayed alive until the encode finished.
+
+**Root cause:** `begin_export_capture` only knew the frame count. The GIF settings (path, delay, capWidth, targetMaxBytes) first reached Rust at `finish_gif_export`, so nothing could start encoding earlier. gifski can stream (`Writer::write<W: Write>`, bounded collector), but it was handed the whole set at once.
+
+**Fix:**
+- `begin_export_capture` takes an optional `gifStream {path, delayMs, capWidth, border, targetMaxBytes}`. When it is set, a per-job `gif-stream` thread (`run_gif_stream`) starts. It owns an UNBOUNDED `mpsc` receiver, so `stage_export_frame` never blocks the IPC/capture chain. The first frame fixes the output width via the same `validate_export_frames` + `validated_gif_width` as the batch path. A feeder decodes each frame (`decode_one_frame`) and calls `add_frame_rgba(idx, img, gif_pts(idx, delay))` in arrival order, which `stage_export_frame` already forces to index order. The writer streams into a `BufWriter<File>` on the `.part` from `output_part_path` (the `atomic_write_output` naming, now shared), then fsyncs. Only the feeder ever waits on gifski's bounded queue.
+- Retention: frames are kept, by the encoder thread, only when `targetMaxBytes` is set, for the twitter-fit re-encode. Without a target, each frame is dropped once gifski has it, and it counts against neither the PNG cap nor the raw cap (`StagedExport.received` now tracks order and completeness separately from `frames`).
+- `finish_gif_export` registers the encoder's own cancellation state (`register_export_state`, peeked by `capture_stream_state` before the take, the same register-then-take order as before), takes the capture, and refuses settings that differ from begin. Then `finish_gif_stream` closes the channel, joins, and either commits the `.part` (`commit_output_part`: RUNNING → COMMITTING, rename, directory fsync) or, on overshoot, deletes it and runs `twitter_fit_shrink` (split out of `encode_gif_gifski_adaptive`) on the retained frames through `atomic_write_output`.
+- Cancel during capture: `cancel_export` drops the capture → `GifStream::drop` sets JOB_CANCELLED **before** closing the channel → gifski stops (`Progress::increase` → false → `Error::Aborted`), and the thread deletes its `.part`. Drop never joins, because it runs under the EXPORT_CAPTURES lock. Cancel during the tail goes through the registered state to the same abort.
+- Headless/CLI/MCP only: `index.html`'s batch path builds one `gifStream` object, passes it to begin, and spreads it into the finish args. The GUI (`glyph-studio.js`) passes nothing and keeps the staged path, so the BUG-009 UI-stutter question doesn't arise yet. MP4 finish on a streaming capture is refused (which also cancels it). `save_gif_real` / `save_gif_to_path` are untouched.
+- Tests: `streamed_gif_is_byte_identical_to_the_staged_encode` (40 mixed PNG/raw frames; streamed == `encode_gif_gifski_adaptive` bytes with no target and with a met target; no `.part` left) and `streamed_gif_overshoot_and_cancel_leave_no_part_files` (impossible target → B11 error, no output; `cancel_export` after 10 of 40 frames → the encoder removes its `.part`). Two new frontend contracts pin the begin/finish wiring.
+
+**Measured** (worm-move, pB, 120 f, 760×1024 GIF; `tests/perf-sample.sh`, three builds interleaved base → ITER-054 → this, 3 rounds; the machine was quieter than the ITER-054 runs, and one base run flagged `suspect_foreign_xpc`):
+
+| build | wall s | app CPU s | WebContent s | GPU s | max RSS | GIF md5 |
+|---|---|---|---|---|---|---|
+| HEAD 7ed11b1 | 18.37 / 16.67 / 18.09 | 20.1 / 17.9 / 20.1 | 16.0 / 13.2 / 18.2 | 7.4 / 7.0 / 11.1 | 1,183 MB | 871b4de2… |
+| ITER-054 window | 22.16 / 19.29 / 15.41 | 20.1 / 21.0 / 18.7 | 19.0 / 16.4 / 12.9 | 8.1 / 7.8 / 6.8 | 861 MB | 871b4de2… |
+| **streaming** | **12.68 / 12.06 / 11.44** | 19.4 / 19.9 / 18.8 | 9.6 / 9.6 / 9.4 | 6.7 / 6.6 / 6.5 | **550 MB** (peak footprint 450 MB) | 871b4de2… (all 9 runs) |
+
+Wall ≈ 17.7 → ≈ 12.1 s (−32 %). The post-capture tail is now `tail after capture 3566 ms` against a 6.4 s gifski pass: gifski falls a little behind the capture and catches up after it. WebContent CPU drops too (≈ 15.8 → 9.5 s), because the webview no longer idles through a 6 s encode before the process exits. Max RSS 1,183 → 550 MB, inside the ~500 MB F13 predicted for both items together.
+- 150 f × 760×1024 (rejected before ITER-054): 15.1 s real, **400 MB** max RSS, 0.8 s tail, md5 identical to the ITER-054 build's output.
+- Twitter-fit overshoot (cream-paper batch, 120 f, capWidth 720, 15 MB target): the same 720 → 536 px passes and a byte-identical 14,700,238 B GIF (md5 1673f85f…) on both builds. Wall 18.96 → 16.20 s, RSS 762 → 735 MB (frames are retained, as designed).
+
+**Gate:** cargo build 0 errors (1 pre-existing deprecation warning) · cargo test 25/25 (was 23) · npm test ok (28 contracts + export tests) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity G1-G7 7/7, B11/B12 ✓ · psnr-gate (archive) **inf** vs golden.mp4.
+
+**Gotchas:** (a) The `.part` now lives for the whole capture, not just the final write. If the process is killed mid-render, a hidden `.<name>.<pid>.<seq>.part` stays in the output directory. Error and cancel paths clean it up. A crash does not. (b) Finish must repeat begin's settings exactly (`GifStreamConfig: PartialEq`, `BorderConfig` gained `PartialEq`). The headless JS guarantees that by spreading the same object. (c) Not done: GUI streaming. It needs a gifski thread cap (BUG-009) and a stutter check at 30 fps realtime capture, and the GUI still ships PNG frames (ITER-052 gotcha d). (d) Another worktree's gate `pkill -f "glyph-grid-studio render"` also matches any shell whose command line contains that string, including this session's tool shells (exit 144 twice). Run renders from a script file when parallel gates are active.
+
+### ITER-054 — 2026-10-17 — v0.2 Phase 2: bounded decode-ahead for GIF export; total pixel cap removed (F13)
+
+**Problem:** A 150-frame 760×1024 render (`render --frames 150`, worm-move + pB) was refused before capture with `capture-pixel-limit` (116.7M pixels > 100M). At 1024×682 the cap allowed only 143 frames, so `MAX_EXPORT_FRAMES = 600` meant nothing above that. The GIF path also had the highest peak memory of any export: 1,183 MB max RSS for the 120-frame gate job (`/usr/bin/time -l`).
+
+**Root cause:** `encode_gif_gifski_adaptive` called `decode_frames_parallel` to decode every frame into one `Vec<ImgVec<RGBA8>>` before gifski started (EXPORT-OPT-2 kept it so the twitter-fit ladder could reuse it). Since ITER-052 the staged headless frames are raw RGBA already, so the job held the set twice: 373 MB staged plus 373 MB decoded. `MAX_TOTAL_DECODED_PIXELS` / JS `MAX_CAPTURE_PIXELS` existed only to keep that decoded set under ~400 MB. Its own comment said so. Since ITER-040 bounded MP4, nothing else needed it.
+
+**Fix:**
+- `encode_gif_gifski_frames(frames, delay, border, width, …)` replaces `decode_frames_parallel` + `encode_gif_gifski_decoded`. It uses the ITER-040 pattern: K = ncpu−2 workers (BUG-009) run `decode_one_frame` into a `sync_channel(2K+2)`, a Condvar holds any worker more than 2K+2 frames ahead of the feeder, and the feeder thread reorders through a BTreeMap and calls `collector.add_frame_rgba(idx, img, pts)` in index order. Frames move into gifski without a clone. The writer runs on the calling thread. A cancel goes through `GifProgress` → `Error::Aborted`, and the "export cancelled" error is reported ahead of the feeder's or writer's own error. Each twitter-fit rung re-decodes through the window (a raw frame decode is one copy; a PNG set takes ~0.3 s), and that cost only applies when `targetMaxBytes` is set.
+- Caps: `MAX_TOTAL_DECODED_PIXELS` is gone from Rust, and `MAX_CAPTURE_PIXELS` + `capture-pixel-limit` are gone from JS. `MAX_EXPORT_FRAMES = 600` and the 256 MB PNG byte cap stay. **Deviation from the F13 text:** F13 was written before ITER-052, when every staged frame was PNG. Raw RGBA frames don't count against the PNG cap, so removing the pixel cap would have left them with no bound. They now count against a new `MAX_TOTAL_RAW_FRAME_BYTES = 1 GiB` (≈ 2.7× the old 400 MB, 344 frames at 760×1024). `MAX_FRAME_PIXELS = 100M` per frame is a decompression-bomb guard on PNG IHDR / raw headers, not a budget. The old dead `encode_gif_gifski` (no callers, compiler warning) is removed.
+- Tests: `export_guard_has_no_total_pixel_cap` (150 × 760×1024 and 600 × 1024×682 validate), `staged_capture_accepts_sets_past_the_old_pixel_cap`, and `windowed_gif_encode_is_deterministic_and_cancellable` (40 mixed PNG/raw frames, more than the window; two runs byte-equal; a cancelled control returns "export cancelled"). The per-frame assertions in the two guard tests were updated. frontend-contracts drops the `MAX_CAPTURE_PIXELS` pin and adds a negative contract so it cannot come back.
+
+**Measured** (worm-move, pB, 120 f, 760×1024 GIF, release binaries. Other worktrees were running run-all on this machine, so wall times are **under parallel load**, and the baseline perf runs flagged `suspect_foreign_xpc`):
+
+| build | max RSS | peak footprint | wall (perf-sample) | app CPU s | GIF md5 |
+|---|---|---|---|---|---|
+| HEAD 7ed11b1 | 1,183 MB | 1,084 MB | 26.97 / 23.97 | 21.7 / 21.7 | 871b4de2… |
+| bounded window | **861 MB** | **761 MB** | 18.52 / 15.64 | 20.5 / 18.2 | 871b4de2… (identical ×3) |
+
+−322 MB RSS. The decoded set was 373 MB, and some of that is now spread across the window and gifski's queues. Wall is within load noise. Decode is no longer a separate step: `encode: 120 frames decoded (bounded window) + gifski in 6397ms` versus `decoded once in 76-113 ms` + gifski before. 150 f × 760×1024: HEAD exits 1 with `capture-pixel-limit`. Now it exits 0, writes a 38.7 MB GIF (ffprobe: 760×1024, 150 frames), 19.5 s real, 984 MB max RSS.
+
+**Gate:** cargo build 0 errors (1 warning, the pre-existing `Shell::open` deprecation) · cargo test 23/23 (was 21) · npm test ok (26 contracts + export tests) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity G1-G7 7/7 · psnr-gate (archive) **inf** vs golden.mp4.
+
+**Gotchas:** (a) The remaining ~860 MB is mostly the 373 MB staged raw set, the Tauri/WebKit host, and the 32 MB output Vec. ITER-053 (streaming) removes the staged set for jobs without a byte target. (b) Over-size jobs now fail at `push_export_frame_raw` partway through capture ("raw frames are too large … lower duration, FPS, or output size"), not at the JS preflight. Before, the preflight rejected far smaller jobs. (c) `tests/run-all.sh`'s `pkill -f` pattern also matches the calling shell's own command line. Bracket the pattern (`[g]lyph-grid-studio-perf/…`) or the gate kills itself (exit 144).
+
+### ITER-052 — 2026-10-17 — v0.2 Phase 2: raw RGBA capture over the raw-body IPC + working layer memo for animated sources (F2 steps 2-3)
+
+**Problem:** Every headless frame went through `canvas.toBlob('image/png')`. WebKit runs that readback and the PNG encode synchronously inside the JS call (research F2: ~40 % of the WebContent main thread was waiting in `toBlob`), and WebContent is the process that bounds the run (PERF-V0.2-BASELINE). Rust then PNG-decoded every frame again before the MP4/GIF encoders. Separately, the ITER-042 still-source layer memo was off for animated sources, and it turned out it never hit at all.
+
+**Root cause:** (1) PNG was the only frame format the staged capture understood, including for consumers that only ever wanted pixels. (2) `SCENES[CONFIG.scene](src, t, CONFIG)` binds `this` to the `SCENES` container, so the studio scene's `this.__sourceProcessed` / `this.__sourceDepth` lived on `SCENES` itself. The layer memo (`studio.__sourceProcessed === __srcLayerProcessed`), `clearSourceDerivedCaches`, `memProbe` and the GUI's `sceneCacheKeys` all read `SCENES[name]`, which is always undefined there. Instrumented render: 0 reuses on 131 draws (cream-paper, kaneki, worm-move). A latent side effect: a source swap never dropped the depth buffer.
+
+**Fix:**
+- `beginRecord({ rawFrames: true })` is honoured only for a pure `onFrame` consumer (no ZIP, no retained base64). `handleRecordFrame` then calls `drawingContext.getImageData(0, 0, canvas.width, canvas.height)` synchronously, at the point where toBlob used to snapshot, and passes `{ rgba, width, height }` to `onFrame`. The headless batch path (`render`, `batch`, MCP) opts in. `pushFrame` sends the RGBA buffer as the raw IPC body (zero-copy `Uint8Array` view) with `x-format: rgba`, `x-width`, `x-height`. In `--perf` mode the 3 PERF_JOB anchor frames are PNG-encoded on a scratch canvas, and only those 3.
+- Rust: `PngFrame` gains `rgba: Option<(w, h)>`, `dimensions()` (IHDR or the declared size, never a decode) and `to_rgba8()` (PNG decode, or one copy of the raw bytes). `push_export_frame_raw` checks the raw body before copying it (`check_raw_rgba_len`: exactly w×h×4, w×h ≤ pixel cap). `stage_export_frame`, `validate_export_frames`, `decode_one_frame` (GIF + twitter-fit ladder, still decoded once and shared) and the MP4 preprocess workers all go through those helpers. PNG and raw frames can mix in one capture as long as the sizes agree. Tests: `raw_rgba_frames_match_the_png_round_trip` and `raw_rgba_length_and_pixel_guard`.
+- The GUI staged path, `framesB64`, the ZIP fallback and the base64 commands still send PNG and are unchanged.
+- **What the 256 MB cap means now:** `MAX_TOTAL_COMPRESSED_FRAME_BYTES` counts PNG payloads only. Raw frames are exactly w×h×4, so `MAX_TOTAL_DECODED_PIXELS` already caps them at ≤ 400 MB staged.
+- F2 step 3: the frame index is now part of the layer key (`revision|frameIdx|WxH|bg|depth`), so animated sources are no longer excluded, and the scene is called as `sceneFn.call(sceneFn, …)` so its caches live where every reader looks.
+
+**Measured** (worm-move, pB, 120 f, 760×1024, `--mp4-quality archive`, `tests/perf-sample.sh`; other phases were rendering on this machine, so all numbers are **under parallel load**. WebContent/GPU are our own pids; the post-change runs flagged `suspect_foreign_xpc` and the foreign pids are excluded):
+
+| build | wall s | app s | WebContent s | GPU s | encode-mp4 ms |
+|---|---|---|---|---|---|
+| HEAD 8877a10 (same session) | 18.27 / 17.62 | 3.32 / 3.12 | 15.24 / 14.31 | 6.80 / 6.65 | 2490 |
+| raw RGBA only | 13.79 / 12.70 / 13.48 | 1.99 / 2.10 / 1.97 | 10.49 / 10.06 / 10.67 | 6.83 / 6.77 / 6.73 | 1170 / 1061 / 1212 |
+| raw RGBA + memo (shipped) | 14.15 / 14.00 | 2.06 / 1.93 | 11.19 / 10.93 | 7.78 / 7.06 | 1875 / 1542 |
+
+Default-upload HEAD runs in the same window: wall 16.80 / 14.73, WebContent 13.44 / 12.36. Net: WebContent ≈ 14.8 → ≈ 10.8 s (−27 %) and wall ≈ 17.9 → ≈ 13.6 s (−24 %), GPU flat, host CPU −1 s (no PNG decode). That is about 4 s of the ~10 s upper bound F2 estimated. The rest of the old toBlob time did not go away: getImageData still waits for the GPU process to flush the 28,800 blits before it can read back. If more is needed, F2 step 1 (in-process canvas) is the remaining lever.
+
+Memo: kaneki.gif (90 ms frames at 30 fps) now reuses the layer on 86 of 131 draws (was 0), and the still cream-paper source on 35 / 35. worm-move's GIF runs at 40 ms = the 25 fps render, so its source frame changes on every render frame and the memo cannot help there. kaneki wall 10.46 / 9.70 → 9.29 s, WebContent 5.4-5.7 → 6.1 s: kaneki is GPU-bound (GPU 11 s), so skipping the scene repaint shows no measurable gain on either source. It ships because it is output-identical and fixes the dead-cache bug, which also helps the GUI's still-source preview.
+
+**Output:** psnr-gate **inf** vs golden.mp4 (120 / 120 frames). Kaneki with and without the memo: byte-identical MP4. byte-identity G1-G7 7/7. getImageData returns un-premultiplied RGBA, but the canvas is opaque (alpha 255), so no premultiplication rounding is possible and the golden was not regenerated. Raw `ffmpeg -lavfi psnr` against golden prints 17.3 dB: that is the ITER-050 timestamp-pairing artifact, not a pixel difference. psnr-gate pairs frames by index.
+
+**Gate:** cargo build 0 errors · cargo test 21/21 (was 19) · npm test ok (both files, 27 contracts) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity 7/7 · psnr-gate inf.
+
+**Gotchas:** (a) Staged memory changed shape. The MP4 path used to hold PNGs (~1.1 MB/frame here, estimated from an ffmpeg PNG of frame 60; WebKit's PNG size is UNCERTAIN, so ≈ 136 MB) plus a YUV window. It now holds 3.1 MB/frame raw, 373 MB for this job, ≤ 400 MB at the pixel cap. The GIF path already held the decoded set, so its peak is unchanged. (b) The getImageData call must stay synchronous in `handleRecordFrame`: deferring it to a microtask would read whatever the next draw painted. (c) Don't use `pkill -f "glyph-grid-studio render"` while parallel phases are rendering. It matches other worktrees' binaries, so this gate killed only `glyph-grid-studio-perf/…/glyph-grid-studio render|batch`. (d) Not done: the GUI staged path still sends PNG. Switching it means passing `rawFrames: staged` plus the raw headers in `pushStagedFrame`, and dropping the b64 fallback for raw frames. The headless path came first because it is the one the gates measure. Also not done: the per-frame luminance plane cache (`_lumKey`) still skips animated sources.
+
+### ITER-051 — 2026-10-17 — v0.2 Phase 2: Twitter-fit predicts the fitting width from the first pass (F14)
+
+**Problem:** On overshoot, `encode_gif_gifski_adaptive` walked a fixed 600 → 540 → 480 → 420 → 360 ladder, one full gifski pass per rung. A 720 px export at 1.6-2× the cap spent one or two passes on rungs that could never fit, and the user got whichever rung fell under the cap first rather than the widest width that fits.
+
+**Root cause:** The ladder ignored what the first pass already measured. GIF bytes scale ~linearly with pixel count at fixed content (ITER-026 log: 18.54 MB × (600/720)² = 12.87 MB predicted vs 12.82 MB measured), so one pass is enough to estimate the width.
+
+**Fix:** `twitter_fit_width(width, bytes, target, margin)` = even(width × √(target/bytes) × margin), clamped to [`TWITTER_FIT_MIN_WIDTH` = 360, largest even width below the current one]; `None` when that range is empty. After the first pass overshoots, pass 2 encodes at the predicted width × 0.96 (≈8 % byte headroom). If that still overshoots, pass 3 re-predicts from pass 2's own size × 0.97 (B/px measured that close to the answer moves < 1 %). Nothing else is tried; if pass 3 misses, or there is nothing narrower than 360 px left, the same "GIF cannot meet target size: smallest attempt is N bytes" error as before is returned (B11 fail-closed unchanged). At most 3 gifski passes instead of 6. The log now prints B/px per pass, and keeps the "entering shrink ladder" line that B11/B12 grep for. Unit test `twitter_fit_width_predicts_from_bytes_per_pixel` covers the B12 and worm-move numbers, the floor clamp, the `None` cases and the minimum one-step shrink.
+
+**Measured (batch, 120 f, `capWidth: 720`, 15 MB target, release binaries; other phases were building and rendering on this machine, so encode_ms is under parallel load and noisy):**
+
+| source | old ladder | predictor |
+|---|---|---|
+| cream-paper.png (24.83 MB @ 720) | 720 → 600 (17.66 MB) → **540** ✓ 14.27 MB · 3 passes · encode 18.9 / 18.6 s | 720 → **536** ✓ 14.02 MB · 2 passes · encode 13.3 s |
+| worm-move.gif (31.23 MB @ 720) | 720 → 600 → 540 → **480** ✓ 14.66 MB · 4 passes · encode 13.4 s | 720 → **478** ✓ 14.64 MB · 2 passes · encode 14.5 s |
+| run-all B12 (4 f, 700 KB target) | 720 → 600 → 540 → 480 → **420** ✓ · 5 passes | 720 → **446** ✓ 586 KB · 2 passes |
+| run-all B11 (4 f, 200 KB target) | 6 passes, then error | 720 → 360 (0.35 MB), then the same error · 2 passes |
+
+The expected 2-8 % width gain did not show up on the two real sources. B/px rises as the width shrinks (+1.9 % cream-paper 720 → 536, +6.4 % worm-move 720 → 478), so the margin that keeps pass 2 inside the cap gives back what the ladder lost to its coarse rungs. The output lands within 1 % of the ladder's width (−0.7 %, −0.4 %), and on tiny 4-frame jobs it is wider (446 vs 420). The real gain is passes: 2 instead of 3-5. Encode wall time is too noisy under parallel load to quote as a speedup. gifski output also varies about 2 % run to run on the same width.
+
+**Gate:** cargo build 0 errors · cargo test 19/19 · npm test ok (both files) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity G1-G7 7/7 · psnr-gate (`--mp4-quality archive`) inf vs golden · perf-sample (archive gate render) wall 15.3 / 15.0 s, app 2.44 / 2.74 s, WebContent 12.5 / 12.4 s, GPU 6.26 / 6.27 s.
+
+**Gotchas:** (a) A margin of 0.97 on pass 2 missed worm-move by 10 KB (484 px → 15.01 MB); a 0.95 correction from there overshot down to 458 px. That is how 0.96 / 0.97 were picked; revisit with more sources. (b) Concurrent run-all gates from other worktrees `pkill -f "glyph-grid-studio render"`, which also matches this worktree's renders. Three gate runs here lost a random render (G3-G7, C5, C7) to that before a quiet window gave a clean 25/0. Wait for other run-all processes to finish before gating. (c) Not done: GUI `_estimateBytes` calibration from the measured B/px (the other half of F14) and a `gifQuality` knob. The new log lines carry the B/px value that calibration would need.
+
+### ITER-050 — 2026-10-17 — v0.2 Phase 2: MP4 bitrate rate control (upload default, archive keeps QP 26) + track timescale fix (F11)
+
+**Problem:** MP4 export claimed a "5 Mbps cap … 1-2 MB for a 90-frame loop" but shipped 7-13× that: cream-paper 120 f at 1024×682 was 17.3 MB (≈38 Mbps), the worm-move preset 22.0 MB (≈37 Mbps). Separately, every MP4 declared 1 ms per frame — ffprobe read a 120-frame clip as `time_base=1/1000, r_frame_rate=1000/1, duration=0.12`.
+
+**Root cause:** (1) `RateControlMode::Off` makes openh264 use the fixed layer QP (SVC_QUALITY_BASE_QP = 26, ratectl.cpp WelsRcPictureInitDisable); the bitrate field is never read on that path. RC Off had been chosen because bitrate RC "emitted zero NAL units for some frames" — that was frame *skipping*, which the openh264 crate enables by default (`enable_skip_frame: true`). (2) mp4 0.14's `TrackConfig::from(AvcConfig)` hard-codes the mdhd timescale to 1000 (`// XXX` in track.rs); only the mvhd got `timescale = fps`, while samples were written with `duration = 1`.
+
+**Fix:**
+- `Mp4Quality { Upload, Archive }` (lib.rs). Upload (default): `RateControlMode::Bitrate` + `.skip_frames(false)` at `mp4_upload_bitrate(w, h)` = 5 Mbps up to 1080p, scaled by pixel count above. Archive: the old RC-Off config verbatim, so its H.264 elementary stream is byte-identical to v0.1.x. The "frame N produced no slice NALs" guard stays as the frame-skip tripwire.
+- `track_config.timescale = timescale` after `TrackConfig::from`.
+- Plumbing: `render --mp4-quality upload|archive` (clap `value_parser`), batch job field `mp4Quality` (unknown values refuse the manifest with exit 2 before any webview starts), MCP `glyph_grid_render.mp4_quality`, and `mp4Quality` on `save_mp4_real` / `save_mp4_to_path` / `finish_mp4_export` (bad values rejected there too; `finish_mp4_export` parses after taking the capture so it is still released). The GUI passes nothing → Upload; an export-pane toggle is a follow-up.
+- `tests/psnr-gate.sh` now pairs frames by index (`settb=1/1000,setpts=N` on both inputs). ffmpeg's psnr framesync pairs by timestamp, so the timescale fix alone made a pixel-identical archive render score 17.30 dB against the 1-ms-per-frame golden.
+- cargo tests: `mp4_upload_rate_control_keeps_every_frame_near_target` (120 frames 640×360 @ 30 fps: 60 flat + 60 with a fresh noise band; every sample non-empty, duration 1, track timescale = fps, total < 1.5 × bitrate × duration), `mp4_quality_parse_defaults_to_upload_and_rejects_typos`, `batch_manifest_rejects_unknown_mp4_quality`. The rate test fails on Archive (4.63 MB vs a 3.75 MB limit) and passes on Upload (2.06 MB).
+
+**Measured (release binary; other phases were building on this machine, so timings are under parallel load):**
+- Gate (worm-move, pB preset, 120 f, 760×1024 @ 25 fps): `--mp4-quality archive` → 21,953,413 B, **PSNR inf** vs golden.mp4 (decoded RGBA md5 identical, Annex-B elementary stream byte-identical; the only file difference is the mdhd timescale + durations, +28 B). Default upload → **5,177,733 B (4.2× smaller), 24.26 dB vs golden** (worst frame #71 @ 23.86 dB), 8.6 Mbps against the 5 Mbps target: with skipping off, RC runs out of QP headroom on temporal-dither content and overshoots ~1.7×. libx264 `-crf 23` of the golden is 5.86 MB at 29.17 dB, so this preset is near-incompressible for any encoder.
+- cream-paper default config, 120 f, 1024×682 @ 33 fps: archive 17,312,884 B → upload **2,274,226 B (7.6×), exactly 5.00 Mbps**, 22.55 dB vs archive. The upload frames are visibly softer on dense stipple (glyph edges blur); that is the size/quality tradeoff F11 asked for, and archive is the escape hatch.
+- Timing, `tests/perf-sample.sh`, 2 runs each: archive wall 15.5 / 17.2 s, app 1.98 / 2.75 s, WebContent 12.3 / 12.8 s, GPU 6.4 / 6.5 s, openh264 1.03 / 1.20 s; upload wall 18.0 / 17.3 s, app 2.91 / 2.95 s, WebContent 14.1 / 14.2 s, GPU 6.9 / 6.7 s, openh264 1.63 / 1.90 s. Encode time is within load noise.
+
+**Gate:** cargo build 0 errors · cargo test 18/18 (was 15) · npm test ok (both files) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity G1-G7 7/7 · psnr-gate archive inf.
+
+**Gotchas:** (a) Any later gate that renders the default MP4 against golden.mp4 will now read ~24 dB: render the gate with `--mp4-quality archive` (golden was not regenerated; archive reproduces it exactly). (b) `ScreenContentRealTime` usage type was tried as an A/B knob on the gate frames: 9.0 MB at 29.80 dB, i.e. better quality per byte than camera mode but 3× over the target, because it swaps the QP range. Not shipped; `Profile::High`, `Complexity::High` and real `encode_at` timestamps changed nothing measurable (4,648,754 B / 23.82 dB in each case). (c) An end-to-end CLI check (3rd archive job in B8: upload smaller than archive, 1/fps timescale, typo refused) passed locally as B13 but is not committed: `tests/run-all.sh` is on the loop pre-commit deny-list. The batch-typo and timescale checks live in the cargo tests above instead.
+
 ### ITER-049 — 2026-10-17 — v0.2 Phase 1 review: priming before loop(), honest test gates, setup() failure exits, switch_ms without priming
 
 **Problem:** The Phase 1 review turned up seven small defects in the determinism work and its instruments. (1) `beginRecord` called `loop()` *before* `primeTemporalState(total)` with `recState` already installed. p5 1.11.2's `loop()` is `_loop = true; _draw()`, and `_draw` draws synchronously when enough time has passed since the last frame — true for every batch job after the first (the previous job ended in `noLoop()`), so frame 0 could be captured from un-primed state and the priming then rewound `frameIdx` to 0 on top of it. (2) `tests/byte-identity.sh` had no `pipefail`, so an ffmpeg decode failure hashed as `"" == ""` and passed; nothing checked that a file actually held the requested frame count, so two identically truncated outputs also passed. (3) `tests/psnr-gate.sh`'s header promised exit 2 on a frame-count mismatch but ffmpeg's `psnr` filter silently compares the shorter stream. (4) `tryHeadlessRender` awaited `__setupReady`, which only ever resolved — a `setup()` throw (the compat validator's `error` level, a canvas allocation failure) left the CLI process waiting forever. (5) `__lastPrime` kept the previous job's diagnostics when `primeTemporalState` early-returned (no source / `window.PIPELINE`), so the per-job `prime:` log line could describe the wrong job. (6) `__markChange('job:' + name)` was stamped before `beginRecord`, so the priming passes landed inside `switch_ms`. (7) `tests/perf-sample.sh` summed every WebContent/GPU pid it discovered without saying when it had found more than one webview's worth.

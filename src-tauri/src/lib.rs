@@ -57,6 +57,9 @@ pub struct HeadlessRenderJob {
     /// past it the process exits 3.  None = no budget (the stall guard
     /// still applies).
     pub timeout_secs: Option<u64>,
+    /// MP4 rate control: `"upload"` (default, bitrate RC) or `"archive"`
+    /// (fixed QP 26, the v0.1.x bitstream).  Ignored for GIF output.
+    pub mp4_quality: Option<String>,
 }
 
 impl HeadlessRenderJob {
@@ -524,7 +527,7 @@ fn canonical_json(v: &serde_json::Value) -> serde_json::Value {
 /// targetMaxBytes; not `name` / `outPath`.
 fn job_config_sha256(job: &serde_json::Value, batch_in: &str) -> String {
     use sha2::{Digest, Sha256};
-    let key = serde_json::json!({
+    let mut key = serde_json::json!({
         "in": job["inPath"].as_str().unwrap_or(batch_in),
         "format": job["format"],
         "frames": job["frames"],
@@ -533,6 +536,15 @@ fn job_config_sha256(job: &serde_json::Value, batch_in: &str) -> String {
         "capWidth": job["capWidth"],
         "targetMaxBytes": job["targetMaxBytes"],
     });
+    // ITER-071: upload vs archive (ITER-050) changes the MP4 bytes, so it is
+    // part of the key — for MP4 jobs only, so GIF hashes stay as they were.
+    if job["format"].as_str() == Some("mp4") {
+        let q = match Mp4Quality::parse(job["mp4Quality"].as_str()) {
+            Ok(Mp4Quality::Archive) => "archive",
+            _ => "upload",
+        };
+        key["mp4Quality"] = serde_json::Value::from(q);
+    }
     Sha256::digest(canonical_json(&key).to_string().as_bytes())
         .iter()
         .map(|b| format!("{:02x}", b))
@@ -654,6 +666,13 @@ pub fn run_validate(path: PathBuf) -> i32 {
                 {
                     eprintln!("validate: error: {}", e);
                     manifest_errors += 1;
+                }
+                // ITER-071: the same mp4Quality check `batch` runs (ITER-050).
+                if let Some(q) = j.get("mp4Quality").and_then(|v| v.as_str()) {
+                    if let Err(e) = Mp4Quality::parse(Some(q)) {
+                        eprintln!("validate: error: {}: {}", what, e);
+                        manifest_errors += 1;
+                    }
                 }
                 let cfg = j.get("config").cloned().unwrap_or(serde_json::json!({}));
                 targets.push((format!("{} config", what), cfg));
@@ -782,6 +801,35 @@ fn abort_headless(code: i32, why: &str) -> ! {
             let _ = fs::remove_file(p);
         }
     }
+    // ITER-071: a `batch --jobs` parent asks its children to stop the same
+    // clean way (SIGTERM → their own sweep, exit 143), waits up to 2 s for
+    // the main thread to reap them — the relays must keep draining their
+    // stderr meanwhile: a child whose stderr pipe is gone panics in
+    // eprintln! and never runs its sweep — then SIGKILLs any straggler and
+    // drops the private sub-manifest directory.
+    BATCH_ABORTING.store(true, Ordering::SeqCst);
+    let pids = BATCH_CHILDREN_LIVE.lock().map(|l| l.0.clone()).unwrap_or_default();
+    if !pids.is_empty() {
+        for pid in &pids {
+            terminate_child(*pid);
+        }
+        let grace = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < grace
+            && BATCH_CHILDREN_LIVE.lock().map(|l| !l.0.is_empty()).unwrap_or(false)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if let Ok(live) = BATCH_CHILDREN_LIVE.lock() {
+            for pid in &live.0 {
+                kill_child_hard(*pid);
+            }
+        }
+    }
+    if let Ok(live) = BATCH_CHILDREN_LIVE.lock() {
+        if let Some(dir) = &live.1 {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
     std::process::exit(code);
 }
 
@@ -848,6 +896,20 @@ mod sig {
             kill(pid as i32, SIGTERM);
         }
     }
+
+    pub fn kill_hard(pid: u32) {
+        unsafe {
+            kill(pid as i32, 9);
+        }
+    }
+}
+
+/// SIGKILL a `--jobs` child that ignored SIGTERM for the 2 s grace (ITER-071).
+fn kill_child_hard(pid: u32) {
+    #[cfg(unix)]
+    sig::kill_hard(pid);
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Ask a headless child (`render`/`batch`) to stop cleanly: SIGTERM → its
@@ -924,11 +986,14 @@ fn exit_with_status(_app: tauri::AppHandle, state: tauri::State<CliJobState>, ok
 /// side via `CliJobState`.  The JS hook (`tryHeadlessRender`) detects the
 /// `batch: true` discriminator and runs `runBatchExport` with all jobs in
 /// a single Tauri session — no per-variant Tauri restarts.  See ITER-024.
+/// `jobs > 1` fans the manifest out over that many child processes instead
+/// (ITER-055); 1 is the single-session behaviour above.
 pub fn run_headless_batch(
     manifest_path: PathBuf,
     show_window: bool,
     timeout_secs: Option<u64>,
     resume: bool,
+    jobs: usize,
 ) -> i32 {
     let raw = match fs::read_to_string(&manifest_path) {
         Ok(s) => s,
@@ -1030,6 +1095,18 @@ pub fn run_headless_batch(
             );
             return 2;
         }
+        // ITER-050: a typo'd `mp4Quality` would otherwise only surface after
+        // the whole capture ran; refuse it with the manifest instead.
+        let quality = j.get("mp4Quality");
+        if let Some(e) = match quality {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(q)) => Mp4Quality::parse(Some(q)).err(),
+            Some(other) => Some(format!("mp4Quality must be a string, got {}", other)),
+        } {
+            let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            eprintln!("batch: job {} ({:?}): {}", i, name, e);
+            return 2;
+        }
     }
 
     // R7 (ITER-056): validate every job config against the preset schema
@@ -1070,7 +1147,7 @@ pub fn run_headless_batch(
 
     // Build the JS-shaped batch JSON.  Each job carries its own out/format/config.
     let jobs_js: Vec<serde_json::Value> = jobs_arr
-        .into_iter()
+        .iter()
         .map(|j| {
             let name = j
                 .get("name")
@@ -1142,6 +1219,7 @@ pub fn run_headless_batch(
                 "config": config,
                 "capWidth": cap_width,
                 "targetMaxBytes": target_max_bytes,
+                "mp4Quality": j.get("mp4Quality").and_then(|v| v.as_str()),
             })
         })
         .collect();
@@ -1150,11 +1228,14 @@ pub fn run_headless_batch(
     // (ITER-024's out-of-scope item: a timed-out 64-job run resumes with
     // one flag).  ITER-068: "done" = a matching `<out>.ggs.json` sidecar,
     // else the frame-count fallback — see resume_skip_reason.
-    let mut jobs_js = jobs_js;
+    // ITER-071: the raw manifest job rides along so `--jobs` can split
+    // exactly the jobs resume kept.
+    let mut paired: Vec<(serde_json::Value, serde_json::Value)> =
+        jobs_arr.into_iter().zip(jobs_js).collect();
     let job_sha = |j: &serde_json::Value| job_config_sha256(j, &in_path);
     if resume {
-        let before = jobs_js.len();
-        jobs_js.retain(|j| {
+        let before = paired.len();
+        paired.retain(|(_, j)| {
             let out = j["outPath"].as_str().unwrap_or("");
             match resume_skip_reason(
                 out,
@@ -1170,10 +1251,34 @@ pub fn run_headless_batch(
                 None => true,
             }
         });
-        eprintln!("batch: resume: skipped {} of {} jobs", before - jobs_js.len(), before);
-        if jobs_js.is_empty() {
+        eprintln!("batch: resume: skipped {} of {} jobs", before - paired.len(), before);
+        if paired.is_empty() {
             eprintln!("batch complete: nothing to do (every output is already done)");
             return 0;
+        }
+    }
+    let (jobs_arr, jobs_js): (Vec<serde_json::Value>, Vec<serde_json::Value>) =
+        paired.into_iter().unzip();
+
+    // ITER-055 (F4): `--jobs N` forks N CLI children, each its own
+    // app + WebContent + GPU triple, over a round-robin split of the
+    // already-validated manifest.  ITER-071: after every pre-launch check
+    // and the resume filter, so the children see only jobs that must run;
+    // each child writes its own sidecars.  Wall is bound by each off-screen
+    // webview's throttled rAF, not by CPU, so independent processes scale.
+    let workers = batch_fan_out_count(
+        jobs,
+        jobs_arr.len(),
+        std::thread::available_parallelism().ok().map(|p| p.get()),
+    );
+    if workers > 1 {
+        if let Some(dup) = duplicate_out_path(&jobs_arr) {
+            eprintln!(
+                "batch: --jobs {} ignored: two jobs write {:?}; running serially so the last one wins as before",
+                jobs, dup
+            );
+        } else {
+            return run_batch_children(&manifest, &in_path, &jobs_arr, workers, show_window, timeout_secs);
         }
     }
 
@@ -1235,8 +1340,290 @@ pub fn headless_render_json(job: &HeadlessRenderJob) -> Result<serde_json::Value
             None => serde_json::Value::from("auto"),
         },
         "format": job.resolved_format(),
+        "mp4Quality": job.mp4_quality,
         "config": config,
     }))
+}
+
+/// ITER-055: how many child processes `batch --jobs N` forks.  Capped by the
+/// job count and by `cores - 2` (BUG-009's headroom: each child also runs
+/// gifski/MP4 workers, and the host stays usable).  1 = run in-process.
+fn batch_fan_out_count(requested: usize, n_jobs: usize, cores: Option<usize>) -> usize {
+    let cap = cores.map(|c| c.saturating_sub(2)).unwrap_or(1).max(1);
+    requested.min(n_jobs).min(cap).max(1)
+}
+
+/// First `out` path two jobs share.  Serially the later job overwrites the
+/// earlier one; across children the two writes would race, so fan-out is
+/// refused for such manifests.  ITER-070: compared after `normalize_out_path`
+/// so `a.gif`, `./a.gif` and `sub/../a.gif` count as the same file.
+fn duplicate_out_path(jobs: &[serde_json::Value]) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    jobs.iter()
+        .filter_map(|j| j.get("out").and_then(|v| v.as_str()))
+        .find(|o| !seen.insert(normalize_out_path(o)))
+        .map(|o| o.to_string())
+}
+
+/// Absolute, lexically normalised form of an output path: `.` dropped, `..`
+/// pops the previous component.  Lexical on purpose — the file usually does
+/// not exist yet, so `canonicalize` can't be used.  The parent directory is
+/// canonicalised when it exists, so a symlinked directory and its target
+/// also collide.
+fn normalize_out_path(out: &str) -> PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(out).unwrap_or_else(|_| PathBuf::from(out));
+    let mut norm = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                norm.pop();
+            }
+            other => norm.push(other.as_os_str()),
+        }
+    }
+    match (norm.parent().and_then(|p| p.canonicalize().ok()), norm.file_name()) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => norm,
+    }
+}
+
+/// Round-robin split of the manifest into `n` sub-manifests (top-level keys
+/// kept, `in` canonical).  Serially a job without its own `in` renders
+/// whatever source the previous job left loaded (runBatchExport only swaps
+/// when `inPath` is set), so each job is pinned to that effective source
+/// here — a child must not fall back to the manifest `in` where the serial
+/// batch would not.
+fn split_batch_manifest(
+    manifest: &serde_json::Value,
+    in_path: &str,
+    jobs: &[serde_json::Value],
+    n: usize,
+) -> Vec<serde_json::Value> {
+    let mut current_src = in_path.to_string();
+    let mut parts: Vec<Vec<serde_json::Value>> = vec![Vec::new(); n];
+    for (i, j) in jobs.iter().enumerate() {
+        let mut j = j.clone();
+        match j.get("in").and_then(|v| v.as_str()) {
+            Some(s) => current_src = s.to_string(),
+            None => {
+                if let Some(obj) = j.as_object_mut() {
+                    obj.insert("in".into(), serde_json::Value::String(current_src.clone()));
+                }
+            }
+        }
+        parts[i % n].push(j);
+    }
+    parts
+        .into_iter()
+        .map(|p| {
+            let mut m = manifest.clone();
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("in".into(), serde_json::Value::String(in_path.to_string()));
+                obj.insert("jobs".into(), serde_json::Value::Array(p));
+            }
+            m
+        })
+        .collect()
+}
+
+/// ITER-055: run the split manifest as `n` concurrent `batch` children of
+/// this binary.  Each child's stderr is relayed line by line (PERF_JOB and
+/// `--progress` NDJSON lines verbatim so NDJSON consumers need no change;
+/// everything else tagged `batch[i/n]`).  Exit = the worst child's code (a
+/// signal counts as 1).  ITER-071: the parent runs the ITER-059 watchdog
+/// (`--timeout`, stall guard, SIGINT/SIGTERM); `abort_headless` SIGTERMs
+/// the registered children (each sweeps its own `.part` files) and removes
+/// the private sub-manifest directory before exiting.
+fn run_batch_children(
+    manifest: &serde_json::Value,
+    in_path: &str,
+    jobs: &[serde_json::Value],
+    n: usize,
+    show_window: bool,
+    timeout_secs: Option<u64>,
+) -> i32 {
+    use std::io::BufRead;
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("batch: --jobs: cannot locate own binary: {}", e);
+            return 2;
+        }
+    };
+    let parts = split_batch_manifest(manifest, in_path, jobs, n);
+    // ITER-070: sub-manifests live in a private 0700 directory created for
+    // this run (fresh name, mkdir fails rather than following anything that
+    // already exists) and are opened create_new 0600 — never a predictable
+    // path in the shared temp dir.  The guard removes the directory and
+    // kills any child still running on every exit path, panics included.
+    let mut guard = match BatchChildren::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("batch: --jobs: cannot create private sub-manifest dir: {}", e);
+            return 2;
+        }
+    };
+    let mut paths = Vec::with_capacity(n);
+    for (i, part) in parts.iter().enumerate() {
+        let p = guard.dir.join(format!("part-{}.json", i));
+        if let Err(e) = write_private_file(&p, part.to_string().as_bytes()) {
+            eprintln!("batch: --jobs: cannot write sub-manifest {:?}: {}", p, e);
+            return 2;
+        }
+        paths.push(p);
+    }
+    eprintln!("batch: {} jobs across {} processes", jobs.len(), n);
+    if let Ok(mut live) = BATCH_CHILDREN_LIVE.lock() {
+        live.1 = Some(guard.dir.clone());
+    }
+    start_watchdog(timeout_secs);
+
+    let mut worst = 0;
+    let mut relays = Vec::with_capacity(n);
+    for (i, p) in paths.iter().enumerate() {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("batch").arg("--manifest").arg(p);
+        if show_window {
+            cmd.arg("--show-window");
+        }
+        if PROGRESS_NDJSON.load(Ordering::Relaxed) {
+            cmd.arg("--progress");
+        }
+        match cmd.stderr(std::process::Stdio::piped()).spawn() {
+            Ok(mut child) => {
+                let stderr = child.stderr.take().expect("piped stderr");
+                if let Ok(mut live) = BATCH_CHILDREN_LIVE.lock() {
+                    live.0.push(child.id());
+                }
+                guard.children.push(Some(child));
+                let relay = std::thread::spawn(move || {
+                    let mut r = std::io::BufReader::new(stderr);
+                    let mut line = Vec::new();
+                    while matches!(r.read_until(b'\n', &mut line), Ok(k) if k > 0) {
+                        let text = String::from_utf8_lossy(&line);
+                        let text = text.trim_end_matches('\n');
+                        touch_liveness();
+                        if text.contains("PERF_JOB") || text.starts_with("{\"type\":\"progress\"") {
+                            eprintln!("{}", text);
+                        } else {
+                            eprintln!("batch[{}/{}]: {}", i + 1, n, text);
+                        }
+                        line.clear();
+                    }
+                });
+                relays.push(relay);
+            }
+            Err(e) => {
+                eprintln!("batch: --jobs: cannot spawn child {}: {}", i + 1, e);
+                worst = 2;
+            }
+        }
+    }
+    for k in 0..guard.children.len() {
+        let code = match guard.children[k].as_mut().map(|c| c.wait()) {
+            Some(Ok(s)) => s.code().unwrap_or(1),
+            _ => 1,
+        };
+        // Reaped: neither the guard nor abort_headless may signal a pid
+        // that may be reused.
+        if let (Some(pid), Ok(mut live)) =
+            (guard.children[k].as_ref().map(|c| c.id()), BATCH_CHILDREN_LIVE.lock())
+        {
+            live.0.retain(|p| *p != pid);
+        }
+        guard.children[k] = None;
+        worst = worst.max(code);
+    }
+    for relay in relays {
+        let _ = relay.join();
+    }
+    // ITER-071: abort_headless owns the exit code (3 / 130 / 143).
+    while BATCH_ABORTING.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    worst
+}
+
+/// ITER-070: owns the `--jobs` children and their private sub-manifest
+/// directory.  Drop kills (and reaps) every child not yet waited for and
+/// removes the directory, so neither outlives the parent's batch call.
+/// ITER-071: `std::process::exit` (the watchdog's `abort_headless`) skips
+/// Drop, so the live pids + directory are also mirrored in
+/// `BATCH_CHILDREN_LIVE` for that path.
+struct BatchChildren {
+    dir: PathBuf,
+    children: Vec<Option<std::process::Child>>,
+}
+
+impl BatchChildren {
+    fn new() -> std::io::Result<Self> {
+        use std::hash::{BuildHasher, Hasher};
+        #[cfg(unix)]
+        use std::os::unix::fs::DirBuilderExt;
+        let mut last = None;
+        for attempt in 0..8u32 {
+            // RandomState is seeded from the OS RNG per process; hashing the
+            // pid, attempt and clock through it gives an unguessable suffix.
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u32(std::process::id());
+            h.write_u32(attempt);
+            h.write_u128(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            );
+            let dir = std::env::temp_dir()
+                .join(format!("ggs-batch-{}-{:016x}", std::process::id(), h.finish()));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&dir) {
+                Ok(()) => {
+                    return Ok(BatchChildren {
+                        dir,
+                        children: Vec::new(),
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| std::io::Error::other("no free temp dir name")))
+    }
+}
+
+/// `--jobs` children still running + their sub-manifest dir (ITER-071).
+static BATCH_CHILDREN_LIVE: Mutex<(Vec<u32>, Option<PathBuf>)> = Mutex::new((Vec::new(), None));
+/// Set by `abort_headless`: the batch parent's main thread must not race
+/// it to `exit` with the children's 143 once it has reaped them.
+static BATCH_ABORTING: AtomicBool = AtomicBool::new(false);
+
+impl Drop for BatchChildren {
+    fn drop(&mut self) {
+        if let Ok(mut live) = BATCH_CHILDREN_LIVE.lock() {
+            *live = (Vec::new(), None);
+        }
+        for child in self.children.iter_mut().flatten() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Write `bytes` to a file that must not exist yet, mode 0600 (ITER-070).
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)?.write_all(bytes)
 }
 
 /// Public entry point invoked by main.rs for `render` subcommand.  Returns
@@ -1300,17 +1687,59 @@ struct GifFrame {
     b64: String,
 }
 
+/// One staged frame.  `rgba: None` → `bytes` is a PNG file (GUI staged,
+/// base64 and fallback paths).  `rgba: Some((w, h))` → `bytes` is exactly
+/// w×h×4 straight (un-premultiplied) RGBA8 from the headless capture's
+/// getImageData (ITER-052) and is never PNG-decoded.
 #[derive(Debug)]
 struct PngFrame {
     bytes: Vec<u8>,
+    rgba: Option<(u32, u32)>,
+}
+
+impl PngFrame {
+    fn png(bytes: Vec<u8>) -> Self {
+        PngFrame { bytes, rgba: None }
+    }
+
+    /// Width/height from the PNG IHDR or the raw frame's declared size —
+    /// never a decode.
+    fn dimensions(&self, index: usize) -> Result<(u32, u32), String> {
+        match self.rgba {
+            Some(dimensions) => Ok(dimensions),
+            None => png_dimensions(&self.bytes, index),
+        }
+    }
+
+    /// RGBA8 image for the encoders: a PNG decode, or one copy of the raw
+    /// bytes (the staged set is borrowed so the twitter-fit ladder and the
+    /// MP4 workers can share it).
+    fn to_rgba8(&self, index: usize) -> Result<image::RgbaImage, String> {
+        match self.rgba {
+            Some((width, height)) => image::RgbaImage::from_raw(width, height, self.bytes.clone())
+                .ok_or_else(|| format!("frame {} raw RGBA length mismatch", index)),
+            None => Ok(
+                image::load_from_memory_with_format(&self.bytes, image::ImageFormat::Png)
+                    .map_err(|e| format!("frame {} decode: {}", index, e))?
+                    .into_rgba8(),
+            ),
+        }
+    }
 }
 
 /// Hard safety limits for native animation export. These limits are checked
 /// from PNG IHDR metadata before any frame is decompressed into RGB/RGBA.
-/// 100M pixels is about 381 MiB as raw RGBA before encoder overhead.
+/// ITER-054: there is no total decoded-pixel cap any more.  It existed
+/// because the GIF path decoded the whole set up front; both encoders now
+/// decode through a bounded window, so decode-side memory is flat in frame
+/// count.  What is retained is bounded directly: PNG payloads by the 256 MiB
+/// byte cap, raw RGBA frames (ITER-052, exactly w×h×4) by the raw byte cap.
+/// `MAX_FRAME_PIXELS` is a per-frame decompression-bomb guard (one
+/// 10000×10000 frame), not a budget.
 const MAX_EXPORT_FRAMES: usize = 600;
-const MAX_TOTAL_DECODED_PIXELS: u64 = 100_000_000;
+const MAX_FRAME_PIXELS: u64 = 100_000_000;
 const MAX_TOTAL_COMPRESSED_FRAME_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_RAW_FRAME_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_TOTAL_COMPRESSED_BASE64_CHARS: u64 =
     (((MAX_TOTAL_COMPRESSED_FRAME_BYTES + 2) / 3) * 4) + 4;
 const MAX_SOURCE_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -1328,10 +1757,242 @@ static OUTPUT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct StagedExport {
     expected_frames: usize,
+    /// Frames accepted so far (== `frames.len()` unless streaming).
+    received: usize,
+    /// Retained frames.  Empty for a streaming GIF job without a byte
+    /// target: those frames go to the encoder thread and are not kept.
     frames: Vec<PngFrame>,
     dimensions: Option<(u32, u32)>,
-    total_pixels: u64,
     total_bytes: u64,
+    total_raw_bytes: u64,
+    stream: Option<GifStream>,
+}
+
+/// ITER-053 (F12): the GIF encode settings, handed to `begin_export_capture`
+/// so gifski can encode while frames are still being captured.
+/// `finish_gif_export` must repeat the same values.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GifStreamConfig {
+    path: String,
+    delay_ms: u32,
+    cap_width: Option<u32>,
+    border: Option<BorderConfig>,
+    target_max_bytes: Option<u64>,
+}
+
+/// What the streaming encoder thread hands back: the `.part` it wrote, the
+/// width it encoded at, and the frames it retained for the twitter-fit
+/// ladder (only when a byte target is set).
+struct StreamedGif {
+    part_path: PathBuf,
+    frames: usize,
+    size: u64,
+    width: u32,
+    retained: Vec<PngFrame>,
+}
+
+/// A per-job streaming GIF encoder (ITER-053).  Frames go over an unbounded
+/// channel so the IPC/capture chain rarely waits on gifski (index.html
+/// pauses the draw loop at 3 in-flight pushes).  ITER-070: for a job that
+/// retains nothing, the bytes sitting in that channel are counted in
+/// `queued` (the feeder subtracts each frame once gifski has it) and
+/// `stage_export_frame` waits while a push would take the queue past the
+/// same byte caps a retaining job is held to — a slow encoder throttles the
+/// capture instead of growing memory without bound.
+struct GifStream {
+    config: GifStreamConfig,
+    tx: Option<std::sync::mpsc::Sender<PngFrame>>,
+    state: Arc<AtomicU8>,
+    handle: Option<std::thread::JoinHandle<Result<StreamedGif, String>>>,
+    queued: Arc<AtomicU64>,
+    /// (compressed, raw) queue caps; the export byte caps outside tests.
+    queue_caps: (u64, u64),
+}
+
+impl GifStreamConfig {
+    /// Frames are kept for a possible twitter-fit re-encode only when a
+    /// byte target is set.
+    fn retains_frames(&self) -> bool {
+        self.target_max_bytes.is_some_and(|t| t > 0)
+    }
+}
+
+/// What `stage_export_frame` does with a frame for a non-retaining stream
+/// (ITER-070): send it, wait for the encoder to drain, or fail.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamAdmit {
+    Send,
+    Wait,
+}
+
+/// `queued` bytes are in the channel; can `len` more go in under `cap`?
+/// A frame that alone exceeds the cap can never fit, and a stopped encoder
+/// never drains, so both fail instead of waiting forever.
+fn stream_queue_admit(queued: u64, len: u64, cap: u64, running: bool) -> Result<StreamAdmit, String> {
+    match queued.checked_add(len) {
+        Some(total) if total <= cap => Ok(StreamAdmit::Send),
+        _ if queued == 0 => Err(format!(
+            "frame of {} bytes exceeds the streaming queue limit {} bytes",
+            len, cap
+        )),
+        _ if !running => Err(
+            "streaming GIF encoder stopped; finish or cancel the export for the cause".to_string(),
+        ),
+        _ => Ok(StreamAdmit::Wait),
+    }
+}
+
+impl GifStream {
+    /// Encoder thread alive and the job neither cancelled nor committing.
+    fn is_running(&self) -> bool {
+        self.state.load(Ordering::Acquire) == JOB_RUNNING
+            && self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Close the frame channel and wait for the encoder to finish the GIF.
+    fn finish(mut self) -> Result<StreamedGif, String> {
+        drop(self.tx.take());
+        self.handle
+            .take()
+            .ok_or_else(|| "GIF stream already finished".to_string())?
+            .join()
+            .map_err(|_| "streaming GIF encoder panicked".to_string())?
+    }
+}
+
+impl Drop for GifStream {
+    /// Abandoned without `finish` (cancel_export dropped the capture, or a
+    /// finish was refused): mark the job cancelled BEFORE closing the
+    /// channel, so the encoder sees the cancel, gifski stops with
+    /// `Error::Aborted` and the thread deletes its `.part`.  Never joins:
+    /// this can run under the EXPORT_CAPTURES lock.
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            let _ = self.state.compare_exchange(
+                JOB_RUNNING,
+                JOB_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        drop(self.tx.take());
+    }
+}
+
+/// Body of the streaming encoder thread.  The first frame fixes the output
+/// width (same `validate_export_frames` + `validated_gif_width` as the
+/// batch path); then every frame is decoded and fed to gifski in arrival
+/// order — `stage_export_frame` already enforces index order — with the
+/// same pts, so the GIF is byte-identical to the batch encode.  Any error
+/// or cancel removes the `.part`.
+fn run_gif_stream(
+    rx: std::sync::mpsc::Receiver<PngFrame>,
+    config: GifStreamConfig,
+    total: usize,
+    part_path: PathBuf,
+    control: ExportControl,
+    queued: Arc<AtomicU64>,
+) -> Result<StreamedGif, String> {
+    let retain = config.retains_frames();
+    let border = config.border.as_ref();
+    let result = (|| -> Result<StreamedGif, String> {
+        // Channel closed before any frame: the capture was dropped.
+        let first = rx.recv().map_err(|_| "export cancelled".to_string())?;
+        control.check_cancelled()?;
+        let dimensions = validate_export_frames(std::slice::from_ref(&first), border)?;
+        let width = validated_gif_width(dimensions, config.cap_width)?;
+        let (collector, writer) =
+            gifski::new(gifski_settings(width)).map_err(|e| format!("gifski init: {}", e))?;
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+            .map_err(|e| format!("create {:?}: {}", part_path, e))?;
+        let mut out = std::io::BufWriter::new(file);
+        let delay_ms = config.delay_ms;
+        let feed_control = control.clone();
+        let (written, fed) = std::thread::scope(|s| {
+            let feeder = s.spawn(move || -> Result<(Vec<PngFrame>, usize), String> {
+                let control = feed_control;
+                let mut retained = Vec::new();
+                let mut next = Some(first);
+                let mut idx = 0usize;
+                let result = loop {
+                    let frame = match next.take() {
+                        Some(frame) => frame,
+                        None => match rx.recv() {
+                            Ok(frame) => frame,
+                            Err(_) => break Ok(()), // capture finished (or dropped)
+                        },
+                    };
+                    if let Err(error) = control.check_cancelled() {
+                        break Err(error);
+                    }
+                    let img = match decode_one_frame(&frame, idx, border) {
+                        Ok(img) => img,
+                        Err(error) => break Err(error),
+                    };
+                    if let Err(error) = collector.add_frame_rgba(idx, img, gif_pts(idx, delay_ms)) {
+                        break Err(format!("frame {} add: {}", idx, error));
+                    }
+                    if retain {
+                        retained.push(frame);
+                    } else {
+                        // ITER-070: gifski has it; free its queue budget.
+                        let len = frame.bytes.len() as u64;
+                        drop(frame);
+                        queued.fetch_sub(len, Ordering::AcqRel);
+                    }
+                    idx += 1;
+                };
+                drop(collector); // signals the writer to finalise
+                result.map(|_| (retained, idx))
+            });
+            let written = writer.write(
+                &mut out,
+                &mut GifProgress {
+                    control: control.clone(),
+                    phase: "encode-gif-attempt-1".to_string(),
+                    completed: 0,
+                    total,
+                },
+            );
+            let fed = feeder
+                .join()
+                .unwrap_or_else(|_| Err("streaming GIF feeder panicked".to_string()));
+            (written, fed)
+        });
+        control.check_cancelled()?;
+        let (retained, count) = fed?;
+        written.map_err(|e| format!("gifski write: {}", e))?;
+        if count != total {
+            return Err(format!(
+                "incomplete export capture: encoded {} of {} frames",
+                count, total
+            ));
+        }
+        let file = out
+            .into_inner()
+            .map_err(|e| format!("write {:?}: {}", part_path, e.error()))?;
+        file.sync_all()
+            .map_err(|e| format!("sync {:?}: {}", part_path, e))?;
+        let size = file
+            .metadata()
+            .map_err(|e| format!("stat {:?}: {}", part_path, e))?
+            .len();
+        Ok(StreamedGif {
+            part_path: part_path.clone(),
+            frames: count,
+            size,
+            width,
+            retained,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&part_path);
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -1428,12 +2089,10 @@ fn is_remembered(queue: &Mutex<VecDeque<String>>, job_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn atomic_write_output(
-    path: &PathBuf,
-    bytes: &[u8],
-    control: &ExportControl,
-) -> Result<(), String> {
-    control.check_cancelled()?;
+/// Hidden sibling temp file for `path` (`.<name>.<pid>.<seq>.part`), with the
+/// destination directory created.  Shared by `atomic_write_output` and the
+/// streaming GIF encoder (ITER-053), which writes the `.part` during capture.
+fn output_part_path(path: &PathBuf) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1444,12 +2103,57 @@ fn atomic_write_output(
         .and_then(|name| name.to_str())
         .ok_or_else(|| "export destination has no valid file name".to_string())?;
     let sequence = OUTPUT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let part_path = parent.join(format!(
+    Ok(parent.join(format!(
         ".{}.{}.{}.part",
         file_name,
         std::process::id(),
         sequence
-    ));
+    )))
+}
+
+/// Commit a fully written + synced `.part` over `path`: the RUNNING →
+/// COMMITTING transition (after which cancel reports false), rename, then
+/// directory fsync.  The caller removes the `.part` on error.
+fn commit_output_part(
+    part_path: &PathBuf,
+    path: &PathBuf,
+    control: &ExportControl,
+) -> Result<(), String> {
+    control.begin_commit()?;
+    if let Err(error) = fs::rename(part_path, path) {
+        let _ = control.state.compare_exchange(
+            JOB_COMMITTING,
+            JOB_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        return Err(format!("rename {:?} to {:?}: {}", part_path, path, error));
+    }
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("sync export directory {:?}: {}", parent, e))?;
+    }
+    // ITER-068 sidecar, here so the streamed GIF commit (ITER-053) records
+    // one too, not only atomic_write_output.
+    let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    write_resume_sidecar(path, bytes);
+    control.emit("write", 1, 1);
+    Ok(())
+}
+
+fn atomic_write_output(
+    path: &PathBuf,
+    bytes: &[u8],
+    control: &ExportControl,
+) -> Result<(), String> {
+    control.check_cancelled()?;
+    let part_path = output_part_path(path)?;
 
     if let Ok(mut parts) = live_parts().lock() {
         parts.insert(part_path.clone());
@@ -1466,23 +2170,7 @@ fn atomic_write_output(
         file.sync_all()
             .map_err(|e| format!("sync {:?}: {}", part_path, e))?;
         drop(file);
-        control.begin_commit()?;
-        if let Err(error) = fs::rename(&part_path, path) {
-            let _ = control.state.compare_exchange(
-                JOB_COMMITTING,
-                JOB_RUNNING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            return Err(format!("rename {:?} to {:?}: {}", part_path, path, error));
-        }
-        #[cfg(unix)]
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|e| format!("sync export directory {:?}: {}", parent, e))?;
-        write_resume_sidecar(path, bytes.len() as u64);
-        control.emit("write", 1, 1);
-        Ok(())
+        commit_output_part(&part_path, path, control)
     })();
 
     if result.is_err() {
@@ -1528,7 +2216,17 @@ fn register_export(
     app: tauri::AppHandle,
     job_id: Option<String>,
 ) -> (ExportControl, ExportRegistration) {
-    let state = Arc::new(AtomicU8::new(JOB_RUNNING));
+    register_export_state(app, job_id, Arc::new(AtomicU8::new(JOB_RUNNING)))
+}
+
+/// `register_export` with a caller-supplied state: a streaming GIF job
+/// (ITER-053) registers the state its encoder thread already watches, so a
+/// cancel during finish aborts the running gifski encode.
+fn register_export_state(
+    app: tauri::AppHandle,
+    job_id: Option<String>,
+    state: Arc<AtomicU8>,
+) -> (ExportControl, ExportRegistration) {
     if let Some(id) = &job_id {
         let _ = take_remembered(
             COMMITTED_EXPORT_JOBS.get_or_init(|| Mutex::new(VecDeque::new())),
@@ -1601,8 +2299,18 @@ fn cancel_export(job_id: String) -> bool {
     true
 }
 
+/// `gif_stream` (ITER-053, optional): the GIF job's encode settings.  When
+/// present the gifski encode starts now, on its own thread, and consumes
+/// frames as they are pushed; `finish_gif_export` then only waits for the
+/// tail.  Absent → frames are staged and encoded at finish, as before (the
+/// GUI path, MP4, older frontends).
 #[tauri::command]
-fn begin_export_capture(job_id: String, total: usize, label: Option<String>) -> Result<(), String> {
+fn begin_export_capture(
+    job_id: String,
+    total: usize,
+    gif_stream: Option<GifStreamConfig>,
+    label: Option<String>,
+) -> Result<(), String> {
     if job_id.trim().is_empty() {
         return Err("jobId must not be empty".into());
     }
@@ -1625,12 +2333,14 @@ fn begin_export_capture(job_id: String, total: usize, label: Option<String>) -> 
     ) {
         return Err("export cancelled".into());
     }
-    let capture = StagedExport {
+    let mut capture = StagedExport {
         expected_frames: total,
-        frames: Vec::with_capacity(total),
+        received: 0,
+        frames: if gif_stream.is_none() { Vec::with_capacity(total) } else { Vec::new() },
         dimensions: None,
-        total_pixels: 0,
         total_bytes: 0,
+        total_raw_bytes: 0,
+        stream: None,
     };
     let mut captures = EXPORT_CAPTURES
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1644,6 +2354,36 @@ fn begin_export_capture(job_id: String, total: usize, label: Option<String>) -> 
             "too many concurrent export captures: limit is {}",
             MAX_CONCURRENT_CAPTURES
         ));
+    }
+    if let Some(config) = gif_stream {
+        let part_path = output_part_path(&PathBuf::from(&config.path))?;
+        // ITER-059's abort sweep must see the streamed .part too: it lives
+        // for the whole capture (ITER-053 gotcha a).
+        if let Ok(mut parts) = live_parts().lock() {
+            parts.insert(part_path.clone());
+        }
+        let state = Arc::new(AtomicU8::new(JOB_RUNNING));
+        let control = ExportControl {
+            state: state.clone(),
+            app: None,
+            job_id: Some(job_id.clone()),
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<PngFrame>();
+        let thread_config = config.clone();
+        let queued = Arc::new(AtomicU64::new(0));
+        let thread_queued = queued.clone();
+        let handle = std::thread::Builder::new()
+            .name("gif-stream".into())
+            .spawn(move || run_gif_stream(rx, thread_config, total, part_path, control, thread_queued))
+            .map_err(|e| format!("spawn GIF stream encoder: {}", e))?;
+        capture.stream = Some(GifStream {
+            config,
+            tx: Some(tx),
+            state,
+            handle: Some(handle),
+            queued,
+            queue_caps: (MAX_TOTAL_COMPRESSED_FRAME_BYTES, MAX_TOTAL_RAW_FRAME_BYTES),
+        });
     }
     captures.insert(job_id, capture);
     Ok(())
@@ -1661,7 +2401,7 @@ async fn push_export_frame(job_id: String, index: usize, b64: String) -> Result<
         let bytes = general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| format!("frame {} b64: {}", index, e))?;
-        stage_export_frame(&job_id, index, bytes)
+        stage_export_frame(&job_id, index, PngFrame::png(bytes))
     })
     .await
     .map_err(|e| format!("frame staging worker failed: {}", e))?
@@ -1686,26 +2426,103 @@ async fn push_export_frame_raw(request: tauri::ipc::Request<'_>) -> Result<(), S
     let index: usize = header(&request, "x-index")?
         .parse()
         .map_err(|_| "invalid x-index header".to_string())?;
+    // ITER-052: `x-format: rgba` + `x-width`/`x-height` marks a straight
+    // RGBA8 body (headless getImageData capture); absent → PNG as before.
+    let rgba = match request.headers().get("x-format").map(|v| v.to_str()) {
+        None => None,
+        Some(Ok("png")) => None,
+        Some(Ok("rgba")) => {
+            let dim = |name: &str| -> Result<u32, String> {
+                header(&request, name)?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| format!("invalid {} header", name))
+            };
+            Some((dim("x-width")?, dim("x-height")?))
+        }
+        Some(_) => return Err("invalid x-format header".into()),
+    };
     let bytes = match request.body() {
         tauri::ipc::InvokeBody::Raw(bytes) => {
-            if bytes.len() as u64 > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
-                return Err(format!("frame {} payload exceeds export byte limit", index));
+            match rgba {
+                Some((width, height)) => check_raw_rgba_len(bytes.len(), width, height, index)?,
+                None => {
+                    if bytes.len() as u64 > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
+                        return Err(format!("frame {} payload exceeds export byte limit", index));
+                    }
+                }
             }
             bytes.clone()
         }
         _ => return Err("push_export_frame_raw expects a raw binary body".into()),
     };
-    tauri::async_runtime::spawn_blocking(move || stage_export_frame(&job_id, index, bytes))
+    let frame = PngFrame { bytes, rgba };
+    tauri::async_runtime::spawn_blocking(move || stage_export_frame(&job_id, index, frame))
         .await
         .map_err(|e| format!("frame staging worker failed: {}", e))?
 }
 
-/// Validate one PNG frame against the job's staged capture (order, declared
-/// total, consistent dimensions, pixel + byte budgets) and retain it.  Shared
-/// by the base64 and raw-body push commands.
-fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), String> {
+/// ITER-052: a raw frame must be exactly width×height×4 bytes and fit the
+/// per-frame pixel guard — checked before the IPC body is copied.
+fn check_raw_rgba_len(len: usize, width: u32, height: u32, index: usize) -> Result<(), String> {
+    let pixels = check_frame_pixels(width, height, index)?;
+    if len as u64 != pixels * 4 {
+        return Err(format!(
+            "frame {} raw RGBA is {} bytes, expected {}x{}x4 = {}",
+            index,
+            len,
+            width,
+            height,
+            pixels * 4
+        ));
+    }
+    Ok(())
+}
+
+/// Per-frame decompression-bomb guard (ITER-054): one frame's pixel count,
+/// never a running total.
+fn check_frame_pixels(width: u32, height: u32, index: usize) -> Result<u64, String> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| format!("frame {} pixel count overflow", index))?;
+    if pixels > MAX_FRAME_PIXELS {
+        return Err(format!(
+            "frame {} is {}x{} = {} pixels, exceeds the per-frame pixel limit {}",
+            index, width, height, pixels, MAX_FRAME_PIXELS
+        ));
+    }
+    Ok(pixels)
+}
+
+/// Validate one frame against the job's staged capture (order, declared
+/// total, consistent dimensions, retained-byte budgets) and retain it.  Shared
+/// by the base64 and raw-body push commands.  ITER-070: a non-retaining
+/// stream whose queue is full hands the frame back; wait (outside the
+/// captures lock, so the encoder, other jobs and cancel_export proceed) and
+/// retry.  A cancel drops the capture, so the retry fails as unknown.
+fn stage_export_frame(job_id: &str, index: usize, frame: PngFrame) -> Result<(), String> {
     touch_liveness();
-    let dimensions = png_dimensions(&bytes, index)?;
+    let mut frame = frame;
+    loop {
+        match try_stage_export_frame(job_id, index, frame)? {
+            None => return Ok(()),
+            Some(back) => {
+                frame = back;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// One attempt of `stage_export_frame`: `Ok(None)` = staged, `Ok(Some)` =
+/// the stream queue is full, try again later with the returned frame.
+fn try_stage_export_frame(
+    job_id: &str,
+    index: usize,
+    frame: PngFrame,
+) -> Result<Option<PngFrame>, String> {
+    let dimensions = frame.dimensions(index)?;
     let mut captures = EXPORT_CAPTURES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -1713,11 +2530,10 @@ fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), 
     let capture = captures
         .get_mut(job_id)
         .ok_or_else(|| format!("unknown export capture: {}", job_id))?;
-    if index != capture.frames.len() {
+    if index != capture.received {
         return Err(format!(
             "out-of-order frame: got index {}, expected {}",
-            index,
-            capture.frames.len()
+            index, capture.received
         ));
     }
     if index >= capture.expected_frames {
@@ -1736,39 +2552,84 @@ fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), 
     } else {
         capture.dimensions = Some(dimensions);
     }
-    let pixels = u64::from(dimensions.0)
-        .checked_mul(u64::from(dimensions.1))
-        .ok_or_else(|| format!("frame {} pixel count overflow", index))?;
-    let next_pixels = capture
-        .total_pixels
-        .checked_add(pixels)
-        .ok_or_else(|| "total decoded pixel count overflow".to_string())?;
-    if next_pixels > MAX_TOTAL_DECODED_PIXELS {
-        return Err(format!(
-            "export is too large: {} decoded pixels exceeds limit {}",
-            next_pixels, MAX_TOTAL_DECODED_PIXELS
-        ));
+    check_frame_pixels(dimensions.0, dimensions.1, index)?;
+    // ITER-054: PNG payloads count against the compressed-byte cap, raw
+    // RGBA (ITER-052) against the raw-byte cap — what is held, not what a
+    // decode would produce.  ITER-053: a streaming job without a byte target
+    // retains nothing (each frame is dropped once gifski has it), so its
+    // frames count against neither running total — ITER-070 bounds what is
+    // still queued for the encoder instead, below.
+    let retained = capture
+        .stream
+        .as_ref()
+        .map_or(true, |stream| stream.config.retains_frames());
+    let (mut next_bytes, mut next_raw_bytes) = (capture.total_bytes, capture.total_raw_bytes);
+    let len = if retained { frame.bytes.len() as u64 } else { 0 };
+    if frame.rgba.is_some() {
+        next_raw_bytes = next_raw_bytes
+            .checked_add(len)
+            .ok_or_else(|| "total raw frame byte count overflow".to_string())?;
+        if next_raw_bytes > MAX_TOTAL_RAW_FRAME_BYTES {
+            return Err(format!(
+                "raw frames are too large: {} bytes exceeds limit {} bytes; lower duration, FPS, or output size",
+                next_raw_bytes, MAX_TOTAL_RAW_FRAME_BYTES
+            ));
+        }
+    } else {
+        next_bytes = next_bytes
+            .checked_add(len)
+            .ok_or_else(|| "total compressed frame byte count overflow".to_string())?;
+        if next_bytes > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
+            return Err(format!(
+                "compressed frames are too large: {} bytes exceeds limit {} bytes",
+                next_bytes, MAX_TOTAL_COMPRESSED_FRAME_BYTES
+            ));
+        }
     }
-    let next_bytes = capture
-        .total_bytes
-        .checked_add(bytes.len() as u64)
-        .ok_or_else(|| "total compressed frame byte count overflow".to_string())?;
-    if next_bytes > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
-        return Err(format!(
-            "compressed frames are too large: {} bytes exceeds limit {} bytes",
-            next_bytes, MAX_TOTAL_COMPRESSED_FRAME_BYTES
-        ));
+    let mut reserved = 0;
+    if let Some(stream) = capture.stream.as_ref().filter(|_| !retained) {
+        let cap = if frame.rgba.is_some() { stream.queue_caps.1 } else { stream.queue_caps.0 };
+        let frame_len = frame.bytes.len() as u64;
+        // Serialised by the captures lock; the feeder only ever subtracts.
+        let queued = stream.queued.load(Ordering::Acquire);
+        match stream_queue_admit(queued, frame_len, cap, stream.is_running())? {
+            StreamAdmit::Send => {
+                stream.queued.fetch_add(frame_len, Ordering::AcqRel);
+                reserved = frame_len;
+            }
+            StreamAdmit::Wait => return Ok(Some(frame)),
+        }
     }
-    capture.total_pixels = next_pixels;
+    match &capture.stream {
+        // The encoder keeps retained frames itself, for the ladder.
+        Some(stream) => {
+            let sent = stream
+                .tx
+                .as_ref()
+                .ok_or_else(|| "GIF stream is closed".to_string())
+                .and_then(|tx| {
+                    tx.send(frame).map_err(|_| {
+                        "streaming GIF encoder stopped; finish or cancel the export for the cause"
+                            .to_string()
+                    })
+                });
+            if let Err(error) = sent {
+                stream.queued.fetch_sub(reserved, Ordering::AcqRel);
+                return Err(error);
+            }
+        }
+        None => capture.frames.push(frame),
+    }
     capture.total_bytes = next_bytes;
-    capture.frames.push(PngFrame { bytes });
-    let (staged, expected) = (capture.frames.len(), capture.expected_frames);
+    capture.total_raw_bytes = next_raw_bytes;
+    capture.received += 1;
+    let (staged, expected) = (capture.received, capture.expected_frames);
     drop(captures);
     progress_line(job_id, "capture", staged, expected);
-    Ok(())
+    Ok(None)
 }
 
-fn take_export_capture(job_id: &str) -> Result<Vec<PngFrame>, String> {
+fn take_export_capture(job_id: &str) -> Result<StagedExport, String> {
     let mut captures = EXPORT_CAPTURES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -1776,17 +2637,29 @@ fn take_export_capture(job_id: &str) -> Result<Vec<PngFrame>, String> {
     let capture = captures
         .get(job_id)
         .ok_or_else(|| format!("unknown export capture: {}", job_id))?;
-    if capture.frames.len() != capture.expected_frames {
+    if capture.received != capture.expected_frames {
         return Err(format!(
             "incomplete export capture: received {} of {} frames",
-            capture.frames.len(),
-            capture.expected_frames
+            capture.received, capture.expected_frames
         ));
     }
     Ok(captures
         .remove(job_id)
-        .expect("capture existed while lock was held")
-        .frames)
+        .expect("capture existed while lock was held"))
+}
+
+/// The cancellation state a streaming capture's encoder already watches
+/// (ITER-053), so `finish_gif_export` can register it before taking the
+/// capture — the same register-then-take order as the non-streaming path.
+fn capture_stream_state(job_id: &str) -> Option<Arc<AtomicU8>> {
+    EXPORT_CAPTURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?
+        .get(job_id)?
+        .stream
+        .as_ref()
+        .map(|stream| stream.state.clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1802,7 +2675,7 @@ struct ExportFrameDimensions {
 /// `width > 0`, frames get a palette-bg matte band of `width` px on all
 /// four sides before encoding.  v0.1.1 supports `style: "solid"` only;
 /// v0.1.2 will add `inner-line`, `passepartout`, and `deckle`.
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq)]
 #[serde(default)]
 struct BorderConfig {
     enabled: bool,
@@ -1857,7 +2730,7 @@ fn validate_export_frames(
     let mut output_dimensions = None;
     let mut total_output_pixels = 0_u64;
     for (index, frame) in frames.iter().enumerate() {
-        let dimensions = png_dimensions(&frame.bytes, index)?;
+        let dimensions = frame.dimensions(index)?;
         if let Some(expected) = first_dimensions {
             if dimensions != expected {
                 return Err(format!(
@@ -1892,18 +2765,12 @@ fn validate_export_frames(
             _ => dimensions,
         };
         output_dimensions = Some((output_width, output_height));
-        let frame_pixels = u64::from(output_width)
-            .checked_mul(u64::from(output_height))
-            .ok_or_else(|| format!("frame {} pixel count overflow", index))?;
+        // ITER-054: per-frame guard only; the encoders decode through a
+        // bounded window, so the total is not a memory figure any more.
+        let frame_pixels = check_frame_pixels(output_width, output_height, index)?;
         total_output_pixels = total_output_pixels
             .checked_add(frame_pixels)
             .ok_or_else(|| "total decoded pixel count overflow".to_string())?;
-        if total_output_pixels > MAX_TOTAL_DECODED_PIXELS {
-            return Err(format!(
-                "export is too large: {} decoded pixels exceeds limit {}",
-                total_output_pixels, MAX_TOTAL_DECODED_PIXELS
-            ));
-        }
     }
 
     let (width, height) = first_dimensions.expect("non-empty frames checked above");
@@ -1977,7 +2844,7 @@ fn decode_frame_payloads(frames: Vec<GifFrame>) -> Result<Vec<PngFrame>, String>
             ));
         }
         png_dimensions(&bytes, index)?;
-        decoded.push(PngFrame { bytes });
+        decoded.push(PngFrame::png(bytes));
     }
     Ok(decoded)
 }
@@ -2063,27 +2930,14 @@ async fn save_png(app: tauri::AppHandle, data_url: String) -> Result<String, Str
     }
 }
 
-/// Encode a recorded sequence of PNG frames as a single animated GIF using
-/// the `gifski` crate.  gifski produces ~30-50% smaller files than the
-/// previous `gif` crate path because it computes a SHARED palette across
-/// all frames (not one palette per frame) and uses error-diffusion
-/// dithering across the whole sequence.  Quality 100 is genuinely lossless
-/// for our use case (glyph art has ≤ ~20 unique colours).
-///
-/// `cap_width` resizes frames to that width with aspect ratio preserved
-/// (gifski handles the resize internally).  `None` keeps the source size.
-/// At Twitter's recommended 720 px wide for posts, kaneki drops from
-/// ~30 MB → ~6-8 MB without visible quality change on phone screens.
-/// Decode one base64-PNG frame to RGBA, applying the optional border.
+/// Decode one staged frame (PNG, or raw RGBA since ITER-052) to RGBA, applying the optional border.
 /// Pure per-frame function — safe to run on any thread (EXPORT-OPT-1).
 fn decode_one_frame(
     frame: &PngFrame,
     idx: usize,
     border: Option<&BorderConfig>,
 ) -> Result<imgref::ImgVec<rgb::RGBA8>, String> {
-    let mut img = image::load_from_memory_with_format(&frame.bytes, image::ImageFormat::Png)
-        .map_err(|e| format!("frame {} decode: {}", idx, e))?
-        .to_rgba8();
+    let mut img = frame.to_rgba8(idx)?;
     if let Some(b) = border {
         img = apply_border(img, b);
     }
@@ -2100,159 +2954,198 @@ fn decode_one_frame(
     Ok(imgref::ImgVec::new(pixels, w, h))
 }
 
-/// EXPORT-OPT-1 (2026-06-10): parallel frame decode with std scoped
-/// threads (no new deps).  The old sequential base64→PNG→RGBA loop was
-/// the single-threaded head of every export: ~40-60 % of GIF encode
-/// wall-time on a 150-frame loop, while 7+ cores idled.  Each frame is
-/// an independent pure decode, so this is bit-exact by construction —
-/// frame N's bytes are identical regardless of which thread decoded it.
-fn decode_frames_parallel(
-    frames: &[PngFrame],
-    delay_ms: u32,
-    border: Option<&BorderConfig>,
-    control: &ExportControl,
-) -> Result<Vec<(imgref::ImgVec<rgb::RGBA8>, f64)>, String> {
-    let n = frames.len();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    // BUG-009: leave 2 cores free — a GUI export runs this while the
-    // webview's draw loop is live (the loop resumes during encode since
-    // v0.1.7); saturating every core starves the UI thread and the app
-    // reads as frozen even though the encode is progressing.
-    let threads = std::thread::available_parallelism()
-        .map(|p| p.get().saturating_sub(2).max(2))
-        .unwrap_or(4)
-        .min(n);
-    let chunk = n.div_ceil(threads);
-
-    let mut slots: Vec<Option<Result<imgref::ImgVec<rgb::RGBA8>, String>>> = Vec::with_capacity(n);
-    slots.resize_with(n, || None);
-
-    std::thread::scope(|s| {
-        for (t, slot_chunk) in slots.chunks_mut(chunk).enumerate() {
-            let base = t * chunk;
-            s.spawn(move || {
-                for (i, slot) in slot_chunk.iter_mut().enumerate() {
-                    let idx = base + i;
-                    *slot = Some(
-                        control
-                            .check_cancelled()
-                            .and_then(|_| decode_one_frame(&frames[idx], idx, border)),
-                    );
-                }
-            });
-        }
-    });
-
-    let mut out = Vec::with_capacity(n);
-    for (idx, slot) in slots.into_iter().enumerate() {
-        let img = slot.ok_or_else(|| format!("frame {}: decode slot empty", idx))??;
-        let pts = (idx as f64) * (delay_ms as f64) / 1000.0;
-        out.push((img, pts));
-    }
-    control.check_cancelled()?;
-    control.emit("decode", n, n);
-    Ok(out)
+/// gifski progress hook: forwards per-frame progress and turns a cancelled
+/// job into `false`, which makes gifski stop with `Error::Aborted`.
+struct GifProgress {
+    control: ExportControl,
+    phase: String,
+    completed: usize,
+    total: usize,
 }
 
-/// Encode pre-decoded frames with gifski.  Split out of
-/// `encode_gif_gifski` so the twitter-fit ladder can decode ONCE and
-/// re-encode at each cap width (EXPORT-OPT-2) — previously every ladder
-/// rung re-decoded all frames from base64.  Frames are cloned one at a
-/// time into the collector (gifski wants owned ImgVecs); transient peak
-/// is the decoded set + one frame.
-fn encode_gif_gifski_decoded(
-    decoded: &[(imgref::ImgVec<rgb::RGBA8>, f64)],
-    cap_width: Option<u32>,
-    control: &ExportControl,
-    progress_phase: &str,
-) -> Result<Vec<u8>, String> {
-    if decoded.is_empty() {
-        return Err("no frames provided".into());
+impl gifski::progress::ProgressReporter for GifProgress {
+    fn increase(&mut self) -> bool {
+        self.completed = (self.completed + 1).min(self.total);
+        self.control.emit(&self.phase, self.completed, self.total);
+        self.control.state.load(Ordering::Acquire) != JOB_CANCELLED
     }
-    let settings = gifski::Settings {
-        width: cap_width,
+    fn done(&mut self, _msg: &str) {}
+}
+
+/// Presentation timestamp gifski gets for frame `idx` (seconds).
+fn gif_pts(idx: usize, delay_ms: u32) -> f64 {
+    (idx as f64) * (delay_ms as f64) / 1000.0
+}
+
+/// gifski settings shared by every GIF encode.  Quality 100 is genuinely
+/// lossless for our use case (glyph art has ≤ ~20 unique colours).
+fn gifski_settings(width: u32) -> gifski::Settings {
+    gifski::Settings {
+        width: Some(width),
         height: None,
         quality: 100,
         fast: false,
         repeat: gif::Repeat::Infinite,
-    };
-    let (collector, writer) = gifski::new(settings).map_err(|e| format!("gifski init: {}", e))?;
-
-    struct Progress {
-        control: ExportControl,
-        phase: String,
-        completed: usize,
-        total: usize,
     }
-    impl gifski::progress::ProgressReporter for Progress {
-        fn increase(&mut self) -> bool {
-            self.completed = (self.completed + 1).min(self.total);
-            self.control.emit(&self.phase, self.completed, self.total);
-            self.control.state.load(Ordering::Acquire) != JOB_CANCELLED
-        }
-        fn done(&mut self, _msg: &str) {}
-    }
+}
 
-    // Collector and writer must run concurrently — the collector
-    // quantises each frame as it arrives, the writer assembles the final
-    // palette + LZW stream after the collector closes.  Scoped thread so
-    // the collector can borrow `decoded`.
+/// Encode staged frames as one animated GIF with the `gifski` crate.
+/// gifski produces ~30-50% smaller files than the old `gif` crate path
+/// because it computes a SHARED palette across all frames and uses
+/// error-diffusion dithering across the whole sequence.  `width` is the
+/// output width (gifski resizes internally, aspect preserved; at Twitter's
+/// 720 px kaneki drops from ~30 MB → ~6-8 MB).
+///
+/// ITER-054 (F13): bounded decode-ahead, the ITER-040 MP4 pattern.  K
+/// workers decode frames (`decode_one_frame`, pure per frame) into a
+/// sync_channel; a feeder thread hands them to the collector strictly in
+/// index order through a reorder buffer, so gifski sees exactly the
+/// sequence the old decode-everything-first loop fed it and the output is
+/// bit-identical.  A window of 2K+2 frames caps how far workers run ahead,
+/// so at most a handful of decoded frames exist at once instead of the whole
+/// set (373 MB for 120 × 760×1024).  The twitter-fit ladder re-decodes per
+/// rung — a raw RGBA "decode" is one copy, a PNG set ~0.3 s.
+fn encode_gif_gifski_frames(
+    frames: &[PngFrame],
+    delay_ms: u32,
+    border: Option<&BorderConfig>,
+    width: u32,
+    control: &ExportControl,
+    progress_phase: &str,
+) -> Result<Vec<u8>, String> {
+    let n = frames.len();
+    if n == 0 {
+        return Err("no frames provided".into());
+    }
+    let (collector, writer) =
+        gifski::new(gifski_settings(width)).map_err(|e| format!("gifski init: {}", e))?;
+
+    // BUG-009: leave 2 cores free — a GUI export runs this while the
+    // webview's draw loop is live (the loop resumes during encode since
+    // v0.1.7); saturating every core starves the UI thread.
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get().saturating_sub(2).max(1))
+        .unwrap_or(2)
+        .min(n);
+    let window = 2 * workers + 2;
+    let next_index = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    // Frames handed to gifski; a worker holding index >= fed + window waits
+    // here until the feeder catches up.
+    let fed = (Mutex::new(0usize), std::sync::Condvar::new());
+    let (tx, rx) =
+        std::sync::mpsc::sync_channel::<(usize, Result<imgref::ImgVec<rgb::RGBA8>, String>)>(window);
+
     let mut output: Vec<u8> = Vec::new();
     std::thread::scope(|s| -> Result<(), String> {
-        let handle = s.spawn(move || -> Result<(), String> {
-            for (idx, (imgvec, pts)) in decoded.iter().enumerate() {
-                control.check_cancelled()?;
-                collector
-                    .add_frame_rgba(idx, imgvec.clone(), *pts)
-                    .map_err(|e| format!("frame {} add: {}", idx, e))?;
-            }
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (next_index, stop, fed) = (&next_index, &stop, &fed);
+            s.spawn(move || loop {
+                let idx = next_index.fetch_add(1, Ordering::Relaxed);
+                if idx >= n {
+                    return;
+                }
+                {
+                    let mut done = fed.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while idx >= *done + window && !stop.load(Ordering::Relaxed) {
+                        done = fed.1.wait(done).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                // A panic here would leave the feeder waiting on this index
+                // forever; turn it into an ordinary per-frame error instead.
+                let result = control.check_cancelled().and_then(|_| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decode_one_frame(&frames[idx], idx, border)
+                    }))
+                    .unwrap_or_else(|_| Err(format!("frame {} decode panicked", idx)))
+                });
+                let failed = result.is_err();
+                if tx.send((idx, result)).is_err() || failed {
+                    return;
+                }
+            });
+        }
+        drop(tx);
+
+        // Collector and writer must run concurrently: gifski quantises frames
+        // as they arrive and the writer streams them out, so the feeder gets
+        // its own thread and the writer runs on this one.
+        let (stop_ref, fed_ref) = (&stop, &fed);
+        let feeder = s.spawn(move || -> Result<(), String> {
+            // ITER-070: release parked workers even if this thread panics —
+            // the guard's Drop runs on unwind, an inline block would not.
+            let release = ReleaseGifWorkers { stop: stop_ref, fed: fed_ref };
+            let mut pending: std::collections::BTreeMap<
+                usize,
+                Result<imgref::ImgVec<rgb::RGBA8>, String>,
+            > = std::collections::BTreeMap::new();
+            let result = (|| -> Result<(), String> {
+                for idx in 0..n {
+                    let img = loop {
+                        if let Some(ready) = pending.remove(&idx) {
+                            break ready?;
+                        }
+                        let (got, result) = rx
+                            .recv()
+                            .map_err(|_| format!("frame {} decode worker exited", idx))?;
+                        pending.insert(got, result);
+                    };
+                    control.check_cancelled()?;
+                    collector
+                        .add_frame_rgba(idx, img, gif_pts(idx, delay_ms))
+                        .map_err(|e| format!("frame {} add: {}", idx, e))?;
+                    *fed_ref.0.lock().unwrap_or_else(|e| e.into_inner()) = idx + 1;
+                    fed_ref.1.notify_all();
+                }
+                Ok(())
+            })();
             drop(collector); // signals the writer to finalise
-            Ok(())
+            drop(release);
+            drop(rx);
+            result
         });
-        writer
-            .write(
-                &mut output,
-                &mut Progress {
-                    control: control.clone(),
-                    phase: progress_phase.to_string(),
-                    completed: 0,
-                    total: decoded.len(),
-                },
-            )
-            .map_err(|e| format!("gifski write: {}", e))?;
-        handle
+        let written = writer.write(
+            &mut output,
+            &mut GifProgress {
+                control: control.clone(),
+                phase: progress_phase.to_string(),
+                completed: 0,
+                total: n,
+            },
+        );
+        let feed = feeder
             .join()
-            .map_err(|_| "gifski collector thread panicked".to_string())??;
-        Ok(())
+            .map_err(|_| "gifski feeder thread panicked".to_string())?;
+        control.check_cancelled()?;
+        feed?;
+        written.map_err(|e| format!("gifski write: {}", e))
     })?;
 
     control.check_cancelled()?;
-
     Ok(output)
 }
 
-fn encode_gif_gifski(
-    frames: &[PngFrame],
-    delay_ms: u32,
-    cap_width: Option<u32>,
-    border: Option<&BorderConfig>,
-    control: &ExportControl,
-) -> Result<Vec<u8>, String> {
-    let dimensions = validate_export_frames(frames, border)?;
-    let encode_width = validated_gif_width(dimensions, cap_width)?;
-    let t0 = std::time::Instant::now();
-    let decoded = decode_frames_parallel(frames, delay_ms, border, control)?;
-    let t_decode = t0.elapsed();
-    let out = encode_gif_gifski_decoded(&decoded, Some(encode_width), control, "encode-gif")?;
-    eprintln!(
-        "encode: {} frames — decode {:.0}ms (parallel) + gifski {:.0}ms",
-        frames.len(),
-        t_decode.as_secs_f64() * 1000.0,
-        t0.elapsed().as_secs_f64() * 1000.0 - t_decode.as_secs_f64() * 1000.0,
-    );
-    Ok(out)
+/// Releases every decode worker parked on the window (or about to park) in
+/// `encode_gif_gifski_frames`.  The flag is set under the mutex so a worker
+/// can't check it, miss this notify, and park forever (lost wakeup).  A
+/// Drop guard (ITER-070) so a feeder panic still runs it.
+struct ReleaseGifWorkers<'a> {
+    stop: &'a AtomicBool,
+    fed: &'a (Mutex<usize>, std::sync::Condvar),
+}
+
+impl Drop for ReleaseGifWorkers<'_> {
+    fn drop(&mut self) {
+        {
+            let _g = self.fed.0.lock().unwrap_or_else(|e| e.into_inner());
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        self.fed.1.notify_all();
+    }
 }
 
 /// Adaptive Twitter-fit wrapper.  ITER-025 surfaced that the GUI's
@@ -2263,11 +3156,14 @@ fn encode_gif_gifski(
 /// driver-level safety-net pipeline that proved 53 / 53 rescue on the
 /// ghost-I.gif 64-variant batch (see ITER-024 / ITER-025).
 ///
-/// `target_max_bytes`: when `Some(N)`, the function tries `cap_width`
-/// first, then `[600, 540, 480, 420, 360]` (skipping any caps ≥ the
-/// initial cap), and returns the first buffer ≤ N.  If all six caps
-/// overshoot the target, returns an error rather than silently producing an
-/// upload that violates the requested hard limit.
+/// `target_max_bytes`: when `Some(N)`, the function encodes at `cap_width`
+/// first; on overshoot it predicts the width that fits from that pass's
+/// size (`twitter_fit_width`, ITER-051), encodes once there, and if that
+/// still overshoots re-predicts from the second pass for one correction
+/// rung — at most three full gifski passes, never below
+/// `TWITTER_FIT_MIN_WIDTH`.  Returns the first buffer ≤ N; if none fits,
+/// returns an error rather than silently producing an upload that violates
+/// the requested hard limit.
 /// When `None`, behaves identically to `encode_gif_gifski` (single try).
 fn encode_gif_gifski_adaptive(
     frames: &[PngFrame],
@@ -2283,19 +3179,24 @@ fn encode_gif_gifski_adaptive(
     control.check_cancelled()?;
     control.emit("validate", frames.len(), frames.len());
 
-    // EXPORT-OPT-2 (2026-06-10): decode ONCE for the entire ladder.
-    // Previously every rung re-ran the full base64→PNG→RGBA decode of
-    // all frames; a 5-rung walk decoded the set 6 times. gifski resizes
-    // internally from cap_width, so one decoded set serves every rung.
+    // ITER-054: no shared decoded set any more (EXPORT-OPT-2 decoded once for
+    // the whole ladder and held all of it); each pass decodes through the
+    // bounded window, which costs a raw-RGBA copy or ~0.3 s of PNG decode
+    // per extra rung, and only when target_max_bytes is set.
     let t0 = std::time::Instant::now();
-    let decoded = decode_frames_parallel(frames, delay_ms, border, control)?;
+    let single = encode_gif_gifski_frames(
+        frames,
+        delay_ms,
+        border,
+        first_width,
+        control,
+        "encode-gif-attempt-1",
+    )?;
     eprintln!(
-        "encode: {} frames decoded once in {:.0}ms (parallel, shared across ladder)",
+        "encode: {} frames decoded (bounded window) + gifski in {:.0}ms",
         frames.len(),
         t0.elapsed().as_secs_f64() * 1000.0,
     );
-    let single =
-        encode_gif_gifski_decoded(&decoded, Some(first_width), control, "encode-gif-attempt-1")?;
     let target = match target_max_bytes {
         Some(t) if t > 0 => t,
         _ => return Ok(single),
@@ -2309,52 +3210,119 @@ fn encode_gif_gifski_adaptive(
         );
         return Ok(single);
     }
-    // Try shrink ladder.
+    twitter_fit_shrink(
+        frames,
+        delay_ms,
+        border,
+        dimensions,
+        first_width,
+        single.len(),
+        target,
+        control,
+    )
+}
+
+/// Twitter-fit passes 2-3 after a first pass at `first_width` measured
+/// `first_size` bytes > `target`.  Split out of `encode_gif_gifski_adaptive`
+/// so the streaming encoder (ITER-053), whose first pass is already on disk,
+/// can run the same ladder from its retained frames.  Returns the first
+/// buffer ≤ target, or the "cannot meet target size" error.
+fn twitter_fit_shrink(
+    frames: &[PngFrame],
+    delay_ms: u32,
+    border: Option<&BorderConfig>,
+    dimensions: ExportFrameDimensions,
+    first_width: u32,
+    first_size: usize,
+    target: u64,
+    control: &ExportControl,
+) -> Result<Vec<u8>, String> {
+    // ITER-051 (F14): predict instead of walking the fixed 600/540/480/420/360
+    // ladder.  GIF bytes scale ~linearly with pixel count at fixed content
+    // (ITER-026 log: 18.54 MB × (600/720)² = 12.87 MB predicted vs 12.82 MB
+    // measured), and pixels scale with width², so one pass gives the width.
+    // Below ~400 px the linear model over-predicts (LZW + palette do better),
+    // which errs toward fitting.
     let initial_cap = first_width;
-    let ladder: [u32; 5] = [600, 540, 480, 420, 360];
-    let mut best = single;
+    let mut best = first_size;
+    let pixels = |width: u32| -> f64 {
+        let height = (u64::from(dimensions.output_height) * u64::from(width))
+            .div_ceil(u64::from(dimensions.output_width));
+        frames.len() as f64 * f64::from(width) * height as f64
+    };
     eprintln!(
-        "twitter-fit: cap={} size={:.2}MB > target {:.2}MB — entering shrink ladder",
+        "twitter-fit: cap={} size={:.2}MB ({:.3} B/px) > target {:.2}MB — entering shrink ladder",
         initial_cap,
-        best.len() as f64 / 1024.0 / 1024.0,
+        best as f64 / 1024.0 / 1024.0,
+        best as f64 / pixels(initial_cap),
         target as f64 / 1024.0 / 1024.0,
     );
-    for (attempt_index, cap) in ladder.iter().enumerate() {
+    // Pass 2: predicted width × 0.96 (≈8 % byte headroom).  Measured B/px
+    // drift between 720 px and the fitted width: +6.4 % on worm-move.gif,
+    // +1.9 % on cream-paper, -0.4 % on the ITER-026 sample.  Pass 3
+    // (correction): re-predict from pass 2's own size × 0.97 — B/px measured
+    // that close to the answer moves < 1 %, and there is no fourth pass.
+    let mut width = initial_cap;
+    let mut size = best;
+    for (attempt, margin) in [(2usize, 0.96f64), (3, 0.97)] {
         control.check_cancelled()?;
-        if *cap >= initial_cap {
-            continue;
-        }
-        let phase = format!("encode-gif-attempt-{}", attempt_index + 2);
-        let encode_width = validated_gif_width(dimensions, Some(*cap))?;
-        let buf = encode_gif_gifski_decoded(&decoded, Some(encode_width), control, &phase)?;
+        let Some(next) = twitter_fit_width(width, size, target, margin) else {
+            break;
+        };
+        let phase = format!("encode-gif-attempt-{}", attempt);
+        let encode_width = validated_gif_width(dimensions, Some(next))?;
+        let buf =
+            encode_gif_gifski_frames(frames, delay_ms, border, encode_width, control, &phase)?;
         eprintln!(
-            "twitter-fit: cap={} size={:.2}MB",
-            cap,
+            "twitter-fit: predicted cap={} size={:.2}MB ({:.3} B/px)",
+            next,
             buf.len() as f64 / 1024.0 / 1024.0,
+            buf.len() as f64 / pixels(next),
         );
-        let fits = (buf.len() as u64) <= target;
-        if buf.len() < best.len() {
-            best = buf;
-        }
-        if fits {
-            eprintln!("twitter-fit: cap={} ✓", cap);
-            return Ok(best);
+        width = next;
+        size = buf.len();
+        best = best.min(buf.len());
+        // A fitting pass is also the smallest so far: every earlier one
+        // was over the target.
+        if (buf.len() as u64) <= target {
+            eprintln!("twitter-fit: cap={} ✓", next);
+            return Ok(buf);
         }
     }
     Err(format!(
         "GIF cannot meet target size: smallest attempt is {} bytes, target is {} bytes",
-        best.len(),
+        best,
         target
     ))
+}
+
+/// Narrowest width the Twitter-fit predictor will try (the old ladder's
+/// last rung); below it glyph cells stop being legible.
+const TWITTER_FIT_MIN_WIDTH: u32 = 360;
+
+/// Width predicted to bring a GIF that measured `bytes` at `width` under
+/// `target`, assuming bytes ∝ width² (pixels at a fixed aspect), scaled by
+/// `margin` and rounded down to even.  Clamped to
+/// [`TWITTER_FIT_MIN_WIDTH`, largest even width < `width`]; `None` when that
+/// range is empty, i.e. there is nothing narrower left to try.
+fn twitter_fit_width(width: u32, bytes: usize, target: u64, margin: f64) -> Option<u32> {
+    let upper = width.saturating_sub(1) & !1;
+    if upper < TWITTER_FIT_MIN_WIDTH || bytes == 0 {
+        return None;
+    }
+    let predicted = f64::from(width) * (target as f64 / bytes as f64).sqrt() * margin;
+    let predicted = (predicted.max(0.0) as u32) & !1;
+    Some(predicted.clamp(TWITTER_FIT_MIN_WIDTH, upper))
 }
 
 /// Save a recorded sequence of PNG frames as a single animated GIF.
 /// Pops the native save dialog and writes the encoded bytes there.
 /// `cap_width` (optional) resizes frames before encoding for smaller
 /// output files (Twitter's 15 MB GIF limit, etc.).
-/// `target_max_bytes` (optional, ITER-026): when set, walks a shrink
-/// ladder (720 → 600 → 540 → 480 → 420 → 360) until output ≤ N.  The
-/// GUI's `Export GIF (Twitter-fit)` button passes 15 MB.
+/// `target_max_bytes` (optional, ITER-026): when set, shrinks the width
+/// until output ≤ N — predicted from the first pass, plus at most one
+/// correction (ITER-051).  The GUI's `Export GIF (Twitter-fit)` button
+/// passes 15 MB.
 #[tauri::command]
 async fn save_gif_real(
     app: tauri::AppHandle,
@@ -2450,11 +3418,58 @@ fn mp4_sample_timing(index: usize, frame_duration: u32) -> (u64, u32) {
     (index as u64 * u64::from(frame_duration), frame_duration)
 }
 
+/// MP4 rate-control profile (F11 / ITER-050).
+///   - `Upload` (default): openh264 bitrate RC at `mp4_upload_bitrate`, frame
+///     skipping off — a few MB for a typical loop, sized for social uploads.
+///   - `Archive`: the pre-v0.2 path, RC Off = fixed QP 26 (openh264's
+///     SVC_QUALITY_BASE_QP).  Near-lossless for glyph art and bit-identical
+///     to v0.1.x output, at ~30-60 Mbps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mp4Quality {
+    Upload,
+    Archive,
+}
+
+impl Mp4Quality {
+    /// `None` / empty → `Upload`.  Unknown values are an error rather than a
+    /// silent fallback, so a typo in a batch manifest can't change the output.
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("upload") => Ok(Self::Upload),
+            Some("archive") => Ok(Self::Archive),
+            Some(other) => Err(format!(
+                "unknown mp4 quality {:?} (expected \"upload\" or \"archive\")",
+                other
+            )),
+        }
+    }
+}
+
+/// ITER-070: clap value parser for `render --mp4-quality`, so the CLI
+/// accepts exactly the spellings the manifest and MCP accept (any case,
+/// surrounding whitespace) and hands the canonical name on.
+pub fn parse_mp4_quality_arg(value: &str) -> Result<String, String> {
+    Ok(match Mp4Quality::parse(Some(value))? {
+        Mp4Quality::Upload => "upload".to_string(),
+        Mp4Quality::Archive => "archive".to_string(),
+    })
+}
+
+/// Upload-mode target bitrate: 5 Mbps up to 1080p, scaled by pixel count
+/// above that so 1440p/4K exports don't get starved.
+fn mp4_upload_bitrate(width: u32, height: u32) -> u32 {
+    const BASE_BPS: u64 = 5_000_000;
+    const BASE_PIXELS: u64 = 1920 * 1080;
+    let pixels = (u64::from(width) * u64::from(height)).max(BASE_PIXELS);
+    (BASE_BPS * pixels / BASE_PIXELS).min(u64::from(u32::MAX)) as u32
+}
+
 fn encode_mp4_h264(
     frames: &[PngFrame],
     fps: u32,
     cap_width: Option<u32>,
     border: Option<&BorderConfig>,
+    quality: Mp4Quality,
     control: &ExportControl,
 ) -> Result<Vec<u8>, String> {
     use mp4::{AvcConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig};
@@ -2497,19 +3512,30 @@ fn encode_mp4_h264(
         ));
     }
 
-    // Configure the encoder explicitly:
-    //   - Rate control = Off — never skip frames.  Glyph art has very low
-    //     inter-frame motion in static backgrounds; under default bitrate-
-    //     based RC openh264 was emitting zero NAL units for some frames,
-    //     producing a broken stream.  RC Off makes every encode() yield a
-    //     real slice NAL.
-    //   - Bitrate = 5 Mbps cap (still small for our content; usually
-    //     produces 1-2 MB output for a 90-frame loop).
-    //   - Max frame rate 30 — tells the encoder the playback target.
-    let cfg = EncoderConfig::new()
-        .max_frame_rate(FrameRate::from_hz(fps as f32))
-        .bitrate(BitRate::from_bps(5_000_000))
-        .rate_control_mode(RateControlMode::Off);
+    // Configure the encoder explicitly (F11 / ITER-050):
+    //   - Frame skipping OFF.  The "zero NAL units for some frames" breakage
+    //     that once forced RC Off was openh264 *skipping* frames to hold the
+    //     bitrate (the crate defaults `enable_skip_frame: true`).  With skip
+    //     off every encode() yields a slice; the "no slice NALs" check below
+    //     stays as the tripwire.
+    //   - Upload: bitrate RC at `mp4_upload_bitrate`.  Without skipping, RC
+    //     steers QP and can overshoot the target on high-entropy sources.
+    //   - Archive: RC Off = fixed QP 26 — the bitrate field is never read on
+    //     that path (ratectl.cpp WelsRcPictureInitDisable).  Kept verbatim so
+    //     archive output is bit-identical to v0.1.x.
+    //   - Max frame rate = the export fps — the playback target RC budgets
+    //     per-frame bits against.
+    let cfg = match quality {
+        Mp4Quality::Upload => EncoderConfig::new()
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            .bitrate(BitRate::from_bps(mp4_upload_bitrate(target_w, target_h)))
+            .rate_control_mode(RateControlMode::Bitrate)
+            .skip_frames(false),
+        Mp4Quality::Archive => EncoderConfig::new()
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            .bitrate(BitRate::from_bps(5_000_000))
+            .rate_control_mode(RateControlMode::Off),
+    };
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), cfg)
         .map_err(|e| format!("openh264 init: {}", e))?;
 
@@ -2537,10 +3563,7 @@ fn encode_mp4_h264(
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<YUVBuffer, String>)>(window);
 
     let preprocess = |idx: usize| -> Result<YUVBuffer, String> {
-        let dyn_img =
-            image::load_from_memory_with_format(&frames[idx].bytes, image::ImageFormat::Png)
-                .map_err(|e| format!("frame {} decode: {}", idx, e))?;
-        let mut rgba_img = dyn_img.into_rgba8();
+        let mut rgba_img = frames[idx].to_rgba8(idx)?;
         if let Some(b) = border {
             rgba_img = apply_border(rgba_img, b);
         }
@@ -2708,11 +3731,12 @@ fn encode_mp4_h264(
     })?;
 
     eprintln!(
-        "encode-mp4: {} frames decoded, preprocessed, and encoded in {:.0}ms ({} preprocess workers, openh264 {:.0}ms)",
+        "encode-mp4: {} frames decoded, preprocessed, and encoded in {:.0}ms ({} preprocess workers, openh264 {:.0}ms, quality {:?})",
         n,
         t_encode.elapsed().as_secs_f64() * 1000.0,
         workers,
         encode_ms,
+        quality,
     );
 
     let sps = sps.ok_or("no SPS NAL emitted by encoder")?;
@@ -2734,12 +3758,16 @@ fn encode_mp4_h264(
     let mut writer =
         Mp4Writer::write_start(buf, &mp4_config).map_err(|e| format!("mp4 write_start: {}", e))?;
 
-    let track_config = TrackConfig::from(AvcConfig {
+    let mut track_config = TrackConfig::from(AvcConfig {
         width: target_w as u16,
         height: target_h as u16,
         seq_param_set: sps,
         pic_param_set: pps,
     });
+    // mp4 0.14 leaves the track (mdhd) timescale at 1000 regardless of the
+    // movie timescale, so `frame_duration = 1` meant 1 ms per frame: a
+    // 120-frame clip claimed 0.12 s at 1000 fps (ITER-050).
+    track_config.timescale = timescale;
     writer
         .add_track(&track_config)
         .map_err(|e| format!("mp4 add_track: {}", e))?;
@@ -2775,8 +3803,10 @@ async fn save_mp4_real(
     fps: u32,
     cap_width: Option<u32>,
     border: Option<BorderConfig>,
+    mp4_quality: Option<String>,
     job_id: Option<String>,
 ) -> Result<String, String> {
+    let quality = Mp4Quality::parse(mp4_quality.as_deref())?;
     // Ask first: cancelling the dialog must not decode or encode any frames.
     let path: Option<PathBuf> = app
         .dialog()
@@ -2792,7 +3822,14 @@ async fn save_mp4_real(
     tauri::async_runtime::spawn_blocking(move || {
         let _registration = registration;
         let frames = decode_frame_payloads(frames)?;
-        let mp4_buf = encode_mp4_h264(&frames, fps, cap_width, border.as_ref(), &control)?;
+        let mp4_buf = encode_mp4_h264(
+            &frames,
+            fps,
+            cap_width,
+            border.as_ref(),
+            quality,
+            &control,
+        )?;
         atomic_write_output(&p, &mp4_buf, &control)?;
         Ok::<String, String>(p.display().to_string())
     })
@@ -2811,14 +3848,23 @@ async fn save_mp4_to_path(
     path: String,
     cap_width: Option<u32>,
     border: Option<BorderConfig>,
+    mp4_quality: Option<String>,
     job_id: Option<String>,
 ) -> Result<String, String> {
+    let quality = Mp4Quality::parse(mp4_quality.as_deref())?;
     let p = PathBuf::from(&path);
     let (control, registration) = register_export(app, job_id);
     tauri::async_runtime::spawn_blocking(move || {
         let _registration = registration;
         let frames = decode_frame_payloads(frames)?;
-        let mp4_buf = encode_mp4_h264(&frames, fps, cap_width, border.as_ref(), &control)?;
+        let mp4_buf = encode_mp4_h264(
+            &frames,
+            fps,
+            cap_width,
+            border.as_ref(),
+            quality,
+            &control,
+        )?;
         atomic_write_output(&p, &mp4_buf, &control)?;
         Ok::<String, String>(p.display().to_string())
     })
@@ -2856,6 +3902,70 @@ async fn choose_export_path(
     Ok(path.display().to_string())
 }
 
+/// Finish a streaming GIF job (ITER-053): wait for the encoder's tail, then
+/// commit its `.part` — or, when a byte target is set and the streamed pass
+/// overshot it, run the twitter-fit shrink from the frames the encoder
+/// retained and write that result through `atomic_write_output`.
+fn finish_gif_stream(
+    stream: GifStream,
+    finish_config: GifStreamConfig,
+    control: &ExportControl,
+) -> Result<String, String> {
+    if finish_config != stream.config {
+        // Dropping `stream` cancels the encoder and removes its .part.
+        return Err("finish_gif_export settings differ from begin_export_capture".into());
+    }
+    let config = stream.config.clone();
+    let t0 = std::time::Instant::now();
+    let streamed = stream.finish()?;
+    let path = PathBuf::from(&config.path);
+    let result = (|| -> Result<String, String> {
+        control.check_cancelled()?;
+        eprintln!(
+            "encode: {} frames streamed into gifski; tail after capture {:.0}ms",
+            streamed.frames,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        let target = config.target_max_bytes.filter(|t| *t > 0);
+        if target.map_or(true, |t| streamed.size <= t) {
+            if let Some(t) = target {
+                eprintln!(
+                    "twitter-fit: cap={:?} size={:.2}MB ≤ target {:.2}MB ✓",
+                    config.cap_width,
+                    streamed.size as f64 / 1024.0 / 1024.0,
+                    t as f64 / 1024.0 / 1024.0,
+                );
+            }
+            control.emit("write", 0, 1);
+            commit_output_part(&streamed.part_path, &path, control)?;
+            return Ok(path.display().to_string());
+        }
+        let _ = fs::remove_file(&streamed.part_path);
+        let frames = &streamed.retained;
+        let border = config.border.as_ref();
+        let dimensions = validate_export_frames(frames, border)?;
+        let gif_buf = twitter_fit_shrink(
+            frames,
+            config.delay_ms,
+            border,
+            dimensions,
+            streamed.width,
+            streamed.size as usize,
+            target.expect("overshoot implies a target"),
+            control,
+        )?;
+        atomic_write_output(&path, &gif_buf, control)?;
+        Ok(path.display().to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&streamed.part_path);
+    }
+    if let Ok(mut parts) = live_parts().lock() {
+        parts.remove(&streamed.part_path);
+    }
+    result
+}
+
 #[tauri::command]
 async fn finish_gif_export(
     app: tauri::AppHandle,
@@ -2866,8 +3976,29 @@ async fn finish_gif_export(
     border: Option<BorderConfig>,
     target_max_bytes: Option<u64>,
 ) -> Result<String, String> {
-    let (control, registration) = register_export(app, Some(job_id.clone()));
-    let frames = take_export_capture(&job_id)?;
+    // ITER-053: a streaming capture registers the state its encoder thread
+    // watches, so cancel during the tail aborts gifski.
+    let (control, registration) = match capture_stream_state(&job_id) {
+        Some(state) => register_export_state(app, Some(job_id.clone()), state),
+        None => register_export(app, Some(job_id.clone())),
+    };
+    let capture = take_export_capture(&job_id)?;
+    if let Some(stream) = capture.stream {
+        let finish_config = GifStreamConfig {
+            path,
+            delay_ms,
+            cap_width,
+            border,
+            target_max_bytes,
+        };
+        return tauri::async_runtime::spawn_blocking(move || {
+            let _registration = registration;
+            finish_gif_stream(stream, finish_config, &control)
+        })
+        .await
+        .map_err(|e| format!("GIF export worker failed: {}", e))?;
+    }
+    let frames = capture.frames;
     let path = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || {
         let _registration = registration;
@@ -2894,13 +4025,28 @@ async fn finish_mp4_export(
     fps: u32,
     cap_width: Option<u32>,
     border: Option<BorderConfig>,
+    mp4_quality: Option<String>,
 ) -> Result<String, String> {
     let (control, registration) = register_export(app, Some(job_id.clone()));
-    let frames = take_export_capture(&job_id)?;
+    let capture = take_export_capture(&job_id)?;
+    if capture.stream.is_some() {
+        // Dropping the capture cancels the GIF encoder and removes its .part.
+        return Err("export capture was started as a streaming GIF".into());
+    }
+    let frames = capture.frames;
+    // Parsed after the capture is taken so a bad value still releases it.
+    let quality = Mp4Quality::parse(mp4_quality.as_deref())?;
     let path = PathBuf::from(path);
     tauri::async_runtime::spawn_blocking(move || {
         let _registration = registration;
-        let mp4_buf = encode_mp4_h264(&frames, fps, cap_width, border.as_ref(), &control)?;
+        let mp4_buf = encode_mp4_h264(
+            &frames,
+            fps,
+            cap_width,
+            border.as_ref(),
+            quality,
+            &control,
+        )?;
         atomic_write_output(&path, &mp4_buf, &control)?;
         Ok::<String, String>(path.display().to_string())
     })
@@ -3383,7 +4529,7 @@ mod export_guard_tests {
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
         bytes.extend_from_slice(&[0, 0, 0, 0]); // CRC is decoded by image, not the guard.
-        PngFrame { bytes }
+        PngFrame::png(bytes)
     }
 
     fn valid_png_frame(width: u32, height: u32) -> PngFrame {
@@ -3393,18 +4539,21 @@ mod export_guard_tests {
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut cursor, image::ImageFormat::Png)
             .unwrap();
-        PngFrame {
-            bytes: cursor.into_inner(),
-        }
+        PngFrame::png(cursor.into_inner())
     }
 
     #[test]
-    fn export_guard_accepts_consistent_frames_at_pixel_limit() {
-        let frames: Vec<_> = (0..100).map(|_| png_header_frame(1_000, 1_000)).collect();
+    fn export_guard_has_no_total_pixel_cap() {
+        // ITER-054: 150 × 760×1024 (116.7M pixels) was rejected by the old
+        // 100M total cap; 600 × 1024×682 is the MAX_EXPORT_FRAMES ceiling.
+        let frames: Vec<_> = (0..150).map(|_| png_header_frame(760, 1_024)).collect();
         let dimensions = validate_export_frames(&frames, None).unwrap();
-        assert_eq!(dimensions.width, 1_000);
-        assert_eq!(dimensions.height, 1_000);
-        assert_eq!(dimensions.total_output_pixels, MAX_TOTAL_DECODED_PIXELS);
+        assert_eq!((dimensions.width, dimensions.height), (760, 1_024));
+        assert_eq!(dimensions.total_output_pixels, 150 * 760 * 1_024);
+        let frames: Vec<_> = (0..MAX_EXPORT_FRAMES)
+            .map(|_| png_header_frame(1_024, 682))
+            .collect();
+        assert!(validate_export_frames(&frames, None).is_ok());
     }
 
     #[test]
@@ -3428,12 +4577,46 @@ mod export_guard_tests {
             .unwrap_err()
             .contains("frame 0 b64"));
 
-        let not_png = vec![PngFrame {
-            bytes: vec![0_u8; 33],
-        }];
+        let not_png = vec![PngFrame::png(vec![0_u8; 33])];
         assert!(validate_export_frames(&not_png, None)
             .unwrap_err()
             .contains("not a valid PNG header"));
+    }
+
+    #[test]
+    fn raw_rgba_frames_match_the_png_round_trip() {
+        // ITER-052: an opaque raw frame must decode to the same pixels the
+        // PNG path produced, through both the GIF decode and the MP4 path.
+        let png = valid_png_frame(6, 4);
+        let raw_bytes = png.to_rgba8(0).unwrap().into_raw();
+        let raw = PngFrame {
+            bytes: raw_bytes.clone(),
+            rgba: Some((6, 4)),
+        };
+        assert_eq!(raw.dimensions(0).unwrap(), (6, 4));
+        assert_eq!(png.to_rgba8(0).unwrap(), raw.to_rgba8(0).unwrap());
+        let a = decode_one_frame(&png, 0, None).unwrap();
+        let b = decode_one_frame(&raw, 0, None).unwrap();
+        assert_eq!(a.buf(), b.buf());
+        // Mixed PNG/raw sets validate as long as the sizes agree.
+        let mixed = vec![valid_png_frame(6, 4), raw];
+        assert_eq!(validate_export_frames(&mixed, None).unwrap().width, 6);
+        let short = PngFrame {
+            bytes: raw_bytes[..raw_bytes.len() - 4].to_vec(),
+            rgba: Some((6, 4)),
+        };
+        assert!(short.to_rgba8(0).unwrap_err().contains("length mismatch"));
+    }
+
+    #[test]
+    fn raw_rgba_length_and_pixel_guard() {
+        assert!(check_raw_rgba_len(6 * 4 * 4, 6, 4, 0).is_ok());
+        assert!(check_raw_rgba_len(6 * 4 * 4 - 1, 6, 4, 3)
+            .unwrap_err()
+            .contains("frame 3 raw RGBA is 95 bytes"));
+        assert!(check_raw_rgba_len(0, 100_000, 100_000, 0)
+            .unwrap_err()
+            .contains("per-frame pixel limit"));
     }
 
     #[test]
@@ -3454,7 +4637,7 @@ mod export_guard_tests {
         let oversized = vec![png_header_frame(10_001, 10_000)];
         assert!(validate_export_frames(&oversized, None)
             .unwrap_err()
-            .contains("decoded pixels exceeds limit"));
+            .contains("per-frame pixel limit"));
 
         let border = BorderConfig {
             enabled: true,
@@ -3510,7 +4693,7 @@ mod export_guard_tests {
             .lock()
             .unwrap();
         let job_id = "rust-staged-export-test".to_string();
-        begin_export_capture(job_id.clone(), 2, None).unwrap();
+        begin_export_capture(job_id.clone(), 2, None, None).unwrap();
         let frame = png_header_frame(10, 10);
         let b64 = general_purpose::STANDARD.encode(&frame.bytes);
 
@@ -3521,13 +4704,301 @@ mod export_guard_tests {
 
         tauri::async_runtime::block_on(push_export_frame(job_id.clone(), 0, b64.clone())).unwrap();
         assert!(take_export_capture(&job_id)
-            .unwrap_err()
+            .err()
+            .unwrap()
             .contains("incomplete export capture"));
         tauri::async_runtime::block_on(push_export_frame(job_id.clone(), 1, b64)).unwrap();
-        assert_eq!(take_export_capture(&job_id).unwrap().len(), 2);
+        assert_eq!(take_export_capture(&job_id).ok().unwrap().frames.len(), 2);
         let _ = take_remembered(
             CANCELLED_CAPTURE_JOBS.get_or_init(|| Mutex::new(VecDeque::new())),
             &job_id,
+        );
+    }
+
+    #[test]
+    fn staged_capture_accepts_sets_past_the_old_pixel_cap() {
+        // ITER-054: 150 × 760×1024 failed staging with "decoded pixels
+        // exceeds limit"; PNG headers keep the test allocation tiny.
+        let _guard = STATE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let job_id = "rust-staged-past-pixel-cap".to_string();
+        begin_export_capture(job_id.clone(), 150, None, None).unwrap();
+        for index in 0..150 {
+            stage_export_frame(&job_id, index, png_header_frame(760, 1_024)).unwrap();
+        }
+        assert_eq!(take_export_capture(&job_id).ok().unwrap().frames.len(), 150);
+    }
+
+    /// 40 small frames, PNG and raw RGBA mixed, more than any decode window.
+    fn gif_test_frames() -> Vec<PngFrame> {
+        (0..40u8)
+            .map(|i| {
+                let image = image::RgbaImage::from_fn(32, 24, |x, y| {
+                    image::Rgba([i.wrapping_mul(6), (x * 8) as u8, (y * 10) as u8, 0xff])
+                });
+                if i % 2 == 0 {
+                    PngFrame {
+                        bytes: image.into_raw(),
+                        rgba: Some((32, 24)),
+                    }
+                } else {
+                    let mut cursor = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::ImageRgba8(image)
+                        .write_to(&mut cursor, image::ImageFormat::Png)
+                        .unwrap();
+                    PngFrame::png(cursor.into_inner())
+                }
+            })
+            .collect()
+    }
+
+    fn stream_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "glyph-grid-{}-{}-{}",
+            name,
+            std::process::id(),
+            OUTPUT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn part_files(dir: &PathBuf) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".part")
+            })
+            .count()
+    }
+
+    /// Stage `frames` into a streaming capture and finish it.
+    fn run_stream(job_id: &str, config: GifStreamConfig) -> Result<String, String> {
+        let frames = gif_test_frames();
+        begin_export_capture(job_id.to_string(), frames.len(), Some(config.clone()), None).unwrap();
+        for (index, frame) in frames.into_iter().enumerate() {
+            stage_export_frame(job_id, index, frame).unwrap();
+        }
+        let stream = take_export_capture(job_id).ok().unwrap().stream.unwrap();
+        let control = ExportControl {
+            state: stream.state.clone(),
+            app: None,
+            job_id: None,
+        };
+        finish_gif_stream(stream, config, &control)
+    }
+
+    #[test]
+    fn streamed_gif_is_byte_identical_to_the_staged_encode() {
+        // ITER-053: same frames, same order, same pts → same bytes, with and
+        // without a (met) byte target; the .part is renamed, never left.
+        let _guard = STATE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let dir = stream_test_dir("gif-stream");
+        let expected = encode_gif_gifski_adaptive(
+            &gif_test_frames(),
+            40,
+            None,
+            None,
+            None,
+            &test_control(JOB_RUNNING),
+        )
+        .unwrap();
+        for (name, target) in [("plain.gif", None), ("fit.gif", Some(64 * 1024 * 1024))] {
+            let path = dir.join(name);
+            let config = GifStreamConfig {
+                path: path.display().to_string(),
+                delay_ms: 40,
+                cap_width: None,
+                border: None,
+                target_max_bytes: target,
+            };
+            run_stream("rust-gif-stream", config).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected, "{name}");
+        }
+        assert_eq!(part_files(&dir), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streamed_gif_queue_is_byte_bounded_and_drains() {
+        // ITER-070: a non-retaining stream's queued bytes are capped.  With
+        // the cap at one frame, every push past the first waits for the
+        // feeder; the GIF must still be byte-identical and the counter must
+        // drain to zero.  Admission rules checked directly too.
+        assert_eq!(stream_queue_admit(0, 10, 10, true), Ok(StreamAdmit::Send));
+        assert_eq!(stream_queue_admit(5, 6, 10, true), Ok(StreamAdmit::Wait));
+        assert!(stream_queue_admit(5, 6, 10, false).unwrap_err().contains("stopped"));
+        assert!(stream_queue_admit(0, 11, 10, true).unwrap_err().contains("queue limit"));
+        assert!(stream_queue_admit(u64::MAX, 1, 10, true).is_ok());
+
+        let _guard = STATE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let dir = stream_test_dir("gif-stream-queue");
+        let frames = gif_test_frames();
+        let expected =
+            encode_gif_gifski_adaptive(&frames, 40, None, None, None, &test_control(JOB_RUNNING))
+                .unwrap();
+        let cap = frames.iter().map(|f| f.bytes.len() as u64).max().unwrap();
+        let job_id = "rust-gif-stream-queue";
+        let path = dir.join("queued.gif");
+        let config = GifStreamConfig {
+            path: path.display().to_string(),
+            delay_ms: 40,
+            cap_width: None,
+            border: None,
+            target_max_bytes: None,
+        };
+        begin_export_capture(job_id.to_string(), frames.len(), Some(config.clone()), None).unwrap();
+        let queued = {
+            let mut captures = EXPORT_CAPTURES.get().unwrap().lock().unwrap();
+            let stream = captures.get_mut(job_id).unwrap().stream.as_mut().unwrap();
+            stream.queue_caps = (cap, cap);
+            stream.queued.clone()
+        };
+        for (index, frame) in frames.into_iter().enumerate() {
+            stage_export_frame(job_id, index, frame).unwrap();
+            assert!(queued.load(Ordering::Acquire) <= cap, "queue over cap at frame {index}");
+        }
+        let stream = take_export_capture(job_id).ok().unwrap().stream.unwrap();
+        let control = ExportControl {
+            state: stream.state.clone(),
+            app: None,
+            job_id: None,
+        };
+        finish_gif_stream(stream, config, &control).unwrap();
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn duplicate_out_path_normalises_relative_spellings() {
+        // ITER-070: `a.gif` and `./a.gif` (and `x/../a.gif`) are one file.
+        let jobs: Vec<serde_json::Value> = ["a.gif", "./a.gif"]
+            .iter()
+            .map(|o| serde_json::json!({ "out": o }))
+            .collect();
+        assert_eq!(duplicate_out_path(&jobs).as_deref(), Some("./a.gif"));
+        let jobs: Vec<serde_json::Value> = ["out/b.gif", "out/x/../b.gif", "out/c.gif"]
+            .iter()
+            .map(|o| serde_json::json!({ "out": o }))
+            .collect();
+        assert_eq!(duplicate_out_path(&jobs).as_deref(), Some("out/x/../b.gif"));
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("d.gif").display().to_string();
+        let jobs = vec![serde_json::json!({ "out": "d.gif" }), serde_json::json!({ "out": abs })];
+        assert!(duplicate_out_path(&jobs).is_some());
+    }
+
+    #[test]
+    fn batch_children_dir_is_private_and_removed_on_drop() {
+        // ITER-070: fresh 0700 dir, 0600 create_new files, gone after Drop
+        // (with any still-running child killed and reaped).
+        use std::os::unix::fs::PermissionsExt;
+        let mut guard = BatchChildren::new().unwrap();
+        let dir = guard.dir.clone();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        let file = dir.join("part-0.json");
+        write_private_file(&file, b"{}").unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(write_private_file(&file, b"{}").is_err(), "create_new must refuse an existing file");
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        guard.children.push(Some(child));
+        drop(guard);
+        assert!(!dir.exists());
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "child {pid} must be killed by the guard");
+    }
+
+    #[test]
+    fn streamed_gif_overshoot_and_cancel_leave_no_part_files() {
+        let _guard = STATE_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let dir = stream_test_dir("gif-stream-fail");
+        // Overshoot: 32 px frames have no ladder rung (floor is 360 px), so
+        // the retained-frame shrink fails closed with the B11 error.
+        let path = dir.join("tiny.gif");
+        let config = GifStreamConfig {
+            path: path.display().to_string(),
+            delay_ms: 40,
+            cap_width: None,
+            border: None,
+            target_max_bytes: Some(1),
+        };
+        assert!(run_stream("rust-gif-stream-overshoot", config)
+            .unwrap_err()
+            .contains("GIF cannot meet target size"));
+        assert!(!path.exists());
+
+        // Cancel mid-capture: cancel_export drops the capture, the encoder
+        // aborts and deletes its .part on its own thread.
+        let job_id = "rust-gif-stream-cancel".to_string();
+        let config = GifStreamConfig {
+            path: dir.join("cancelled.gif").display().to_string(),
+            delay_ms: 40,
+            cap_width: None,
+            border: None,
+            target_max_bytes: None,
+        };
+        begin_export_capture(job_id.clone(), 40, Some(config), None).unwrap();
+        for (index, frame) in gif_test_frames().into_iter().take(10).enumerate() {
+            stage_export_frame(&job_id, index, frame).unwrap();
+        }
+        // ITER-071: the encoder opens its .part only after the first frame
+        // arrives; wait for it, or a cancel racing that open sees 0 parts
+        // here and 1 a moment later (flaked ~1 in 13 under parallel tests).
+        let opened = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while part_files(&dir) == 0 && std::time::Instant::now() < opened {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(cancel_export(job_id.clone()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while part_files(&dir) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(part_files(&dir), 0);
+        assert!(!dir.join("cancelled.gif").exists());
+        let _ = take_remembered(
+            CANCELLED_CAPTURE_JOBS.get_or_init(|| Mutex::new(VecDeque::new())),
+            &job_id,
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windowed_gif_encode_is_deterministic_and_cancellable() {
+        // ITER-054: more frames than the decode window, PNG and raw mixed;
+        // two runs must produce the same bytes (in-order feed), and a
+        // cancelled job must stop with the cancel error.
+        let frames = gif_test_frames();
+        let control = test_control(JOB_RUNNING);
+        let a = encode_gif_gifski_frames(&frames, 40, None, 32, &control, "t").unwrap();
+        let b = encode_gif_gifski_frames(&frames, 40, None, 32, &control, "t").unwrap();
+        assert!(a.starts_with(b"GIF89a"));
+        assert_eq!(a, b);
+        let cancelled = test_control(JOB_CANCELLED);
+        assert_eq!(
+            encode_gif_gifski_frames(&frames, 40, None, 32, &cancelled, "t").unwrap_err(),
+            "export cancelled"
         );
     }
 
@@ -3540,7 +5011,7 @@ mod export_guard_tests {
         let early = "rust-early-cancel-test".to_string();
         assert!(cancel_export(early.clone()));
         assert_eq!(
-            begin_export_capture(early.clone(), 1, None).unwrap_err(),
+            begin_export_capture(early.clone(), 1, None, None).unwrap_err(),
             "export cancelled"
         );
 
@@ -3548,9 +5019,9 @@ mod export_guard_tests {
             .map(|index| format!("rust-capture-limit-{index}"))
             .collect();
         for id in &ids {
-            begin_export_capture(id.clone(), 1, None).unwrap();
+            begin_export_capture(id.clone(), 1, None, None).unwrap();
         }
-        let overflow = begin_export_capture("rust-capture-overflow".into(), 1, None).unwrap_err();
+        let overflow = begin_export_capture("rust-capture-overflow".into(), 1, None, None).unwrap_err();
         assert!(overflow.contains("too many concurrent export captures"));
         for id in ids {
             assert!(cancel_export(id));
@@ -3622,6 +5093,26 @@ mod export_guard_tests {
     }
 
     #[test]
+    fn twitter_fit_width_predicts_from_bytes_per_pixel() {
+        // run-all B12: 720 px → 1.60 MB, 700 KB target. sqrt(0.4375)·0.96·720
+        // = 457.2 → 456 (the old ladder walked 600/540/480 to land on 420).
+        assert_eq!(twitter_fit_width(720, 1_600_000, 700_000, 0.96), Some(456));
+        // worm-move.gif 120 f: 31.23 MB at 720, 15 MB cap → 478 px in one
+        // pass (the ladder spent 600/540 to land on 480).
+        assert_eq!(
+            twitter_fit_width(720, 32_747_000, 15 * 1024 * 1024, 0.96),
+            Some(478)
+        );
+        // Tiny targets clamp to the floor; nothing narrower than the floor
+        // (or than the current width) is ever proposed.
+        assert_eq!(twitter_fit_width(720, 1_600_000, 1, 0.96), Some(360));
+        assert_eq!(twitter_fit_width(360, 1_600_000, 1, 0.90), None);
+        assert_eq!(twitter_fit_width(8, 100, 1, 0.95), None);
+        // A barely-over first pass still shrinks by at least one step.
+        assert_eq!(twitter_fit_width(720, 700_001, 700_000, 1.0), Some(718));
+    }
+
+    #[test]
     fn mp4_timing_is_exact_for_supported_frame_rates() {
         for fps in [24, 25, 30] {
             let (timescale, duration) = mp4_timing(fps).unwrap();
@@ -3630,6 +5121,163 @@ mod export_guard_tests {
             assert_eq!(mp4_sample_timing(119, duration), (119, 1));
         }
         assert_eq!(mp4_timing(0).unwrap_err(), "fps must be > 0");
+    }
+
+    /// ITER-050 (F11): upload mode must hold its bitrate target without
+    /// dropping frames.  60 flat frames (where the old skip-frame RC emitted
+    /// nothing) then 60 frames with a fresh noise band each (where RC without
+    /// skipping overshoots), 640x360 @ 30 fps = 4 s.
+    #[test]
+    fn mp4_upload_rate_control_keeps_every_frame_near_target() {
+        const W: u32 = 640;
+        const H: u32 = 360;
+        const FPS: u32 = 30;
+        const N: u32 = 120;
+        let mut seed: u32 = 0x1234_5678;
+        let frames: Vec<PngFrame> = (0..N)
+            .map(|i| {
+                let mut img = image::RgbImage::from_pixel(W, H, image::Rgb([0xf2, 0xe8, 0xd8]));
+                if i >= N / 2 {
+                    for y in H / 4..3 * H / 4 {
+                        for x in 0..W {
+                            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            let v = (seed >> 24) as u8;
+                            img.put_pixel(x, y, image::Rgb([v, v, v]));
+                        }
+                    }
+                }
+                let mut cursor = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(img)
+                    .write_to(&mut cursor, image::ImageFormat::Png)
+                    .unwrap();
+                PngFrame::png(cursor.into_inner())
+            })
+            .collect();
+
+        let out = encode_mp4_h264(
+            &frames,
+            FPS,
+            None,
+            None,
+            Mp4Quality::Upload,
+            &test_control(JOB_RUNNING),
+        )
+        .unwrap();
+
+        let size = out.len() as u64;
+        let mut reader = mp4::Mp4Reader::read_header(std::io::Cursor::new(out), size).unwrap();
+        let track_id = *reader.tracks().keys().next().unwrap();
+        assert_eq!(reader.tracks()[&track_id].timescale(), FPS);
+        assert_eq!(reader.sample_count(track_id).unwrap(), N);
+        let mut sample_bytes = 0u64;
+        for sample_id in 1..=N {
+            let sample = reader.read_sample(track_id, sample_id).unwrap().unwrap();
+            assert!(!sample.bytes.is_empty(), "sample {} is empty", sample_id);
+            assert_eq!(sample.duration, 1);
+            sample_bytes += sample.bytes.len() as u64;
+        }
+        let duration_s = f64::from(N) / f64::from(FPS);
+        let budget = f64::from(mp4_upload_bitrate(W, H)) / 8.0 * duration_s;
+        assert!(
+            (size as f64) < 1.5 * budget,
+            "upload MP4 is {} bytes ({} in samples), over 1.5x the {:.0}-byte budget",
+            size,
+            sample_bytes,
+            budget
+        );
+    }
+
+    /// A typo'd per-job `mp4Quality` must be refused with the manifest
+    /// (exit 2, before any webview starts), not after the capture ran.
+    #[test]
+    fn batch_manifest_rejects_unknown_mp4_quality() {
+        let dir = std::env::temp_dir().join(format!(
+            "glyph-grid-mp4-quality-{}-{}",
+            std::process::id(),
+            OUTPUT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("in.png");
+        fs::write(&source, &valid_png_frame(4, 4).bytes).unwrap();
+        let manifest = dir.join("manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::json!({
+                "in": source,
+                "jobs": [{"name": "typo", "out": dir.join("out.mp4"), "mp4Quality": "lossless"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(run_headless_batch(manifest, false, None, false, 1), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// ITER-055: `--jobs` clamps to the job count and cores-2, never below 1,
+    /// and the split keeps every job once, round-robin, each pinned to the
+    /// source the serial batch would have rendered it with.
+    #[test]
+    fn batch_fan_out_clamps_and_split_pins_effective_sources() {
+        assert_eq!(batch_fan_out_count(1, 20, Some(8)), 1);
+        assert_eq!(batch_fan_out_count(4, 20, Some(8)), 4);
+        assert_eq!(batch_fan_out_count(16, 20, Some(8)), 6);
+        assert_eq!(batch_fan_out_count(4, 3, Some(8)), 3);
+        assert_eq!(batch_fan_out_count(4, 20, Some(2)), 1);
+        assert_eq!(batch_fan_out_count(0, 20, None), 1);
+
+        let jobs: Vec<serde_json::Value> = vec![
+            serde_json::json!({"name": "a", "out": "a.gif"}),
+            serde_json::json!({"name": "b", "out": "b.gif", "in": "/x.png"}),
+            serde_json::json!({"name": "c", "out": "c.gif"}),
+            serde_json::json!({"name": "d", "out": "d.gif", "in": "/y.png"}),
+            serde_json::json!({"name": "e", "out": "e.gif"}),
+        ];
+        let manifest =
+            serde_json::json!({"in": "rel.png", "frames": 7, "perf": true, "jobs": jobs});
+        let parts = split_batch_manifest(&manifest, "/m.png", &jobs, 2);
+        let names = |p: &serde_json::Value| -> Vec<(String, String)> {
+            p["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|j| {
+                    (
+                        j["name"].as_str().unwrap().into(),
+                        j["in"].as_str().unwrap().into(),
+                    )
+                })
+                .collect()
+        };
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            names(&parts[0]),
+            vec![s("a", "/m.png"), s("c", "/x.png"), s("e", "/y.png")]
+        );
+        assert_eq!(names(&parts[1]), vec![s("b", "/x.png"), s("d", "/y.png")]);
+        for p in &parts {
+            assert_eq!(p["in"], "/m.png");
+            assert_eq!(p["frames"], 7);
+            assert_eq!(p["perf"], true);
+        }
+
+        assert_eq!(duplicate_out_path(&jobs), None);
+        let mut dup = jobs.clone();
+        dup.push(serde_json::json!({"name": "f", "out": "c.gif"}));
+        assert_eq!(duplicate_out_path(&dup).as_deref(), Some("c.gif"));
+    }
+
+    #[test]
+    fn mp4_quality_parse_defaults_to_upload_and_rejects_typos() {
+        assert_eq!(Mp4Quality::parse(None).unwrap(), Mp4Quality::Upload);
+        assert_eq!(Mp4Quality::parse(Some("")).unwrap(), Mp4Quality::Upload);
+        assert_eq!(Mp4Quality::parse(Some("Archive")).unwrap(), Mp4Quality::Archive);
+        assert!(Mp4Quality::parse(Some("lossless")).is_err());
+        // ITER-070: the CLI flag shares the parser (case-insensitive).
+        assert_eq!(parse_mp4_quality_arg("ARCHIVE").unwrap(), "archive");
+        assert_eq!(parse_mp4_quality_arg(" Upload ").unwrap(), "upload");
+        assert!(parse_mp4_quality_arg("lossless").is_err());
+        assert_eq!(mp4_upload_bitrate(1024, 682), 5_000_000);
+        assert_eq!(mp4_upload_bitrate(3840, 2160), 20_000_000);
     }
 
     #[test]
@@ -3681,6 +5329,7 @@ mod preset_schema_tests {
             config_overrides: overrides,
             format: None,
             timeout_secs: None,
+            mp4_quality: None,
         }
     }
 
@@ -3981,5 +5630,27 @@ mod source_probe_tests {
         assert!(!probe_image_path(&unknown).unwrap().probed);
         assert!(probe_image_path(&dir.join("missing.png")).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    /// ITER-071: `--resume` must re-render an MP4 job whose mp4Quality
+    /// changed (ITER-050 changes the bytes); GIF hashes ignore the field.
+    #[test]
+    fn resume_hash_covers_mp4_quality_for_mp4_only() {
+        let job = |format: &str, q: Option<&str>| {
+            serde_json::json!({
+                "inPath": null, "format": format, "frames": 4, "border": null,
+                "config": {}, "capWidth": 0, "targetMaxBytes": null, "mp4Quality": q,
+            })
+        };
+        let h = |format: &str, q: Option<&str>| job_config_sha256(&job(format, q), "/src.png");
+        assert_ne!(h("mp4", None), h("mp4", Some("archive")));
+        assert_eq!(h("mp4", None), h("mp4", Some("upload")));
+        assert_eq!(h("mp4", Some("archive")), h("mp4", Some("ARCHIVE")));
+        assert_eq!(h("gif", None), h("gif", Some("archive")));
     }
 }

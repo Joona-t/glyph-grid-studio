@@ -94,6 +94,10 @@ pub struct RenderParams {
     /// progress for 300 s still times out.
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// MP4 rate control: `upload` (default; ~5 Mbps, a few MB per loop) or
+    /// `archive` (fixed QP 26, near-lossless, ~30-60 Mbps). Ignored for GIF.
+    #[serde(default)]
+    pub mp4_quality: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -110,7 +114,8 @@ pub struct BatchParams {
     pub perf: Option<bool>,
     /// The jobs, rendered in order in ONE app session. Each is
     /// `{name, out, format?, in?, frames?, capWidth?, targetMaxBytes?,
-    /// border?: {width, bgColor?, style?, inkColor?}, config?: {partial CONFIG}}`
+    /// mp4Quality?: "upload"|"archive", border?: {width, bgColor?, style?,
+    /// inkColor?}, config?: {partial CONFIG}}`
     /// — the same shape as a `batch --manifest` file. `out` must be an
     /// absolute path.
     pub jobs: Vec<serde_json::Value>,
@@ -491,7 +496,13 @@ impl GlyphGridServer {
             },
             format: p.format.clone(),
             timeout_secs: p.timeout_s,
+            mp4_quality: p.mp4_quality.clone(),
         };
+        // ITER-071: a typo'd mp4_quality is refused here too, not after a
+        // spawn (the CLI's clap parser would exit 2 anyway).
+        if let Some(Err(e)) = p.mp4_quality.as_deref().map(crate::parse_mp4_quality_arg) {
+            return tool_error("invalid_arguments", Some("/mp4_quality".into()), e);
+        }
         if let Err(e) = probe.build_js_config() {
             return tool_error(
                 "invalid_arguments",
@@ -550,6 +561,9 @@ impl GlyphGridServer {
         if let Some(v) = &p.format {
             cmd.arg("--format").arg(v);
         }
+        if let Some(v) = &p.mp4_quality {
+            cmd.arg("--mp4-quality").arg(v);
+        }
         if let Some(v) = p.timeout_s {
             cmd.arg("--timeout").arg(v.to_string());
         }
@@ -587,7 +601,7 @@ impl GlyphGridServer {
         description = "Render several jobs (same or different sources, any CONFIG each) in ONE app \
                        session — the start-up cost is paid once, not per job. Arguments are a \
                        `batch --manifest` object: {in, frames?, jobs:[{name, out, format?, in?, \
-                       frames?, capWidth?, border?, config?}]}. Sends notifications/progress per \
+                       frames?, capWidth?, mp4Quality?, border?, config?}]}. Sends notifications/progress per \
                        finished job when the request carries a progressToken. Returns one line per job."
     )]
     async fn glyph_grid_batch(

@@ -17,7 +17,6 @@ const contracts = [
   ['recorder preserves supplied job IDs', /jobId:\s*opts\.jobId\s*\|\|\s*\(\+\+__recordJobSequence\)/],
   ['frame consumer participates in capture backpressure', /return state\.onFrame\(\{/],
   ['capture frame limit is explicit', /MAX_CAPTURE_FRAMES\s*=\s*600/],
-  ['capture pixel budget is aligned with Rust', /MAX_CAPTURE_PIXELS\s*=\s*100\s*\*\s*1000\s*\*\s*1000/],
   ['source file limit is aligned with Rust', /maxFileBytes:\s*64\s*\*\s*1024\s*\*\s*1024/],
   ['source frame limit is explicit', /maxFrames:\s*480/],
   ['source decoded-pixel limit is explicit', /maxDecodedPixels:\s*100\s*\*\s*1000\s*\*\s*1000/],
@@ -52,7 +51,9 @@ const contracts = [
   ['CLI setConfig uses the shared deep merge', /setConfig: \(overrides\) => \{[\s\S]{0,400}window\.GlyphStudio\.deepMerge\(CONFIG, overrides \|\| \{\}\);/],
   ['batch applyConfig uses the shared deep merge', /function applyConfig\(cfg\) \{\s*if \(!cfg\) return;\s*window\.GlyphStudio\.deepMerge\(CONFIG, cfg\);/],
   ['frames "auto" follows the GUI export plan', /job\.frames === 'auto'\s*\? Math\.max\(2, Math\.round\(\(\(CONFIG\.animation && CONFIG\.animation\.duration\) \|\| 6\) \* effFps\)\)/],
-  ['per-job border reaches both encoders', /fps: Math\.round\(effFps\),[\s\S]{0,200}border: jobBorder,[\s\S]{0,300}delayMs: delayMs,[\s\S]{0,200}border: jobBorder,/],
+  /* ITER-071: the GIF border rides in the ITER-053 gifStream settings, which finish repeats */
+  ['per-job border reaches the MP4 encoder', /fps: Math\.round\(effFps\),[\s\S]{0,200}border: jobBorder,/],
+  ['per-job border reaches the streamed GIF settings', /const gifStream = fmt === 'mp4' \? null : \{[\s\S]{0,300}border: jobBorder,/],
   ['batch jobs carry per-job frames and border', /frames:\s+j\.frames \|\| job\.frames \|\| 24,[\s\S]{0,120}border:\s+j\.border \|\| null,/],
   /* ITER-062 (F17 part 2): static-frame detector */
   ['idle check runs after the live frame is painted, never while recording', /if \(recState\) \{\s*handleRecordFrame\(\);\s*\} else \{\s*idleCheck\(\);\s*\}/],
@@ -64,6 +65,9 @@ const contracts = [
   ['Tweakpane is loaded from the vendored copy', /<script src="vendor\/tweakpane-3\.1\.10\/tweakpane\.min\.js"><\/script>/],
   ['JSZip is loaded from the vendored copy', /<script src="vendor\/jszip-3\.10\.1\/jszip\.min\.js"><\/script>/],
   ['fflate is loaded from the vendored copy', /<script src="vendor\/fflate-0\.8\.2\/index\.js"><\/script>/],
+  /* ITER-053 (F12): headless GIF streams into gifski during capture; finish repeats the same settings */
+  ['headless GIF passes its encode settings to begin_export_capture', /tauri\('begin_export_capture', \{ jobId: jobId, total: frameTotal, gifStream: gifStream, label: job\.name \}\)/],
+  ['finish_gif_export args are the streamed settings', /:\s*Object\.assign\(\{ jobId: jobId \}, gifStream\);/],
 ];
 
 for (const [name, pattern] of contracts) {
@@ -77,6 +81,8 @@ const banned = [
   ['post-load / post-config settle sleeps', /await new Promise\(function \(r\) \{ setTimeout\(r, (300|200|1500)\); \}\);/],
   ['batch settle timer', /opts\.settleMs/],
   ['remote <script>/<link> (offline boot, ITER-063)', /<(script|link)\b[^>]*\b(src|href)=["']?(https?:)?\/\//i],
+  /* ITER-054: the total capture pixel cap went away with the GIF path's decode-everything step. */
+  ['total capture pixel cap', /MAX_CAPTURE_PIXELS|capture-pixel-limit/],
 ];
 for (const [name, pattern] of banned) {
   assert(!pattern.test(html), `frontend contract violated: ${name} is back`);

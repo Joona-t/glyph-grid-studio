@@ -42,8 +42,15 @@ fi
 STATS="$(mktemp "${TMPDIR:-/tmp}/psnr-gate.XXXXXX")"
 LOG="$(mktemp "${TMPDIR:-/tmp}/psnr-gate-log.XXXXXX")"
 
+# ITER-050: pair frames by INDEX, not timestamp.  The psnr filter's framesync
+# matches on pts, so an MP4 written before the track-timescale fix (1 ms per
+# frame) against one written after it (1/fps per frame) compared frame 0 with
+# whatever the other stream held at that instant — 17 dB between two
+# pixel-identical files.  Re-stamp both streams as pts = N in a common 1/1000
+# timebase.
 ffmpeg -nostdin -hide_banner -i "$NEW" -i "$BASE" \
-  -lavfi "psnr=stats_file=$STATS" -f null - >"$LOG" 2>&1
+  -lavfi "[0:v]settb=1/1000,setpts=N[a];[1:v]settb=1/1000,setpts=N[b];[a][b]psnr=stats_file=$STATS" \
+  -f null - >"$LOG" 2>&1
 rc=$?
 if [[ $rc -ne 0 ]]; then
   echo "psnr-gate: ffmpeg failed (exit $rc):" >&2

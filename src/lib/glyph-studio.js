@@ -807,7 +807,7 @@
     monitorCapture(testHook, frameTotal, onProgress, job);
   }
 
-  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border, job, destinationPath, staged) {
+  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border, job, destinationPath, staged, mp4Quality) {
     if (!testHook) return;
     var inTauri = !!_tauriInvoke;
     var frameTotal = total || 24;
@@ -859,6 +859,8 @@
           path: destinationPath || undefined,
           capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
           border: (border && border.enabled) ? border : null,
+          // ITER-070: the panel's rate-control pick; Rust defaults to upload.
+          mp4Quality: mp4Quality === 'archive' ? 'archive' : 'upload',
         }).then(function (path) {
           if (job && !isActiveExportJob(job)) return;
           if (path) console.log('glyph-studio: saved MP4 to', path);
@@ -2067,6 +2069,14 @@
       label: 'output size',
       options: { 'full (no cap)': 0, '720px (Twitter)': 720, '480px (small)': 480 },
     }), 'Cap output width before encoding. Smaller = smaller file, no quality loss for mobile viewing.');
+    /* ITER-070: MP4 rate control (ITER-050).  `upload` = ~5 Mbps bitrate
+       target (a few MB per loop); `archive` = fixed QP, near-lossless,
+       ~30-60 Mbps.  Same two values as the CLI --mp4-quality flag. */
+    sizeOpts.mp4Quality = 'upload';
+    tip(fExp.addInput(sizeOpts, 'mp4Quality', {
+      label: 'mp4 quality',
+      options: { 'upload (small)': 'upload', 'archive (near-lossless)': 'archive' },
+    }), 'MP4 only. Upload keeps files small for social posts; archive keeps near-lossless detail at a much larger size.');
 
     /* Bordered export — palette-aware matte added to the encoded frame.
        Frames out at (w + 2*borderWidth) × (h + 2*borderWidth), rounded to
@@ -2132,10 +2142,11 @@
          exportRun('mp4',  720)  — mobile-fit MP4
        `capOverride === null` means "honour the panel dropdown".
        `capOverride > 0` means "force this exact capWidth, ignore dropdown".
-       `targetMaxBytes` (ITER-026): when > 0, the Rust encoder retries
-       smaller caps (600→540→480→420→360) until output ≤ N. Used by the
-       Twitter-fit button to target 15 MB; Rust returns an error when even
-       the smallest configured attempt cannot meet that target. */
+       `targetMaxBytes` (ITER-026): when > 0, the Rust encoder retries at a
+       width predicted from the first pass (plus at most one correction,
+       floor 360 px; ITER-051) until output ≤ N. Used by the Twitter-fit
+       button to target 15 MB; Rust returns an error when even the
+       narrowest attempt cannot meet that target. */
     function exportRun(format, capOverride, targetMaxBytes) {
       /* BUG-010 (v0.1.8): block GIF/MP4 export before any image is loaded.
          draw() early-returns in the empty state, so the recorder would
@@ -2189,7 +2200,7 @@
             var encFps = Math.round(p.effFps);
             console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2));
             recordMP4(opts.testHook, p.frames, onProgress, onDone, encFps,
-              capW > 0 ? capW : null, border, job, destinationPath, staged);
+              capW > 0 ? capW : null, border, job, destinationPath, staged, sizeOpts.mp4Quality);
           } else {
             var fitNote = (targetMaxBytes > 0)
               ? ' (twitter-fit ' + (targetMaxBytes / 1024 / 1024).toFixed(0) + ' MB target; auto-shrinks if needed)'

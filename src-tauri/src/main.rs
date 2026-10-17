@@ -142,6 +142,13 @@ struct RenderArgs {
     /// "frame":12,"total":120}`.
     #[arg(long)]
     progress: bool,
+
+    /// MP4 rate control: `upload` (default; ~5 Mbps bitrate target, a few MB
+    /// per loop) or `archive` (fixed QP 26, near-lossless, ~30-60 Mbps).
+    /// Ignored for GIF output.  Case-insensitive, same parser as the
+    /// manifest `mp4Quality` and the MCP tool (ITER-070).
+    #[arg(long, value_name = "QUALITY", value_parser = app_lib::parse_mp4_quality_arg)]
+    mp4_quality: Option<String>,
 }
 
 /// `--frames` value: `None` = auto.
@@ -163,7 +170,7 @@ struct BatchArgs {
     /// Path to a JSON manifest (schema: src/glyph-grid.manifest.schema.json;
     /// unknown keys are errors, optional `"version": 1`). Shape:
     /// `{"in":"<source>","frames":<N|"auto">,"jobs":[{"name":"...","out":"...","format":"gif|mp4",
-    /// "frames":<N|"auto">,"border":{"width":32,"bgColor":"auto"},"config":{...}}, ...]}`
+    /// "frames":<N|"auto">,"border":{"width":32,"bgColor":"auto"},"mp4Quality":"upload|archive","config":{...}}, ...]}`
     #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
 
@@ -187,6 +194,13 @@ struct BatchArgs {
     /// timed-out or interrupted batch with the same manifest + `--resume`.
     #[arg(long)]
     resume: bool,
+
+    /// Render the manifest across N child processes (each its own webview),
+    /// jobs split round-robin. Capped at the job count and at CPU cores - 2.
+    /// Default 1 renders every job in one session. One render already keeps
+    /// ~3 cores busy, so past ~cores/4 the children contend (ITER-055).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    jobs: usize,
 }
 
 fn main() {
@@ -232,6 +246,7 @@ fn main() {
                 },
                 format: args.format,
                 timeout_secs: args.timeout,
+                mp4_quality: args.mp4_quality,
             };
             if args.dry_run {
                 match app_lib::headless_render_json(&job) {
@@ -259,7 +274,7 @@ fn main() {
             if args.progress {
                 app_lib::enable_progress_ndjson();
             }
-            let code = app_lib::run_headless_batch(args.manifest, args.show_window, args.timeout, args.resume);
+            let code = app_lib::run_headless_batch(args.manifest, args.show_window, args.timeout, args.resume, args.jobs);
             std::process::exit(code);
         }
         Some(Command::Catalog) => {

@@ -31,6 +31,7 @@
           "capWidth": { "description": "Downscale the output to at most this width (720 = Twitter-fit, 15 MB default target).", "type": "integer", "minimum": 0 },
           "targetMaxBytes": { "description": "Adaptive shrink ladder target size (GIF).", "type": "integer", "minimum": 1 },
           "border": { "description": "{width, bgColor?, style?, inkColor?} — checked by the batch CLI.", "type": "object" },
+          "mp4Quality": { "description": "MP4 rate control: \"upload\" (default, bitrate RC) or \"archive\" (fixed QP 26, v0.1 stream). Case-insensitive; checked by the batch CLI (ITER-050).", "type": "string" },
           "config": { "description": "Partial CONFIG — validated against glyph-grid.schema.json.", "type": "object" }
         }
       }
