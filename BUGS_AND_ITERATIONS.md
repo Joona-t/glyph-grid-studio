@@ -4,6 +4,31 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-065 — 2026-10-17 — v0.2 Phase 4: GL grid path measured (F6 step 0), revived, and made output-equivalent to the sprite blit (F7)
+
+**Problem:** F6 asked for a measured split of the opt-in `renderer: 'webgl'` path (fill loop / GL draw / composite / capture) before committing to GL-as-surface work; F7 said the existing shader could not match the CPU sprite path by construction (glyph squashed into the 4.27×4.2 px cell, opaque writes, its own white-on-black LINEAR/mediump atlas, no `|0` column snap).
+
+**Root cause (found while instrumenting):** the GL path had been **dead since v0.1.6** (2e22901). `drawGridWebGL` read `_stabOnInt` and `bgR/bgG/bgB` — locals of its caller `drawBrightnessGrid` — so the first GL frame threw `ReferenceError: Can't find variable: _stabOnInt`; the catch latched `_glOk=false`, flipped `CONFIG.renderer` back to `'cpu'`, and every frame after ran the CPU blit. Nothing failed loudly (`console.warn` doesn't reach the CLI's stderr). With the locals passed in, the original shader vs CPU measured **10.1 dB** (240×120) / **5.6 dB** (400×300) on lossless PNG frames — a different picture.
+
+**Fix:**
+- `src/index.html`: `__pfAdd(name, ms)` nests sub-stage timers inside a `__pf` stage without moving its mark: `cpu_blit`, `gl_fill`, `gl_draw`, `gl_composite`, and in `handleRecordFrame` `cap_toBlob_call` (sync part) / `cap_toBlob_async` (until the PNG callback). They land in PERF_JOB `avg_ms`.
+- `drawGridWebGL` rewritten as a transcription of the CPU monochrome blit: takes `_stabOnInt` as an argument, uses the CPU's own `_ensureRampSprite` atlas and tile size (9×12 at font 8), computes origins with the CPU's exact `((c*cellW)|0) + halfCellW - halfTW) | 0` snaps, skips space glyphs via `_rampSpriteSpaceMask` (instance list stays row-major so draw order matches), and sends per-cell alpha with the `globalAlpha` clamp. One grow-only `Float32Array(N*4)` `[x0, y0, idx, alpha]`.
+- `src/lib/glyph-wave6.js`: new `makeSprite`/`drawSprite` (WebGL2, GLSL 300 es, VAO): NEAREST 1:1 texels from integer origins, `highp`, fragment reads only the atlas texel's alpha × instance alpha with ink as a uniform (no un-premultiply error at low coverage), premultiplied source-over (`ONE, ONE_MINUS_SRC_ALPHA`) into a transparent premultiplied buffer that one `drawImage` composites over the p5 background — the CPU's per-glyph "over", associated. Atlas re-uploads only when the sprite canvas object changes; instance buffer is `bufferSubData` into a grow-only allocation. The legacy `make`/`draw` and the `output.webgl-canvas` stage are untouched.
+- `tests/frontend-contracts.test.js`: behavioural block runs `drawGridWebGL` in a vm with a stub `wave6` and asserts it does not throw, drops space glyphs, and emits exactly the CPU formula's origins/idx/alpha, the sprite atlas and the 9×12 tile; plus a contract that the gate passes `_stabOnInt`.
+- `tests/PERF-V0.2-GL.md`: the step-0 numbers and the reading.
+
+**Measured (under parallel load; PERF_JOB avg of 30 frames, cream-paper 1024×682, monochrome brightness):**
+- Fill loop: **0.1–0.7 ms** at 240×120, ~0.7–1.0 ms at 400×300 — under the 5 ms bar, so **F6 step 1 (shader-side placement) is not done**, and steps 2–3 are not justified by this data.
+- Grid stage: GL 1.8–2.1 ms vs CPU 7.8–8.1 ms (240×120); GL 2.7–4.1 ms vs CPU 101–121 ms (400×300). Frame total 4.2–4.3 vs 10.7–11.4 ms; 4.8–6.8 vs 105–131 ms.
+- Capture: `toBlob` is effectively synchronous on this WebKit (callback ~0.1 ms after the call) and is **cheaper** on the GL-composited canvas (12–22 ms) than on the sprite-blitted one (22–64 ms) — ITER-028's inferred "~34 ms readback trap" did not reproduce.
+- Equivalence (GL vs CPU, lossless PERF_JOB PNG anchors first/mid/last): 240×120 **57.8 / 60.2 / 61.6 dB** (max |Δ| 3 LSB), 400×300 **51.6 / 51.5 / 51.4 dB** (max |Δ| 4), 80×40 font 14 65–71 dB, temporal stability on 57.8–59.2 dB, kawaii-pink palette 57.7–58.9 dB. Via MP4 + `tests/psnr-gate.sh` (≥30 dB bar): 37.5 / 36.6 / 40.7 / 40.8 / 54.7 dB — H.264 re-quantises two near-identical high-frequency inputs differently, so the PNG anchors are the real measure.
+- Default output untouched (`renderer: 'cpu'`): worm 120 frames ×2 vs golden **inf dB**, md5 `163e203c…` = golden; 18 mode renders (edge-directional, shape octant, dither none, phosphorDecay, scanlines ×2, kawaii, scanlines+kawaii+letterbox, scanlines+bloom; still and animated) rgba-identical to the pre-change binary.
+- Timing (perf-sample, under parallel load, `suspect_foreign_xpc:true`): wall 23.80 / 22.47 s, app CPU 3.53 / 3.46 s.
+
+**Gate:** cargo build 0 errors · cargo test 18/18 · npm test ok (38 invariants + GL fill block + loader 5 cases + export tests) · run-all PASS 27 / FAIL 0 (incl. the uncommitted ITER-064 B13 hunk), MCP 10/10, byte-identity 7/7 · output gate inf dB.
+
+**Gotchas:** (a) `performance.now()` is clamped to ~1 ms in this WebKit; sub-ms stage values are averages of quantised ticks. (b) The GL path still only covers monochrome + brightness selection (incl. dithered `cellIndex`); shape/octant and edge-directional draw through other functions and stay CPU (edge mono needs fractional-origin resampling — separate step per F7(f)). (c) `renderer: 'webgl'` remains opt-in; with ≥51 dB lossless equivalence a GL default is now gate-verifiable, but that is an owner call. (d) A GL failure still only `console.warn`s — the CLI never sees it; the new vm test is what catches a dead GL path now.
+
 ### ITER-064 — 2026-10-17 — v0.2 Phase 4: native imports load via the asset protocol + a Rust header probe rejects over-limit sources before decode (F18 steps 1+2)
 
 **Problem:** every native import (GUI drop, Pick image, Pick + animate, Recent list, headless `render`/`batch`) went `fs::read` → base64 → `data:` URL string → JSON IPC payload → WebKit `JSON.parse` → p5's data-URL fetch: up to six full-file copies for a 64 MB GIF (≈85 MB base64 string ×3). And the source limits (480 frames, 16384 px, 100 M decoded px) could only run *after* p5 had decoded every GIF frame into a logical-size `ImageData` (≤400 MB) — BUGS backlog #1 said so openly.

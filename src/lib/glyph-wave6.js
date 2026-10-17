@@ -419,6 +419,142 @@
     r.drawInstanced(gl.TRIANGLES, 0, 6, instPos.length / 4);
   }
 
+  /* v0.2 Phase 4 (F7): sprite-equivalent instanced renderer for the
+     studio's monochrome brightness path. The legacy renderer above squashes
+     its own white-on-black atlas into the CELL and writes opaque colour, so
+     it could never match the canvas-2D sprite blit (9×12 tiles overlapping
+     4.27×4.2 cells, per-cell globalAlpha, source-over). This one is a
+     transcription of that blit:
+       - the atlas IS the CPU path's `_rampSprite.canvas` (same WebKit text
+         AA), sampled NEAREST at 1:1 texels from integer tile origins the
+         host computes with the CPU's own `|0` snaps;
+       - per-instance alpha, premultiplied source-over (ONE,
+         ONE_MINUS_SRC_ALPHA) into a transparent premultiplied drawing
+         buffer, which the host composites over the p5 background with one
+         drawImage — the same "over" the CPU does per glyph, associated;
+       - instances arrive in row-major order with space glyphs already
+         dropped, so draw order and coverage match the CPU loop.
+     WebGL2 only (GLSL 300 es); a null context throws → host falls back. */
+  function makeSpriteRenderer(canvas) {
+    const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: true,
+      alpha: true, preserveDrawingBuffer: true });
+    if (!gl) throw new GGE('STAGE_MISSING_HOST', 'webgl-sprite', 'output', {
+      message: 'No WebGL2 context available.',
+    });
+    const vsSrc = `#version 300 es
+      in vec2 aQuad;                 /* 0..1 tile corners */
+      in vec4 aInst;                 /* (x0, y0, glyphIdx, alpha); x0/y0 integer px */
+      uniform vec2 uResolution;
+      uniform vec2 uTile;            /* tileW, tileH (integer px) */
+      uniform float uAtlasW;
+      out vec2 vUV;
+      out float vA;
+      void main() {
+        vec2 pos = aInst.xy + aQuad * uTile;
+        vec2 clip = (pos / uResolution) * 2.0 - 1.0;
+        gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+        vUV = vec2((aInst.z + aQuad.x) * uTile.x / uAtlasW, aQuad.y);
+        vA = aInst.w;
+      }`;
+    const fsSrc = `#version 300 es
+      precision highp float;
+      uniform sampler2D uAtlas;
+      uniform vec3 uInk;
+      in vec2 vUV;
+      in float vA;
+      out vec4 outColor;
+      void main() {
+        /* Ink RGB is constant across the atlas, so only the texel's own
+           coverage is read — no un-premultiply error at low alpha. */
+        float a = texture(uAtlas, vUV).a * vA;
+        outColor = vec4(uInk * a, a);
+      }`;
+    function compile(src, type) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src); gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        throw new Error('shader compile: ' + gl.getShaderInfoLog(sh));
+      }
+      return sh;
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(vsSrc, gl.VERTEX_SHADER));
+    gl.attachShader(prog, compile(fsSrc, gl.FRAGMENT_SHADER));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error('link: ' + gl.getProgramInfoLog(prog));
+    }
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const quadVbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1]), gl.STATIC_DRAW);
+    const aQuad = gl.getAttribLocation(prog, 'aQuad');
+    gl.enableVertexAttribArray(aQuad);
+    gl.vertexAttribPointer(aQuad, 2, gl.FLOAT, false, 0, 0);
+    const instBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    const aInst = gl.getAttribLocation(prog, 'aInst');
+    gl.enableVertexAttribArray(aInst);
+    gl.vertexAttribPointer(aInst, 4, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(aInst, 1);
+    gl.bindVertexArray(null);
+    const tex = gl.createTexture();
+    return {
+      gl: gl, prog: prog, vao: vao, instBuf: instBuf, instCap: 0, tex: tex, atlasSrc: null,
+      atlasW: 0, atlasH: 0,
+      locs: {
+        uResolution: gl.getUniformLocation(prog, 'uResolution'),
+        uTile: gl.getUniformLocation(prog, 'uTile'),
+        uAtlasW: gl.getUniformLocation(prog, 'uAtlasW'),
+        uAtlas: gl.getUniformLocation(prog, 'uAtlas'),
+        uInk: gl.getUniformLocation(prog, 'uInk'),
+      },
+    };
+  }
+
+  /* inst: Float32Array(count*4) [x0, y0, glyphIdx, alpha] per visible cell.
+     atlasCanvas is (re)uploaded only when the object changes. */
+  function drawSprite(r, canvas, atlasCanvas, tileW, tileH, inst, count, ink) {
+    const gl = r.gl;
+    gl.useProgram(r.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, r.tex);
+    if (r.atlasSrc !== atlasCanvas) {
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvas);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      r.atlasSrc = atlasCanvas; r.atlasW = atlasCanvas.width; r.atlasH = atlasCanvas.height;
+    }
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.uniform2f(r.locs.uResolution, canvas.width, canvas.height);
+    gl.uniform2f(r.locs.uTile, tileW, tileH);
+    gl.uniform1f(r.locs.uAtlasW, r.atlasW);
+    gl.uniform1i(r.locs.uAtlas, 0);
+    gl.uniform3f(r.locs.uInk, ink[0], ink[1], ink[2]);
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (count > 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, r.instBuf);
+      const view = inst.length === count * 4 ? inst : inst.subarray(0, count * 4);
+      if (r.instCap < inst.length) {
+        gl.bufferData(gl.ARRAY_BUFFER, inst.byteLength, gl.DYNAMIC_DRAW);
+        r.instCap = inst.length;
+      }
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, view);
+      gl.bindVertexArray(r.vao);
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
+      gl.bindVertexArray(null);
+    }
+  }
+
   rt.register('output', 'webgl-canvas', function (colored, ctx, stage) {
     const canvas = ctx.canvas || document.querySelector('canvas');
     if (!canvas) throw new GGE('STAGE_MISSING_HOST', 'webgl-canvas', 'output', { message: 'No canvas.' });
@@ -726,6 +862,7 @@
      CPU path. Kept minimal: no new logic, just a callable surface over
      the existing makeWebGLRenderer/drawWebGL closures. */
   const _wave6RendererCache = new WeakMap();
+  const _wave6SpriteCache = new WeakMap();
   window.GlyphGrid.wave6 = Object.freeze({
     /* Returns a cached renderer for `canvas`, rebuilt when the ramp
        string or font metrics change (atlas is ramp/font-specific). */
@@ -738,6 +875,16 @@
                                   atlasCellW, atlasCellH);
       _wave6RendererCache.set(canvas, { key: key, r: r });
       return r;
+    },
+    /* F7: sprite-equivalent renderer (see makeSpriteRenderer). One per
+       canvas; the atlas texture follows the host's sprite canvas. */
+    makeSprite: function (canvas) {
+      let r = _wave6SpriteCache.get(canvas);
+      if (!r) { r = makeSpriteRenderer(canvas); _wave6SpriteCache.set(canvas, r); }
+      return r;
+    },
+    drawSprite: function (r, canvas, atlasCanvas, tileW, tileH, inst, count, ink) {
+      drawSprite(r, canvas, atlasCanvas, tileW, tileH, inst, count, ink);
     },
     /* instPos: Float32Array(N*4) [cx,cy,cellW,cellH]; glyphIdx:
        Float32Array(N); color: Float32Array(N*3) 0..1; bg: [r,g,b] 0..1. */

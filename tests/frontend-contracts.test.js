@@ -212,3 +212,51 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     console.log('native source loader: ok (5 cases)');
   }).catch((e) => { console.error(e); process.exit(1); });
 }
+
+/* ITER-065 (F7): the GL grid path must place, skip and weight glyphs exactly
+   like the CPU monochrome sprite blit — and must run on its own arguments
+   (pre-ITER-065 it read the caller's locals and threw on frame 1). */
+{
+  const m = html.match(/  let _glInst = null;[^\n]*\n[\s\S]*?\n  function drawGridWebGL\([\s\S]*?\n  \}\n/);
+  assert(m, 'drawGridWebGL() not found');
+  const gate = /drawGridWebGL\(cellIndex, signal, cols, rows, cellW, cellH,\s*palette, ramp, rampLast, _stabOnInt\)/;
+  assert(gate.test(html), 'GL gate passes the stability flag explicitly');
+  const sprite = { canvas: { width: 90, height: 12 }, tileW: 9, tileH: 12, halfW: 4.5, halfH: 6 };
+  const seen = {};
+  const lut = new Float32Array(256); for (let i = 0; i < 256; i++) lut[i] = i / 255;
+  const ctx = {
+    width: 1024, height: 504, CONFIG: { font: { size: 8 }, renderer: 'webgl' },
+    _glOk: true, _glCanvas: null, _stabOn: false, _stabIdx: null, _gammaLut: lut,
+    _rampSpriteSpaceMask: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    _ensureRampSprite: () => sprite, fontFamilyForActive: () => 'mono',
+    _hexToRgb: () => [17, 34, 51], _stableIdx: (s, i, v, idx) => idx, _stableIdxInt: (i, idx) => idx,
+    __pfAdd: () => {}, performance: { now: () => 0 }, console: { warn: (...a) => { seen.warn = a; } },
+    drawingContext: { drawImage: (c) => { seen.composited = c; } },
+    document: { createElement: () => ({ width: 0, height: 0 }) },
+  };
+  ctx.window = { GlyphGrid: { wave6: {
+    makeSprite: () => ({}),
+    drawSprite: (r, c, atlas, tw, th, inst, n, ink) => { Object.assign(seen, { atlas, tw, th, inst: Array.from(inst.subarray(0, n * 4)), n, ink }); },
+  } } };
+  vm.createContext(ctx);
+  vm.runInContext(m[0].replace(/^  let _glInst = null;/, 'var _glInst = null;') + '\nthis.__f = drawGridWebGL;', ctx);
+  const cols = 3, rows = 2, cellW = 1024 / 3, cellH = 504 / 2;
+  const signal = Float32Array.from([0, 0.5, 1, 0.2, 0.9, 0.05]);
+  assert.strictEqual(ctx.__f(null, signal, cols, rows, cellW, cellH, { inks: ['#112233'] }, ' .:-=+*#%@', 9, false), true, 'GL path renders');
+  assert(!seen.warn, 'GL path must not throw: ' + (seen.warn && seen.warn[1]));
+  /* CPU reference: same idx rule, space skip, origin snaps and alpha clamp. */
+  const want = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const curved = lut[(signal[r * cols + c] * 255) | 0];
+    const idx = Math.min(9, (curved * 9 + 0.0001) | 0);
+    if (ctx._rampSpriteSpaceMask[idx]) continue;
+    const a = Math.min(1, curved * 1.1);
+    want.push(((((c * cellW) | 0) + cellW * 0.5) - 4.5) | 0, ((((r * cellH) | 0) + cellH * 0.5) - 6) | 0, idx, Math.fround(a));
+  }
+  assert.strictEqual(seen.n, want.length / 4, 'space glyphs are dropped from the instance list');
+  assert.deepStrictEqual(seen.inst, want, 'instance origins/idx/alpha match the CPU sprite blit');
+  assert.strictEqual(seen.atlas, sprite.canvas, 'GL samples the CPU ramp sprite atlas');
+  assert.deepStrictEqual([seen.tw, seen.th], [9, 12], 'tile size is the sprite tile, not the cell');
+  assert.strictEqual(seen.composited, ctx._glCanvas, 'GL result is composited onto the p5 canvas');
+  console.log('GL sprite-equivalent instance fill: ok');
+}
