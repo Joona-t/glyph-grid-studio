@@ -27,6 +27,11 @@ const contracts = [
   ['atlas commits reject stale generations', /requestedGeneration === __renderGeneration/],
   ['p5 cadence follows the live FPS setting', /frameRate\(fps\)/],
   ['CLI accepts metadata-bearing native image payloads', /typeof loaded === ['"]object['"]\)[\s\S]{0,100}loaded\.dataUrl/],
+  /* ITER-064 (F18): header probe gates the source before p5 decodes it; the
+     webview streams the file via the asset protocol. */
+  ['CLI validates the header probe before any loadImage', /invoke\('probe_image_file', \{ path: inPath \}\);[\s\S]{0,600}validateSourceMetadata\([\s\S]{0,1200}window\.loadImage\(sourceUrl,/],
+  ['CLI loads native sources via convertFileSrc', /sourceUrl = core\.convertFileSrc\(inPath\);/],
+  ['studio imageRef exposes the pre-decode validator', /validate: function \(img, extra\) \{ return validateSourceMetadata\(img, extra\); \}/],
   ['memory probe sums every audited cache (F20)', /GlyphGrid\.memProbe = function[\s\S]{0,6000}totalBytes: total/],
   ['memory probe covers the wave6 atlas map', /wave6\.atlasCacheStats\(\)/],
   /* v0.2 Phase 1 determinism (ITER-046/047) */
@@ -148,4 +153,62 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     'font faces must load behind one parallel readiness promise');
   assert(!/waitForFace\([^)]*\)\s*\.then\(function \(\) \{ return waitForFace/.test(fontsJs),
     'sequential font wait chain is back');
+}
+
+/* ITER-064 (F18): behavioural check of the studio's native loader. An
+   over-limit probe must never reach loadImage; an in-limit one loads the
+   asset-protocol URL; without convertFileSrc it falls back to inline data. */
+{
+  const path = require('path');
+  const studioJs = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'glyph-studio.js'), 'utf8');
+  const m = studioJs.match(/\n  function loadNativeImageLatest\([\s\S]*?\n  \}\n/);
+  assert(m, 'loadNativeImageLatest() not found');
+  const run = (probe, withConvert) => {
+    const calls = { invoke: [], loaded: [], feedback: [] };
+    const core = {
+      invoke(cmd, args) {
+        calls.invoke.push([cmd, args]);
+        if (cmd === 'probe_image_file') return Promise.resolve(probe);
+        if (cmd === 'read_image_file') return Promise.resolve({ dataUrl: 'data:image/gif;base64,AA==', sizeBytes: 1 });
+        return Promise.reject(new Error('unexpected ' + cmd));
+      },
+    };
+    if (withConvert) core.convertFileSrc = (p) => 'asset://localhost/' + encodeURIComponent(p);
+    const ctx = {
+      window: { __TAURI__: { core } },
+      isCurrentSourceLoad: () => true,
+      sourcePayload: (v) => ({ dataUrl: (v && v.dataUrl) || '' }),
+      exportFeedback: (msg) => calls.feedback.push(msg),
+      loadImageLatest: (url) => calls.loaded.push(url),
+    };
+    vm.createContext(ctx);
+    vm.runInContext(m[0] + '\nthis.__f = loadNativeImageLatest;', ctx);
+    const imageRef = {
+      validate(img, extra) {
+        const frames = img.numFrames();
+        const reason = img.width > 16384 || img.height > 16384 ? 'logical dimensions exceed 16384 px'
+          : frames > 480 ? 'animation has ' + frames + ' frames (limit 480)' : '';
+        return { ok: !reason, reason, meta: { sizeBytes: extra.sizeBytes } };
+      },
+    };
+    ctx.__f('/tmp/a b.gif', imageRef, 'a b.gif', 1, () => {});
+    return new Promise((r) => setTimeout(r, 0)).then(() => calls);
+  };
+  Promise.all([
+    run({ width: 1, height: 1, frames: 481, sizeBytes: 17830, probed: true }, true),
+    run({ width: 16385, height: 1, frames: 1, sizeBytes: 97, probed: true }, true),
+    run({ width: 462, height: 622, frames: 50, sizeBytes: 1, probed: true }, true),
+    run({ width: 462, height: 622, frames: 50, sizeBytes: 1, probed: true }, false),
+    run({ width: 0, height: 0, frames: 0, sizeBytes: 1, probed: false }, true),
+  ]).then(([tooMany, tooWide, ok, noConvert, unprobed]) => {
+    assert.deepStrictEqual(tooMany.loaded, [], '481-frame GIF must be rejected before loadImage');
+    assert(/481 frames/.test(tooMany.feedback[0]), 'frame-limit rejection is reported');
+    assert.deepStrictEqual(tooWide.loaded, [], '16385-px still must be rejected before loadImage');
+    assert.deepStrictEqual(ok.loaded, ['asset://localhost/%2Ftmp%2Fa%20b.gif']);
+    assert(!ok.invoke.some(([cmd]) => cmd === 'read_image_file'), 'asset path must not read the file over IPC');
+    assert.deepStrictEqual(noConvert.loaded, ['data:image/gif;base64,AA==']);
+    assert.strictEqual(JSON.stringify(noConvert.invoke[1]), JSON.stringify(['read_image_file', { path: '/tmp/a b.gif', inline: true }]));
+    assert.strictEqual(unprobed.loaded.length, 1, 'unprobed formats fall back to the post-decode guard');
+    console.log('native source loader: ok (5 cases)');
+  }).catch((e) => { console.error(e); process.exit(1); });
 }

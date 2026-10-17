@@ -4,6 +4,31 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-064 — 2026-10-17 — v0.2 Phase 4: native imports load via the asset protocol + a Rust header probe rejects over-limit sources before decode (F18 steps 1+2)
+
+**Problem:** every native import (GUI drop, Pick image, Pick + animate, Recent list, headless `render`/`batch`) went `fs::read` → base64 → `data:` URL string → JSON IPC payload → WebKit `JSON.parse` → p5's data-URL fetch: up to six full-file copies for a 64 MB GIF (≈85 MB base64 string ×3). And the source limits (480 frames, 16384 px, 100 M decoded px) could only run *after* p5 had decoded every GIF frame into a logical-size `ImageData` (≤400 MB) — BUGS backlog #1 said so openly.
+
+**Root cause:** `read_path_as_data_url_with_metadata` was the only transport, although `assetProtocol` was already enabled in `tauri.conf.json` and never used (`convertFileSrc`: 0 hits). `validateSourceMetadata` reads `img.numFrames()`, which only exists once p5 has allocated all frames.
+
+**Spike first (required by F18):** a throwaway edit loaded the headless source via `convertFileSrc(inPath)` and called `img.loadPixels()` in the load callback. PNG (`cream-paper.png`, `asset://localhost/%2FUsers%2F…`): `loadPixels ok 1382400 720x480`; GIF (`worm-move.gif`): `loadPixels ok … 462x622 frames=50` — no taint (Tauri 2.11's asset handler sends `Access-Control-Allow-Origin: <window origin>`, and p5's `fetch(mode:'cors')` + `crossOrigin='Anonymous'` path accepts it; the GIF branch still sees `content-type: image/gif`), and the 120-frame worm render was **inf dB** vs golden. Spike reverted, then the real change landed.
+
+**Fix:**
+- `src-tauri/src/lib.rs`: `read_image_file(path, inline?)` and `pick_image_with_path` return metadata only — `{path, sizeBytes, mimeType}` (64 MB file guard kept via the new `source_file_size`). `inline: true` returns the old data URL for the fallback when `convertFileSrc` is absent; legacy `pick_image` is untouched.
+- New `probe_image_file(path)` → `{width, height, frames, sizeBytes, mimeType, probed}`: content-sniffed via `image::ImageReader::with_guessed_format`; GIFs use `gif::DecodeOptions` with `skip_frame_decoding(true)` and walk `next_frame_info()` (logical screen size + frame count, no pixel buffers); stills use `into_dimensions()`. Formats outside the `image` crate's features (AVIF) return `probed: false` and fall back to the post-decode guard; unreadable files error.
+- `src/lib/glyph-studio.js`: one `loadNativeImageLatest(path, imageRef, label, token, …)` used by all four GUI routes: probe → `imageRef.validate` (new field on the imageRef in `index.html`, = `validateSourceMetadata`) → `loadImage(convertFileSrc(path))`, or `read_image_file{inline:true}` when `convertFileSrc` is missing. A rejected probe shows "Image rejected: <name> — <reason>." and never calls `loadImage`.
+- `src/index.html` `_cliLoadSource`: same order; a rejection throws `source rejected before decode: <reason>`, and the initial-load failure is now forwarded to stderr via `cli_log` (it used to exit 1 silently). `acceptSourceImage`'s post-decode check stays as the second line of defence.
+- Fixtures `tests/sources/limit-481-frames.gif` (1×1, 481 frames, 17,830 B) and `limit-16385-wide.png` (16385×1, 97 B). Cargo: 3 probe tests (481 frames, 16385×1, cream-paper 720×480 + size, junk GIF errors, unknown AVIF `probed:false`, missing file errors). run-all B13 ×2: CLI exits non-zero with "rejected before decode" and writes no output (that `tests/run-all.sh` hunk is left uncommitted in the working tree — the file is on the pre-commit deny-list; the owner lands it). npm: 3 contracts + a 5-case behavioural test of `loadNativeImageLatest` (over-limit frame/dimension probes never reach `loadImage`; in-limit loads the `asset://` URL without a `read_image_file` IPC; no `convertFileSrc` → inline data URL; unprobed → post-decode guard).
+
+**Measured:**
+- Transport: a 6,458,778 B GIF (worm-move) no longer becomes an 8.6 MB base64 string + JSON payload + JS string + fetch copy; the IPC payload is now ~100 B of metadata (+ ~80 B for the probe). Load time not separately timed (one-shot per import).
+- Over-limit rejection: 481-frame GIF and 16385-px still exit in 1.42 s / 1.07 s wall (process boot dominates) with zero frames decoded — message `source load failed: source rejected before decode: animation has 481 frames (limit 480)` / `…logical dimensions exceed 16384 px`.
+- Output: worm-move 120 frames ×2 runs vs golden **inf dB**, MP4 md5 `163e203c…` = golden (asset-protocol decode is byte-identical to the data-URL decode). Byte-identity G1–G7 green.
+- Timing (perf-sample, under parallel load, `suspect_foreign_xpc:true`): wall 18.27 / 16.81 s, app CPU 3.21 / 3.17 s, WebContent 22.9 / 20.2 s, GPU 15.4 / 13.6 s (foreign-XPC inflated).
+
+**Gate:** cargo build 0 errors · cargo test 18/18 · npm test ok (38 invariants + native-loader 5 cases + export tests) · run-all PASS 27 / FAIL 0 with the uncommitted B13 hunk (25 without it), MCP 10/10 · output gate inf dB.
+
+**Gotchas:** (a) The four GUI routes share one loader and its logic is unit-tested, but the actual Finder drop / dialog pick was not driven in a GUI session this pass — the headless run proves the same WebView loads `asset://` without taint. (b) `assetProtocol.scope` is `["**"]`; narrowing it (e.g. to the picked/dropped paths at runtime) is the hardening follow-up, and needs `tauri.conf.json` (hook-protected here). (c) The probe counts image descriptors exactly like p5's `GifReader.numFrames()` (worm: 50 = Pillow `n_frames`); a GIF whose frames lack any colour table errors in the probe ("no color table available") — p5 would render it black, so failing loud is acceptable. (d) F18 step 3 (Rust decode + downsample, resident-memory cut) remains deferred.
+
 ### ITER-063 — 2026-10-17 — v0.2 Phase 4: vendored front-end deps (offline boot) + one parallel font readiness promise (F19)
 
 **Problem:** `src/index.html` loaded p5 1.11.2, JSZip 3.10.1, fflate 0.8.2 and Tweakpane 3.1.10 as parser-blocking `<script src="https://cdn.jsdelivr.net/...">` tags (1,332,182 B). The headless `render`/`batch` CLI loads the same page, so on a cold WebKit cache (first launch, fresh machine, CI, offline install) neither the GUI nor the CLI could boot, and every launch depended on a third-party CDN serving the right bytes. Separately, `GlyphGrid.fonts.load` waited for its three local faces in sequence (3000 + 1500 + 1500 ms caps, 6 s worst case on a stalled decode).
@@ -429,6 +454,8 @@ work and fixtures:
 1. p5 still decodes animated GIFs before frame-count/logical-dimension metadata
    is available. The 64 MiB pre-decode file guard reduces exposure, but a native
    bounded GIF decoder with disposal/timing fixtures remains planned.
+   **Closed by ITER-064:** `probe_image_file` reads logical size + frame count
+   from the headers and `validateSourceMetadata` runs before `loadImage`.
 2. Staged GUI capture removes the oversized one-shot IPC and browser duplication,
    but each PNG still crosses IPC as base64. A binary channel should replace that
    representation after Tauri/WebKit transfer behavior is benchmarked.

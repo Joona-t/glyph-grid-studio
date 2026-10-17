@@ -5242,6 +5242,7 @@
       name: 'sourceImg',
       begin: beginSourceImport,
       set: function (img, options) { return acceptSourceImage(img, options); },
+      validate: function (img, extra) { return validateSourceMetadata(img, extra); },
     },
   });
 
@@ -5261,20 +5262,33 @@
   let __cliCurrentSource = null;
   async function _cliLoadSource(inPath) {
     const importGeneration = beginSourceImport(inPath);
-    const loaded = await window.__TAURI__.core.invoke('read_image_file', { path: inPath });
-    /* v0.1.9 native reads return metadata with the data URL.  Accept the
-       legacy string response so older binaries/headless fixtures remain
-       compatible during rollout. */
-    const dataUrl = (loaded && typeof loaded === 'object')
-      ? (loaded.dataUrl || loaded.data_url) : loaded;
-    if (!dataUrl) throw new Error('read_image_file returned no image data');
-    const sourceBytes = loaded && typeof loaded === 'object'
-      ? (loaded.sizeBytes || loaded.size_bytes || 0) : 0;
-    if (sourceBytes > SOURCE_LIMITS.maxFileBytes) {
-      throw new Error('source exceeds the ' + Math.round(SOURCE_LIMITS.maxFileBytes / 1048576) + ' MB limit');
+    const core = window.__TAURI__.core;
+    /* ITER-064 (F18): probe the file headers first so an over-limit
+       animation/still is rejected before p5 allocates any frame. */
+    const probe = await core.invoke('probe_image_file', { path: inPath });
+    const sourceBytes = (probe && probe.sizeBytes) || 0;
+    if (probe && probe.probed) {
+      const checked = validateSourceMetadata({
+        width: probe.width, height: probe.height,
+        numFrames: function () { return probe.frames; },
+      }, { sizeBytes: sourceBytes });
+      if (!checked.ok) {
+        window.__glyphLastImportError = checked;
+        throw new Error('source rejected before decode: ' + checked.reason);
+      }
     }
+    /* The webview streams the file from disk via the asset protocol (no
+       base64 data URL across IPC).  Fallback: inline data URL. */
+    let sourceUrl = '';
+    if (typeof core.convertFileSrc === 'function') {
+      sourceUrl = core.convertFileSrc(inPath);
+    } else {
+      const loaded = await core.invoke('read_image_file', { path: inPath, inline: true });
+      sourceUrl = (loaded && typeof loaded === 'object') ? (loaded.dataUrl || loaded.data_url) : loaded;
+    }
+    if (!sourceUrl) throw new Error('read_image_file returned no image data');
     await new Promise(function (resolve, reject) {
-      window.loadImage(dataUrl, function (img) {
+      window.loadImage(sourceUrl, function (img) {
         const accepted = acceptSourceImage(img, {
           generation: importGeneration,
           sizeBytes: sourceBytes,
@@ -5340,6 +5354,7 @@
       await _cliLoadSource(initialSource);
     } catch (e) {
       console.error('CLI: initial loadImage failed:', e);
+      try { await window.__TAURI__.core.invoke('cli_log', { msg: 'source load failed: ' + ((e && e.message) || e) }); } catch (_) {}
       try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
     }
