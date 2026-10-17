@@ -4,6 +4,49 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-040 — 2026-10-17 — Rust export path: pipelined MP4 preprocess + raw-body frame IPC
+
+- **Problem:** (a) `encode_mp4_h264` ran PNG decode, border, Lanczos3 resize
+  and RGB→YUV on the same single thread as the openh264 encoder (BUG-013 had
+  made it sequential to kill the v0.1.5 "RGB Vec per frame" RAM spike, which
+  also threw away the throughput). (b) Every staged frame was base64'd in the
+  webview (FileReader data-URL + split copy), sent as a 33 %-larger JSON
+  string, and base64-decoded in Rust — on the capture critical path, since
+  capture waits on each `push_export_frame`.
+- **Root cause:** preprocess is pure per-frame work but was serialized behind a
+  stateful encoder; the staged IPC kept the legacy string transport.
+- **Fix:** (a) K = cores−2 (≥1) scoped worker threads preprocess frames from a
+  shared index counter; the encoder thread consumes them strictly in index
+  order via a BTreeMap reorder buffer, so the bitstream is unchanged. A
+  2K+2-frame window (Condvar on "frames encoded") bounds how far workers run
+  ahead, so peak RAM is a handful of YUV frames, not the whole set. Errors and
+  cancellation surface in frame order; a stop flag + dropped receiver release
+  parked workers. `to_rgba8` → `into_rgba8` drops one copy per frame.
+  (b) New `push_export_frame_raw(tauri::ipc::Request)`: PNG bytes are the raw
+  IPC body, jobId/index ride in `x-job-id`/`x-index` headers. Validation moved
+  into shared `stage_export_frame` used by both commands. JS `pushStagedFrame`
+  sends `blob.arrayBuffer()` bytes; on an "unknown command" error it falls back
+  once to the b64 command (base64 built from the same bytes) for the session.
+  `index.html` now base64-encodes only when frames are retained (non-staged
+  path). The `_tauriInvoke` wrapper also forwards its options argument (it
+  silently dropped them — caught by the new test).
+- **Measured (worm-move.gif, 120 frames, preset pB, `--format mp4`):**
+  `encode-mp4` stage 2523 / 2682 ms → 1458 / 1702 ms (≈1.6×, now openh264-bound:
+  1435 / 1667 ms of it is the encoder itself). Output pixel-identical to
+  baseline: PSNR average **inf** vs base2.mp4. Whole-run wall time is
+  capture-dominated and unchanged within noise (real 27.5 / 29.4 s vs
+  baseline 19.7–30.0 s). Raw IPC gain is unmeasured (CLI render does not use
+  the staged GUI path); estimated 2–8 ms per ~1 MB frame.
+- **Not done — finding #14 (stream MP4 encode during capture):** skipped. It
+  needs a new `begin_export_capture` contract (format/fps/cap/border), a
+  per-job encoder thread living in the global capture map with cancel/join
+  semantics, and its win (≈ min(capture, encode)) shrinks now that encode is
+  ~1.5 s for 120 frames while workers would compete with WebView capture for
+  the same cores. Revisit only with a GUI capture-vs-encode timing showing
+  encode is a meaningful share.
+- **Gate:** cargo build --release clean; cargo test 15 passed; npm test both ok
+  (export tests +2 raw/fallback cases); run-all PASS 24 FAIL 0, MCP 10/0.
+
 ## 2026-08-08 — v0.1.9: bounded imports, staged exports, responsive controls
 
 This release follows a source-level performance audit prompted by freezes and

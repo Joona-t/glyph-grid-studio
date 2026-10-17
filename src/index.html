@@ -3678,7 +3678,9 @@
         return;
       }
       if (state.zip) state.zip.file(name, blob);
-      const needsBase64 = !!(state.framesB64 || state.onFrame);
+      /* ITER-040: onFrame consumers get the Blob and push raw bytes; only
+         the retained-frames (non-staged) path still needs base64 here. */
+      const needsBase64 = !!state.framesB64;
       const encoded = needsBase64 ? blobToBase64(blob) : Promise.resolve(null);
       encoded.then(function (base64) {
         if (recState !== state || state.cancelled) return null;

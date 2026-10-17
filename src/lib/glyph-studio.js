@@ -63,7 +63,7 @@
      this data subscribe to _persistReady and rebuild once the seed
      lands (init() runs before the async load resolves). */
   var _tauriInvoke = (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)
-    ? function (cmd, args) { return window.__TAURI__.core.invoke(cmd, args); }
+    ? function (cmd, args, options) { return window.__TAURI__.core.invoke(cmd, args, options); }
     : null;
   function persistMirror(key) {
     if (!_tauriInvoke) return;
@@ -597,6 +597,35 @@
   function nativeCommandUnavailable(error) {
     return /unknown command|command .* not found|not registered|does not exist/i.test(String(error));
   }
+  /* ITER-040: staged frames cross IPC as a raw binary body (no data-URL
+     build, no base64 JSON string, no Rust-side decode). Older binaries
+     without push_export_frame_raw fall back to the base64 command once and
+     stay there for the session. */
+  var _rawFramePush = true;
+  function bytesToBase64(bytes) {
+    var parts = [];
+    for (var i = 0; i < bytes.length; i += 0x8000) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+    }
+    return btoa(parts.join(''));
+  }
+  function pushStagedFrame(job, frame) {
+    function pushB64(b64) {
+      return _tauriInvoke('push_export_frame', { jobId: job.id, index: frame.index, b64: b64 });
+    }
+    if (!frame.blob || typeof frame.blob.arrayBuffer !== 'function') return pushB64(frame.b64);
+    return frame.blob.arrayBuffer().then(function (buf) {
+      var bytes = new Uint8Array(buf);
+      if (!_rawFramePush) return pushB64(bytesToBase64(bytes));
+      return _tauriInvoke('push_export_frame_raw', bytes, {
+        headers: { 'x-job-id': String(job.id), 'x-index': String(frame.index) },
+      }).catch(function (e) {
+        if (!nativeCommandUnavailable(e)) throw e;
+        _rawFramePush = false;
+        return pushB64(bytesToBase64(bytes));
+      });
+    });
+  }
   function cancelNativeJob(job) {
     if (!_tauriInvoke || !job) return;
     _tauriInvoke('cancel_export', { jobId: job.id }).catch(function () {});
@@ -613,13 +642,7 @@
       jobId: job && job.id,
       collectFrames: inTauri && !staged,
       collectZip: !inTauri,
-      onFrame: staged ? function (frame) {
-        return _tauriInvoke('push_export_frame', {
-          jobId: job.id,
-          index: frame.index,
-          b64: frame.b64,
-        });
-      } : null,
+      onFrame: staged ? function (frame) { return pushStagedFrame(job, frame); } : null,
       onProgress: function (completed, count) {
         if (onProgress) onProgress(completed, count);
         if (job) setExportPhase(job, 'capturing', completed, count);
@@ -700,13 +723,7 @@
       jobId: job && job.id,
       collectFrames: inTauri && !staged,
       collectZip: !inTauri,
-      onFrame: staged ? function (frame) {
-        return _tauriInvoke('push_export_frame', {
-          jobId: job.id,
-          index: frame.index,
-          b64: frame.b64,
-        });
-      } : null,
+      onFrame: staged ? function (frame) { return pushStagedFrame(job, frame); } : null,
       onProgress: function (completed, count) {
         if (onProgress) onProgress(completed, count);
         if (job) setExportPhase(job, 'capturing', completed, count);
