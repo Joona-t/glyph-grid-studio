@@ -4,6 +4,25 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-080 — 2026-10-18 — video: NALs hiding start codes refused, limits on the coded size, crops under a macroblock
+
+**Problem:** two gaps left after ITER-079. (1) `to_annexb` type-checks each length-prefixed NAL, then joins them with `00 00 00 01`. openh264 splits that Annex-B buffer itself. A NAL whose payload held `00 00 01` (e.g. an "IDR" `65 88 84 00 00 01` followed by a type-7 SPS for 8192×8192) therefore carried a second NAL that openh264 would parse and the type check never saw. The avcC SPS/PPS entries went into `params` unscanned the same way. (2) `sps_dimensions` returns the cropped size, and `check_limits` ran on it. openh264 allocates the coded size (whole macroblocks). An SPS of 8192×8192 coded "cropped" to 160×90 passed the limits, as did a 16400-wide coded picture cropped to 16372.
+
+**Root cause:** the checks looked at the units the demuxer frames and the size openh264 outputs. The decoder obeys the bytes it splits and allocates the coded size.
+
+**Fix:**
+1. `has_start_code(nal)`: true if the payload after the header byte holds `00 00 00` or `00 00 01`. Emulation prevention keeps both out of valid H.264, and `00 00 03` still passes. `to_annexb` refuses such a sample NAL with `Err("NAL payload contains a start code")`. `stream_dimensions` refuses any such avcC SPS or PPS entry at open (rejected) and in the probe (Err).
+2. `sps_size(nal) -> Result<SpsSize { coded, cropped }, String>`. `sps_dimensions` is now its cropped wrapper (same `Option` contract). A crop of 16 px or more on any edge (`CropUnit × offset >= 16`) is refused as "SPS crops a macroblock or more off an edge". Real encoders crop under one MB to reach a non-multiple-of-16 size.
+3. `open` runs `check_limits` on the coded size and keeps the cropped size as `info.width/height`, the output and tkhd/avc1 comparison size. The decoder stores `coded`. An in-band SPS must match both: cropped == admitted (unchanged message), and coded == avcC coded, else "in-band SPS changes the coded size (WxH vs the admitted WxH)".
+
+**Tests (cargo 64 → 67):** `a_nal_hiding_a_start_code_is_refused`: (a) tiny.mp4 with sample 0 led by an IDR NAL that embeds `00 00 01` + the 8192² SPS is refused by open, before frame 0 is decoded, and the same NAL fed straight to `to_annexb` errors. (b) An avcC SPS with a trailing `00 00 01 68` is rejected at open and errors the probe. A new `with_avcc_sps` helper rewrites the avcC SPS, growing every enclosing box and the stco offset, and zeroes the tkhd/avc1 dims. Its sanity check puts tiny.mp4's own SPS back, and the frames decode identical. `the_coded_size_is_what_is_admitted`: (c) a 1025-MB-wide SPS (16400×16 coded, 7+7 crop units → 16372×16) is rejected for the coded 16400. 8192² cropped to 160×90 and a 16 px single-edge crop are refused by the parser. A 176×96 in-band SPS cropped to 160×90 is refused for the coded size. Both fixtures admit coded 160×96. (d) `fixture_frames_are_unchanged_by_the_iter080_checks` pins FNV-1a hashes of all 24 fixture frames, taken before the change. A one-off `GGS_VIDEO_DUMP` md5 of every frame also matched before and after (md5 of the 24 md5s `66bd51dc420d284444da779ee86685c8`).
+
+**Measured:** golden render vs golden-p3-iter057.mp4 gives PSNR inf over 120 frames (no output change), real 17.60 s, user 2.25 s. Gate: cargo 67/67, run-all PASS 49 / FAIL 0, MCP 34/34, byte-identity 9/9.
+
+**Gotchas:** for field-coded SPS (frame_mbs_only 0) the vertical CropUnit already doubles, so "under one MB" is checked in luma rows. A crop of up to 30 px per axis is still allowed, which is why the limits use the coded size rather than relying on the crop cap. tiny.mp4 stores its moov before the mdat, so `with_avcc_sps` must shift the chunk offset. tiny-bframes.mp4 does not need that.
+
+---
+
 ### ITER-079 — 2026-10-18 — video: in-band SPS cannot resize the decode, size checked before the RGBA allocation
 
 **Problem:** ITER-078 enforced SOURCE_LIMITS against the avcC SPS only (stream_dimensions + check_limits in `VideoDecoder::open`). `to_annexb` then copied every sample NAL verbatim, so a type-7 SPS carried in a sample (e.g. declaring 8192×8192 in a file whose avcC says 160×90) reached openh264. openh264 honours the newest SPS and reallocates for it. The first size check was `emit()`, which ran AFTER `yuv_rgba` had already allocated w·h·4 bytes (256 MB for 8192², up to 1 GB at 16384²) for the oversized picture.

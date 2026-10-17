@@ -104,12 +104,43 @@ impl Bits<'_> {
     }
 }
 
+/// ITER-080: true if a NAL payload (after its header byte) holds 00 00 00
+/// or 00 00 01.  Emulation prevention keeps both out of valid H.264, but
+/// openh264's Annex-B splitter would cut a second NAL at an embedded
+/// 00 00 01 — one to_annexb's type check never saw.
+fn has_start_code(nal: &[u8]) -> bool {
+    nal.get(1..).map_or(false, |p| p.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] <= 1))
+}
+
+/// Both picture sizes an SPS declares.  openh264 allocates `coded`
+/// (whole macroblocks) and outputs `cropped`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpsSize {
+    pub coded: (u32, u32),
+    pub cropped: (u32, u32),
+}
+
 /// Cropped picture size from an SPS NAL unit (header byte included), per
 /// H.264 7.3.2.1.1 — the size openh264 will output.  `None` = unparseable.
 pub fn sps_dimensions(nal: &[u8]) -> Option<(u32, u32)> {
+    sps_size(nal).ok().map(|s| s.cropped)
+}
+
+/// Coded + cropped size from an SPS NAL unit.  ITER-080: the crop must be
+/// under one macroblock on every edge (what encoders emit to reach a
+/// non-multiple-of-16 size); a larger one would let a huge coded picture
+/// pass check_limits on a small cropped size.
+pub fn sps_size(nal: &[u8]) -> Result<SpsSize, String> {
     if nal.first().map(|h| h & 0x1F) != Some(7) {
-        return None;
+        return Err("not an SPS".into());
     }
+    sps_parse(nal)
+        .ok_or_else(|| "unparseable SPS".to_string())?
+        .ok_or_else(|| "SPS crops a macroblock or more off an edge".to_string())
+}
+
+/// `None` = unparseable, `Some(None)` = crop of a macroblock or more.
+fn sps_parse(nal: &[u8]) -> Option<Option<SpsSize>> {
     let mut rbsp = Vec::with_capacity(nal.len());
     let mut zeros = 0;
     for &b in &nal[1..] {
@@ -196,17 +227,25 @@ pub fn sps_dimensions(nal: &[u8]) -> Option<(u32, u32)> {
         2 => (2, 2 - frame_mbs_only),
         _ => (1, 2 - frame_mbs_only),
     };
-    let w = (w_mbs * 16).checked_sub(cx * (cl + cr))?;
-    let h = ((2 - frame_mbs_only) * h_map * 16).checked_sub(cy * (ct + cb))?;
-    if w == 0 || h == 0 || w > u32::MAX as u64 || h > u32::MAX as u64 {
+    let (coded_w, coded_h) = (w_mbs * 16, (2 - frame_mbs_only) * h_map * 16);
+    if coded_w > u32::MAX as u64 || coded_h > u32::MAX as u64 {
         return None;
     }
-    Some((w as u32, h as u32))
+    // ue() saturates at u32::MAX, so these products cannot overflow u64.
+    if [cx * cl, cx * cr, cy * ct, cy * cb].iter().any(|&c| c >= 16) {
+        return Some(None);
+    }
+    let (w, h) = (coded_w - cx * (cl + cr), coded_h - cy * (ct + cb));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(Some(SpsSize { coded: (coded_w as u32, coded_h as u32), cropped: (w as u32, h as u32) }))
 }
 
 /// The picture size every SPS in the avcC declares, checked against the
 /// container's own claims (tkhd, avc1 sample entry; 0 = not stated).
-fn stream_dimensions(track: &mp4::Mp4Track) -> Result<(u32, u32), String> {
+/// ITER-080: no SPS/PPS entry may hide a start code (has_start_code).
+fn stream_dimensions(track: &mp4::Mp4Track) -> Result<SpsSize, String> {
     let avc1 = track
         .trak
         .mdia
@@ -216,15 +255,20 @@ fn stream_dimensions(track: &mp4::Mp4Track) -> Result<(u32, u32), String> {
         .avc1
         .as_ref()
         .ok_or("avc1 sample entry missing")?;
-    let mut dims: Option<(u32, u32)> = None;
-    for sps in &avc1.avcc.sequence_parameter_sets {
-        let d = sps_dimensions(&sps.bytes).ok_or("unparseable SPS in avcC")?;
+    let avcc = &avc1.avcc;
+    if avcc.sequence_parameter_sets.iter().chain(avcc.picture_parameter_sets.iter()).any(|n| has_start_code(&n.bytes)) {
+        return Err("NAL payload contains a start code".into());
+    }
+    let mut dims: Option<SpsSize> = None;
+    for sps in &avcc.sequence_parameter_sets {
+        let d = sps_size(&sps.bytes).map_err(|e| format!("{} in avcC", e))?;
         if dims.map_or(false, |prev| prev != d) {
             return Err("avcC SPS entries disagree on the picture size".into());
         }
         dims = Some(d);
     }
-    let (w, h) = dims.ok_or("avcC carries no SPS")?;
+    let size = dims.ok_or("avcC carries no SPS")?;
+    let (w, h) = size.cropped;
     let tkhd = &track.trak.tkhd;
     for (what, cw, ch) in [
         ("tkhd", tkhd.width.value() as u32, tkhd.height.value() as u32),
@@ -237,7 +281,7 @@ fn stream_dimensions(track: &mp4::Mp4Track) -> Result<(u32, u32), String> {
             ));
         }
     }
-    Ok((w, h))
+    Ok(size)
 }
 
 /// `video_open` / probe result.  `supported: false` carries `reason`; the
@@ -329,6 +373,8 @@ pub struct VideoDecoder {
     length_size: usize,
     /// Annex-B SPS + PPS, prepended to every sync sample.
     params: Vec<u8>,
+    /// Coded (macroblock) size of the avcC SPS; an in-band SPS must match.
+    coded: (u32, u32),
     samples: u32,
     /// 0-based decode index of every sync sample, ascending (gops[0] == 0).
     gops: Vec<u32>,
@@ -375,8 +421,11 @@ impl VideoDecoder {
         // ITER-078: the SPS (what openh264 will allocate) must agree with
         // the container's dims and fit the source limits — checked before
         // any table is indexed or a frame decoded.
-        let (sw, sh) = stream_dimensions(track).map_err(|r| rejected(codec, r))?;
-        check_limits(sw, sh, track.sample_count()).map_err(|r| rejected(codec, r))?;
+        // ITER-080: the limits apply to the coded size (what openh264
+        // allocates), not the cropped one it outputs.
+        let size = stream_dimensions(track).map_err(|r| rejected(codec, r))?;
+        let (sw, sh) = size.cropped;
+        check_limits(size.coded.0, size.coded.1, track.sample_count()).map_err(|r| rejected(codec, r))?;
         let avcc = &track
             .trak
             .mdia
@@ -410,6 +459,7 @@ impl VideoDecoder {
             track_id,
             length_size,
             params,
+            coded: size.coded,
             samples,
             gops: Vec::new(),
             decoder: None,
@@ -573,16 +623,26 @@ impl VideoDecoder {
                 return Err("truncated NAL unit".into());
             }
             let nal = &avcc[i..i + len];
+            if has_start_code(nal) {
+                return Err("NAL payload contains a start code".into());
+            }
             match nal.first().map(|h| h & 0x1F) {
                 Some(7) => {
                     let admitted = (self.info.width, self.info.height);
-                    let got = sps_dimensions(nal);
-                    if got != Some(admitted) {
+                    let got = sps_size(nal);
+                    if got.as_ref().map(|s| s.cropped) != Ok(admitted) {
                         return Err(format!(
                             "in-band SPS changes the stream size ({} vs the admitted {}x{})",
-                            got.map_or("unparseable".into(), |(w, h)| format!("{}x{}", w, h)),
+                            got.map_or("unparseable".into(), |s| format!("{}x{}", s.cropped.0, s.cropped.1)),
                             admitted.0,
                             admitted.1
+                        ));
+                    }
+                    let coded = got.map(|s| s.coded).unwrap_or_default();
+                    if coded != self.coded {
+                        return Err(format!(
+                            "in-band SPS changes the coded size ({}x{} vs the admitted {}x{})",
+                            coded.0, coded.1, self.coded.0, self.coded.1
                         ));
                     }
                 }
@@ -755,7 +815,7 @@ pub fn probe_mp4(path: &Path) -> Result<Option<VideoInfo>, String> {
         Err(_) => "unknown",
     };
     let (width, height) = if codec == "h264" {
-        stream_dimensions(track)?
+        stream_dimensions(track)?.cropped
     } else {
         (track.width() as u32, track.height() as u32)
     };
@@ -1082,6 +1142,15 @@ mod tests {
     /// cropping, emulation prevention applied — hand-built for the crafted
     /// in-band fixtures below.
     fn sps_nal(w_mbs: u32, h_mbs: u32) -> Vec<u8> {
+        sps_nal_crop(w_mbs, h_mbs, None)
+    }
+
+    /// `crop` = frame_crop_{left,right,top,bottom}_offset (4:2:0: x2 px).
+    fn sps_nal_cropped(w_mbs: u32, h_mbs: u32, crop: [u32; 4]) -> Vec<u8> {
+        sps_nal_crop(w_mbs, h_mbs, Some(crop))
+    }
+
+    fn sps_nal_crop(w_mbs: u32, h_mbs: u32, crop: Option<[u32; 4]>) -> Vec<u8> {
         let mut bits: Vec<u8> = Vec::new();
         let mut put = |v: u32, n: u32| (0..n).rev().for_each(|k| bits.push(((v >> k) & 1) as u8));
         let ue = |put: &mut dyn FnMut(u32, u32), v: u32| {
@@ -1101,7 +1170,10 @@ mod tests {
         ue(&mut put, h_mbs - 1);
         put(1, 1); // frame_mbs_only_flag
         put(1, 1); // direct_8x8_inference_flag
-        put(0, 1); // frame_cropping_flag
+        put(crop.is_some() as u32, 1); // frame_cropping_flag
+        for v in crop.unwrap_or_default() {
+            ue(&mut put, v);
+        }
         put(0, 1); // vui_parameters_present_flag
         put(1, 1); // rbsp_stop_one_bit
         while bits.len() % 8 != 0 {
@@ -1198,6 +1270,136 @@ mod tests {
             for i in 0..12 {
                 assert!(d.frame(i).unwrap() == orig.frame(i).unwrap(), "{} frame {}", name, i);
             }
+        }
+    }
+
+    /// FNV-1a 64 over every frame of `name` in presentation order.
+    /// GGS_VIDEO_DUMP=<dir> also writes each frame's RGBA there (md5 it).
+    fn frames_fnv(name: &str) -> u64 {
+        let mut d = VideoDecoder::open(&fixture(name)).unwrap_or_else(|i| panic!("{}: {:?}", name, i.reason));
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for i in 0..d.samples {
+            let f = d.frame(i).unwrap();
+            if let Ok(dir) = std::env::var("GGS_VIDEO_DUMP") {
+                std::fs::write(std::path::Path::new(&dir).join(format!("{}-{:02}.rgba", name, i)), &f[..]).unwrap();
+            }
+            for &b in f.iter() {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// ITER-080 (d): the start-code scan and coded-size admission leave the
+    /// fixtures' pixels alone (hashes taken before the change; the md5 of
+    /// the 24 GGS_VIDEO_DUMP frames matched too).
+    #[test]
+    fn fixture_frames_are_unchanged_by_the_iter080_checks() {
+        assert_eq!(frames_fnv("tiny.mp4"), 0xf056_e448_4f99_41b2);
+        assert_eq!(frames_fnv("tiny-bframes.mp4"), 0x62e3_9b83_75ba_698b);
+    }
+
+    /// A copy of `name` whose (single) avcC SPS is replaced by `sps`, with
+    /// every enclosing box, the stco offset (moov before mdat) and the
+    /// tkhd / avc1 dims (zeroed = "not stated") patched to match.
+    fn with_avcc_sps(name: &str, sps: &[u8], tag: &str) -> PathBuf {
+        let mut b = std::fs::read(fixture(name)).unwrap();
+        let be = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+        let pos = |b: &[u8], t: &[u8]| b.windows(4).rposition(|w| w == t).unwrap() - 4;
+        let avcc = pos(&b, b"avcC");
+        assert_eq!(b[avcc + 13], 0xE1, "{}: one SPS", name);
+        let old = u16::from_be_bytes([b[avcc + 14], b[avcc + 15]]) as usize;
+        let delta = sps.len() as i64 - old as i64;
+        let grow = |b: &mut Vec<u8>, o: usize| {
+            let v = (be(b, o) as i64 + delta) as u32;
+            b[o..o + 4].copy_from_slice(&v.to_be_bytes());
+        };
+        for t in [&b"moov"[..], b"trak", b"mdia", b"minf", b"stbl", b"stsd", b"avc1", b"avcC"] {
+            let o = pos(&b, t);
+            grow(&mut b, o);
+        }
+        if pos(&b, b"moov") < pos(&b, b"mdat") {
+            let stco = pos(&b, b"stco");
+            assert_eq!(be(&b, stco + 12), 1, "{}: one chunk", name);
+            grow(&mut b, stco + 16);
+        }
+        let tkhd = pos(&b, b"tkhd");
+        assert_eq!(b[tkhd + 8], 0, "tkhd v0");
+        b[tkhd + 84..tkhd + 92].fill(0);
+        let avc1 = pos(&b, b"avc1");
+        b[avc1 + 32..avc1 + 36].fill(0);
+        b[avcc + 14..avcc + 16].copy_from_slice(&(sps.len() as u16).to_be_bytes());
+        b.splice(avcc + 16..avcc + 16 + old, sps.iter().copied());
+        let dir = std::env::temp_dir().join(format!("ggs-video-avcc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("{}-{}", tag, name));
+        std::fs::write(&out, b).unwrap();
+        out
+    }
+
+    fn open_reason(p: &Path) -> String {
+        VideoDecoder::open(p).err().and_then(|i| i.reason).unwrap_or_default()
+    }
+
+    /// ITER-080 (a, b): a NAL hiding 00 00 01 is refused, in a sample (here
+    /// an IDR smuggling an 8192x8192 SPS) and in the avcC.
+    #[test]
+    fn a_nal_hiding_a_start_code_is_refused() {
+        let mut idr = vec![0x65, 0x88, 0x84, 0x00, 0x00, 0x01];
+        idr.extend_from_slice(&sps_nal(512, 512));
+        let smuggled = with_inband("tiny.mp4", 0, &idr, "idr-sc");
+        assert!(open_reason(&smuggled).contains("NAL payload contains a start code"), "{}", open_reason(&smuggled));
+        let d = VideoDecoder::open(&fixture("tiny.mp4")).unwrap();
+        let mut pkt = (idr.len() as u32).to_be_bytes().to_vec();
+        pkt.extend_from_slice(&idr);
+        assert_eq!(d.to_annexb(&pkt, false).unwrap_err(), "NAL payload contains a start code");
+        // 00 00 00 too; 00 00 03 (emulation prevention) and the header byte are fine.
+        assert!(has_start_code(&[0x65, 1, 0, 0, 0, 2]));
+        assert!(!has_start_code(&[0x65, 0, 0, 3, 0, 0, 3]));
+        assert!(!has_start_code(&[0x00, 0, 1]));
+
+        // The rewriter is sound: the fixture's own SPS put back decodes the same.
+        let mut orig = VideoDecoder::open(&fixture("tiny.mp4")).unwrap();
+        let own = orig.reader.tracks()[&orig.track_id].trak.mdia.minf.stbl.stsd.avc1.as_ref().unwrap().avcc.sequence_parameter_sets[0].bytes.clone();
+        let mut same = VideoDecoder::open(&with_avcc_sps("tiny.mp4", &own, "avcc-same")).unwrap_or_else(|i| panic!("{:?}", i.reason));
+        for i in [0u32, 5, 11] {
+            assert!(same.frame(i).unwrap() == orig.frame(i).unwrap(), "frame {}", i);
+        }
+        let mut sps = sps_nal(10, 6);
+        sps.extend_from_slice(&[0x00, 0x00, 0x01, 0x68]);
+        let bad = with_avcc_sps("tiny.mp4", &sps, "avcc-sc");
+        let r = VideoDecoder::open(&bad).err().unwrap();
+        assert!(r.rejected && r.reason.as_deref() == Some("NAL payload contains a start code"), "{:?}", r);
+        assert_eq!(probe_mp4(&bad).unwrap_err(), "NAL payload contains a start code");
+    }
+
+    /// ITER-080 (c): limits apply to the coded size openh264 allocates; a
+    /// crop cannot buy a bigger picture, and crops are under a macroblock.
+    #[test]
+    fn the_coded_size_is_what_is_admitted() {
+        // 16400x16 coded, 7+7 (x2) px cropped -> 16372x16, under the limit.
+        let wide = sps_nal_cropped(1025, 1, [7, 7, 0, 0]);
+        assert_eq!(sps_size(&wide), Ok(SpsSize { coded: (16400, 16), cropped: (16372, 16) }));
+        assert!(check_limits(16372, 16, 12).is_ok(), "the cropped size alone would pass");
+        let r = VideoDecoder::open(&with_avcc_sps("tiny.mp4", &wide, "coded-wide")).err().unwrap();
+        assert!(r.rejected && r.reason.as_deref().unwrap_or("").contains("16400x16; dimensions exceed"), "{:?}", r);
+
+        // A crop of a macroblock or more: 8192x8192 coded "cropped" to 160x90.
+        let huge = sps_nal_cropped(512, 512, [0, 4016, 0, 4051]);
+        assert!(sps_dimensions(&huge).is_none());
+        assert_eq!(sps_size(&huge).unwrap_err(), "SPS crops a macroblock or more off an edge");
+        let r = open_reason(&with_avcc_sps("tiny.mp4", &huge, "crop-huge"));
+        assert!(r.contains("crops a macroblock or more"), "{}", r);
+        assert!(sps_size(&sps_nal_cropped(10, 6, [0, 0, 0, 8])).is_err(), "16 px off one edge");
+
+        // In-band: same cropped size (160x90) but a different coded size.
+        let other = sps_nal_cropped(11, 6, [4, 4, 0, 3]);
+        assert_eq!(sps_size(&other), Ok(SpsSize { coded: (176, 96), cropped: (160, 90) }));
+        let r = open_reason(&with_inband("tiny.mp4", 0, &other, "coded-inband"));
+        assert!(r.contains("in-band SPS changes the coded size (176x96 vs the admitted 160x96)"), "{}", r);
+        // The fixtures: 160x96 coded, cropped to 160x90.
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            assert_eq!(VideoDecoder::open(&fixture(name)).unwrap().coded, (160, 96), "{}", name);
         }
     }
 
