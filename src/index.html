@@ -1478,11 +1478,14 @@
        depth), so when its identity key and cached buffers are unchanged
        we keep last frame's src + src.pixels and skip both the repaint
        and the full-canvas getImageData readback.  Only the scene's
-       config side effect (xdog sigma sweep) still has to run. */
+       config side effect (xdog sigma sweep) still has to run.
+       ITER-052 (F2 step 3): an animated source is a still between GIF
+       frame changes — the studio scene keys its preprocess on the same
+       frame index and paints nothing time-dependent after it — so the
+       frame index joins the key instead of disqualifying it. */
     const studio = SCENES.studio;
-    const layerKey = (CONFIG.scene === 'studio' && sourceImg
-        && window.__sourceFrameIdx === -1)
-      ? (__sourceRevision + '|' + src.width + 'x' + src.height + '|'
+    const layerKey = (CONFIG.scene === 'studio' && sourceImg)
+      ? (__sourceRevision + '|' + window.__sourceFrameIdx + '|' + src.width + 'x' + src.height + '|'
          + bgColor(CONFIG) + '|' + !!(CONFIG.depth && CONFIG.depth.enabled))
       : null;
     const reuseLayer = layerKey !== null && layerKey === __srcLayerKey
@@ -1492,7 +1495,14 @@
     if (reuseLayer) {
       studioSigmaSweep(t, CONFIG);
     } else {
-      sceneResult = SCENES[CONFIG.scene](src, t, CONFIG) || null;
+      /* ITER-052: call the scene with itself as `this`.  `SCENES[name](…)`
+         bound `this` to SCENES, so every scene's `this.__sourceProcessed`
+         / `__sourceDepth` cache lived on the shared container while the
+         layer memo above, clearSourceDerivedCaches, memProbe and the GUI's
+         sceneCacheKeys all read SCENES[name] — the ITER-042 memo never hit
+         and a source swap never dropped the depth buffer. */
+      const sceneFn = SCENES[CONFIG.scene];
+      sceneResult = sceneFn.call(sceneFn, src, t, CONFIG) || null;
       depthImg = (sceneResult && sceneResult.depth && sceneResult.depth.width > 0)
         ? sceneResult.depth : null;
     }
@@ -4069,12 +4079,29 @@
     const name = `frame_${String(idx + 1).padStart(4, '0')}.png`;
     statusEl().textContent =
       `RECORDING ${idx + 1}/${state.total} (${CONFIG.scene} @ ${CONFIG.palette})`;
-    const blobReady = new Promise(function (resolve, reject) {
-      drawingContext.canvas.toBlob(function (blob) {
-        if (blob) resolve(blob);
-        else reject(new Error('canvas PNG capture returned no data'));
-      }, 'image/png');
-    });
+    /* ITER-052 (F2 step 2): raw capture reads the canvas back with
+       getImageData, synchronously and before the next draw, and hands the
+       onFrame consumer straight RGBA — no PNG.  WebKit's toBlob does the
+       GPU readback AND the PNG encode synchronously inside the call
+       (research F2: ~40 % of the WebContent main thread), so the pipeline
+       below never overlapped it.  The canvas is opaque, so getImageData's
+       un-premultiplied bytes equal what the PNG round-trip decoded to. */
+    let blobReady;
+    if (state.rawFrames) {
+      try {
+        const cv = drawingContext.canvas;
+        blobReady = Promise.resolve(drawingContext.getImageData(0, 0, cv.width, cv.height));
+      } catch (e) {
+        blobReady = Promise.reject(e);
+      }
+    } else {
+      blobReady = new Promise(function (resolve, reject) {
+        drawingContext.canvas.toBlob(function (blob) {
+          if (blob) resolve(blob);
+          else reject(new Error('canvas PNG capture returned no data'));
+        }, 'image/png');
+      });
+    }
     state.frameIdx++;           // the next draw renders the next logical frame
     state._inFlight = (state._inFlight || 0) + 1;
     if (state.frameIdx >= state.total || state._inFlight >= CAPTURE_PIPELINE_DEPTH) {
@@ -4094,6 +4121,13 @@
       return encoded.then(function (base64) {
         if (recState !== state || state.cancelled) return null;
         if (state.framesB64) state.framesB64.push(base64);
+        if (state.onFrame && state.rawFrames) {
+          return state.onFrame({
+            jobId: state.jobId, index: idx, name, blob: null, b64: null,
+            rgba: blob.data, width: blob.width, height: blob.height,
+            total: state.total,
+          });
+        }
         if (state.onFrame) {
           return state.onFrame({
             jobId: state.jobId, index: idx, name, blob, b64: base64,
@@ -4263,6 +4297,9 @@
       const onFrame = (typeof opts.onFrame === 'function') ? opts.onFrame : null;
       const collectZip = opts.collectZip === true
         || (opts.collectZip !== false && !collectFrames && !onFrame);
+      /* ITER-052: raw RGBA frames only for a pure streaming consumer — the
+         ZIP and retained-base64 paths still need PNG files. */
+      const rawFrames = opts.rawFrames === true && !!onFrame && !collectZip && !collectFrames;
       /* A pending settings redraw must never fire between noLoop() and the
          asynchronous toBlob callback. Capture becomes the sole loop owner. */
       cancelScheduledConfigRender();
@@ -4276,6 +4313,7 @@
         done: false,
         cancelled: false,
         onFrame,
+        rawFrames,
         onProgress: opts.onProgress,
         onError: opts.onError,
         onFinish: opts.onFinish || onFinishOverride,
@@ -4646,7 +4684,38 @@
           staged = false;
           Promise.resolve(tauri('cancel_export', { jobId: jobId })).catch(()=>{});
         }
+        /* ITER-052: perf mode's 3 anchor PNGs, rebuilt from a raw frame on
+           a scratch canvas (only those 3 frames pay for a PNG encode). */
+        function rgbaToPngBase64(frame) {
+          const cv = document.createElement('canvas');
+          cv.width = frame.width;
+          cv.height = frame.height;
+          cv.getContext('2d').putImageData(new ImageData(frame.rgba, frame.width, frame.height), 0, 0);
+          return new Promise(function (resolve, reject) {
+            cv.toBlob(function (b) { b ? resolve(b) : reject(new Error('anchor PNG encode failed')); }, 'image/png');
+          }).then(function (b) { return b.arrayBuffer(); })
+            .then(function (buf) { return bytesToBase64(new Uint8Array(buf)); });
+        }
         function pushFrame(frame) {
+          if (frame.rgba) {
+            /* ITER-052: straight RGBA + its size; Rust skips the PNG decode. */
+            const anchored = !anchorFrames || anchorIdx.indexOf(frame.index) < 0 ? Promise.resolve()
+              : rgbaToPngBase64(frame).then(function (b64) {
+                  for (let i = 0; i < anchorIdx.length; i++) {
+                    if (anchorIdx[i] === frame.index) anchorFrames[i] = b64;
+                  }
+                });
+            return anchored.then(function () {
+              const px = frame.rgba;
+              return tauri('push_export_frame_raw',
+                new Uint8Array(px.buffer, px.byteOffset, px.byteLength), {
+                  headers: {
+                    'x-job-id': jobId, 'x-index': String(frame.index),
+                    'x-format': 'rgba', 'x-width': String(frame.width), 'x-height': String(frame.height),
+                  },
+                });
+            });
+          }
           return frame.blob.arrayBuffer().then(function (buf) {
             const bytes = new Uint8Array(buf);
             /* perf mode keeps only the 3 PERF_JOB anchor PNGs as base64. */
@@ -4692,6 +4761,7 @@
               jobId: jobId,
               collectFrames: false,
               collectZip: false,
+              rawFrames: true,
               onFrame: pushFrame,
               onError(error) {
                 cancelStaged();

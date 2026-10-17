@@ -470,14 +470,52 @@ struct GifFrame {
     b64: String,
 }
 
+/// One staged frame.  `rgba: None` → `bytes` is a PNG file (GUI staged,
+/// base64 and fallback paths).  `rgba: Some((w, h))` → `bytes` is exactly
+/// w×h×4 straight (un-premultiplied) RGBA8 from the headless capture's
+/// getImageData (ITER-052) and is never PNG-decoded.
 #[derive(Debug)]
 struct PngFrame {
     bytes: Vec<u8>,
+    rgba: Option<(u32, u32)>,
+}
+
+impl PngFrame {
+    fn png(bytes: Vec<u8>) -> Self {
+        PngFrame { bytes, rgba: None }
+    }
+
+    /// Width/height from the PNG IHDR or the raw frame's declared size —
+    /// never a decode.
+    fn dimensions(&self, index: usize) -> Result<(u32, u32), String> {
+        match self.rgba {
+            Some(dimensions) => Ok(dimensions),
+            None => png_dimensions(&self.bytes, index),
+        }
+    }
+
+    /// RGBA8 image for the encoders: a PNG decode, or one copy of the raw
+    /// bytes (the staged set is borrowed so the twitter-fit ladder and the
+    /// MP4 workers can share it).
+    fn to_rgba8(&self, index: usize) -> Result<image::RgbaImage, String> {
+        match self.rgba {
+            Some((width, height)) => image::RgbaImage::from_raw(width, height, self.bytes.clone())
+                .ok_or_else(|| format!("frame {} raw RGBA length mismatch", index)),
+            None => Ok(
+                image::load_from_memory_with_format(&self.bytes, image::ImageFormat::Png)
+                    .map_err(|e| format!("frame {} decode: {}", index, e))?
+                    .into_rgba8(),
+            ),
+        }
+    }
 }
 
 /// Hard safety limits for native animation export. These limits are checked
 /// from PNG IHDR metadata before any frame is decompressed into RGB/RGBA.
 /// 100M pixels is about 381 MiB as raw RGBA before encoder overhead.
+/// ITER-052: the 256 MiB byte cap counts PNG payloads only.  Raw RGBA frames
+/// are exactly w×h×4 bytes, so the pixel cap already bounds them (≤ 400 MB
+/// staged, the same set the GIF path held decoded anyway).
 const MAX_EXPORT_FRAMES: usize = 600;
 const MAX_TOTAL_DECODED_PIXELS: u64 = 100_000_000;
 const MAX_TOTAL_COMPRESSED_FRAME_BYTES: u64 = 256 * 1024 * 1024;
@@ -813,7 +851,7 @@ async fn push_export_frame(job_id: String, index: usize, b64: String) -> Result<
         let bytes = general_purpose::STANDARD
             .decode(b64)
             .map_err(|e| format!("frame {} b64: {}", index, e))?;
-        stage_export_frame(&job_id, index, bytes)
+        stage_export_frame(&job_id, index, PngFrame::png(bytes))
     })
     .await
     .map_err(|e| format!("frame staging worker failed: {}", e))?
@@ -838,25 +876,68 @@ async fn push_export_frame_raw(request: tauri::ipc::Request<'_>) -> Result<(), S
     let index: usize = header(&request, "x-index")?
         .parse()
         .map_err(|_| "invalid x-index header".to_string())?;
+    // ITER-052: `x-format: rgba` + `x-width`/`x-height` marks a straight
+    // RGBA8 body (headless getImageData capture); absent → PNG as before.
+    let rgba = match request.headers().get("x-format").map(|v| v.to_str()) {
+        None => None,
+        Some(Ok("png")) => None,
+        Some(Ok("rgba")) => {
+            let dim = |name: &str| -> Result<u32, String> {
+                header(&request, name)?
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| format!("invalid {} header", name))
+            };
+            Some((dim("x-width")?, dim("x-height")?))
+        }
+        Some(_) => return Err("invalid x-format header".into()),
+    };
     let bytes = match request.body() {
         tauri::ipc::InvokeBody::Raw(bytes) => {
-            if bytes.len() as u64 > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
-                return Err(format!("frame {} payload exceeds export byte limit", index));
+            match rgba {
+                Some((width, height)) => check_raw_rgba_len(bytes.len(), width, height, index)?,
+                None => {
+                    if bytes.len() as u64 > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
+                        return Err(format!("frame {} payload exceeds export byte limit", index));
+                    }
+                }
             }
             bytes.clone()
         }
         _ => return Err("push_export_frame_raw expects a raw binary body".into()),
     };
-    tauri::async_runtime::spawn_blocking(move || stage_export_frame(&job_id, index, bytes))
+    let frame = PngFrame { bytes, rgba };
+    tauri::async_runtime::spawn_blocking(move || stage_export_frame(&job_id, index, frame))
         .await
         .map_err(|e| format!("frame staging worker failed: {}", e))?
 }
 
-/// Validate one PNG frame against the job's staged capture (order, declared
+/// ITER-052: a raw frame must be exactly width×height×4 bytes and fit the
+/// pixel cap on its own — checked before the IPC body is copied.
+fn check_raw_rgba_len(len: usize, width: u32, height: u32, index: usize) -> Result<(), String> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_TOTAL_DECODED_PIXELS {
+        return Err(format!("frame {} exceeds export pixel limit", index));
+    }
+    if len as u64 != pixels * 4 {
+        return Err(format!(
+            "frame {} raw RGBA is {} bytes, expected {}x{}x4 = {}",
+            index,
+            len,
+            width,
+            height,
+            pixels * 4
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one frame against the job's staged capture (order, declared
 /// total, consistent dimensions, pixel + byte budgets) and retain it.  Shared
 /// by the base64 and raw-body push commands.
-fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), String> {
-    let dimensions = png_dimensions(&bytes, index)?;
+fn stage_export_frame(job_id: &str, index: usize, frame: PngFrame) -> Result<(), String> {
+    let dimensions = frame.dimensions(index)?;
     let mut captures = EXPORT_CAPTURES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -900,9 +981,16 @@ fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), 
             next_pixels, MAX_TOTAL_DECODED_PIXELS
         ));
     }
+    // ITER-052: raw RGBA is bounded by the pixel cap above; only PNG
+    // payloads count against the compressed-byte cap.
+    let compressed = if frame.rgba.is_some() {
+        0
+    } else {
+        frame.bytes.len() as u64
+    };
     let next_bytes = capture
         .total_bytes
-        .checked_add(bytes.len() as u64)
+        .checked_add(compressed)
         .ok_or_else(|| "total compressed frame byte count overflow".to_string())?;
     if next_bytes > MAX_TOTAL_COMPRESSED_FRAME_BYTES {
         return Err(format!(
@@ -912,7 +1000,7 @@ fn stage_export_frame(job_id: &str, index: usize, bytes: Vec<u8>) -> Result<(), 
     }
     capture.total_pixels = next_pixels;
     capture.total_bytes = next_bytes;
-    capture.frames.push(PngFrame { bytes });
+    capture.frames.push(frame);
     Ok(())
 }
 
@@ -1005,7 +1093,7 @@ fn validate_export_frames(
     let mut output_dimensions = None;
     let mut total_output_pixels = 0_u64;
     for (index, frame) in frames.iter().enumerate() {
-        let dimensions = png_dimensions(&frame.bytes, index)?;
+        let dimensions = frame.dimensions(index)?;
         if let Some(expected) = first_dimensions {
             if dimensions != expected {
                 return Err(format!(
@@ -1125,7 +1213,7 @@ fn decode_frame_payloads(frames: Vec<GifFrame>) -> Result<Vec<PngFrame>, String>
             ));
         }
         png_dimensions(&bytes, index)?;
-        decoded.push(PngFrame { bytes });
+        decoded.push(PngFrame::png(bytes));
     }
     Ok(decoded)
 }
@@ -1222,16 +1310,14 @@ async fn save_png(app: tauri::AppHandle, data_url: String) -> Result<String, Str
 /// (gifski handles the resize internally).  `None` keeps the source size.
 /// At Twitter's recommended 720 px wide for posts, kaneki drops from
 /// ~30 MB → ~6-8 MB without visible quality change on phone screens.
-/// Decode one base64-PNG frame to RGBA, applying the optional border.
+/// Decode one staged frame (PNG, or raw RGBA since ITER-052) to RGBA, applying the optional border.
 /// Pure per-frame function — safe to run on any thread (EXPORT-OPT-1).
 fn decode_one_frame(
     frame: &PngFrame,
     idx: usize,
     border: Option<&BorderConfig>,
 ) -> Result<imgref::ImgVec<rgb::RGBA8>, String> {
-    let mut img = image::load_from_memory_with_format(&frame.bytes, image::ImageFormat::Png)
-        .map_err(|e| format!("frame {} decode: {}", idx, e))?
-        .to_rgba8();
+    let mut img = frame.to_rgba8(idx)?;
     if let Some(b) = border {
         img = apply_border(img, b);
     }
@@ -1776,10 +1862,7 @@ fn encode_mp4_h264(
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Result<YUVBuffer, String>)>(window);
 
     let preprocess = |idx: usize| -> Result<YUVBuffer, String> {
-        let dyn_img =
-            image::load_from_memory_with_format(&frames[idx].bytes, image::ImageFormat::Png)
-                .map_err(|e| format!("frame {} decode: {}", idx, e))?;
-        let mut rgba_img = dyn_img.into_rgba8();
+        let mut rgba_img = frames[idx].to_rgba8(idx)?;
         if let Some(b) = border {
             rgba_img = apply_border(rgba_img, b);
         }
@@ -2556,7 +2639,7 @@ mod export_guard_tests {
         bytes.extend_from_slice(&height.to_be_bytes());
         bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
         bytes.extend_from_slice(&[0, 0, 0, 0]); // CRC is decoded by image, not the guard.
-        PngFrame { bytes }
+        PngFrame::png(bytes)
     }
 
     fn valid_png_frame(width: u32, height: u32) -> PngFrame {
@@ -2566,9 +2649,7 @@ mod export_guard_tests {
         image::DynamicImage::ImageRgba8(image)
             .write_to(&mut cursor, image::ImageFormat::Png)
             .unwrap();
-        PngFrame {
-            bytes: cursor.into_inner(),
-        }
+        PngFrame::png(cursor.into_inner())
     }
 
     #[test]
@@ -2601,12 +2682,46 @@ mod export_guard_tests {
             .unwrap_err()
             .contains("frame 0 b64"));
 
-        let not_png = vec![PngFrame {
-            bytes: vec![0_u8; 33],
-        }];
+        let not_png = vec![PngFrame::png(vec![0_u8; 33])];
         assert!(validate_export_frames(&not_png, None)
             .unwrap_err()
             .contains("not a valid PNG header"));
+    }
+
+    #[test]
+    fn raw_rgba_frames_match_the_png_round_trip() {
+        // ITER-052: an opaque raw frame must decode to the same pixels the
+        // PNG path produced, through both the GIF decode and the MP4 path.
+        let png = valid_png_frame(6, 4);
+        let raw_bytes = png.to_rgba8(0).unwrap().into_raw();
+        let raw = PngFrame {
+            bytes: raw_bytes.clone(),
+            rgba: Some((6, 4)),
+        };
+        assert_eq!(raw.dimensions(0).unwrap(), (6, 4));
+        assert_eq!(png.to_rgba8(0).unwrap(), raw.to_rgba8(0).unwrap());
+        let a = decode_one_frame(&png, 0, None).unwrap();
+        let b = decode_one_frame(&raw, 0, None).unwrap();
+        assert_eq!(a.buf(), b.buf());
+        // Mixed PNG/raw sets validate as long as the sizes agree.
+        let mixed = vec![valid_png_frame(6, 4), raw];
+        assert_eq!(validate_export_frames(&mixed, None).unwrap().width, 6);
+        let short = PngFrame {
+            bytes: raw_bytes[..raw_bytes.len() - 4].to_vec(),
+            rgba: Some((6, 4)),
+        };
+        assert!(short.to_rgba8(0).unwrap_err().contains("length mismatch"));
+    }
+
+    #[test]
+    fn raw_rgba_length_and_pixel_guard() {
+        assert!(check_raw_rgba_len(6 * 4 * 4, 6, 4, 0).is_ok());
+        assert!(check_raw_rgba_len(6 * 4 * 4 - 1, 6, 4, 3)
+            .unwrap_err()
+            .contains("frame 3 raw RGBA is 95 bytes"));
+        assert!(check_raw_rgba_len(0, 100_000, 100_000, 0)
+            .unwrap_err()
+            .contains("pixel limit"));
     }
 
     #[test]
@@ -2852,9 +2967,7 @@ mod export_guard_tests {
                 image::DynamicImage::ImageRgb8(img)
                     .write_to(&mut cursor, image::ImageFormat::Png)
                     .unwrap();
-                PngFrame {
-                    bytes: cursor.into_inner(),
-                }
+                PngFrame::png(cursor.into_inner())
             })
             .collect();
 

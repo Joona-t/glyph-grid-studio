@@ -4,6 +4,37 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-052 — 2026-10-17 — v0.2 Phase 2: raw RGBA capture over the raw-body IPC + working layer memo for animated sources (F2 steps 2-3)
+
+**Problem:** Every headless frame went through `canvas.toBlob('image/png')`. WebKit runs that readback and the PNG encode synchronously inside the JS call (research F2: ~40 % of the WebContent main thread was waiting in `toBlob`), and WebContent is the process that bounds the run (PERF-V0.2-BASELINE). Rust then PNG-decoded every frame again before the MP4/GIF encoders. Separately, the ITER-042 still-source layer memo was off for animated sources, and it turned out it never hit at all.
+
+**Root cause:** (1) PNG was the only frame format the staged capture understood, including for consumers that only ever wanted pixels. (2) `SCENES[CONFIG.scene](src, t, CONFIG)` binds `this` to the `SCENES` container, so the studio scene's `this.__sourceProcessed` / `this.__sourceDepth` lived on `SCENES` itself. The layer memo (`studio.__sourceProcessed === __srcLayerProcessed`), `clearSourceDerivedCaches`, `memProbe` and the GUI's `sceneCacheKeys` all read `SCENES[name]`, which is always undefined there. Instrumented render: 0 reuses on 131 draws (cream-paper, kaneki, worm-move). A latent side effect: a source swap never dropped the depth buffer.
+
+**Fix:**
+- `beginRecord({ rawFrames: true })` is honoured only for a pure `onFrame` consumer (no ZIP, no retained base64). `handleRecordFrame` then calls `drawingContext.getImageData(0, 0, canvas.width, canvas.height)` synchronously, at the point where toBlob used to snapshot, and passes `{ rgba, width, height }` to `onFrame`. The headless batch path (`render`, `batch`, MCP) opts in. `pushFrame` sends the RGBA buffer as the raw IPC body (zero-copy `Uint8Array` view) with `x-format: rgba`, `x-width`, `x-height`. In `--perf` mode the 3 PERF_JOB anchor frames are PNG-encoded on a scratch canvas, and only those 3.
+- Rust: `PngFrame` gains `rgba: Option<(w, h)>`, `dimensions()` (IHDR or the declared size, never a decode) and `to_rgba8()` (PNG decode, or one copy of the raw bytes). `push_export_frame_raw` checks the raw body before copying it (`check_raw_rgba_len`: exactly w×h×4, w×h ≤ pixel cap). `stage_export_frame`, `validate_export_frames`, `decode_one_frame` (GIF + twitter-fit ladder, still decoded once and shared) and the MP4 preprocess workers all go through those helpers. PNG and raw frames can mix in one capture as long as the sizes agree. Tests: `raw_rgba_frames_match_the_png_round_trip` and `raw_rgba_length_and_pixel_guard`.
+- The GUI staged path, `framesB64`, the ZIP fallback and the base64 commands still send PNG and are unchanged.
+- **What the 256 MB cap means now:** `MAX_TOTAL_COMPRESSED_FRAME_BYTES` counts PNG payloads only. Raw frames are exactly w×h×4, so `MAX_TOTAL_DECODED_PIXELS` already caps them at ≤ 400 MB staged.
+- F2 step 3: the frame index is now part of the layer key (`revision|frameIdx|WxH|bg|depth`), so animated sources are no longer excluded, and the scene is called as `sceneFn.call(sceneFn, …)` so its caches live where every reader looks.
+
+**Measured** (worm-move, pB, 120 f, 760×1024, `--mp4-quality archive`, `tests/perf-sample.sh`; other phases were rendering on this machine, so all numbers are **under parallel load**. WebContent/GPU are our own pids; the post-change runs flagged `suspect_foreign_xpc` and the foreign pids are excluded):
+
+| build | wall s | app s | WebContent s | GPU s | encode-mp4 ms |
+|---|---|---|---|---|---|
+| HEAD 8877a10 (same session) | 18.27 / 17.62 | 3.32 / 3.12 | 15.24 / 14.31 | 6.80 / 6.65 | 2490 |
+| raw RGBA only | 13.79 / 12.70 / 13.48 | 1.99 / 2.10 / 1.97 | 10.49 / 10.06 / 10.67 | 6.83 / 6.77 / 6.73 | 1170 / 1061 / 1212 |
+| raw RGBA + memo (shipped) | 14.15 / 14.00 | 2.06 / 1.93 | 11.19 / 10.93 | 7.78 / 7.06 | 1875 / 1542 |
+
+Default-upload HEAD runs in the same window: wall 16.80 / 14.73, WebContent 13.44 / 12.36. Net: WebContent ≈ 14.8 → ≈ 10.8 s (−27 %) and wall ≈ 17.9 → ≈ 13.6 s (−24 %), GPU flat, host CPU −1 s (no PNG decode). That is about 4 s of the ~10 s upper bound F2 estimated. The rest of the old toBlob time did not go away: getImageData still waits for the GPU process to flush the 28,800 blits before it can read back. If more is needed, F2 step 1 (in-process canvas) is the remaining lever.
+
+Memo: kaneki.gif (90 ms frames at 30 fps) now reuses the layer on 86 of 131 draws (was 0), and the still cream-paper source on 35 / 35. worm-move's GIF runs at 40 ms = the 25 fps render, so its source frame changes on every render frame and the memo cannot help there. kaneki wall 10.46 / 9.70 → 9.29 s, WebContent 5.4-5.7 → 6.1 s: kaneki is GPU-bound (GPU 11 s), so skipping the scene repaint shows no measurable gain on either source. It ships because it is output-identical and fixes the dead-cache bug, which also helps the GUI's still-source preview.
+
+**Output:** psnr-gate **inf** vs golden.mp4 (120 / 120 frames). Kaneki with and without the memo: byte-identical MP4. byte-identity G1-G7 7/7. getImageData returns un-premultiplied RGBA, but the canvas is opaque (alpha 255), so no premultiplication rounding is possible and the golden was not regenerated. Raw `ffmpeg -lavfi psnr` against golden prints 17.3 dB: that is the ITER-050 timestamp-pairing artifact, not a pixel difference. psnr-gate pairs frames by index.
+
+**Gate:** cargo build 0 errors · cargo test 21/21 (was 19) · npm test ok (both files, 27 contracts) · run-all PASS 25 / FAIL 0, MCP 10/10, byte-identity 7/7 · psnr-gate inf.
+
+**Gotchas:** (a) Staged memory changed shape. The MP4 path used to hold PNGs (~1.1 MB/frame here, estimated from an ffmpeg PNG of frame 60; WebKit's PNG size is UNCERTAIN, so ≈ 136 MB) plus a YUV window. It now holds 3.1 MB/frame raw, 373 MB for this job, ≤ 400 MB at the pixel cap. The GIF path already held the decoded set, so its peak is unchanged. (b) The getImageData call must stay synchronous in `handleRecordFrame`: deferring it to a microtask would read whatever the next draw painted. (c) Don't use `pkill -f "glyph-grid-studio render"` while parallel phases are rendering. It matches other worktrees' binaries, so this gate killed only `glyph-grid-studio-perf/…/glyph-grid-studio render|batch`. (d) Not done: the GUI staged path still sends PNG. Switching it means passing `rawFrames: staged` plus the raw headers in `pushStagedFrame`, and dropping the b64 fallback for raw frames. The headless path came first because it is the one the gates measure. Also not done: the per-frame luminance plane cache (`_lumKey`) still skips animated sources.
+
 ### ITER-051 — 2026-10-17 — v0.2 Phase 2: Twitter-fit predicts the fitting width from the first pass (F14)
 
 **Problem:** On overshoot, `encode_gif_gifski_adaptive` walked a fixed 600 → 540 → 480 → 420 → 360 ladder, one full gifski pass per rung. A 720 px export at 1.6-2× the cap spent one or two passes on rungs that could never fit, and the user got whichever rung fell under the cap first rather than the widest width that fits.
