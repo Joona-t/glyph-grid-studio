@@ -784,7 +784,8 @@
         "camera": {
           "type": "boolean",
           "default": false,
-          "description": "GUI only (experimental): the webcam is the source while on. Ignored headless."
+          "deprecated": true,
+          "description": "Ignored (ITER-078): the camera is runtime-only GUI state (Video › camera (beta)). Accepted so older files still validate, then stripped from every preset, batch job, MCP config and --set."
         },
         "mirror": {
           "type": "boolean",

@@ -295,9 +295,11 @@
        picker or drag-drop; see lib/glyph-video-source.js).  decode: auto =
        H.264 MP4/MOV through the Rust openh264 decoder (frame-exact), other
        codecs through a hidden <video>; native = Rust only (a non-H.264
-       clip is an error); webview = always the <video> seek path.  camera
-       (GUI only, experimental): the webcam replaces the source while on. */
-    video: { decode: 'auto', camera: false, mirror: true },
+       clip is an error); webview = always the <video> seek path.  mirror:
+       the camera image.  ITER-078: the camera switch itself is NOT config —
+       it lives in the runtime-only CAMERA below, so no preset / batch /
+       MCP config / --set can turn a webcam on. */
+    video: { decode: 'auto', mirror: true },
     /* v0.1.6: anti-flicker Schmitt trigger on ramp index (off = legacy). */
     temporalStability: { enabled: false, strength: 0.75 },
     /* v0.1.6: ETF flow mode tuning (selectionMode: 'flow'). */
@@ -1466,7 +1468,7 @@
       if (old.__ggsVideo.camera && !(img && img === __cameraPrev)) {
         if (__cameraPrev && __cameraPrev !== img) disposeVideoSource(__cameraPrev);
         __cameraPrev = null;
-        if (CONFIG_BASE.video) CONFIG_BASE.video.camera = false;
+        CAMERA.camera = false;
       }
       disposeVideoSource(old);
     }
@@ -1737,8 +1739,12 @@
      source comes back when it goes off.  Experimental: the WKWebView
      media-capture permission path is not verified headlessly. */
   let __cameraPrev = null;
+  /* ITER-078 (privacy): runtime-only camera switch.  Never part of CONFIG,
+     never serialised or deep-merged; only the GUI Video folder's toggle
+     (bound here through GlyphStudio.init's cameraState) writes it. */
+  const CAMERA = { camera: false };
   window.__videoCameraKick = async function () {
-    const want = !!(CONFIG_BASE.video && CONFIG_BASE.video.camera);
+    const want = !!CAMERA.camera;
     const live = !!(sourceImg && sourceImg.__ggsVideo && sourceImg.__ggsVideo.camera);
     if (want && !live) {
       try {
@@ -1751,7 +1757,7 @@
         if (acceptSourceImage(g, { keepPrevious: true })) __cameraPrev = prev;
         else { GlyphGrid.video.dispose(vs); try { g.remove(); } catch (_) {} }
       } catch (e) {
-        CONFIG_BASE.video.camera = false;
+        CAMERA.camera = false;
         statusEl().textContent = 'Camera unavailable: ' + ((e && e.message) || e);
       }
     } else if (!want && live) {
@@ -2202,7 +2208,10 @@
       if (!window.__statusHold) statusEl().textContent =
         `${CONFIG.scene} | ${__tlPaletteName === CONFIG.palette ? 'timeline blend' : CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
         `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag}${animTag}${fpsTag} | ` +
-        `t=${t.toFixed(2)}s | compat=${CONFIG.compat}`;
+        `t=${t.toFixed(2)}s | compat=${CONFIG.compat}` +
+        /* ITER-078: a palette track under colorMode preserve is a no-op. */
+        ((window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.paletteIgnored(CONFIG_BASE))
+          ? ' | ⚠ palette track ignored (colorMode preserve)' : '');
     }
 
     /* 4. Record capture. */
@@ -5171,7 +5180,7 @@
          same as the GUI preset path).  The old one-level Object.assign
          replaced nested blocks: { postprocess: { vignette: { enabled } } }
          dropped vignette.strength. */
-      window.GlyphStudio.deepMerge(CONFIG, overrides || {});
+      window.GlyphStudio.deepMerge(CONFIG, window.GlyphStudio.stripRuntimeOnly(overrides || {}));
       scheduleConfigRender(Object.keys(overrides || {}).join(','));
     },
     getRecState: () => recState,
@@ -5314,7 +5323,7 @@
       /* F24 (ITER-057): same merge as setConfig and the GUI presets. */
       function applyConfig(cfg) {
         if (!cfg) return;
-        window.GlyphStudio.deepMerge(CONFIG, cfg);
+        window.GlyphStudio.deepMerge(CONFIG, window.GlyphStudio.stripRuntimeOnly(cfg));
       }
 
       /* ITER-057: manifest `border` → the BorderConfig the encoders take.
@@ -5385,6 +5394,9 @@
            before frames 'auto' and the capture size are resolved. */
         syncTextSource(true);
         textStrokeCheck();
+        /* ITER-078: headless twin of the status-bar palette-track note. */
+        const _tlNote = GlyphGrid.timeline && GlyphGrid.timeline.paletteIgnored(CONFIG_BASE);
+        if (_tlNote) tauri('cli_log', { msg: 'warn: ' + _tlNote }).catch(()=>{});
         // Force loop on so draw() advances
         try { loop(); } catch (e) {}
 
@@ -6091,6 +6103,7 @@
     ramps: RAMPS,
     testHook: window.__glyphGridTest,
     sceneCacheKeys: ['__sourceProcessed'],
+    cameraState: CAMERA,
     imageRef: {
       name: 'sourceImg',
       begin: beginSourceImport,
@@ -6124,9 +6137,6 @@
   /* ITER-077 (R4): the video FrameSource (Rust openh264 for H.264, else
      the WebView <video>), installed through the same acceptSourceImage. */
   async function _cliLoadVideo(inPath, probe, decode, importGeneration, sourceBytes) {
-    if (CONFIG_BASE.video && CONFIG_BASE.video.camera) {
-      cliLog('video: warn: video.camera is GUI-only; ignored headless');
-    }
     const g = await openVideoSource(inPath, probe, decode, true);
     if (!acceptSourceImage(g, { generation: importGeneration, sizeBytes: sourceBytes })) {
       disposeVideoSource(g);

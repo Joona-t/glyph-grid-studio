@@ -117,6 +117,15 @@ assert.strictEqual(TL.active({ timeline: { enabled: false, tracks: base.timeline
 assert.strictEqual(TL.active({ timeline: { enabled: true, tracks: {} } }), false, 'no tracks = off');
 assert.strictEqual(TL.active({}), false);
 
+/* ITER-078: a palette track under colorMode preserve is flagged */
+const palTrack = { palette: [{ u: 0, v: 'mono' }, { u: 1, v: 'spice' }] };
+assert(/no effect under colorMode "preserve"/.test(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: true, tracks: palTrack } })));
+assert.strictEqual(TL.paletteIgnored({ colorMode: 'monochrome', timeline: { enabled: true, tracks: palTrack } }), '');
+assert.strictEqual(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: false, tracks: palTrack } }), '', 'timeline off: nothing runs');
+assert.strictEqual(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: true, tracks: { 'grid.cols': [{ u: 0, v: 80 }] } } }), '');
+assert.strictEqual(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: true,
+  tracks: Object.assign({ colorMode: [{ u: 0, v: 'preserve' }, { u: 0.5, v: 'monochrome' }] }, palTrack) } }), '', 'a colorMode track may switch preserve off');
+
 /* the schema's ease enum is this module's (gen-schema reads it) */
 const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'glyph-grid.schema.json'), 'utf8'));
 assert.deepStrictEqual(schema.properties.timeline.properties.tracks.additionalProperties.items.properties.ease.enum, TL.EASES);

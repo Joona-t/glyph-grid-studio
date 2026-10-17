@@ -542,9 +542,48 @@ function sharedDeepMerge() {
   assert.strictEqual(cfg.glyphSet, null);
 }
 
+/* ITER-078 (privacy): the camera is runtime-only.  An imported preset,
+   share URL, batch config or setConfig carrying video.camera:true never
+   reaches CONFIG nor the GUI toggle, so the kick never calls
+   getUserMedia; the GUI toggle (opts.cameraState) is the only switch. */
+function cameraIsRuntimeOnly() {
+  const env = loadStudio(() => Promise.resolve('{}'));
+  let gum = 0;
+  const cameraState = { camera: false };
+  env.window.GlyphGrid = { video: { DECODERS: ['auto', 'native', 'webview'] } };
+  /* index.html's __videoCameraKick reads CAMERA.camera only (contract in
+     glyph-video-source.test.js); this stub has the same gate. */
+  env.window.__videoCameraKick = function () { if (cameraState.camera) gum++; };
+  const config = {
+    studio: { enabled: true }, animation: { fps: 25, duration: 1, loop: true },
+    grid: { cols: 80, rows: 40 }, font: { family: 'monospace', size: 8 },
+    ramp: 'gradient', brightnessGamma: 1, samplingStrategy: 'average',
+    colorMode: 'monochrome', palette: 'cream-paper', selectionMode: 'brightness', glyphSet: null,
+    video: { decode: 'auto', mirror: true },
+  };
+  env.studio.init({ config, cameraState, testHook: { getRecState() { return null; } } });
+  assert.strictEqual(env.inputs.get('camera'), cameraState, 'the camera toggle binds the runtime state, not CONFIG.video');
+  const preset = { video: { camera: true, decode: 'webview', mirror: false } };
+  env.studio.applyPreset(config, preset);
+  assert.strictEqual(preset.video.camera, true, 'the caller\'s preset object is not mutated');
+  assert(!('camera' in config.video), 'applyPreset strips video.camera');
+  assert.strictEqual(config.video.decode, 'webview', 'the rest of video still applies');
+  assert.strictEqual(cameraState.camera, false);
+  const setCfg = env.studio.stripRuntimeOnly({ video: { camera: true }, palette: 'spice' });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(setCfg)), { video: {}, palette: 'spice' });
+  assert.strictEqual(env.studio.stripRuntimeOnly(null), null);
+  assert(!('camera' in (env.studio.snapshotConfig(Object.assign({}, config, { video: { camera: true } })).video)));
+  env.window.__videoCameraKick();
+  assert.strictEqual(gum, 0, 'a preset with video.camera:true never reaches getUserMedia');
+  cameraState.camera = true;  // the user flips the GUI toggle
+  env.window.__videoCameraKick();
+  assert.strictEqual(gum, 1);
+}
+
 (async function run() {
   presetSchemaStampAndUnknownKeys();
   sharedDeepMerge();
+  cameraIsRuntimeOnly();
   await nativeSuccessSkipsZip();
   await nativeFailureBuildsFallbackOnce();
   await stagedUiFlowStreamsWithoutRetainingFrames();

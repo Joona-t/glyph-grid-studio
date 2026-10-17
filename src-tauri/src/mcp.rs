@@ -430,6 +430,14 @@ fn child_error(
     }))
 }
 
+/// The canonical output format of a render call: `format` through the
+/// CLI's own parser (any case / padding), else inferred from `out_path`.
+fn render_format(format: Option<&str>, out_path: &str) -> String {
+    format
+        .and_then(|f| crate::parse_format_arg(f).ok())
+        .unwrap_or_else(|| crate::format_from_path(out_path).to_string())
+}
+
 /// Inline bodies stop here: a 240x120 TXT is ~29 KB, ANSI larger.
 const INLINE_TEXT_MAX: u64 = 64 * 1024;
 
@@ -585,6 +593,10 @@ impl GlyphGridServer {
         // ITER-074: same parser as `render --format`.
         if let Some(Err(e)) = p.format.as_deref().map(crate::parse_format_arg) {
             return tool_error("invalid_arguments", Some("/format".into()), e);
+        }
+        // ITER-078: text formats are only written to text extensions.
+        if let Some(e) = crate::text_out_mismatch(&render_format(p.format.as_deref(), &p.out_path), &p.out_path) {
+            return tool_error("invalid_arguments", Some("/out_path".into()), e);
         }
         match probe.build_js_config() {
             Err(e) => {

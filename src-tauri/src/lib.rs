@@ -129,6 +129,19 @@ pub fn format_from_path(path: &str) -> &'static str {
     }
 }
 
+/// ITER-078: a text format must be written to a text extension (the only
+/// paths `save_text_export` accepts); `None` when the pair is fine.
+pub fn text_out_mismatch(format: &str, out: &str) -> Option<String> {
+    if TEXT_FORMATS.contains(&format) && !TEXT_FORMATS.contains(&format_from_path(out)) {
+        Some(format!(
+            "format {} needs an output path ending in .txt / .ans / .ansi / .cast / .html / .htm (got {:?})",
+            format, out
+        ))
+    } else {
+        None
+    }
+}
+
 /// clap / MCP parser for `--format`: any case, canonical name out.
 pub fn parse_format_arg(value: &str) -> Result<String, String> {
     let v = value.trim().to_ascii_lowercase();
@@ -576,12 +589,41 @@ fn schema_postprocess_stages() -> Vec<String> {
 }
 
 /// `$schema` / `version` describe the preset file, not CONFIG — drop them
-/// before the config reaches the renderer.
+/// before the config reaches the renderer.  ITER-078 (privacy): so is
+/// `video.camera` — a webcam switch is runtime-only GUI state, and no
+/// preset / `--set` / batch job / MCP config may carry it into the page.
 fn strip_preset_meta(cfg: &mut serde_json::Value) {
     if let Some(obj) = cfg.as_object_mut() {
         obj.remove("$schema");
         obj.remove("version");
+        if let Some(video) = obj.get_mut("video").and_then(|v| v.as_object_mut()) {
+            video.remove("camera");
+        }
     }
+}
+
+/// ITER-078: config combinations that validate but do nothing, as
+/// `"<json path>: <message>"` warnings (shared by validate / --dry-run /
+/// render / batch through `validate_config`).
+fn ineffective_config_warnings(cfg: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let tl = &cfg["timeline"];
+    // ITER-075: a palette track recolours the inks, and colorMode
+    // "preserve" takes the source's own colours — the track is a no-op.
+    if tl["enabled"].as_bool() == Some(true)
+        && tl["tracks"].get("palette").is_some()
+        && tl["tracks"].get("colorMode").is_none()
+        && cfg["colorMode"].as_str() == Some("preserve")
+    {
+        out.push(
+            "/timeline/tracks/palette: has no effect under colorMode \"preserve\" (the source colours are kept); use monochrome / duotone / gradient"
+                .into(),
+        );
+    }
+    if cfg["video"].get("camera").is_some() {
+        out.push("/video/camera: ignored — the camera is runtime-only GUI state and is stripped from presets and configs".into());
+    }
+    out
 }
 
 /// Validate a (partial) CONFIG object against the preset schema.
@@ -608,7 +650,8 @@ pub fn validate_config(cfg: &serde_json::Value) -> Result<Vec<String>, Vec<Strin
         return Err(errors);
     }
     let known = preset_schema()["properties"].as_object();
-    Ok(match (cfg.as_object(), known) {
+    let mut warnings = ineffective_config_warnings(cfg);
+    warnings.extend(match (cfg.as_object(), known) {
         (Some(obj), Some(known)) => obj
             .keys()
             .filter(|k| !known.contains_key(*k))
@@ -621,7 +664,8 @@ pub fn validate_config(cfg: &serde_json::Value) -> Result<Vec<String>, Vec<Strin
             })
             .collect(),
         _ => Vec::new(),
-    })
+    });
+    Ok(warnings)
 }
 
 /* ---------- F27 (ITER-061): manifest schema + `--resume` ---------- */
@@ -1373,6 +1417,15 @@ pub fn run_headless_batch(
             eprintln!("batch: {}", e);
             config_errors += 1;
         }
+        // ITER-078: save_text_export only writes text extensions — refuse a
+        // text-format job with a .gif/.mp4 `out` now, not after its render.
+        let out = j.get("out").and_then(|v| v.as_str()).unwrap_or("");
+        let format = j.get("format").and_then(|v| v.as_str()).map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| format_from_path(out).into());
+        if let Some(e) = text_out_mismatch(&format, out) {
+            eprintln!("batch: {}: {}", what, e);
+            config_errors += 1;
+        }
         let cfg = j.get("config").cloned().unwrap_or(serde_json::json!({}));
         match validate_config(&cfg) {
             Ok(warnings) => {
@@ -1578,6 +1631,9 @@ pub fn headless_render_json(job: &HeadlessRenderJob) -> Result<serde_json::Value
         eprintln!("render: warning: config{}", w);
     }
     require_source(job, &config)?;
+    if let Some(e) = text_out_mismatch(&job.resolved_format(), &job.out_path.to_string_lossy()) {
+        return Err(e);
+    }
     let text_import = match &job.text_import {
         Some(p) => read_text_import(p)?,
         None => serde_json::Value::Null,
@@ -4315,19 +4371,56 @@ async fn finish_mp4_export(
     .map_err(|e| format!("MP4 export worker failed: {}", e))?
 }
 
+/// Extensions `save_text_export` may write (the TEXT_FORMATS' own).
+const TEXT_EXPORT_EXTS: [&str; 6] = ["txt", "ans", "ansi", "cast", "html", "htm"];
+
+/// ITER-078: the renderer names the path `save_text_export` writes, so a
+/// compromised or buggy page could otherwise write anywhere the user can.
+/// Always a text extension; with a CLI job active (render / batch) the path
+/// must also be one the job declared (`outPath`, or a batch job's).
+fn text_export_path_allowed(job: Option<&serde_json::Value>, path: &str) -> Result<(), String> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    if !ext.as_deref().map_or(false, |e| TEXT_EXPORT_EXTS.contains(&e)) {
+        return Err(format!(
+            "text export refused: {:?} does not end in .{}",
+            path,
+            TEXT_EXPORT_EXTS.join(" / .")
+        ));
+    }
+    let Some(job) = job else { return Ok(()) };
+    let declared = job["outPath"].as_str() == Some(path)
+        || job["jobs"]
+            .as_array()
+            .map_or(false, |js| js.iter().any(|j| j["outPath"].as_str() == Some(path)));
+    if declared {
+        Ok(())
+    } else {
+        Err(format!("text export refused: {:?} is not an output path this job declared", path))
+    }
+}
+
 /// Save an arbitrary blob (e.g. an already-assembled GIF or ZIP) to a path
 /// chosen via native save dialog.  Kept for back-compat with the ZIP path.
 /// ITER-074: write a text-family export (txt / ansi / cast / html) to an
 /// absolute path with no dialog — the headless `render` / `batch` path.
 /// Same temp-file + fsync + rename commit as the encoders, so a batch
 /// output gets its `--resume` sidecar and a crash never leaves a torn file.
+/// ITER-078: the path is checked by `text_export_path_allowed` first.
 #[tauri::command]
 async fn save_text_export(
     app: tauri::AppHandle,
+    state: tauri::State<'_, CliJobState>,
     path: String,
     bytes_b64: String,
 ) -> Result<String, String> {
     touch_liveness();
+    {
+        let job = state.job.lock().map_err(|_| "cli job state poisoned".to_string())?;
+        text_export_path_allowed(job.as_ref(), &path)?;
+    }
     let bytes = general_purpose::STANDARD
         .decode(&bytes_b64)
         .map_err(|e| format!("text export payload: {}", e))?;
@@ -4474,10 +4567,12 @@ fn probe_image_path(p: &PathBuf) -> Result<ImageProbe, String> {
     /* R4 (ITER-077): video containers.  MP4/MOV headers give frames / fps /
        dims without decoding, so the same SOURCE_LIMITS apply before the
        first frame; webm (or an MP4 the demuxer rejects) is probed: false
-       and validated once the <video> element has its metadata. */
+       and validated once the <video> element has its metadata.
+       ITER-078: H.264 dims are the SPS's; a tkhd / avc1 entry that
+       disagrees with the SPS is an error, not a probe. */
     if let Some(container) = video::sniff_container(p) {
         let info = match container {
-            video::Container::IsoBmff => video::probe_mp4(p),
+            video::Container::IsoBmff => video::probe_mp4(p)?,
             video::Container::Webm => None,
         };
         return Ok(match info {
@@ -5685,6 +5780,40 @@ mod preset_schema_tests {
         p
     }
 
+    /// ITER-078: video.camera is stripped from every config path (it is
+    /// runtime-only GUI state) and both no-op combinations warn.
+    #[test]
+    fn camera_is_stripped_and_noop_configs_warn() {
+        let preset = temp_preset(
+            "camera",
+            r#"{"video": {"camera": true, "decode": "webview"}, "colorMode": "preserve"}"#,
+        );
+        let job = job_with(
+            Some(preset.clone()),
+            ConfigOverrides {
+                set: vec!["video.camera=true".into()],
+                timeline: vec!["palette=0:(cream-paper),1:(spice)".into()],
+                ..Default::default()
+            },
+        );
+        let (cfg, warnings) = job.build_js_config().unwrap();
+        assert!(cfg["video"].get("camera").is_none(), "{}", cfg["video"]);
+        assert_eq!(cfg["video"]["decode"], "webview");
+        assert!(warnings.iter().any(|w| w.starts_with("/video/camera: ignored")), "{:?}", warnings);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("/timeline/tracks/palette: has no effect under colorMode")),
+            "{:?}",
+            warnings
+        );
+        let mono = serde_json::json!({"colorMode": "monochrome",
+            "timeline": {"enabled": true, "tracks": {"palette": [{"u": 0, "v": "spice"}]}}});
+        assert!(validate_config(&mono).unwrap().is_empty());
+        let mut batch_cfg = serde_json::json!({"video": {"camera": true, "mirror": false}});
+        strip_preset_meta(&mut batch_cfg);
+        assert_eq!(batch_cfg, serde_json::json!({"video": {"mirror": false}}));
+        let _ = fs::remove_file(preset);
+    }
+
     #[test]
     fn embedded_schema_compiles_and_catalog_is_its_projection() {
         let cat: serde_json::Value = serde_json::from_str(&catalog_json()).unwrap();
@@ -6066,6 +6195,30 @@ mod source_probe_tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    /// ITER-078: save_text_export refuses non-text extensions always, and
+    /// any path a headless job did not declare; the GUI (no job) only
+    /// needs the extension.
+    #[test]
+    fn text_export_path_is_confined() {
+        for bad in ["/tmp/x.sh", "/tmp/u/.zshrc", "/tmp/a.gif", "/tmp/noext", "/tmp/a.txt.command"] {
+            assert!(text_export_path_allowed(None, bad).unwrap_err().contains("does not end in"), "{}", bad);
+        }
+        for ok in ["/tmp/a.txt", "/tmp/a.ANS", "/tmp/a.ansi", "/tmp/a.cast", "/tmp/a.html", "/tmp/a.htm"] {
+            assert!(text_export_path_allowed(None, ok).is_ok(), "{}", ok);
+        }
+        let render = serde_json::json!({"outPath": "/o/r.txt", "format": "txt"});
+        assert!(text_export_path_allowed(Some(&render), "/o/r.txt").is_ok());
+        assert!(text_export_path_allowed(Some(&render), "/o/other.txt").unwrap_err().contains("not an output path"));
+        assert!(text_export_path_allowed(Some(&render), "/o/r.sh").is_err());
+        let batch = serde_json::json!({"batch": true, "jobs": [{"outPath": "/o/a.cast"}, {"outPath": "/o/b.html"}]});
+        assert!(text_export_path_allowed(Some(&batch), "/o/b.html").is_ok());
+        assert!(text_export_path_allowed(Some(&batch), "/o/../o/b.html").is_err(), "exact declared path only");
+        assert!(text_export_path_allowed(Some(&batch), "/home/u/.bashrc.txt").is_err());
+        assert!(text_out_mismatch("txt", "/o/a.gif").unwrap().contains(".txt"));
+        assert_eq!(text_out_mismatch("txt", "/o/a.TXT"), None);
+        assert_eq!(text_out_mismatch("gif", "/o/a.gif"), None);
+    }
 
     /// ITER-071: `--resume` must re-render an MP4 job whose mp4Quality
     /// changed (ITER-050 changes the bytes); GIF hashes ignore the field.

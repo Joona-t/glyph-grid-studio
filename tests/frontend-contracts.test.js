@@ -48,8 +48,8 @@ const contracts = [
   ['reduced motion pins frame index for still sources', /const _rmPinned = _rmStill && window\.__sourceFrameIdx === -1;\s*const _frameIdx = _rmPinned \? 0 :/],
   ['reduced motion pins the temporal dither phase', /_persistentDitherOpts\.frameIdx = _rmPinned \? 0 : frameIdx;/],
   /* ITER-057 (F24): one config merger for GUI / CLI / batch */
-  ['CLI setConfig uses the shared deep merge', /setConfig: \(overrides\) => \{[\s\S]{0,400}window\.GlyphStudio\.deepMerge\(CONFIG, overrides \|\| \{\}\);/],
-  ['batch applyConfig uses the shared deep merge', /function applyConfig\(cfg\) \{\s*if \(!cfg\) return;\s*window\.GlyphStudio\.deepMerge\(CONFIG, cfg\);/],
+  ['CLI setConfig uses the shared deep merge', /setConfig: \(overrides\) => \{[\s\S]{0,400}window\.GlyphStudio\.deepMerge\(CONFIG, window\.GlyphStudio\.stripRuntimeOnly\(overrides \|\| \{\}\)\);/],
+  ['batch applyConfig uses the shared deep merge', /function applyConfig\(cfg\) \{\s*if \(!cfg\) return;\s*window\.GlyphStudio\.deepMerge\(CONFIG, window\.GlyphStudio\.stripRuntimeOnly\(cfg\)\);/],
   ['frames "auto" follows the GUI export plan', /job\.frames === 'auto'\s*\? Math\.max\(2, Math\.round\(\(\(CONFIG\.animation && CONFIG\.animation\.duration\) \|\| 6\) \* effFps\)\)/],
   /* ITER-071: the GIF border rides in the ITER-053 gifStream settings, which finish repeats */
   ['per-job border reaches the MP4 encoder', /fps: Math\.round\(effFps\),[\s\S]{0,200}border: jobBorder,/],

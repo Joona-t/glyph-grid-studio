@@ -124,6 +124,20 @@
     return false;
   }
 
+  /* ITER-078: a palette track recolours the inks; colorMode 'preserve'
+     keeps the source's own colours, so the track silently does nothing.
+     The one-line warning for the GUI status bar and the headless cli_log
+     (Rust's validate_config says the same for validate / --dry-run), or
+     '' when the combination is fine.  A colorMode track may switch the
+     mode mid-loop, so it suppresses the warning. */
+  const PALETTE_IGNORED = 'timeline: the palette track has no effect under colorMode "preserve" (the source colours are kept); use monochrome / duotone / gradient';
+  function paletteIgnored(config) {
+    if (!active(config)) return '';
+    const tr = config.timeline.tracks;
+    const has = function (k) { return Object.prototype.hasOwnProperty.call(tr, k); };
+    return (has(PALETTE_PATH) && !has('colorMode') && config.colorMode === 'preserve') ? PALETTE_IGNORED : '';
+  }
+
   /* Copy-on-write along each tracked path: the shadow shares every
      untouched sub-object with `base` (so per-frame side effects on them —
      the XDoG sigma sweep — land where they always did), and clones only
@@ -173,6 +187,7 @@
     blendPalettes: blendPalettes,
     frameConfig: frameConfig,
     active: active,
+    paletteIgnored: paletteIgnored,
   });
 
   root.GlyphGrid = root.GlyphGrid || {};

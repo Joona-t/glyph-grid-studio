@@ -89,7 +89,17 @@ assert.deepStrictEqual(V.DECODERS, ['auto', 'native', 'webview']);
   assert(/const _prefetch = prefetchCaptureFrames\(total\);[\s\S]{0,700}primeTemporalState\(total\);/.test(html),
     'beginRecord decodes the priming frames before it primes');
   assert(/isVideo\) return _cliLoadVideo\(/.test(html), 'the CLI loader routes clips to the video source');
-  assert(/video: \{ decode: 'auto', camera: false, mirror: true \}/.test(html), 'CONFIG.video defaults');
+  assert(/video: \{ decode: 'auto', mirror: true \},/.test(html), 'CONFIG.video defaults (no camera: ITER-078)');
+  /* ITER-078 (privacy): the webcam switch is runtime-only state. */
+  assert(!/CONFIG(_BASE)?\.video\.camera/.test(html), 'nothing reads or writes CONFIG.video.camera');
+  assert(/const CAMERA = \{ camera: false \};/.test(html) && /const want = !!CAMERA\.camera;/.test(html),
+    'the camera kick reads the runtime CAMERA only');
+  assert.strictEqual((html.match(/CAMERA\.camera = (?!false)/g) || []).length, 0, 'page code only ever switches the camera off');
+  assert(/cameraState: CAMERA,/.test(html), 'the GUI toggle is bound to CAMERA');
+  assert((html.match(/openCamera\(/g) || []).length === 1, 'one getUserMedia entry point (the kick)');
+  assert(/deepMerge\(CONFIG, window\.GlyphStudio\.stripRuntimeOnly\(overrides/.test(html)
+    && /deepMerge\(CONFIG, window\.GlyphStudio\.stripRuntimeOnly\(cfg\)\)/.test(html),
+    'setConfig and the batch applyConfig strip video.camera');
   const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '../src/glyph-grid.schema.json'), 'utf8'));
   assert.deepStrictEqual(schema.properties.video.properties.decode.enum, V.DECODERS, 'schema video.decode enum');
   assert.strictEqual(schema.properties.video.additionalProperties, false, 'video block is closed');

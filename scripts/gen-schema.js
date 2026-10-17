@@ -309,7 +309,8 @@ for (const k of Object.keys(CONFIG)) {
       properties: {
         decode: { type: 'string', enum: VIDEO.DECODERS.slice(), default: D.decode,
           description: 'auto = H.264 MP4/MOV via the Rust openh264 decoder (frame-exact), other codecs via the WebView <video>; native = Rust only (non-H.264 is an error); webview = always the <video> seek path.' },
-        camera: { type: 'boolean', default: D.camera, description: 'GUI only (experimental): the webcam is the source while on. Ignored headless.' },
+        camera: { type: 'boolean', default: false, deprecated: true,
+          description: 'Ignored (ITER-078): the camera is runtime-only GUI state (Video › camera (beta)). Accepted so older files still validate, then stripped from every preset, batch job, MCP config and --set.' },
         mirror: { type: 'boolean', default: D.mirror, description: 'Mirror the camera image.' },
       },
       additionalProperties: false,

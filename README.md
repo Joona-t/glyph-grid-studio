@@ -54,6 +54,10 @@ The selected glyph is typeset into the cell, in a chosen palette and color mode.
 | Text source | kinetic typography (typewriter / rise / fade / scale) and `.srt` / `.lrc` lyric cues rendered as the source, alone or composited onto the image (multiply / screen / mask) |
 | Export | PNG snapshot · animated GIF89a · MP4 (H.264) · preset JSON · share URL |
 
+## Privacy
+
+Nothing leaves your machine: no telemetry, no network calls, no accounts. The webcam source (GUI › Video › camera (beta)) is **runtime-only state**. It is not part of the config, it is never saved in a preset or share URL, and `video.camera` is stripped from every preset, share link, batch job, MCP config and `--set` on the way in. A file someone sends you cannot switch your camera on; only that toggle can, and the headless CLI never opens a camera. Headless text exports (`--format txt|ansi|cast|html`) can only write the output path the job declared.
+
 ## Algorithmic notes
 
 - **6-D shape-vector matching** (Alex Harri 2024): each glyph is encoded as 6 floats describing local mass distribution; per-cell lookup picks the closest match via k-d tree. Matches CNN-quality at ~1% the cost (Chen et al. arXiv 2503.14375, 2025).

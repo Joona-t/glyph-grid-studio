@@ -38,6 +38,208 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// when the webview asks slightly backwards.
 const RING: usize = 8;
 
+/* ITER-078: the SOURCE_LIMITS of index.html, enforced here too, before
+   the first frame is decoded — a header that lies (tkhd / avc1 entry vs
+   the SPS the decoder will actually honour) cannot buy a bigger
+   allocation than the probe admitted. */
+pub const MAX_DIMENSION: u32 = 16384;
+pub const MAX_FRAMES: u32 = 480;
+pub const MAX_DECODED_PIXELS: u64 = 100_000_000;
+/// GlyphGrid.video.CACHE: decoded frames resident at once (JS LRU).
+pub const RESIDENT_FRAMES: u64 = 16;
+
+pub fn check_limits(w: u32, h: u32, frames: u32) -> Result<(), String> {
+    if w == 0 || h == 0 {
+        return Err("video has invalid dimensions".into());
+    }
+    if w > MAX_DIMENSION || h > MAX_DIMENSION {
+        return Err(format!("video is {}x{}; dimensions exceed {} px", w, h, MAX_DIMENSION));
+    }
+    if frames > MAX_FRAMES {
+        return Err(format!("video has {} frames (limit {})", frames, MAX_FRAMES));
+    }
+    let px = w as u64 * h as u64 * (frames as u64).clamp(1, RESIDENT_FRAMES);
+    if px > MAX_DECODED_PIXELS {
+        return Err(format!(
+            "decoded video would exceed the {}-pixel safety limit ({}x{})",
+            MAX_DECODED_PIXELS, w, h
+        ));
+    }
+    Ok(())
+}
+
+/// Exp-Golomb reader over an SPS RBSP (emulation-prevention bytes removed).
+struct Bits<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl Bits<'_> {
+    fn bit(&mut self) -> Option<u32> {
+        let byte = *self.b.get(self.pos / 8)?;
+        let v = (byte >> (7 - (self.pos % 8))) & 1;
+        self.pos += 1;
+        Some(v as u32)
+    }
+    fn bits(&mut self, n: u32) -> Option<u32> {
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.bit()?;
+        }
+        Some(v)
+    }
+    fn ue(&mut self) -> Option<u32> {
+        let mut zeros = 0u32;
+        while self.bit()? == 0 {
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        Some(((1u64 << zeros) - 1 + self.bits(zeros)? as u64).min(u32::MAX as u64) as u32)
+    }
+    fn se(&mut self) -> Option<i64> {
+        let k = self.ue()? as i64;
+        Some(if k % 2 == 1 { (k + 1) / 2 } else { -(k / 2) })
+    }
+}
+
+/// Cropped picture size from an SPS NAL unit (header byte included), per
+/// H.264 7.3.2.1.1 — the size openh264 will output.  `None` = unparseable.
+pub fn sps_dimensions(nal: &[u8]) -> Option<(u32, u32)> {
+    if nal.first().map(|h| h & 0x1F) != Some(7) {
+        return None;
+    }
+    let mut rbsp = Vec::with_capacity(nal.len());
+    let mut zeros = 0;
+    for &b in &nal[1..] {
+        if zeros >= 2 && b == 3 {
+            zeros = 0;
+            continue;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        rbsp.push(b);
+    }
+    let mut r = Bits { b: &rbsp, pos: 0 };
+    let profile = r.bits(8)?;
+    r.bits(16)?; // constraint flags + level_idc
+    r.ue()?; // seq_parameter_set_id
+    let mut chroma = 1u32;
+    let mut separate_planes = false;
+    if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
+        chroma = r.ue()?;
+        if chroma > 3 {
+            return None;
+        }
+        if chroma == 3 {
+            separate_planes = r.bit()? == 1;
+        }
+        r.ue()?; // bit_depth_luma_minus8
+        r.ue()?; // bit_depth_chroma_minus8
+        r.bit()?; // qpprime_y_zero_transform_bypass_flag
+        if r.bit()? == 1 {
+            // seq_scaling_matrix_present_flag: skip the lists (7.3.2.1.1.1).
+            for i in 0..(if chroma == 3 { 12 } else { 8 }) {
+                if r.bit()? == 1 {
+                    let size = if i < 6 { 16 } else { 64 };
+                    let (mut last, mut next) = (8i64, 8i64);
+                    for _ in 0..size {
+                        if next != 0 {
+                            next = (last + r.se()? + 256).rem_euclid(256);
+                        }
+                        last = if next == 0 { last } else { next };
+                    }
+                }
+            }
+        }
+    }
+    r.ue()?; // log2_max_frame_num_minus4
+    match r.ue()? {
+        0 => {
+            r.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+        }
+        1 => {
+            r.bit()?;
+            r.se()?;
+            r.se()?;
+            let cycle = r.ue()?;
+            if cycle > 255 {
+                return None;
+            }
+            for _ in 0..cycle {
+                r.se()?;
+            }
+        }
+        2 => {}
+        _ => return None,
+    }
+    r.ue()?; // max_num_ref_frames
+    r.bit()?; // gaps_in_frame_num_value_allowed_flag
+    let w_mbs = r.ue()? as u64 + 1;
+    let h_map = r.ue()? as u64 + 1;
+    let frame_mbs_only = r.bit()? as u64;
+    if frame_mbs_only == 0 {
+        r.bit()?; // mb_adaptive_frame_field_flag
+    }
+    r.bit()?; // direct_8x8_inference_flag
+    let (mut cl, mut cr, mut ct, mut cb) = (0u64, 0u64, 0u64, 0u64);
+    if r.bit()? == 1 {
+        cl = r.ue()? as u64;
+        cr = r.ue()? as u64;
+        ct = r.ue()? as u64;
+        cb = r.ue()? as u64;
+    }
+    let array_type = if separate_planes { 0 } else { chroma };
+    let (cx, cy) = match array_type {
+        0 => (1, 2 - frame_mbs_only),
+        1 => (2, 2 * (2 - frame_mbs_only)),
+        2 => (2, 2 - frame_mbs_only),
+        _ => (1, 2 - frame_mbs_only),
+    };
+    let w = (w_mbs * 16).checked_sub(cx * (cl + cr))?;
+    let h = ((2 - frame_mbs_only) * h_map * 16).checked_sub(cy * (ct + cb))?;
+    if w == 0 || h == 0 || w > u32::MAX as u64 || h > u32::MAX as u64 {
+        return None;
+    }
+    Some((w as u32, h as u32))
+}
+
+/// The picture size every SPS in the avcC declares, checked against the
+/// container's own claims (tkhd, avc1 sample entry; 0 = not stated).
+fn stream_dimensions(track: &mp4::Mp4Track) -> Result<(u32, u32), String> {
+    let avc1 = track
+        .trak
+        .mdia
+        .minf
+        .stbl
+        .stsd
+        .avc1
+        .as_ref()
+        .ok_or("avc1 sample entry missing")?;
+    let mut dims: Option<(u32, u32)> = None;
+    for sps in &avc1.avcc.sequence_parameter_sets {
+        let d = sps_dimensions(&sps.bytes).ok_or("unparseable SPS in avcC")?;
+        if dims.map_or(false, |prev| prev != d) {
+            return Err("avcC SPS entries disagree on the picture size".into());
+        }
+        dims = Some(d);
+    }
+    let (w, h) = dims.ok_or("avcC carries no SPS")?;
+    let tkhd = &track.trak.tkhd;
+    for (what, cw, ch) in [
+        ("tkhd", tkhd.width.value() as u32, tkhd.height.value() as u32),
+        ("avc1 sample entry", avc1.width as u32, avc1.height as u32),
+    ] {
+        if (cw, ch) != (0, 0) && (cw, ch) != (w, h) {
+            return Err(format!(
+                "{} says {}x{} but the H.264 SPS says {}x{}; refusing a header that disagrees with its stream",
+                what, cw, ch, w, h
+            ));
+        }
+    }
+    Ok((w, h))
+}
+
 /// `video_open` / probe result.  `supported: false` carries `reason`; the
 /// JS side then falls back to the `<video>` element.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -52,6 +254,10 @@ pub struct VideoInfo {
     pub height: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// ITER-078: refused for safety (limits, a lying header) — an error
+    /// for the caller, not a fall-back to the WebView decoder.
+    #[serde(skip)]
+    pub rejected: bool,
 }
 
 /// Container families we recognise as video (sniffed, extension fallback).
@@ -109,7 +315,12 @@ fn unsupported(codec: &str, reason: String) -> VideoInfo {
         width: 0,
         height: 0,
         reason: Some(reason),
+        rejected: false,
     }
+}
+
+fn rejected(codec: &str, reason: String) -> VideoInfo {
+    VideoInfo { rejected: true, ..unsupported(codec, reason) }
 }
 
 pub struct VideoDecoder {
@@ -161,6 +372,11 @@ impl VideoDecoder {
         if codec != "h264" {
             return Err(unsupported(codec, format!("codec {} is not H.264 (the Rust decoder is H.264-only)", codec)));
         }
+        // ITER-078: the SPS (what openh264 will allocate) must agree with
+        // the container's dims and fit the source limits — checked before
+        // any table is indexed or a frame decoded.
+        let (sw, sh) = stream_dimensions(track).map_err(|r| rejected(codec, r))?;
+        check_limits(sw, sh, track.sample_count()).map_err(|r| rejected(codec, r))?;
         let avcc = &track
             .trak
             .mdia
@@ -188,7 +404,6 @@ impl VideoDecoder {
         if !(fps.is_finite() && fps > 0.0) {
             return Err(unsupported(codec, "cannot determine the frame rate".into()));
         }
-        let (tw, th) = (track.width() as u32, track.height() as u32);
 
         let mut dec = VideoDecoder {
             reader,
@@ -209,16 +424,15 @@ impl VideoDecoder {
                 codec: codec.into(),
                 fps: (fps * 1000.0).round() / 1000.0,
                 frames: samples,
-                width: tw,
-                height: th,
+                width: sw,
+                height: sh,
                 reason: None,
+                rejected: false,
             },
         };
         dec.index_gops().map_err(|r| unsupported(codec, r))?;
-        // Decode frame 0: proves the stream decodes and gives the true
-        // (cropped) picture size, which can differ from tkhd.
-        dec.info.width = 0;
-        dec.info.height = 0;
+        // Decode frame 0: proves the stream decodes.  emit() holds every
+        // output to the SPS size (resolution changes are refused).
         if let Err(e) = dec.frame(0) {
             return Err(unsupported(codec, format!("openh264 could not decode frame 0: {}", e)));
         }
@@ -243,32 +457,19 @@ impl VideoDecoder {
             return Err("first sample is not a sync sample".into());
         }
         self.gops = (0..n as u32).filter(|&i| is_sync[i as usize]).collect();
-        // Presentation time = decode time + composition offset.
-        let mut dts = Vec::with_capacity(n);
-        let mut t: i64 = 0;
-        for e in &stbl.stts.entries {
-            for _ in 0..e.sample_count {
-                if dts.len() < n {
-                    dts.push(t);
-                }
-                t += e.sample_delta as i64;
-            }
+        let stts: Vec<(u32, u32)> = stbl.stts.entries.iter().map(|e| (e.sample_count, e.sample_delta)).collect();
+        let ctts: Option<Vec<(u32, i32)>> = stbl
+            .ctts
+            .as_ref()
+            .map(|c| c.entries.iter().map(|e| (e.sample_count, e.sample_offset)).collect());
+        // ITER-078: the mp4 crate sums these counts (from 1) with
+        // checked_add and unwraps the overflow inside read_sample — a panic
+        // on the IPC worker.  Refuse such a table up front.
+        let ctts_counts: Vec<u32> = ctts.iter().flatten().map(|e| e.0).collect();
+        if !counts_fit(stts.iter().map(|e| e.0)) || !counts_fit(ctts_counts.into_iter()) {
+            return Err("stts/ctts sample counts overflow (corrupt or crafted sample tables)".into());
         }
-        if dts.len() != n {
-            return Err("stts does not cover every sample".into());
-        }
-        let mut pts = dts.clone();
-        if let Some(ctts) = &stbl.ctts {
-            let mut i = 0usize;
-            for e in &ctts.entries {
-                for _ in 0..e.sample_count {
-                    if i < n {
-                        pts[i] += e.sample_offset as i64;
-                    }
-                    i += 1;
-                }
-            }
-        }
+        let pts = presentation_times(n, &stts, ctts.as_deref())?;
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&i| (pts[i], i));
         let mut rank = vec![0u32; n];
@@ -284,6 +485,51 @@ impl VideoDecoder {
         Ok(())
     }
 
+}
+
+/// 1 + the sum of `counts` fits a u32 (the mp4 crate's own bookkeeping).
+fn counts_fit(mut counts: impl Iterator<Item = u32>) -> bool {
+    counts.try_fold(1u32, |t, c| t.checked_add(c)).is_some()
+}
+
+/// Presentation time of the first `n` samples = decode time (stts) +
+/// composition offset (ctts).  ITER-078: the per-sample loops are bounded
+/// by the samples still missing, never by a file-supplied `sample_count`
+/// (one stts entry claiming u32::MAX samples used to spin 4 G iterations),
+/// and the running time saturates instead of overflowing.
+fn presentation_times(n: usize, stts: &[(u32, u32)], ctts: Option<&[(u32, i32)]>) -> Result<Vec<i64>, String> {
+    let mut pts = Vec::with_capacity(n);
+    let mut t: i64 = 0;
+    for &(count, delta) in stts {
+        let take = (count as usize).min(n - pts.len());
+        for _ in 0..take {
+            pts.push(t);
+            t = t.saturating_add(delta as i64);
+        }
+        if pts.len() == n {
+            break;
+        }
+    }
+    if pts.len() != n {
+        return Err("stts does not cover every sample".into());
+    }
+    if let Some(ctts) = ctts {
+        let mut i = 0usize;
+        for &(count, offset) in ctts {
+            let take = (count as usize).min(n - i);
+            for p in &mut pts[i..i + take] {
+                *p = p.saturating_add(offset as i64);
+            }
+            i += take;
+            if i == n {
+                break;
+            }
+        }
+    }
+    Ok(pts)
+}
+
+impl VideoDecoder {
     fn gop_of(&self, p: u32) -> usize {
         match self.gops.binary_search(&p) {
             Ok(g) => g,
@@ -421,8 +667,8 @@ fn track_fps(track: &mp4::Mp4Track) -> f64 {
     let stts = &track.trak.mdia.minf.stbl.stts;
     let (mut n, mut ticks) = (0u64, 0u64);
     for e in &stts.entries {
-        n += e.sample_count as u64;
-        ticks += e.sample_count as u64 * e.sample_delta as u64;
+        n = n.saturating_add(e.sample_count as u64);
+        ticks = ticks.saturating_add(e.sample_count as u64 * e.sample_delta as u64);
     }
     if n == 0 || ticks == 0 {
         return track.frame_rate();
@@ -438,13 +684,15 @@ fn yuv_rgba(y: &DecodedYUV<'_>) -> (Vec<u8>, u32, u32) {
 }
 
 /// Header-only probe for `probe_image_file`: frames / fps / dims / codec,
-/// no decode.  `None` when the file is not a parseable MP4/MOV (webm, or a
-/// container the mp4 crate rejects) — the JS side then validates after the
-/// `<video>` element reports its metadata.
-pub fn probe_mp4(path: &Path) -> Option<VideoInfo> {
-    let file = File::open(path).ok()?;
-    let size = file.metadata().ok()?.len();
-    let reader = Mp4Reader::read_header(BufReader::new(file), size).ok()?;
+/// no decode.  `Ok(None)` when the file is not a parseable MP4/MOV (webm,
+/// or a container the mp4 crate rejects) — the JS side then validates
+/// after the `<video>` element reports its metadata.  ITER-078: for H.264
+/// the dims are the SPS's, and a container that disagrees with them is an
+/// `Err` (the probe is what admits the clip past SOURCE_LIMITS).
+pub fn probe_mp4(path: &Path) -> Result<Option<VideoInfo>, String> {
+    let Some(file) = File::open(path).ok() else { return Ok(None) };
+    let Some(size) = file.metadata().ok().map(|m| m.len()) else { return Ok(None) };
+    let Ok(reader) = Mp4Reader::read_header(BufReader::new(file), size) else { return Ok(None) };
     let mut ids: Vec<u32> = reader
         .tracks()
         .iter()
@@ -452,7 +700,8 @@ pub fn probe_mp4(path: &Path) -> Option<VideoInfo> {
         .map(|(id, _)| *id)
         .collect();
     ids.sort();
-    let track = &reader.tracks()[ids.first()?];
+    let Some(id) = ids.first() else { return Ok(None) };
+    let track = &reader.tracks()[id];
     let samples = track.sample_count();
     let fps = track_fps(track);
     let codec = match track.media_type() {
@@ -462,16 +711,22 @@ pub fn probe_mp4(path: &Path) -> Option<VideoInfo> {
         Ok(_) => "other",
         Err(_) => "unknown",
     };
-    Some(VideoInfo {
+    let (width, height) = if codec == "h264" {
+        stream_dimensions(track)?
+    } else {
+        (track.width() as u32, track.height() as u32)
+    };
+    Ok(Some(VideoInfo {
         handle: 0,
         supported: codec == "h264",
         codec: codec.into(),
         fps: if fps.is_finite() { (fps * 1000.0).round() / 1000.0 } else { 0.0 },
         frames: samples,
-        width: track.width() as u32,
-        height: track.height() as u32,
+        width,
+        height,
         reason: None,
-    })
+        rejected: false,
+    }))
 }
 
 /* ---- the one open video (per process; a batch swaps it per source) ---- */
@@ -483,17 +738,19 @@ fn open_slot() -> &'static Mutex<Option<VideoDecoder>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
-/// Open (and replace) the process's video.  Never errors for an
-/// unsupported stream — that is `supported: false` + `reason`.
-pub fn open_video(path: &Path) -> VideoInfo {
+/// Open (and replace) the process's video.  An unsupported stream is
+/// `Ok` with `supported: false` + `reason` (the WebView decodes it); a
+/// rejected one (limits, a lying header — ITER-078) is `Err`.
+pub fn open_video(path: &Path) -> Result<VideoInfo, String> {
     match VideoDecoder::open(path) {
         Ok(mut dec) => {
             dec.info.handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
             let info = dec.info.clone();
             *open_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(dec);
-            info
+            Ok(info)
         }
-        Err(info) => info,
+        Err(info) if info.rejected => Err(format!("video rejected: {}", info.reason.unwrap_or_default())),
+        Err(info) => Ok(info),
     }
 }
 
@@ -511,7 +768,7 @@ pub fn frame_of(handle: u64, index: u32) -> Result<(Arc<Vec<u8>>, u32, u32), Str
 pub async fn video_open(path: String) -> Result<VideoInfo, String> {
     let p = std::path::PathBuf::from(&path);
     crate::source_file_size(&p)?;
-    Ok(open_video(&p))
+    open_video(&p)
 }
 
 /// Frame `index` of the open video as raw RGBA (w·h·4 bytes) in the IPC
@@ -546,7 +803,7 @@ mod tests {
     #[test]
     fn tiny_mp4_opens_with_exact_metadata() {
         let p = fixture("tiny.mp4");
-        let info = probe_mp4(&p).expect("probe");
+        let info = probe_mp4(&p).unwrap().expect("probe");
         assert_eq!((info.codec.as_str(), info.frames, info.width, info.height), ("h264", 12, 160, 90));
         assert!((info.fps - 25.0).abs() < 1e-6, "{}", info.fps);
         let dec = VideoDecoder::open(&p).unwrap_or_else(|i| panic!("{:?}", i.reason));
@@ -598,22 +855,98 @@ mod tests {
         let webm = dir.join("x.webm");
         std::fs::write(&webm, [0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0]).unwrap();
         assert_eq!(sniff_container(&webm), Some(Container::Webm));
-        let info = open_video(&webm);
+        let info = open_video(&webm).unwrap();
         assert!(!info.supported && info.reason.as_deref().unwrap().contains("WebM"), "{:?}", info);
         let junk = dir.join("junk.mp4");
         std::fs::write(&junk, b"\0\0\0\x10ftypisomjunk").unwrap();
-        let j = open_video(&junk);
+        let j = open_video(&junk).unwrap();
         assert!(!j.supported && j.reason.as_deref().unwrap().contains("MP4"), "{:?}", j);
         let png = fixture("cream-paper.png");
         assert_eq!(sniff_container(&png), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A copy of `name` with the 4 bytes at `box_type` + `off` (offset
+    /// from the box start) replaced — crafted headers, no binary fixture.
+    fn patched(name: &str, box_type: &[u8; 4], off: impl Fn(&[u8]) -> usize, val: u32, tag: &str) -> PathBuf {
+        let mut b = std::fs::read(fixture(name)).unwrap();
+        // Last match: `avc1` is also an ftyp compatible brand.
+        let at = b.windows(4).rposition(|w| w == box_type).expect("box") - 4;
+        let o = at + off(&b[at..]);
+        b[o..o + 4].copy_from_slice(&val.to_be_bytes());
+        let dir = std::env::temp_dir().join(format!("ggs-video-patch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("{}-{}", tag, name));
+        std::fs::write(&out, b).unwrap();
+        out
+    }
+
+    /// ITER-078: stts/ctts loops are bounded by the samples still missing.
+    #[test]
+    fn stts_and_ctts_sample_counts_cannot_drive_the_loops() {
+        let t0 = std::time::Instant::now();
+        let pts = presentation_times(12, &[(u32::MAX, 512)], Some(&[(u32::MAX, 1024)])).unwrap();
+        assert_eq!(pts.len(), 12);
+        assert_eq!((pts[0], pts[11]), (1024, 11 * 512 + 1024));
+        let big = presentation_times(3, &[(2, u32::MAX), (u32::MAX, u32::MAX)], Some(&[(1, i32::MAX), (u32::MAX, i32::MAX)])).unwrap();
+        assert!(big.windows(2).all(|w| w[0] <= w[1]), "{:?}", big);
+        assert!(presentation_times(12, &[(5, 1)], None).unwrap_err().contains("stts"));
+        assert!(presentation_times(0, &[(u32::MAX, 1)], None).unwrap().is_empty());
+        // The same through a real file: tiny.mp4 with its stts entry 0
+        // claiming u32::MAX samples is refused at open — no 4 G loop, and
+        // no panic in the mp4 crate's read_sample (it unwraps the overflow).
+        let crafted = patched("tiny.mp4", b"stts", |_| 16, u32::MAX, "stts");
+        let reason = VideoDecoder::open(&crafted).err().and_then(|i| i.reason).unwrap_or_default();
+        assert!(reason.contains("overflow"), "{}", reason);
+        let info = open_video(&crafted).unwrap();
+        assert!(!info.supported && !info.rejected, "corrupt tables fall back to the WebView: {:?}", info);
+        // A large but valid count (the 12 real samples + slack) still opens.
+        let slack = patched("tiny.mp4", b"stts", |_| 16, u32::MAX - 16, "stts-slack");
+        let mut d = VideoDecoder::open(&slack).unwrap_or_else(|i| panic!("{:?}", i.reason));
+        let mut base = VideoDecoder::open(&fixture("tiny.mp4")).unwrap();
+        assert_eq!((d.info.frames, d.info.fps), (12, 25.0));
+        assert!(d.frame(11).unwrap() == base.frame(11).unwrap());
+        assert!(t0.elapsed().as_secs() < 10, "bounded loops took {:?}", t0.elapsed());
+    }
+
+    /// ITER-078: dims come from the SPS (cropping applied) and a container
+    /// that disagrees with them is refused before any frame is decoded.
+    #[test]
+    fn sps_dims_rule_and_a_lying_header_is_rejected() {
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            let f = File::open(fixture(name)).unwrap();
+            let size = f.metadata().unwrap().len();
+            let r = Mp4Reader::read_header(BufReader::new(f), size).unwrap();
+            let t = r.tracks().values().next().unwrap();
+            let sps = &t.trak.mdia.minf.stbl.stsd.avc1.as_ref().unwrap().avcc.sequence_parameter_sets[0];
+            assert_eq!(sps_dimensions(&sps.bytes), Some((160, 90)), "{} (coded 160x96, cropped)", name);
+        }
+        assert_eq!(sps_dimensions(&[0x68, 0xff]), None, "a PPS is not an SPS");
+        assert_eq!(sps_dimensions(&[0x67, 0x42]), None, "truncated");
+        // tkhd width (16.16 at +84 in a v0 box, +96 in v1) → 3840.
+        let tkhd = patched("tiny.mp4", b"tkhd", |b| if b[8] == 1 { 96 } else { 84 }, 3840 << 16, "tkhd");
+        let e = probe_mp4(&tkhd).unwrap_err();
+        assert!(e.contains("tkhd says 3840x90") && e.contains("160x90"), "{}", e);
+        assert!(open_video(&tkhd).unwrap_err().contains("rejected"));
+        assert!(crate::probe_image_path(&tkhd).is_err());
+        // avc1 sample entry width (u16 at +32) → 4000.
+        let avc1 = patched("tiny.mp4", b"avc1", |_| 32, (4000u32 << 16) | 90, "avc1");
+        assert!(probe_mp4(&avc1).unwrap_err().contains("avc1 sample entry says 4000x90"));
+        assert!(VideoDecoder::open(&avc1).err().map_or(false, |i| i.rejected));
+        // The limits themselves (SOURCE_LIMITS, 16 resident frames).
+        assert!(check_limits(1920, 1080, 480).is_ok());
+        assert!(check_limits(3840, 2160, 300).unwrap_err().contains("pixel"));
+        assert!(check_limits(3840, 2160, 2).is_ok(), "a 2-frame 4K clip holds 2 frames");
+        assert!(check_limits(16385, 8, 1).unwrap_err().contains("16384"));
+        assert!(check_limits(64, 64, 481).unwrap_err().contains("481"));
+        assert!(check_limits(0, 64, 1).is_err());
+    }
+
     #[test]
     fn handles_go_stale_when_a_new_video_opens() {
         let p = fixture("tiny.mp4");
-        let a = open_video(&p);
-        let b = open_video(&p);
+        let a = open_video(&p).unwrap();
+        let b = open_video(&p).unwrap();
         assert!(a.supported && b.supported && a.handle != b.handle);
         assert!(frame_of(a.handle, 0).unwrap_err().contains("not open"));
         let (f, w, h) = frame_of(b.handle, 4).unwrap();

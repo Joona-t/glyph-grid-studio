@@ -174,8 +174,23 @@
     }
     return t;
   }
+  /* ITER-078 (privacy): keys that are runtime state, not config — today
+     only video.camera (a webcam switch).  Stripped on every inbound path
+     (applyPreset here, setConfig / the batch applyConfig in index.html;
+     Rust strips it for --preset / --set / batch / MCP), belt-and-braces
+     on top of the camera living outside CONFIG.  Copy-on-write: the
+     caller's object is not mutated. */
+  function stripRuntimeOnly(src) {
+    if (!src || typeof src !== 'object' || !src.video || typeof src.video !== 'object'
+        || !Object.prototype.hasOwnProperty.call(src.video, 'camera')) return src;
+    var out = Object.assign({}, src);
+    out.video = Object.assign({}, src.video);
+    delete out.video.camera;
+    return out;
+  }
   function applyPreset(config, preset) {
     if (!preset || typeof preset !== 'object') return;
+    preset = stripRuntimeOnly(preset);
     /* R7 (ITER-056): $schema / version are preset metadata, not CONFIG.
        Unknown top-level keys are applied as before (schema policy
        x-unknown-key-policy: warn — share URLs from other builds must keep
@@ -471,7 +486,9 @@
             } catch (e) {}
           }, function (err) {
             console.warn('glyph-studio: image decode failed', err);
-            try { exportFeedback('Not a readable image: ' + String(absPath).split('/').pop() + ((err && err.message) ? ' — ' + err.message : ''), true); } catch (e) {}
+            /* ITER-078: Tauri rejects with a plain string (e.g. a video
+               whose header disagrees with its SPS) — show it too. */
+            try { exportFeedback('Not a readable image: ' + String(absPath).split('/').pop() + (err ? ' — ' + ((err && err.message) || err) : ''), true); } catch (e) {}
           });
         })
         .catch(function (e) {
@@ -1939,7 +1956,9 @@
     /* Video (ITER-077, R4).  Clips load like images (Pick image… or
        drag-drop an mp4 / mov / m4v / webm).  decode picks the decoder for
        the NEXT clip opened; camera swaps the webcam in as the source while
-       it is on (experimental — needs the macOS camera permission). */
+       it is on (experimental — needs the macOS camera permission).
+       ITER-078: camera binds the runtime-only opts.cameraState, never
+       config — a loaded preset cannot flip it. */
     if (window.GlyphGrid && window.GlyphGrid.video && config.video) {
       var fVideo = pane.addFolder({ title: 'Video', expanded: false });
       var kickCam = function () { if (window.__videoCameraKick) window.__videoCameraKick(); };
@@ -1947,8 +1966,10 @@
       window.GlyphGrid.video.DECODERS.forEach(function (d) { vOpts[d] = d; });
       tip(fVideo.addInput(config.video, 'decode', { options: vOpts }),
           'auto: H.264 MP4/MOV decode frame-exactly in Rust (openh264); other codecs (HEVC, WebM) use the WebView. native: Rust only. webview: always the WebView seek path. Applies to the next clip you open.');
-      tip(fVideo.addInput(config.video, 'camera', { label: 'camera (beta)' }).on('change', kickCam),
-          'Use the webcam as the source (GUI only, experimental). Turning it off restores the previous source. Live camera exports are not frame-reproducible.');
+      if (opts.cameraState) {
+        tip(fVideo.addInput(opts.cameraState, 'camera', { label: 'camera (beta)' }).on('change', kickCam),
+            'Use the webcam as the source (GUI only, experimental). Turning it off restores the previous source. Live camera exports are not frame-reproducible. Never saved in presets.');
+      }
       tip(fVideo.addInput(config.video, 'mirror').on('change', kickCam),
           'Mirror the camera image horizontally (selfie view).');
     }
@@ -2630,6 +2651,7 @@
     snapshotConfig: snapshotConfig,
     applyPreset: applyPreset,
     deepMerge: deepMerge,
+    stripRuntimeOnly: stripRuntimeOnly,
     presetSchemaId: PRESET_SCHEMA_ID,
     presetSchemaVersion: PRESET_SCHEMA_VERSION,
     listPresets: listPresets,

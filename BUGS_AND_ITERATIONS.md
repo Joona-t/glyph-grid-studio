@@ -4,6 +4,34 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-078 — 2026-10-18 — Phase 5 hardening: text-export path guard, bounded video tables, SPS-checked probe, runtime-only camera, review fixes
+
+**Problem:** the automated review of ITER-074..077 and the phase-5 fix queue found five security / privacy holes and nine review defects.
+1. `save_text_export` (ITER-074) wrote any path the renderer named, so a buggy or compromised page could write anywhere the user can.
+2. `video.rs` index_gops (ITER-077) looped `sample_count` times per stts / ctts entry. That count comes from the file: one entry claiming u32::MAX samples meant 4 G iterations on the IPC worker.
+3. The video probe took its dims from the container (`track.width()` is the avc1 sample entry, the tkhd sits next to it), and SOURCE_LIMITS were applied to those dims. A header could claim 160×90 while its SPS made openh264 allocate something much bigger.
+4. PRIVACY: `CONFIG.video.camera` was ordinary config. An imported preset, a share URL, a batch job, an MCP config or `--set` could switch the webcam on. Only `snapshotConfig` stripped it on the way out.
+5. ITER-075 UX: a `palette` timeline track under `colorMode: "preserve"` did nothing, and said nothing.
+
+**Root cause:** (1) the path was trusted because the only caller was our own batch driver. (2) the loop was written for well-formed files. (3) the SPS, which is what the decoder honours, was never parsed. (4) the camera switch lived in CONFIG, so every config merge path could set it. (5) no cross-key check existed.
+
+**Fix:**
+1. `text_export_path_allowed`: the extension must be .txt / .ans / .ansi / .cast / .html / .htm. With a CLI job active, the path must also equal the job's `outPath` or one batch job's `outPath` (exact string, which JS passes back unchanged). In the GUI there is no job, so the extension check is the only check. A text `--format` with a non-text `--out` is refused before launch: render / `--dry-run` exit 2, batch refuses the manifest, MCP returns `invalid_arguments` at `/out_path` (`text_out_mismatch`).
+2. `presentation_times(n, stts, ctts)`: take = min(sample_count, n − done), break at n, saturating time. A table whose counts overflow u32 is refused at open with "unsupported", so the WebView fallback takes it. The mp4 crate sums the counts with `checked_add` and **`unwrap`s the overflow inside `read_sample`** (track.rs:553 `// XXX`), which panicked the test before this guard existed. `track_fps` saturates too.
+3. `sps_dimensions`: an H.264 7.3.2.1.1 SPS parser (emulation-prevention removed, high-profile chroma / scaling lists, POC types, frame cropping). `stream_dimensions` requires every avcC SPS to agree with the tkhd and the avc1 entry (0 = not stated). `check_limits` holds the SOURCE_LIMITS mirror: ≤ 16384 px a side, ≤ 480 frames, w·h·min(frames, 16) ≤ 100 M. Both run in `VideoDecoder::open` before any table is indexed or frame 0 is decoded. A refusal is an `Err` from `video_open` (`rejected`, not a fall-back), and an `Err` from `probe_image_file`. The GUI now shows string rejections in its "Not a readable image" feedback.
+4. The camera is runtime-only: `const CAMERA = {camera:false}` in index.html is bound to the Video folder toggle through `GlyphStudio.init({cameraState})`. `CONFIG.video` is `{decode, mirror}`. `GlyphStudio.stripRuntimeOnly` (copy-on-write) drops `video.camera` in applyPreset (presets, share URL, import), setConfig and the batch applyConfig. Rust `strip_preset_meta` drops it for `--preset` / `--set` / batch / MCP, and validate warns `/video/camera: ignored`. The schema keeps `camera` as `deprecated` so older files still validate. README has a Privacy section.
+5. `validate_config` warns `/timeline/tracks/palette: has no effect under colorMode "preserve"` (validate / `--dry-run` / render / batch stderr). The JS twin `GlyphGrid.timeline.paletteIgnored` puts a `⚠ palette track ignored` tag on the GUI status bar and writes one `cli_log` per headless job. A `colorMode` track suppresses it.
+
+**Measured:** the crafted stts (entry 0 = u32::MAX samples) is refused in < 1 ms. Before this fix it panicked in the mp4 crate, and a non-overflowing u32::MAX−16 count opens and decodes byte-identically to tiny.mp4. tiny.mp4's SPS reads 160×90 (coded 160×96, 6 rows cropped), and so does tiny-bframes'. A tkhd patched to 3840 and an avc1 entry patched to 4000 are both rejected by probe and by open. `render --format txt --out x.gif --dry-run` exits 2. A headless txt render (cream-paper 60×30) still writes through the guard in 2.0 s.
+
+**Gotchas:**
+- Anamorphic H.264 (tkhd = display width, SPS = stored width, SAR ≠ 1) is now refused. VUI SAR is not parsed. Re-mux with square pixels.
+- The mp4 crate itself `unwrap`s an overflowing stts sum in `read_sample`. The count guard keeps such files away from it; any other crate panic path stays unaudited.
+- A batch job's text path must match its `outPath` byte for byte. JS passes it back unchanged; a caller that re-normalises it would be refused.
+
+**Gate (commit A, items 1-5):** cargo build --release 0 errors (1 pre-existing `Shell::open` deprecation) · cargo test **59/59** (+4) · npm test ok · A9 schema up to date (31 CONFIG keys) · run-all **PASS 49 / FAIL 0** (`TEST_TIMEOUT=400`; the first run was 48/1 on A1, which flagged a `/Users/u/` literal in the new test) · MCP **33/33** · byte-identity **9/9** · worm-move 120 f `pB.json` `--mp4-quality archive` vs `golden-p3-iter057.mp4`: **PSNR inf** (120/120), real 16.9 s, user 2.3 s.
+
+
 ### ITER-077 — 2026-10-17 — Phase 5.4 (R4): video sources — frame-exact H.264 in Rust, WebView fallback, camera (beta)
 
 **Problem:** the only animated input was GIF. A creator's clip (MP4 / MOV / WebM) had to be converted to a GIF first, and the 480-frame GIF decode in p5 held every frame in memory. `glyph-sources.js` had camera/video primitives, but only under `window.PIPELINE`, so none of the studio's palettes, dither, CRT or export applied to them (research R4).
