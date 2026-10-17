@@ -225,7 +225,7 @@ for (const k of Object.keys(CONFIG)) {
   if (DESCRIPTIONS[k]) p = Object.assign({ description: DESCRIPTIONS[k] }, p);
   properties[k] = p;
 }
-/* ITER-062: closed blocks.  A typo inside a fixed-shape block
+/* ITER-068: closed blocks.  A typo inside a fixed-shape block
    (`{"dither":{"moed":"stbn"}}`) used to validate and silently render the
    default.  These blocks get additionalProperties:false; the accepted keys
    are the CONFIG defaults PLUS every key the renderer reads or writes on

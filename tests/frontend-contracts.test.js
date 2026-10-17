@@ -27,6 +27,11 @@ const contracts = [
   ['atlas commits reject stale generations', /requestedGeneration === __renderGeneration/],
   ['p5 cadence follows the live FPS setting', /frameRate\(fps\)/],
   ['CLI accepts metadata-bearing native image payloads', /typeof loaded === ['"]object['"]\)[\s\S]{0,100}loaded\.dataUrl/],
+  /* ITER-064 (F18): header probe gates the source before p5 decodes it; the
+     webview streams the file via the asset protocol. */
+  ['CLI validates the header probe before any loadImage', /invoke\('probe_image_file', \{ path: inPath \}\);[\s\S]{0,600}validateSourceMetadata\([\s\S]{0,1200}window\.loadImage\(sourceUrl,/],
+  ['CLI loads native sources via convertFileSrc', /sourceUrl = core\.convertFileSrc\(inPath\);/],
+  ['studio imageRef exposes the pre-decode validator', /validate: function \(img, extra\) \{ return validateSourceMetadata\(img, extra\); \}/],
   ['memory probe sums every audited cache (F20)', /GlyphGrid\.memProbe = function[\s\S]{0,6000}totalBytes: total/],
   ['memory probe covers the wave6 atlas map', /wave6\.atlasCacheStats\(\)/],
   /* v0.2 Phase 1 determinism (ITER-046/047) */
@@ -49,6 +54,16 @@ const contracts = [
   ['frames "auto" follows the GUI export plan', /job\.frames === 'auto'\s*\? Math\.max\(2, Math\.round\(\(\(CONFIG\.animation && CONFIG\.animation\.duration\) \|\| 6\) \* effFps\)\)/],
   ['per-job border reaches both encoders', /fps: Math\.round\(effFps\),[\s\S]{0,200}border: jobBorder,[\s\S]{0,300}delayMs: delayMs,[\s\S]{0,200}border: jobBorder,/],
   ['batch jobs carry per-job frames and border', /frames:\s+j\.frames \|\| job\.frames \|\| 24,[\s\S]{0,120}border:\s+j\.border \|\| null,/],
+  /* ITER-062 (F17 part 2): static-frame detector */
+  ['idle check runs after the live frame is painted, never while recording', /if \(recState\) \{\s*handleRecordFrame\(\);\s*\} else \{\s*idleCheck\(\);\s*\}/],
+  ['idle park requires a settled EMA', /frameIsTimeDependent\(\) \|\| !\(__emaMaxDelta < IDLE_EMA_EPS\)/],
+  ['a parked redraw that turns dynamic re-arms the loop', /__idleParked = false;\s*setTimeout\(function \(\) \{\s*if \(!recState && !__renderResumeTimer\) \{ try \{ loop\(\); \}/],
+  ['EMA formula is unchanged by the idle probe', /cellSignalEma\[i\] = \(1 - _emaA\) \* cellSignalEma\[i\] \+ _emaA \* cellSignal\[i\];/],
+  /* ITER-063 (F19): vendored deps + single font readiness promise */
+  ['p5 is loaded from the vendored copy', /<script src="vendor\/p5-1\.11\.2\/p5\.min\.js"><\/script>/],
+  ['Tweakpane is loaded from the vendored copy', /<script src="vendor\/tweakpane-3\.1\.10\/tweakpane\.min\.js"><\/script>/],
+  ['JSZip is loaded from the vendored copy', /<script src="vendor\/jszip-3\.10\.1\/jszip\.min\.js"><\/script>/],
+  ['fflate is loaded from the vendored copy', /<script src="vendor\/fflate-0\.8\.2\/index\.js"><\/script>/],
 ];
 
 for (const [name, pattern] of contracts) {
@@ -61,9 +76,332 @@ const banned = [
   ['headless start-up sleep', /setTimeout\(tryHeadlessRender,\s*\d+\)/],
   ['post-load / post-config settle sleeps', /await new Promise\(function \(r\) \{ setTimeout\(r, (300|200|1500)\); \}\);/],
   ['batch settle timer', /opts\.settleMs/],
+  ['remote <script>/<link> (offline boot, ITER-063)', /<(script|link)\b[^>]*\b(src|href)=["']?(https?:)?\/\//i],
 ];
 for (const [name, pattern] of banned) {
   assert(!pattern.test(html), `frontend contract violated: ${name} is back`);
 }
+/* ITER-069: the offline guarantee covers the runtime libs too — no CDN
+   script fallback, no remote import(). Only the SVG namespace URI and the
+   preset schema $id (ITER-056: an identifier, never fetched) may appear. */
+{
+  const libDir = require('path').join(__dirname, '../src/lib');
+  for (const f of fs.readdirSync(libDir).filter((n) => n.endsWith('.js'))) {
+    const src = fs.readFileSync(require('path').join(libDir, f), 'utf8');
+    const hit = src.match(/https?:\/\/(?!www\.w3\.org\/2000\/svg|github\.com\/Joona-t\/glyph-grid-studio\/schema\/)[^\s'"`]+/);
+    assert(!hit, `frontend contract violated: remote URL in src/lib/${f}: ${hit && hit[0]}`);
+  }
+  const studio = fs.readFileSync(require.resolve('../src/lib/glyph-studio.js'), 'utf8');
+  assert(/s\.src = 'vendor\/tweakpane-3\.1\.10\/tweakpane\.min\.js'/.test(studio), 'Tweakpane fallback is the vendored file');
+  /* ITER-069 (ITER-062 follow-up): panel font swaps go through the host hook
+     the idle detector can see. */
+  assert.strictEqual((studio.match(/swapFont\(config\);/g) || []).length, 2, 'both panel font swaps use swapFont()');
+  assert(/window\.__glyphFontSwap\(opts\)/.test(studio), 'swapFont() prefers the host __glyphFontSwap hook');
+  assert(/window\.__glyphFontSwap = function \(opts\) \{[\s\S]{0,200}__fontSwapPending\+\+;[\s\S]{0,300}__fontLoadPromise = [\s\S]{0,300}__fontSwapPending--;\s*\n\s*if \(!recState\) \{ try \{ loop\(\); \}/.test(html),
+    '__glyphFontSwap tracks the swap as pending and re-arms the loop when it resolves');
+}
+
+/* ITER-069: headless determinism — CLI/MCP jobs default to the JS preprocess
+   (only an explicit studio.gpuPreprocess:true from the preset/job opts in),
+   and every job reports the path it ran. */
+{
+  const at = html.indexOf("console.log('CLI: render job received', job);");
+  assert(at > 0, 'CLI job entry located');
+  assert(/^\s*__headlessPreprocessDefault\(\);/.test(html.slice(at + 46, at + 120)), 'headless default applied on job receipt');
+  const apply = html.indexOf('__glyphGridTest.setConfig(job.config)');
+  const batch = html.indexOf('__glyphGridTest.runBatchExport(batchJobs');
+  assert(at < apply && at < batch, 'headless default lands before the preset/manifest config is applied');
+  const fm = html.match(/function __headlessPreprocessDefault\(\) \{[\s\S]*?\n  \}/);
+  assert(fm, '__headlessPreprocessDefault() found');
+  const c = { CONFIG: { studio: { gpuPreprocess: true, enabled: true } } };
+  vm.createContext(c);
+  vm.runInContext(fm[0] + '\n__headlessPreprocessDefault();', c);
+  assert.strictEqual(c.CONFIG.studio.gpuPreprocess, false, 'headless default is the JS preprocess');
+  assert(/' preprocess:' \+ _pp/.test(html), 'batch result line reports preprocess path');
+  assert(/snap\.preprocess = _pp;/.test(html), 'PERF_JOB reports preprocess path');
+  assert(/window\.__preprocessPath = _ppGL \? 'gl' : 'js';/.test(html), 'preprocess path recorded where it is chosen');
+  assert(/'warn: GL preprocess latched the JS path: '/.test(html), 'GL latch warning is forwarded through cli_log');
+  console.log('headless preprocess determinism: ok');
+}
 
 console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${contracts.length} invariants)`);
+
+/* ITER-062: behavioural check of frameIsTimeDependent() against stubbed state.
+   Unknown/dynamic must win; only a fully still config may report false. */
+{
+  const m = html.match(/const IDLE_STATIC_DITHER = [^\n]*\n[\s\S]*?\n  function frameIsTimeDependent\(\) \{[\s\S]*?\n  \}\n/);
+  assert(m, 'frameIsTimeDependent() not found');
+  const src = m[0].replace(/^\s*let __\w+ = [^\n]*\n/gm, '');
+  const make = (over) => {
+    const still = {
+      scene: 'studio', glyphSet: null, prefilter: null, dispersal: { enabled: false },
+      studio: { breathing: { gainSwing: 0, jitter: 0 } }, dither: { mode: 'none' },
+      postprocess: {}, animation: { loop: true },
+    };
+    const ctx = Object.assign({
+      CONFIG: Object.assign(still, over && over.CONFIG),
+      recState: null, __primeOnly: false, __fontLoadPromise: null, fontDescriptor: null, __fontSwapPending: 0,
+      sourceImg: { width: 10 }, _atlasInflight: {}, _atlasCache: {},
+      window: { PIPELINE: null, __sourceFrameIdx: -1 },
+      __prefersReducedMotion: () => false,
+      usesAdvancedPipeline: () => true,
+      _hasImgDataStages: () => false,
+    }, over && over.ctx);
+    ctx.GlyphGrid = { compat: { isV2: () => true, gateDither: (c) => c.dither.mode !== 'none',
+      gatePostprocess: () => true } };
+    ctx.window.GlyphGrid = ctx.GlyphGrid;
+    vm.createContext(ctx);
+    vm.runInContext(src + '\nthis.__f = frameIsTimeDependent;', ctx);
+    return ctx.__f();
+  };
+  assert.strictEqual(make(), false, 'fully still config must be static');
+  const dynamic = [
+    ['default breathing', { CONFIG: { studio: { breathing: {} } } }],
+    ['temporal dither', { CONFIG: { dither: { mode: 'temporal' } } }],
+    ['stbn dither', { CONFIG: { dither: { mode: 'stbn' } } }],
+    ['dispersal', { CONFIG: { dispersal: { enabled: true, startT: 0.2, endT: 0.9 } } }],
+    ['xdog sigma sweep', { CONFIG: { prefilter: { mode: 'xdog' } } }],
+    ['generative scene', { CONFIG: { scene: 'flowField' } }],
+    ['animated source', { ctx: { window: { PIPELINE: null, __sourceFrameIdx: 3 } } }],
+    ['pipeline', { ctx: { window: { PIPELINE: {}, __sourceFrameIdx: -1 } } }],
+    ['recording', { ctx: { recState: { frameIdx: 0 } } }],
+    ['priming', { ctx: { __primeOnly: true } }],
+    ['no source', { ctx: { sourceImg: null } }],
+    ['font pending', { ctx: { __fontLoadPromise: {}, fontDescriptor: null } }],
+    ['studio font swap pending', { ctx: { __fontLoadPromise: {}, fontDescriptor: {}, __fontSwapPending: 1 } }],
+    ['atlas in flight', { ctx: { _atlasInflight: { octant: {} } } }],
+    ['atlas missing', { CONFIG: { glyphSet: 'octant' } }],
+    ['CRT pixel stage', { ctx: { _hasImgDataStages: () => true } }],
+  ];
+  for (const [name, over] of dynamic) {
+    assert.strictEqual(make(over), true, `frameIsTimeDependent must be true for: ${name}`);
+  }
+  /* Reduced motion stills breathing + temporal dither for a still source. */
+  assert.strictEqual(make({ CONFIG: { studio: { breathing: {} }, dither: { mode: 'temporal' } },
+    ctx: { __prefersReducedMotion: () => true } }), false, 'reduced motion still source must be static');
+  assert.strictEqual(make({ CONFIG: { dither: { mode: 'bayer8' } } }), false, 'ordered dither is static');
+}
+
+/* ITER-063: vendored files must match the pinned CDN hashes, ship a licence,
+   and the font loader must wait on all faces in parallel. */
+{
+  const crypto = require('crypto');
+  const path = require('path');
+  const vendorDir = path.join(__dirname, '..', 'src', 'vendor');
+  const sums = fs.readFileSync(path.join(vendorDir, 'SHA256SUMS'), 'utf8').trim().split('\n');
+  assert.strictEqual(sums.length, 4, 'SHA256SUMS must pin exactly the four vendored files');
+  for (const line of sums) {
+    const [hash, rel] = line.split(/\s+/);
+    const got = crypto.createHash('sha256').update(fs.readFileSync(path.join(vendorDir, rel))).digest('hex');
+    assert.strictEqual(got, hash, `vendored file drifted from its pinned hash: ${rel}`);
+    const dir = path.join(vendorDir, path.dirname(rel));
+    assert(fs.readdirSync(dir).some((f) => /^LICENSE/i.test(f)), `missing LICENSE in ${dir}`);
+    assert(html.includes(`<script src="vendor/${rel}"></script>`), `index.html does not load vendor/${rel}`);
+  }
+  const fontsJs = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'glyph-fonts.js'), 'utf8');
+  assert(/return Promise\.all\(\[\s*waitForFace\(FONT_FAMILY, sizePx, 3000\),\s*waitForFace\(FONT_FAMILY \+ '-Fallback'/.test(fontsJs),
+    'font faces must load behind one parallel readiness promise');
+  assert(!/waitForFace\([^)]*\)\s*\.then\(function \(\) \{ return waitForFace/.test(fontsJs),
+    'sequential font wait chain is back');
+}
+
+/* ITER-064 (F18): behavioural check of the studio's native loader. An
+   over-limit probe must never reach loadImage; an in-limit one loads the
+   asset-protocol URL; without convertFileSrc it falls back to inline data. */
+{
+  const path = require('path');
+  const studioJs = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'glyph-studio.js'), 'utf8');
+  const m = studioJs.match(/\n  function loadNativeImageLatest\([\s\S]*?\n  \}\n/);
+  assert(m, 'loadNativeImageLatest() not found');
+  const run = (probe, withConvert) => {
+    const calls = { invoke: [], loaded: [], feedback: [] };
+    const core = {
+      invoke(cmd, args) {
+        calls.invoke.push([cmd, args]);
+        if (cmd === 'probe_image_file') return Promise.resolve(probe);
+        if (cmd === 'read_image_file') return Promise.resolve({ dataUrl: 'data:image/gif;base64,AA==', sizeBytes: 1 });
+        return Promise.reject(new Error('unexpected ' + cmd));
+      },
+    };
+    if (withConvert) core.convertFileSrc = (p) => 'asset://localhost/' + encodeURIComponent(p);
+    const ctx = {
+      window: { __TAURI__: { core } },
+      isCurrentSourceLoad: () => true,
+      sourcePayload: (v) => ({ dataUrl: (v && v.dataUrl) || '' }),
+      exportFeedback: (msg) => calls.feedback.push(msg),
+      loadImageLatest: (url) => calls.loaded.push(url),
+    };
+    vm.createContext(ctx);
+    vm.runInContext(m[0] + '\nthis.__f = loadNativeImageLatest;', ctx);
+    const imageRef = {
+      validate(img, extra) {
+        const frames = img.numFrames();
+        const reason = img.width > 16384 || img.height > 16384 ? 'logical dimensions exceed 16384 px'
+          : frames > 480 ? 'animation has ' + frames + ' frames (limit 480)' : '';
+        return { ok: !reason, reason, meta: { sizeBytes: extra.sizeBytes } };
+      },
+    };
+    ctx.__f('/tmp/a b.gif', imageRef, 'a b.gif', 1, () => {});
+    return new Promise((r) => setTimeout(r, 0)).then(() => calls);
+  };
+  Promise.all([
+    run({ width: 1, height: 1, frames: 481, sizeBytes: 17830, probed: true }, true),
+    run({ width: 16385, height: 1, frames: 1, sizeBytes: 97, probed: true }, true),
+    run({ width: 462, height: 622, frames: 50, sizeBytes: 1, probed: true }, true),
+    run({ width: 462, height: 622, frames: 50, sizeBytes: 1, probed: true }, false),
+    run({ width: 0, height: 0, frames: 0, sizeBytes: 1, probed: false }, true),
+  ]).then(([tooMany, tooWide, ok, noConvert, unprobed]) => {
+    assert.deepStrictEqual(tooMany.loaded, [], '481-frame GIF must be rejected before loadImage');
+    assert(/481 frames/.test(tooMany.feedback[0]), 'frame-limit rejection is reported');
+    assert.deepStrictEqual(tooWide.loaded, [], '16385-px still must be rejected before loadImage');
+    assert.deepStrictEqual(ok.loaded, ['asset://localhost/%2Ftmp%2Fa%20b.gif']);
+    assert(!ok.invoke.some(([cmd]) => cmd === 'read_image_file'), 'asset path must not read the file over IPC');
+    assert.deepStrictEqual(noConvert.loaded, ['data:image/gif;base64,AA==']);
+    assert.strictEqual(JSON.stringify(noConvert.invoke[1]), JSON.stringify(['read_image_file', { path: '/tmp/a b.gif', inline: true }]));
+    assert.strictEqual(unprobed.loaded.length, 1, 'unprobed formats fall back to the post-decode guard');
+    console.log('native source loader: ok (5 cases)');
+  }).catch((e) => { console.error(e); process.exit(1); });
+}
+
+/* ITER-065 (F7): the GL grid path must place, skip and weight glyphs exactly
+   like the CPU monochrome sprite blit — and must run on its own arguments
+   (pre-ITER-065 it read the caller's locals and threw on frame 1). */
+{
+  const m = html.match(/  let _glInst = null;[^\n]*\n[\s\S]*?\n  function drawGridWebGL\([\s\S]*?\n  \}\n/);
+  assert(m, 'drawGridWebGL() not found');
+  const gate = /drawGridWebGL\(cellIndex, signal, cols, rows, cellW, cellH,\s*palette, ramp, rampLast, _stabOnInt\)/;
+  assert(gate.test(html), 'GL gate passes the stability flag explicitly');
+  const sprite = { canvas: { width: 90, height: 12 }, tileW: 9, tileH: 12, halfW: 4.5, halfH: 6 };
+  const seen = {};
+  const lut = new Float32Array(256); for (let i = 0; i < 256; i++) lut[i] = i / 255;
+  const ctx = {
+    width: 1024, height: 504, CONFIG: { font: { size: 8 }, renderer: 'webgl' },
+    _glOk: true, _glCanvas: null, _stabOn: false, _stabIdx: null, _gammaLut: lut,
+    _rampSpriteSpaceMask: Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    _ensureRampSprite: () => sprite, fontFamilyForActive: () => 'mono',
+    _hexToRgb: () => [17, 34, 51], _stableIdx: (s, i, v, idx) => idx, _stableIdxInt: (i, idx) => idx,
+    __pfAdd: () => {}, performance: { now: () => 0 }, console: { warn: (...a) => { seen.warn = a; } },
+    drawingContext: { drawImage: (c) => { seen.composited = c; } },
+    document: { createElement: () => ({ width: 0, height: 0,
+      addEventListener: (type, fn) => { seen.listeners = Object.assign(seen.listeners || {}, { [type]: fn }); } }) },
+  };
+  const glState = { lost: false, loseInDraw: false };
+  const glStub = { isContextLost: () => glState.lost };
+  ctx.window = { GlyphGrid: { wave6: {
+    makeSprite: () => ({ gl: glStub }),
+    drawSprite: (r, c, atlas, tw, th, inst, n, ink) => {
+      Object.assign(seen, { atlas, tw, th, inst: Array.from(inst.subarray(0, n * 4)), n, ink });
+      if (glState.loseInDraw) glState.lost = true;
+    },
+  } } };
+  vm.createContext(ctx);
+  vm.runInContext(m[0].replace(/^  let _glInst = null;/, 'var _glInst = null;') + '\nthis.__f = drawGridWebGL;', ctx);
+  const cols = 3, rows = 2, cellW = 1024 / 3, cellH = 504 / 2;
+  const signal = Float32Array.from([0, 0.5, 1, 0.2, 0.9, 0.05]);
+  assert.strictEqual(ctx.__f(null, signal, cols, rows, cellW, cellH, { inks: ['#112233'] }, ' .:-=+*#%@', 9, false), true, 'GL path renders');
+  assert(!seen.warn, 'GL path must not throw: ' + (seen.warn && seen.warn[1]));
+  /* CPU reference: same idx rule, space skip, origin snaps and alpha clamp. */
+  const want = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const curved = lut[(signal[r * cols + c] * 255) | 0];
+    const idx = Math.min(9, (curved * 9 + 0.0001) | 0);
+    if (ctx._rampSpriteSpaceMask[idx]) continue;
+    const a = Math.min(1, curved * 1.1);
+    want.push(((((c * cellW) | 0) + cellW * 0.5) - 4.5) | 0, ((((r * cellH) | 0) + cellH * 0.5) - 6) | 0, idx, Math.fround(a));
+  }
+  assert.strictEqual(seen.n, want.length / 4, 'space glyphs are dropped from the instance list');
+  assert.deepStrictEqual(seen.inst, want, 'instance origins/idx/alpha match the CPU sprite blit');
+  assert.strictEqual(seen.atlas, sprite.canvas, 'GL samples the CPU ramp sprite atlas');
+  assert.deepStrictEqual([seen.tw, seen.th], [9, 12], 'tile size is the sprite tile, not the cell');
+  assert.strictEqual(seen.composited, ctx._glCanvas, 'GL result is composited onto the p5 canvas');
+  /* ITER-069: context loss latches the CPU sprite path — via the event, a
+     pre-draw isContextLost(), or a loss during the draw (nothing composited). */
+  assert(seen.listeners && typeof seen.listeners.webglcontextlost === 'function', 'webglcontextlost listener installed');
+  seen.listeners.webglcontextlost();
+  assert.strictEqual(ctx._glOk, false, 'webglcontextlost latches _glOk=false');
+  const lostCases = [['lost before draw', { lost: true, loseInDraw: false }], ['lost during draw', { lost: false, loseInDraw: true }]];
+  for (const [name, st] of lostCases) {
+    ctx._glOk = true; Object.assign(glState, st); seen.composited = null;
+    assert.strictEqual(ctx.__f(null, signal, cols, rows, cellW, cellH, { inks: ['#112233'] }, ' .:-=+*#%@', 9, false), false,
+      `${name}: falls through to the CPU path`);
+    assert.strictEqual(ctx._glOk, false, `${name}: latches _glOk=false`);
+    assert.strictEqual(seen.composited, null, `${name}: nothing composited from the lost context`);
+  }
+  console.log('GL sprite-equivalent instance fill + context loss: ok');
+}
+
+/* ITER-066 (F8 Phase A): the WebGL2 preprocess port must keep every tuned
+   constant identical to the JS path it replaces, and only take animated
+   frames behind the CONFIG.studio.gpuPreprocess switch. */
+{
+  const gl = fs.readFileSync(require.resolve('../src/lib/glyph-preprocess-gl.js'), 'utf8');
+  const names = ['gainGlobal', 'midpoint', 'sharpenGlobal', 'sharpenFace', 'gainFace', 'fineSharpen',
+    'sharpAxis', 'sharpChip', 'sharpHand', 'gainAxis', 'gainChip', 'gainHand', 'midpoint2'];
+  const jsBody = html.slice(html.indexOf('1. base image preprocess'), html.indexOf('buf.updatePixels();'));
+  assert(jsBody.length > 1000, 'JS preprocess body located');
+  for (const n of names) {
+    const re = new RegExp('(?:const (?:float )?|, )' + n + '\\s*=\\s*([0-9.]+)');
+    const a = jsBody.match(re), b = gl.match(re);
+    assert(a && b, `constant ${n} present in both preprocess paths`);
+    assert.strictEqual(parseFloat(a[1]), parseFloat(b[1]), `constant ${n}: JS ${a[1]} vs GL ${b[1]}`);
+  }
+  assert(/<script src="lib\/glyph-preprocess-gl\.js"><\/script>/.test(html), 'GL preprocess module is loaded');
+  assert(/_curFrame >= 0 && config\.studio && config\.studio\.gpuPreprocess/.test(html),
+    'GL preprocess only runs for animated frames behind studio.gpuPreprocess');
+  assert(/gpuPreprocess: true,/.test(html), 'studio.gpuPreprocess default is declared');
+  console.log('GL preprocess constant parity: ok (' + names.length + ' constants)');
+}
+
+/* ITER-067 (F10 Tier A): scanlines/kawaii-only stacks skip the readback,
+   and their canvas-2D versions reproduce the RGBA kernels. */
+{
+  const crt = require('../src/lib/glyph-crt.js');
+  /* kawaii: the fillRect blit on a fake source-over ctx vs the RGBA loop. */
+  const w = 97, h = 61, opts = { intensity: 0.9, heartCount: 9, sparkleCount: 14, twinkleCount: 30 };
+  for (const frameIdx of [0, 7, 33]) {
+    const ref = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < ref.length; i++) ref[i] = (i * 37) & 255;
+    const out = Float64Array.from(ref);
+    crt.applyChain({ width: w, height: h, data: ref }, null, { kawaii: Object.assign({ enabled: true }, opts) }, { frameIdx });
+    let fill = [0, 0, 0], alpha = 1, rects = 0;
+    const ctx = {
+      set fillStyle(v) { fill = v.match(/\d+/g).map(Number); },
+      set globalAlpha(v) { alpha = v; },
+      fillRect(x, y, rw, rh) {
+        assert(rw === 1 && rh === 1 && x >= 0 && y >= 0 && x < w && y < h, 'kawaii rects are in-bounds 1x1');
+        const o = (y * w + x) * 4; rects++;
+        for (let c = 0; c < 3; c++) out[o + c] = Math.round(out[o + c] * (1 - alpha) + fill[c] * alpha);
+      },
+    };
+    crt.applyKawaiiCtx(ctx, w, h, opts, frameIdx);
+    assert(rects > 0, 'kawaii ctx blit draws');
+    let maxD = 0;
+    for (let i = 0; i < ref.length; i++) if ((i & 3) !== 3) maxD = Math.max(maxD, Math.abs(ref[i] - out[i]));
+    assert(maxD <= 1, `kawaii ctx blit within 1 LSB of the RGBA kernel (frame ${frameIdx}: ${maxD})`);
+  }
+  /* readback gate truth table + scanline mask rows. */
+  const fnSrc = ['_hasImgDataStages', '_needsImgDataReadback', '_ensureScanlineOverlay'].map((n) => {
+    const m = html.match(new RegExp('\\n  function ' + n + '\\([\\s\\S]*?\\n  \\}\\n'));
+    assert(m, n + ' not found'); return m[0];
+  }).join('\n');
+  const rows = [];
+  const sctx = { document: { createElement: () => ({ getContext: () => ({ fillRect: (x, y) => rows.push(y) }) }) } };
+  vm.createContext(sctx);
+  vm.runInContext('let _scanlineOverlay = null;\n' + fnSrc + '\nthis.n = _needsImgDataReadback; this.o = _ensureScanlineOverlay;', sctx);
+  const on = (o) => Object.assign({ enabled: true }, o);
+  assert.strictEqual(sctx.n({ vignette: on({ strength: 0.5 }) }), false, 'vignette only: no readback');
+  assert.strictEqual(sctx.n({ scanlines: on({ intensity: 0.3 }) }), false, 'scanlines only: no readback');
+  assert.strictEqual(sctx.n({ kawaii: on({ intensity: 0.8 }), scanlines: on({ intensity: 0.3 }) }), false, 'scanlines+kawaii: no readback');
+  assert.strictEqual(sctx.n({ scanlines: on({ intensity: -0.3, strength: 0.4 }) }), true, 'brightening scanlines stay on the RGBA path');
+  assert.strictEqual(sctx.n({ scanlines: on({ intensity: 0.3 }), bloom: on({ strength: 0.9 }) }), true, 'scanlines+bloom: readback');
+  assert.strictEqual(sctx.n({ phosphorDecay: on({ decay: 0.8 }) }), true, 'phosphorDecay: readback');
+  for (const [period, phase] of [[2, 0], [3, 1], [1, 0], [2, 0.5]]) {
+    rows.length = 0;
+    sctx.o(10, 9, period, phase);
+    const ref = new Uint8ClampedArray(10 * 9 * 4).fill(200);
+    crt.applyScanlines(ref, 10, 9, { intensity: 0.5, period, phase });
+    const dark = []; for (let y = 0; y < 9; y++) if (ref[y * 40] !== 200) dark.push(y);
+    assert.deepStrictEqual(rows, dark, `scanline mask rows match applyScanlines (period ${period}, phase ${phase})`);
+  }
+  console.log('postprocess Tier A overlays: ok');
+}

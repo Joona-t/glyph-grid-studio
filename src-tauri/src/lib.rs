@@ -442,7 +442,7 @@ fn output_frame_count(path: &std::path::Path, format: &str) -> Result<u64, Strin
     Ok(n)
 }
 
-/* ---------- ITER-062: `--resume` sidecars ----------
+/* ---------- ITER-068: `--resume` sidecars ----------
  *
  * A frame count is not proof that a job is done: gifski drops consecutive
  * pixel-identical frames (a still source can finish as a 1-frame GIF for
@@ -1148,7 +1148,7 @@ pub fn run_headless_batch(
 
     // F27 (ITER-061): `--resume` drops jobs whose output is already done
     // (ITER-024's out-of-scope item: a timed-out 64-job run resumes with
-    // one flag).  ITER-062: "done" = a matching `<out>.ggs.json` sidecar,
+    // one flag).  ITER-068: "done" = a matching `<out>.ggs.json` sidecar,
     // else the frame-count fallback — see resume_skip_reason.
     let mut jobs_js = jobs_js;
     let job_sha = |j: &serde_json::Value| job_config_sha256(j, &in_path);
@@ -1177,7 +1177,7 @@ pub fn run_headless_batch(
         }
     }
 
-    // ITER-062: every job that runs records a sidecar when its output lands.
+    // ITER-068: every job that runs records a sidecar when its output lands.
     if let Ok(mut pending) = PENDING_SIDECARS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -2956,8 +2956,9 @@ async fn pick_image(app: tauri::AppHandle) -> Result<String, String> {
     }
 }
 
-/// Same as `pick_image` but returns both the absolute path and the data URL,
-/// so the JS side can persist a "recent sources" list keyed on path.
+/// Path-aware picker: returns `{path, sizeBytes, mimeType}` so the JS side
+/// can persist a "recent sources" list keyed on path.  ITER-064 (F18): no
+/// data URL — the webview loads the file itself via the asset protocol.
 #[tauri::command]
 async fn pick_image_with_path(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let path = app
@@ -2972,29 +2973,121 @@ async fn pick_image_with_path(app: tauri::AppHandle) -> Result<serde_json::Value
 
     match path {
         Some(p) => {
-            let image = read_path_as_data_url_with_metadata(&p)?;
+            let size_bytes = source_file_size(&p)?;
             Ok(serde_json::json!({
                 "path": p.to_string_lossy().to_string(),
-                "dataUrl": image.data_url,
-                "sizeBytes": image.size_bytes,
-                "mimeType": image.mime_type
+                "sizeBytes": size_bytes,
+                "mimeType": image_mime_type(&p)
             }))
         }
         None => Err("cancelled".into()),
     }
 }
 
-/// Read an image file from an absolute path and return a metadata payload.
-/// Used by the Tauri drag-drop event fallback (when `dragDropEnabled: true`).
+/// Metadata for an image file at an absolute path: `{path, sizeBytes,
+/// mimeType}`.  ITER-064 (F18): the bytes no longer cross IPC as a base64
+/// data URL (≤6 full-file copies for a 64 MB GIF); the webview loads
+/// `convertFileSrc(path)` from disk.  `inline: true` restores the data URL
+/// for the fallback when `convertFileSrc` is unavailable.
 #[tauri::command]
-async fn read_image_file(path: String) -> Result<serde_json::Value, String> {
+async fn read_image_file(path: String, inline: Option<bool>) -> Result<serde_json::Value, String> {
     let p = PathBuf::from(&path);
-    let image = read_path_as_data_url_with_metadata(&p)?;
+    if inline.unwrap_or(false) {
+        let image = read_path_as_data_url_with_metadata(&p)?;
+        return Ok(serde_json::json!({
+            "path": path,
+            "dataUrl": image.data_url,
+            "sizeBytes": image.size_bytes,
+            "mimeType": image.mime_type
+        }));
+    }
+    let size_bytes = source_file_size(&p)?;
     Ok(serde_json::json!({
-        "dataUrl": image.data_url,
-        "sizeBytes": image.size_bytes,
-        "mimeType": image.mime_type
+        "path": path,
+        "sizeBytes": size_bytes,
+        "mimeType": image_mime_type(&p)
     }))
+}
+
+/// Header-only source probe (ITER-064, F18 step 2; closes BUGS backlog #1).
+/// p5 allocates one logical-size ImageData per GIF frame before
+/// `numFrames()` exists, so the post-decode guard could only reject an
+/// over-limit animation after paying for it.  This reads the logical screen
+/// size and walks the frame headers (LZW skipped, no pixel buffers) so
+/// `validateSourceMetadata` runs before `loadImage`.  `probed: false` means
+/// the format is outside the `image` crate's features (AVIF) — the caller
+/// falls back to the post-decode guard.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ImageProbe {
+    width: u32,
+    height: u32,
+    frames: u32,
+    size_bytes: u64,
+    mime_type: &'static str,
+    probed: bool,
+}
+
+fn probe_image_path(p: &PathBuf) -> Result<ImageProbe, String> {
+    let size_bytes = source_file_size(p)?;
+    let mime_type = image_mime_type(p);
+    let reader = image::ImageReader::open(p)
+        .map_err(|e| format!("could not open {:?}: {}", p, e))?
+        .with_guessed_format()
+        .map_err(|e| format!("could not read {:?}: {}", p, e))?;
+    match reader.format() {
+        Some(image::ImageFormat::Gif) => {
+            let file = fs::File::open(p).map_err(|e| format!("could not open {:?}: {}", p, e))?;
+            let mut opts = gif::DecodeOptions::new();
+            opts.skip_frame_decoding(true);
+            let mut decoder = opts
+                .read_info(std::io::BufReader::new(file))
+                .map_err(|e| format!("not a readable GIF: {}", e))?;
+            let (width, height) = (decoder.width() as u32, decoder.height() as u32);
+            let mut frames: u32 = 0;
+            while decoder
+                .next_frame_info()
+                .map_err(|e| format!("not a readable GIF: {}", e))?
+                .is_some()
+            {
+                frames += 1;
+            }
+            Ok(ImageProbe {
+                width,
+                height,
+                frames: frames.max(1),
+                size_bytes,
+                mime_type: "image/gif",
+                probed: true,
+            })
+        }
+        Some(format) if format.reading_enabled() => {
+            let (width, height) = reader
+                .into_dimensions()
+                .map_err(|e| format!("not a readable image: {}", e))?;
+            Ok(ImageProbe {
+                width,
+                height,
+                frames: 1,
+                size_bytes,
+                mime_type,
+                probed: true,
+            })
+        }
+        _ => Ok(ImageProbe {
+            width: 0,
+            height: 0,
+            frames: 0,
+            size_bytes,
+            mime_type,
+            probed: false,
+        }),
+    }
+}
+
+#[tauri::command]
+async fn probe_image_file(path: String) -> Result<ImageProbe, String> {
+    probe_image_path(&PathBuf::from(&path))
 }
 
 /// ---- Rust-backed key-value persistence (AUDIT-2026-06-10 / BUG-006) ----
@@ -3071,7 +3164,7 @@ fn image_mime_type(p: &PathBuf) -> &'static str {
     }
 }
 
-fn read_path_as_data_url_with_metadata(p: &PathBuf) -> Result<ImageDataUrl, String> {
+fn source_file_size(p: &PathBuf) -> Result<u64, String> {
     let size_bytes = fs::metadata(p)
         .map_err(|e| format!("could not inspect {:?}: {}", p, e))?
         .len();
@@ -3081,6 +3174,11 @@ fn read_path_as_data_url_with_metadata(p: &PathBuf) -> Result<ImageDataUrl, Stri
             size_bytes, MAX_SOURCE_FILE_BYTES
         ));
     }
+    Ok(size_bytes)
+}
+
+fn read_path_as_data_url_with_metadata(p: &PathBuf) -> Result<ImageDataUrl, String> {
+    let size_bytes = source_file_size(p)?;
     let bytes = fs::read(p).map_err(|e| e.to_string())?;
     let mime_type = image_mime_type(p);
     let b64 = general_purpose::STANDARD.encode(&bytes);
@@ -3222,6 +3320,7 @@ fn run_tauri(state: CliJobState, hide_window: bool) {
             pick_image,
             pick_image_with_path,
             read_image_file,
+            probe_image_file,
             kv_load_all,
             kv_save,
             save_preset_json,
@@ -3836,5 +3935,51 @@ mod preset_schema_tests {
         fs::write(&gif_path, b"GIF89a-not-the-recorded-file").unwrap();
         assert!(resume_skip_reason(out, "gif", &four, &sha).is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod source_probe_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/sources")
+            .join(name)
+    }
+
+    #[test]
+    fn probe_counts_gif_frames_from_headers() {
+        let probe = probe_image_path(&fixture("limit-481-frames.gif")).unwrap();
+        assert_eq!((probe.width, probe.height, probe.frames), (1, 1, 481));
+        assert_eq!(probe.mime_type, "image/gif");
+        assert!(probe.probed);
+    }
+
+    #[test]
+    fn probe_reads_still_dimensions_without_decoding() {
+        let probe = probe_image_path(&fixture("limit-16385-wide.png")).unwrap();
+        assert_eq!((probe.width, probe.height, probe.frames), (16385, 1, 1));
+        assert!(probe.probed);
+        let normal = probe_image_path(&fixture("cream-paper.png")).unwrap();
+        assert_eq!((normal.width, normal.height, normal.frames), (720, 480, 1));
+        assert_eq!(
+            normal.size_bytes,
+            fs::metadata(fixture("cream-paper.png")).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn probe_rejects_unreadable_and_flags_unknown_formats() {
+        let dir = std::env::temp_dir().join(format!("ggs-probe-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let junk = dir.join("junk.gif");
+        fs::write(&junk, b"GIF89a\x01").unwrap();
+        assert!(probe_image_path(&junk).is_err());
+        let unknown = dir.join("unknown.avif");
+        fs::write(&unknown, b"not an image header at all").unwrap();
+        assert!(!probe_image_path(&unknown).unwrap().probed);
+        assert!(probe_image_path(&dir.join("missing.png")).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

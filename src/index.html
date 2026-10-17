@@ -64,12 +64,14 @@
 <body aria-label="glyph-grid render canvas">
   <div id="status" role="status" aria-live="polite"></div>
 
-  <!-- p5.js core (unchanged from v1). -->
-  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
+  <!-- p5.js core (unchanged from v1).  ITER-063: all four third-party libs are
+       vendored, pinned and sha256-checked in vendor/ (see vendor/README.md) —
+       the app and the headless CLI never touch the network to boot. -->
+  <script src="vendor/p5-1.11.2/p5.min.js"></script>
   <!-- JSZip stays as the legacy-fallback recorder; new streaming recorder
        prefers File System Access API, then fflate. -->
-  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+  <script src="vendor/jszip-3.10.1/jszip.min.js"></script>
+  <script src="vendor/fflate-0.8.2/index.js"></script>
 
   <!-- glyph-grid skill libs (v2). All IIFEs that attach to window.GlyphGrid. -->
   <script src="lib/glyph-compat.js"></script>
@@ -98,8 +100,10 @@
        output.webgl-canvas + perf instrumentation, source.pointer/keyboard,
        output.audio-synth. -->
   <script src="lib/glyph-wave6.js"></script>
+  <!-- v0.2 Phase 4 (F8): WebGL2 port of the studio source preprocess. -->
+  <script src="lib/glyph-preprocess-gl.js"></script>
   <!-- Tweakpane v3 (UMD) — used by lib/glyph-studio.js when CONFIG.studio.enabled = true. -->
-  <script src="https://cdn.jsdelivr.net/npm/tweakpane@3.1.10/dist/tweakpane.min.js"></script>
+  <script src="vendor/tweakpane-3.1.10/tweakpane.min.js"></script>
   <script src="lib/glyph-studio.js"></script>
 
   <script>
@@ -297,6 +301,11 @@
          keep render cost predictable. Set false to keep canvas at the
          CONFIG.canvas dimensions regardless of source aspect. */
       fitCanvasToImage: true,
+      /* v0.2 Phase 4 (F8): run the per-frame source preprocess of ANIMATED
+         sources as three WebGL2 fragment passes (lib/glyph-preprocess-gl.js)
+         instead of ~10 JS loops. Stills keep the JS path (it runs once and
+         is cached). Falls back to JS when WebGL2 is unavailable. */
+      gpuPreprocess: true,
       breathing: {
         emaAlpha:  0.35,
         gainSwing: 0.30,
@@ -635,6 +644,61 @@
           buf.pixelDensity(1);
           buf.clear();
           buf.image(sourceImg, sourceDx, sourceDy, sourceDrawW, sourceDrawH);
+          const _tPre0 = performance.now();
+          /* Zone geometry shared by the JS passes below and the WebGL2 port
+             (F8). Face zone = upper rows; three soft masks — chip head,
+             tweezer axis, hand body — anchored in source-normalized coords:
+                chip tip:        (0.59, 0.42)
+                tweezer base:    (0.32, 0.70)
+                hand centre:     (0.22, 0.80) — palm/finger cluster */
+          const faceY1 = Math.max(0, Math.min(H0, Math.round(sourceDy + sourceDrawH * 0.45)));
+          const tipX  = sourceDx + sourceDrawW * 0.59, tipY  = sourceDy + sourceDrawH * 0.42;
+          const baseX = sourceDx + sourceDrawW * 0.32, baseY = sourceDy + sourceDrawH * 0.70;
+          const handX = sourceDx + sourceDrawW * 0.22, handY = sourceDy + sourceDrawH * 0.80;
+          const dx_axis = baseX - tipX, dy_axis = baseY - tipY;
+          const axisLen = Math.sqrt(dx_axis * dx_axis + dy_axis * dy_axis);
+          const ux = dx_axis / axisLen, uy = dy_axis / axisLen;
+          const bandHalf = sourceDrawW * 0.18;
+          const bandFlat = sourceDrawW * 0.04;
+          const chipRadius = sourceDrawW * 0.07;
+          /* Hand zone: elliptical (taller than wide), softer falloff so
+             knuckle / fingernail / finger creases get amplified gradually
+             across the whole hand without a visible perimeter. */
+          const handRx = sourceDrawW * 0.20;       /* x-axis of mask ellipse — fully fades here */
+          const handRy = sourceDrawH * 0.34;       /* y-axis of mask ellipse */
+          const handFlatR = 0.40;         /* normalized radius staying at full weight */
+
+          /* F8 Phase A: animated frames go through the GPU port; its output
+             replaces buf's pixels with one drawImage (no getImageData /
+             putImageData, no Float32 planes). Any GL miss → JS path. */
+          const _ppWantGL = _curFrame >= 0 && config.studio && config.studio.gpuPreprocess
+              && window.GlyphGrid && GlyphGrid.preprocessGL && GlyphGrid.preprocessGL.available();
+          const _ppGL = _ppWantGL
+            ? GlyphGrid.preprocessGL.run(buf.elt, W0, H0, {
+                faceY1: faceY1, tipX: tipX, tipY: tipY, ux: ux, uy: uy,
+                tLo: -sourceDrawW * 0.06, tHi: axisLen + sourceDrawW * 0.04,
+                bandHalf: bandHalf, bandFlat: bandFlat, chipRadius: chipRadius,
+                handX: handX, handY: handY, handRx: handRx, handRy: handRy, handFlatR: handFlatR,
+              })
+            : null;
+          /* ITER-069: the path that actually ran is reported per job
+             (batch line + PERF_JOB); a GL latch is forwarded to the CLI
+             log so a headless run never silently mixes the two paths. */
+          window.__preprocessPath = _ppGL ? 'gl' : 'js';
+          if (_ppWantGL && !_ppGL && window.__TAURI__ && window.__TAURI__.core) {
+            Promise.resolve(window.__TAURI__.core.invoke('cli_log', {
+              msg: 'warn: GL preprocess latched the JS path: ' + (GlyphGrid.preprocessGL.lastError() || 'unknown'),
+            })).catch(function () {});
+          }
+          if (_ppGL) {
+            const bctx = buf.drawingContext;
+            bctx.save();
+            bctx.setTransform(1, 0, 0, 1, 0, 0);
+            bctx.globalAlpha = 1;
+            bctx.globalCompositeOperation = 'copy';
+            bctx.drawImage(_ppGL, 0, 0);
+            bctx.restore();
+          } else {  /* JS path — body kept at its original indent */
           buf.loadPixels();
           const px = buf.pixels;
           const scratch = ensureSourceScratch(W0, H0);
@@ -669,7 +733,6 @@
              still recede the face plane. */
           const sharpenFace  = 1.85;
           const gainFace     = 1.12;
-          const faceY1 = Math.max(0, Math.min(H0, Math.round(sourceDy + sourceDrawH * 0.45)));
           for (let y = 0; y < H0; y++) {
             const inFace = y < faceY1;
             const gain    = inFace ? gainGlobal * gainFace : gainGlobal;
@@ -713,32 +776,12 @@
           }
           /* (Inversion removed.) */
 
-          /* Three soft-mask zones — chip head, tweezer axis, hand body.
-             All three blend smoothly into the surrounding image so no
-             visible boundaries.  The skill's preprocess receives a
-             per-pixel weight from each mask and applies a combined
-             sharpen + gain for that pixel.  Mask anchors (source
-             normalized):
-                chip tip:        (0.59, 0.42)
-                tweezer base:    (0.32, 0.70)
-                hand centre:     (0.22, 0.80) — palm/finger cluster
-          */
-          const tipX  = sourceDx + sourceDrawW * 0.59, tipY  = sourceDy + sourceDrawH * 0.42;
-          const baseX = sourceDx + sourceDrawW * 0.32, baseY = sourceDy + sourceDrawH * 0.70;
-          const handX = sourceDx + sourceDrawW * 0.22, handY = sourceDy + sourceDrawH * 0.80;
-          const dx_axis = baseX - tipX, dy_axis = baseY - tipY;
-          const axisLen = Math.sqrt(dx_axis * dx_axis + dy_axis * dy_axis);
-          const ux = dx_axis / axisLen, uy = dy_axis / axisLen;
-          const bandHalf = sourceDrawW * 0.18;
-          const bandFlat = sourceDrawW * 0.04;
-          const chipRadius = sourceDrawW * 0.07;
-          /* Hand zone: elliptical (taller than wide), softer falloff so
-             knuckle / fingernail / finger creases get amplified gradually
-             across the whole hand without a visible perimeter. */
-          const handRx = sourceDrawW * 0.20;       /* x-axis of mask ellipse — fully fades here */
-          const handRy = sourceDrawH * 0.34;       /* y-axis of mask ellipse */
-          const handFlatR = 0.40;         /* normalized radius staying at full weight */
-
+          /* Three soft-mask zones — chip head, tweezer axis, hand body
+             (geometry hoisted above, shared with the GL port). All three
+             blend smoothly into the surrounding image so no visible
+             boundaries.  The skill's preprocess receives a per-pixel
+             weight from each mask and applies a combined sharpen + gain
+             for that pixel. */
           const lumChip = scratch.lumChip;
           for (let i = 0, j = 0; j < lumChip.length; i += 4, j++) {
             lumChip[j] = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
@@ -806,6 +849,8 @@
             }
           }
           buf.updatePixels();
+          }
+          __pfAdd(_ppGL ? 'preprocess_gl' : 'preprocess_js', performance.now() - _tPre0);
           this.__sourceProcessed = buf;
           this.__sourceProcessedFrame = _curFrame;
           this.__sourceProcessedKey = _processedKey;
@@ -932,6 +977,22 @@
      each await still sees the rejection. */
   __setupReady.catch(function () {});
   let __fontLoadPromise = null;
+  /* ITER-069 (ITER-062 follow-up): studio-panel font swaps (glyph-studio.js)
+     route through window.__glyphFontSwap so the idle detector counts them
+     as pending, and the loop re-arms when the face lands — otherwise a
+     parked still kept painting the old face until the next config edit. */
+  let __fontSwapPending = 0;
+  window.__glyphFontSwap = function (opts) {
+    if (!(window.GlyphGrid && GlyphGrid.fonts && GlyphGrid.fonts.load)) return null;
+    __fontSwapPending++;
+    const p = __fontLoadPromise = Promise.resolve(GlyphGrid.fonts.load(opts))
+      .then(function (d) { if (d) fontDescriptor = d; });
+    p.catch(function () {}).then(function () {
+      __fontSwapPending--;
+      if (!recState) { try { loop(); } catch (_) {} }
+    });
+    return p;
+  };
   let retroResolved = null;         /* retro-merged CONFIG, if modeset */
   let gradientStopsCache = null;    /* { key, stops } — parsed OKLab stops for gradient colorMode */
   let sceneResult = null;           /* captured scene return: { zones?, depth? } */
@@ -1367,6 +1428,77 @@
     return true;
   }
 
+  /* ITER-062 (F17 part 2): static-frame detector.  A still source with a
+     time-independent config (no breathing, no frame-hashed dither, no
+     dispersal, no CRT pixel stages, no sigma sweep) paints the same frame
+     forever, yet the loop kept re-rendering it at 30 fps.  After each
+     painted live frame, idleCheck() parks the loop (noLoop) once the frame
+     is provably static AND the cross-frame state has settled: the per-cell
+     EMA step is below IDLE_EMA_EPS and the stability debounce has had
+     enough frames.  Anything unknown counts as time-dependent.  Every
+     config path already re-arms with loop()/redraw() (scheduleConfigRender,
+     acceptSourceImage, the studio preset buttons, beginRecord); a parked
+     redraw() that turns out dynamic re-arms the loop itself.  Never engages
+     while recording, priming or under window.PIPELINE. */
+  const IDLE_EMA_EPS = 1e-4;
+  const IDLE_SETTLE_FRAMES = 8;
+  const IDLE_STATIC_DITHER = ['none', 'bayer4', 'bayer8', 'floydSteinberg', 'atkinson', 'jarvisJudiceNinke'];
+  let __emaMaxDelta = 0;      // largest per-cell EMA step of the last v2 frame (0 on v1)
+  let __idleStreak = 0;       // consecutive static + settled frames
+  let __idleParked = false;   // true while the detector holds the loop stopped
+  function frameIsTimeDependent() {
+    if (recState || window.PIPELINE || __primeOnly) return true;
+    if (!sourceImg || !sourceImg.width) return true;
+    if (window.__sourceFrameIdx !== -1) return true;              // animated source
+    if (CONFIG.scene !== 'studio') return true;                    // generative scenes animate on t
+    if (__fontLoadPromise && !fontDescriptor) return true;         // face swap still pending
+    if (__fontSwapPending > 0) return true;                        // studio font swap in flight
+    for (const _id in _atlasInflight) return true;                 // atlas commit pending
+    if (CONFIG.glyphSet && !_atlasCache[CONFIG.glyphSet]) return true;
+    if (CONFIG.prefilter && CONFIG.prefilter.mode === 'xdog') return true;  // studioSigmaSweep
+    const rm = __prefersReducedMotion();
+    const disp = CONFIG.dispersal || {};
+    if (!rm && disp.enabled && disp.endT > disp.startT) return true;
+    if (!(window.GlyphGrid && GlyphGrid.compat)) return true;
+    if (!GlyphGrid.compat.isV2(CONFIG)) return false;              // v1 path: no t, no frame state
+    if (usesAdvancedPipeline(CONFIG)) {
+      const br = (CONFIG.studio && CONFIG.studio.breathing) || {};
+      const swing = (typeof br.gainSwing === 'number') ? br.gainSwing : 0.30;
+      const jit = (typeof br.jitter === 'number') ? br.jitter : 0.05;
+      if (!rm && (swing > 0 || jit > 0)) return true;
+      if (!rm && GlyphGrid.compat.gateDither(CONFIG)
+          && IDLE_STATIC_DITHER.indexOf(CONFIG.dither.mode) < 0) return true;
+    }
+    if (GlyphGrid.compat.gatePostprocess(CONFIG) && _hasImgDataStages(CONFIG.postprocess)) return true;
+    return false;
+  }
+  function idleCheck() {
+    if (__idleParked && isLooping()) { __idleParked = false; __idleStreak = 0; } // re-armed elsewhere
+    if (frameIsTimeDependent() || !(__emaMaxDelta < IDLE_EMA_EPS)) {
+      __idleStreak = 0;
+      if (__idleParked) {
+        /* A bare redraw() painted a frame that still has to evolve.  Re-arm
+           outside this draw: p5's loop() draws synchronously. */
+        __idleParked = false;
+        setTimeout(function () {
+          if (!recState && !__renderResumeTimer) { try { loop(); } catch (_) {} }
+        }, 0);
+      }
+      return;
+    }
+    if (__idleParked) return;
+    if (++__idleStreak >= Math.max(IDLE_SETTLE_FRAMES, _stabDebounceK + 2)) {
+      __idleStreak = 0;
+      __idleParked = true;
+      noLoop();
+      if (!window.__statusHold) statusEl().textContent += ' | idle';
+    }
+  }
+  window.__idleState = function () {
+    return { parked: __idleParked, streak: __idleStreak, emaMaxDelta: __emaMaxDelta,
+             timeDependent: frameIsTimeDependent() };
+  };
+
   function draw() {
     /* CONFIG.animation.fps is live-mutated by Tweakpane and batch jobs.
        Keep p5's actual timer cadence in sync with the animation math. */
@@ -1575,6 +1707,8 @@
     /* 4. Record capture. */
     if (recState) {
       handleRecordFrame();
+    } else {
+      idleCheck();
     }
   }
 
@@ -1675,6 +1809,12 @@
   function __prefersReducedMotion() {
     if (!__rmQuery && window.matchMedia) {
       __rmQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+      /* ITER-062: a parked static frame must wake when the OS setting flips. */
+      try {
+        __rmQuery.addEventListener('change', function () {
+          if (__idleParked && !recState) { try { loop(); } catch (_) {} }
+        });
+      } catch (_) {}
     }
     return !!(__rmQuery && __rmQuery.matches);
   }
@@ -1687,6 +1827,14 @@
     const now = performance.now();
     __pfFrame.stages[name] = now - __pfLastT;
     __pfLastT = now;
+  }
+  /* v0.2 Phase 4 (F6 step 0): sub-stage timers that nest inside a __pf
+     stage without moving its mark — e.g. the GL grid's fill / draw /
+     composite split inside 'grid', or the capture's toBlob call after
+     the frame committed. Accumulates (a stage can run twice a frame). */
+  function __pfAdd(name, ms) {
+    if (!__pfFrame) return;
+    __pfFrame.stages[name] = (__pfFrame.stages[name] || 0) + ms;
   }
   function __pfCommit(total) {
     __pfFrame.total = total;
@@ -2259,13 +2407,18 @@
     // F8 (audit): branchless clamp replaces Math.max/Math.min function-call
     // pair per cell. 28,800 iters × 2 fewer calls/iter at default 240×120 grid.
     // Semantics identical for all finite values (NaN → NaN in both paths).
+    let _emaMaxD = 0;   /* ITER-062: largest EMA step this frame (idle detector) */
     for (let i = 0; i < cellSignal.length; i++) {
+      const _emaPrev = cellSignalEma[i];
       cellSignalEma[i] = (1 - _emaA) * cellSignalEma[i] + _emaA * cellSignal[i];
+      const _emaD = cellSignalEma[i] - _emaPrev;
+      if (_emaD > _emaMaxD) _emaMaxD = _emaD; else if (-_emaD > _emaMaxD) _emaMaxD = -_emaD;
       const h = ((i * 2246822519) ^ _seed) >>> 0;
       const jitter = ((h & 0xff) - 128) * _jScale;
       const _v = cellSignalEma[i] * _breatheGain + jitter;
       cellSignal[i] = _v < 0 ? 0 : _v > 1 ? 1 : _v;
     }
+    __emaMaxDelta = _emaMaxD;
     if (__pfFrame) __pfFrame.stages._ema = performance.now() - _t_ema0;
     /* ITER-046: priming stops here — the EMA is the only cross-frame state
        the signal stages hold; everything below is per-frame. */
@@ -2780,50 +2933,49 @@
      through to the unchanged CPU code below. */
   let _glOk = true;
   let _glCanvas = null;
-  let _glInstPos = null, _glGlyphIdx = null, _glColor = null;  // grow-only
-
-  function _glEnsureBuffers(n) {
-    if (!_glInstPos || _glInstPos.length < n * 4) {
-      _glInstPos = new Float32Array(n * 4);
-      _glColor   = new Float32Array(n * 3);
-    }
-    if (!_glGlyphIdx || _glGlyphIdx.length < n) {
-      _glGlyphIdx = new Float32Array(n);
-    }
-  }
+  let _glInst = null;  // grow-only Float32Array(N*4): x0, y0, glyphIdx, alpha
 
   /* Returns true if it rendered via WebGL (caller returns), false to
      fall through to the CPU path. Never throws — GL failure latches
-     _glOk=false and returns false. */
+     _glOk=false and returns false.
+     v0.2 Phase 4 (F7): output-equivalent to the CPU monochrome sprite
+     blit below — same `_ensureRampSprite` atlas, same tile size, same
+     `|0`-snapped origins, same space-glyph skip and draw order, per-cell
+     alpha composited source-over (wave6.drawSprite). Before ITER-065 this
+     read the caller's `bgR`/`_stabOnInt` locals, threw a ReferenceError on
+     its first frame and silently latched the CPU path (dead since v0.1.6). */
   function drawGridWebGL(cellIndex, signal, cols, rows, cellW, cellH,
-                         palette, ramp, rampLast) {
+                         palette, ramp, rampLast, _stabOnInt) {
     try {
       const wave6 = window.GlyphGrid && window.GlyphGrid.wave6;
-      if (!wave6) { _glOk = false; return false; }
+      if (!wave6 || !wave6.makeSprite) { _glOk = false; return false; }
       const W = width | 0, H = height | 0;
-      if (!_glCanvas) _glCanvas = document.createElement('canvas');
+      if (!_glCanvas) {
+        _glCanvas = document.createElement('canvas');
+        /* ITER-069: a lost context (GPU reset, driver update, tab pressure)
+           draws nothing without throwing — latch the CPU sprite path for
+           this frame and every later one instead of compositing blanks. */
+        _glCanvas.addEventListener('webglcontextlost', function () { _glOk = false; });
+      }
       if (_glCanvas.width !== W || _glCanvas.height !== H) {
         _glCanvas.width = W; _glCanvas.height = H;
       }
-      const fontPx = CONFIG.font.size;
-      const fam = fontFamilyForActive();
-      // Atlas tile ~ the CPU sprite tile metrics so glyph size matches.
-      const aCW = Math.max(4, Math.ceil(fontPx * 1.1));
-      const aCH = Math.max(4, Math.ceil(fontPx * 1.4));
-      const r = wave6.make(_glCanvas, ramp, fam, fontPx, aCW, aCH);
+      const sprite = _ensureRampSprite(
+        ramp, fontFamilyForActive(), CONFIG.font.size, palette.inks[0]
+      );
+      const r = wave6.makeSprite(_glCanvas);
+      if (r.gl.isContextLost()) { _glOk = false; return false; }
 
+      const _tFill0 = performance.now();
       const N = cols * rows;
-      _glEnsureBuffers(N);
-      const instPos = _glInstPos, glyphIdx = _glGlyphIdx, color = _glColor;
-      const cw = W / cols, ch = H / rows;
-      // monochrome: glyph stamped in ink, intensity = curved*1.1 folded
-      // into the per-cell colour as bg→ink lerp (the shader has no
-      // per-cell alpha; pre-dimming the colour reproduces the CPU
-      // globalAlpha=curved*1.1 look exactly).
-      const ink = (palette.inks && palette.inks[0]) || '#000';
-      const _ic = _hexToRgb(ink);
-      const inkR = _ic[0], inkG = _ic[1], inkB = _ic[2];
+      if (!_glInst || _glInst.length < N * 4) _glInst = new Float32Array(N * 4);
+      const inst = _glInst;
+      const spaceMask = _rampSpriteSpaceMask;
+      const halfTW = sprite.halfW, halfTH = sprite.halfH;
+      const halfCellW = cellW * 0.5, halfCellH = cellH * 0.5;
+      let n = 0;
       for (let rr = 0; rr < rows; rr++) {
+        const y0 = ((((rr * cellH) | 0) + halfCellH) - halfTH) | 0;
         const rowI = rr * cols;
         for (let c = 0; c < cols; c++) {
           const i = rowI + c;
@@ -2840,27 +2992,28 @@
             else if (idx < 0) idx = 0;
             if (_stabOn) idx = _stableIdx(_stabIdx, i, curved * rampLast, idx);
           }
-          let a = curved * 1.1; if (a > 1) a = 1; else if (a < 0) a = 0;
-          const o4 = i * 4, o3 = i * 3;
-          instPos[o4]     = (c + 0.5) * cw;
-          instPos[o4 + 1] = (rr + 0.5) * ch;
-          instPos[o4 + 2] = cw;
-          instPos[o4 + 3] = ch;
-          glyphIdx[i]     = idx;
-          color[o3]     = (bgR + (inkR - bgR) * a) / 255;
-          color[o3 + 1] = (bgG + (inkG - bgG) * a) / 255;
-          color[o3 + 2] = (bgB + (inkB - bgB) * a) / 255;
+          if (spaceMask[idx]) continue;
+          /* globalAlpha semantics: a > 1 clamps to 1; a <= 0 draws nothing. */
+          const a = curved * 1.1;
+          const o = n * 4;
+          inst[o]     = ((((c * cellW) | 0) + halfCellW) - halfTW) | 0;
+          inst[o + 1] = y0;
+          inst[o + 2] = idx;
+          inst[o + 3] = a > 1 ? 1 : (a > 0 ? a : 0);
+          n++;
         }
       }
-      // The renderer's drawArraysInstanced uses instPos.length/4 as the
-      // instance count — pass exact-length views when the grow-only
-      // buffer is larger than N.
-      const ip = instPos.length === N * 4 ? instPos : instPos.subarray(0, N * 4);
-      const gi = glyphIdx.length === N ? glyphIdx : glyphIdx.subarray(0, N);
-      const cl = color.length === N * 3 ? color : color.subarray(0, N * 3);
-      wave6.draw(r, _glCanvas, ip, gi, cl,
-                 [bgR / 255, bgG / 255, bgB / 255]);
+      const _ic = _hexToRgb(palette.inks[0] || '#000');
+      const _tDraw0 = performance.now();
+      wave6.drawSprite(r, _glCanvas, sprite.canvas, sprite.tileW, sprite.tileH, inst, n,
+                       [_ic[0] / 255, _ic[1] / 255, _ic[2] / 255]);
+      if (!_glOk || r.gl.isContextLost()) { _glOk = false; return false; }  // lost mid-draw
+      const _tComp0 = performance.now();
       drawingContext.drawImage(_glCanvas, 0, 0);
+      const _tEnd = performance.now();
+      __pfAdd('gl_fill', _tDraw0 - _tFill0);
+      __pfAdd('gl_draw', _tComp0 - _tDraw0);
+      __pfAdd('gl_composite', _tEnd - _tComp0);
       return true;
     } catch (e) {
       console.warn('glyph-studio: WebGL path failed, latching CPU fallback:', e);
@@ -3011,10 +3164,10 @@
        a successful GL draw; _glOk latches false on GL failure. */
     if (CONFIG.renderer === 'webgl' && _glOk
         && colorMode === 'monochrome' && !depthFogActive && !_dispActive
-        && !(typeof _hasImgDataStages === 'function'
-             && _hasImgDataStages(CONFIG.postprocess))) {
+        && !(typeof _needsImgDataReadback === 'function'
+             && _needsImgDataReadback(CONFIG.postprocess))) {
       if (drawGridWebGL(cellIndex, signal, cols, rows, cellW, cellH,
-                        palette, ramp, rampLast)) {
+                        palette, ramp, rampLast, _stabOnInt)) {
         currentCellDepth = -1;
         return;
       }
@@ -3034,6 +3187,7 @@
       const spriteCanvas = sprite.canvas;
       const spaceMask = _rampSpriteSpaceMask;
       const prevAlpha = ctx.globalAlpha;
+      const _tBlit0 = performance.now();
       for (let r = 0; r < rows; r++) {
         const yBase = (r * cellH) | 0;
         const cy_base = yBase + halfCellH;
@@ -3090,6 +3244,7 @@
         }
       }
       ctx.globalAlpha = prevAlpha;
+      __pfAdd('cpu_blit', performance.now() - _tBlit0);
       currentCellDepth = -1;
       return;
     }
@@ -3875,7 +4030,7 @@
   // NOT trigger the full getImageData + putImageData round-trip (~5 ms/frame
   // combined on default canvas). Mirrors the _stageActive helper in
   // glyph-compat.js — same source of truth as gatePostprocess.
-  function _hasImgDataStages(p) {
+  function _hasImgDataStages(p, skipOverlayable) {
     if (!p) return false;
     function _on(s, ks) {
       if (!s || !s.enabled) return false;
@@ -3890,10 +4045,44 @@
            _on(p.halation, ['intensity', 'strength']) ||
            _on(p.bloom, ['intensity', 'strength']) ||
            _on(p.godRays, ['strength', 'intensity']) ||
-           _on(p.scanlines, ['intensity', 'strength']) ||
+           (!skipOverlayable && _on(p.scanlines, ['intensity', 'strength'])) ||
            _on(p.chromaticAberration, ['amount']) ||
            _on(p.barrel, ['amount']) ||
-           _on(p.kawaii, ['intensity']);
+           (!skipOverlayable && _on(p.kawaii, ['intensity']));
+  }
+
+  /* v0.2 Phase 4 (F10 Tier A): scanlines and kawaii are drawn as canvas-2D
+     composites when they are the ONLY imgData stages, so such stacks skip
+     the full-canvas getImageData/putImageData. True when a stage that still
+     needs the RGBA readback is active. `_hasImgDataStages` keeps its meaning
+     (any per-pixel CRT stage — the idle detector uses it: kawaii twinkles). */
+  function _needsImgDataReadback(p) {
+    if (!p || !_hasImgDataStages(p)) return false;
+    const sl = p.scanlines;
+    const slOn = !!(sl && sl.enabled);
+    const slI = slOn ? (sl.intensity == null ? 0.25 : sl.intensity) : 0;
+    if (slOn && !(slI >= 0)) return true;  /* negative/NaN intensity brightens — CPU only */
+    return _hasImgDataStages(p, true);
+  }
+
+  /* Scanline darken mask: opaque black on the rows applyScanlines darkens,
+     transparent elsewhere; drawn source-over at globalAlpha = intensity it
+     gives c·(1 − intensity) on those rows (±1 LSB vs the RGBA multiply).
+     Cached by (w, h, period, phase). */
+  let _scanlineOverlay = null;       // { canvas, key }
+  function _ensureScanlineOverlay(w, h, period, phase) {
+    const key = w + 'x' + h + ':' + period + ':' + phase;
+    if (_scanlineOverlay && _scanlineOverlay.key === key) return _scanlineOverlay;
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#000';
+    for (let y = 0; y < h; y++) {
+      if ((y + phase) % period === 0) continue;   /* same row test as applyScanlines */
+      ctx.fillRect(0, y, w, 1);
+    }
+    _scanlineOverlay = { canvas: canvas, key: key };
+    return _scanlineOverlay;
   }
 
   // HOT-PATH: applyPostprocess — pixel-stage round-trip. Optimization loop
@@ -3907,8 +4096,9 @@
       : (frameCount - 1);
     const reduced = __prefersReducedMotion();
 
-    /* Phase A — only when any imgData stage is active. */
-    if (_hasImgDataStages(post)) {
+    /* Phase A — only when an imgData stage that needs the RGBA buffer is
+       active (applyChain then also runs scanlines/kawaii in-buffer). */
+    if (_needsImgDataReadback(post)) {
       const imgData = ctx.getImageData(0, 0, w, h);
       /* Stateful stages need a host-owned state: applyChain's own lazy
          init only rebinds its local, so a null crtState meant a fresh
@@ -3925,6 +4115,26 @@
         skipOverlays: true,            /* vignette + letterbox handled below */
       });
       ctx.putImageData(imgData, 0, 0);
+    } else if (_hasImgDataStages(post)) {
+      /* Tier A — scanlines then kawaii, the order applyChain uses, both
+         before the vignette/letterbox overlays like the Phase A path. */
+      const prevAlpha = ctx.globalAlpha, prevFill = ctx.fillStyle;
+      const prevOp = ctx.globalCompositeOperation;
+      ctx.globalCompositeOperation = 'source-over';
+      const sl = post.scanlines;
+      if (sl && sl.enabled) {
+        const intensity = sl.intensity == null ? 0.25 : sl.intensity;
+        if (intensity > 0) {
+          const period = Math.max(1, sl.period | 0 || 2);
+          const phase = reduced ? 0 : (sl.phase || 0);
+          ctx.globalAlpha = intensity > 1 ? 1 : intensity;
+          ctx.drawImage(_ensureScanlineOverlay(w, h, period, phase).canvas, 0, 0);
+        }
+      }
+      const kw = post.kawaii;
+      if (kw && kw.enabled) GlyphGrid.crt.applyKawaiiCtx(ctx, w, h, kw, frameIdx);
+      ctx.globalAlpha = prevAlpha; ctx.fillStyle = prevFill;
+      ctx.globalCompositeOperation = prevOp;
     }
 
     /* Phase B — overlays. drawImage with composite op; no readback. */
@@ -4069,12 +4279,17 @@
     const name = `frame_${String(idx + 1).padStart(4, '0')}.png`;
     statusEl().textContent =
       `RECORDING ${idx + 1}/${state.total} (${CONFIG.scene} @ ${CONFIG.palette})`;
+    const _pfCapFrame = __pfFrame;
+    const _tCap0 = performance.now();
     const blobReady = new Promise(function (resolve, reject) {
       drawingContext.canvas.toBlob(function (blob) {
+        /* F6 step 0: snapshot→PNG latency (async; off the draw thread). */
+        if (_pfCapFrame) _pfCapFrame.stages.cap_toBlob_async = performance.now() - _tCap0;
         if (blob) resolve(blob);
         else reject(new Error('canvas PNG capture returned no data'));
       }, 'image/png');
     });
+    __pfAdd('cap_toBlob_call', performance.now() - _tCap0);
     state.frameIdx++;           // the next draw renders the next logical frame
     state._inFlight = (state._inFlight || 0) + 1;
     if (state.frameIdx >= state.total || state._inFlight >= CAPTURE_PIPELINE_DEPTH) {
@@ -4736,8 +4951,11 @@
               .then(p => {
                 staged = false;              // finish_* consumed the capture
                 const _encMs = performance.now() - _encT0;
-                console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);
-                tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p }).catch(()=>{});
+                /* ITER-069: which preprocess path produced this job — headless
+                   output is only reproducible across machines on 'js'. */
+                const _pp = window.__preprocessPath || 'js';
+                console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p, 'preprocess:' + _pp);
+                tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p + ' preprocess:' + _pp }).catch(()=>{});
                 /* Emit PERF_JOB NDJSON when in perf mode — orchestrator
                    parses this from the studio's stderr. */
                 if (perfMode) {
@@ -4745,6 +4963,7 @@
                     const snap = snapshotPerf(job.name, requestedFrames, anchorFrames);
                     if (snap) {
                       snap.encode_ms = _encMs;
+                      snap.preprocess = _pp;
                       tauri('cli_log', { msg: 'PERF_JOB ' + JSON.stringify(snap) }).catch(()=>{});
                     }
                   } catch (e) {
@@ -5166,6 +5385,7 @@
       name: 'sourceImg',
       begin: beginSourceImport,
       set: function (img, options) { return acceptSourceImage(img, options); },
+      validate: function (img, extra) { return validateSourceMetadata(img, extra); },
     },
   });
 
@@ -5185,20 +5405,33 @@
   let __cliCurrentSource = null;
   async function _cliLoadSource(inPath) {
     const importGeneration = beginSourceImport(inPath);
-    const loaded = await window.__TAURI__.core.invoke('read_image_file', { path: inPath });
-    /* v0.1.9 native reads return metadata with the data URL.  Accept the
-       legacy string response so older binaries/headless fixtures remain
-       compatible during rollout. */
-    const dataUrl = (loaded && typeof loaded === 'object')
-      ? (loaded.dataUrl || loaded.data_url) : loaded;
-    if (!dataUrl) throw new Error('read_image_file returned no image data');
-    const sourceBytes = loaded && typeof loaded === 'object'
-      ? (loaded.sizeBytes || loaded.size_bytes || 0) : 0;
-    if (sourceBytes > SOURCE_LIMITS.maxFileBytes) {
-      throw new Error('source exceeds the ' + Math.round(SOURCE_LIMITS.maxFileBytes / 1048576) + ' MB limit');
+    const core = window.__TAURI__.core;
+    /* ITER-064 (F18): probe the file headers first so an over-limit
+       animation/still is rejected before p5 allocates any frame. */
+    const probe = await core.invoke('probe_image_file', { path: inPath });
+    const sourceBytes = (probe && probe.sizeBytes) || 0;
+    if (probe && probe.probed) {
+      const checked = validateSourceMetadata({
+        width: probe.width, height: probe.height,
+        numFrames: function () { return probe.frames; },
+      }, { sizeBytes: sourceBytes });
+      if (!checked.ok) {
+        window.__glyphLastImportError = checked;
+        throw new Error('source rejected before decode: ' + checked.reason);
+      }
     }
+    /* The webview streams the file from disk via the asset protocol (no
+       base64 data URL across IPC).  Fallback: inline data URL. */
+    let sourceUrl = '';
+    if (typeof core.convertFileSrc === 'function') {
+      sourceUrl = core.convertFileSrc(inPath);
+    } else {
+      const loaded = await core.invoke('read_image_file', { path: inPath, inline: true });
+      sourceUrl = (loaded && typeof loaded === 'object') ? (loaded.dataUrl || loaded.data_url) : loaded;
+    }
+    if (!sourceUrl) throw new Error('read_image_file returned no image data');
     await new Promise(function (resolve, reject) {
-      window.loadImage(dataUrl, function (img) {
+      window.loadImage(sourceUrl, function (img) {
         const accepted = acceptSourceImage(img, {
           generation: importGeneration,
           sizeBytes: sourceBytes,
@@ -5214,6 +5447,16 @@
     /* ITER-047: no settle sleep — acceptSourceImage already fitted the canvas
        and painted once, and beginRecord primes the temporal state itself
        (ITER-046), so pre-capture live draws no longer influence output. */
+  }
+
+  /* ITER-069: headless output must stay a pure function of (source, config,
+     seed). The WebGL2 preprocess (ITER-066) is driver-dependent, so headless
+     runs (CLI render/batch, MCP — which spawns `render` — and window.PIPELINE
+     pieces) default to the JS preprocess; a preset or manifest job opts back
+     in with an explicit studio.gpuPreprocess:true, applied on top of this.
+     The GUI keeps CONFIG's GL default for interactive speed. */
+  function __headlessPreprocessDefault() {
+    if (CONFIG.studio) CONFIG.studio.gpuPreprocess = false;
   }
 
   async function tryHeadlessRender() {
@@ -5233,6 +5476,7 @@
       return;
     }
     console.log('CLI: render job received', job);
+    __headlessPreprocessDefault();
 
     // Pick the initial source — top-level `inPath`, or first job's `in`
     // (multi-source manifests may omit the top-level field).
@@ -5264,6 +5508,7 @@
       await _cliLoadSource(initialSource);
     } catch (e) {
       console.error('CLI: initial loadImage failed:', e);
+      try { await window.__TAURI__.core.invoke('cli_log', { msg: 'source load failed: ' + ((e && e.message) || e) }); } catch (_) {}
       try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
     }

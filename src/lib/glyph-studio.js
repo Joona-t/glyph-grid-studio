@@ -28,7 +28,7 @@
   'use strict';
 
   /* ----------------------------------------------------------------
-   * 1.  Tweakpane availability check + CDN-load fallback
+   * 1.  Tweakpane availability check + vendored-load fallback
    * ---------------------------------------------------------------- */
   function ensureTweakpane(cb) {
     /* Tweakpane 3.x ships UMD (works with <script>); 4.x is ESM-only.
@@ -37,13 +37,29 @@
        this lib uses addInput throughout. */
     if (window.Tweakpane && window.Tweakpane.Pane) { cb(window.Tweakpane.Pane); return; }
     var s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/tweakpane@3.1.10/dist/tweakpane.min.js';
+    /* ITER-069: the vendored copy (ITER-063), never a CDN — offline boot. */
+    s.src = 'vendor/tweakpane-3.1.10/tweakpane.min.js';
     s.onload = function () {
       if (window.Tweakpane && window.Tweakpane.Pane) cb(window.Tweakpane.Pane);
       else console.warn('glyph-studio: Tweakpane loaded but no Pane export found');
     };
-    s.onerror = function () { console.warn('glyph-studio: Tweakpane CDN unreachable'); };
+    s.onerror = function () { console.warn('glyph-studio: vendored Tweakpane failed to load'); };
     document.head.appendChild(s);
+  }
+
+  /* ITER-069: font swaps go through the host's __glyphFontSwap so the
+     idle detector (ITER-062) sees them pending and re-arms the loop when
+     the face resolves; bare fonts.load is the fallback for other hosts. */
+  function swapFont(config) {
+    var opts = {
+      sizePx: config.font.size,
+      glyphSet: config.glyphSet || 'ascii',
+      trustRequested: !!config.glyphSet,
+    };
+    if (typeof window.__glyphFontSwap === 'function') { window.__glyphFontSwap(opts); return; }
+    if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
+      window.GlyphGrid.fonts.load(opts);
+    }
   }
 
   /* ----------------------------------------------------------------
@@ -291,6 +307,39 @@
     });
   }
 
+  /* ITER-064 (F18): native sources skip the base64 data URL.  The header
+     probe (probe_image_file) runs validateSourceMetadata on the logical
+     size + frame count so an over-limit GIF is rejected before p5 decodes
+     one ImageData per frame; then the webview streams the file from disk
+     via the asset protocol.  Falls back to an inline data URL when
+     convertFileSrc is unavailable. */
+  function loadNativeImageLatest(path, imageRef, label, token, onSuccess, onError) {
+    var core = window.__TAURI__.core;
+    core.invoke('probe_image_file', { path: path }).then(function (probe) {
+      if (!isCurrentSourceLoad(token)) return null;
+      if (probe && probe.probed && imageRef && typeof imageRef.validate === 'function') {
+        var checked = imageRef.validate({
+          width: probe.width, height: probe.height,
+          numFrames: function () { return probe.frames; },
+        }, { sizeBytes: probe.sizeBytes || 0 });
+        if (checked && !checked.ok) {
+          exportFeedback('Image rejected: ' + label + ' — ' + checked.reason + '.', true);
+          return null;
+        }
+      }
+      if (typeof core.convertFileSrc === 'function') return core.convertFileSrc(path);
+      return core.invoke('read_image_file', { path: path, inline: true }).then(function (r) {
+        return sourcePayload(r).dataUrl || null;
+      });
+    }).then(function (url) {
+      if (url) loadImageLatest(url, token, onSuccess, onError);
+    }, function (err) {
+      if (!isCurrentSourceLoad(token)) return;
+      if (onError) onError(err);
+      else exportFeedback('Could not read ' + label + '.', true);
+    });
+  }
+
   /* p5.Graphics caches live in the DOM + pInst._elements until .remove();
      a bare delete leaked one hidden canvas per import (ITER-043). */
   function dropSceneCache(scene, key) {
@@ -381,8 +430,8 @@
         .then(function (result) {
           if (!isCurrentSourceLoad(token)) return;
           var meta = sourcePayload(result);
-          if (!validateSourceMeta(meta, basename(absPath)) || !meta.dataUrl) return;
-          loadImageLatest(meta.dataUrl, token, function (img) {
+          if (!validateSourceMeta(meta, basename(absPath))) return;
+          loadNativeImageLatest(absPath, imageRef, basename(absPath), token, function (img) {
             if (imageRef.set(img, { sizeBytes: meta.sizeBytes || 0 }) === false) {
               discardStaleImage(img);
               return;
@@ -891,7 +940,7 @@
     }
     return false;
   }
-  function pickImageNative(loadIntoP5) {
+  function pickImageNative(loadIntoP5, imageRef) {
     if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
       var token = beginSourceLoad();
       /* Use the path-aware variant so we can record the load in
@@ -901,8 +950,8 @@
         .then(function (result) {
           if (!isCurrentSourceLoad(token)) return;
           var meta = sourcePayload(result);
-          if (meta.dataUrl && validateSourceMeta(meta, basename(result && result.path))) {
-            loadImageLatest(meta.dataUrl, token, function (img) {
+          if (result && result.path && validateSourceMeta(meta, basename(result.path))) {
+            loadNativeImageLatest(result.path, imageRef, basename(result.path), token, function (img) {
               if (loadIntoP5(img, meta) !== false) {
                 try { addRecentSource(result.path); } catch (e) {}
               }
@@ -1343,7 +1392,7 @@
         } catch (e) {}
         return true;
       };
-      if (pickImageNative(swap)) return;
+      if (pickImageNative(swap, opts.imageRef)) return;
       var inp = document.createElement('input');
       inp.type = 'file'; inp.accept = 'image/*';
       inp.onchange = function () {
@@ -1396,8 +1445,8 @@
         .then(function (result) {
           if (!isCurrentSourceLoad(token)) return;
           var meta = sourcePayload(result);
-          if (!meta.dataUrl || !validateSourceMeta(meta, basename(result && result.path))) return;
-          loadImageLatest(meta.dataUrl, token, function (img) {
+          if (!(result && result.path) || !validateSourceMeta(meta, basename(result.path))) return;
+          loadNativeImageLatest(result.path, opts.imageRef, basename(result.path), token, function (img) {
             if (opts.imageRef && opts.imageRef.set && opts.imageRef.set(img, {
               sizeBytes: meta.sizeBytes || 0,
             }) === false) {
@@ -1464,8 +1513,8 @@
           .then(function (result) {
             if (!isCurrentSourceLoad(token)) return;
             var meta = sourcePayload(result);
-            if (!meta.dataUrl || !validateSourceMeta(meta, basename(e.value))) return;
-            loadImageLatest(meta.dataUrl, token, function (img) {
+            if (!validateSourceMeta(meta, basename(e.value))) return;
+            loadNativeImageLatest(e.value, opts.imageRef, basename(e.value), token, function (img) {
               if (opts.imageRef && opts.imageRef.set && opts.imageRef.set(img, {
                 sizeBytes: meta.sizeBytes || 0,
               }) === false) {
@@ -1522,13 +1571,7 @@
     if (!config.font) config.font = { family: 'monospace', size: 8 };
     tip(addStructuralInput(fGrid, config.font, 'size', { min: 3, max: 14, step: 1 }, {
       onCommit: function () {
-        if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
-          window.GlyphGrid.fonts.load({
-            sizePx: config.font.size,
-            glyphSet: config.glyphSet || 'ascii',
-            trustRequested: !!config.glyphSet,
-          });
-        }
+        swapFont(config);
       },
     }),
         'Glyph pixel size. Tune until characters bleed into neighbours and the grid pattern dissolves.');
@@ -1634,13 +1677,7 @@
       fromTarget: function (value) { return value || 'null'; },
       toTarget: function (value) { return value === 'null' ? null : value; },
       onCommit: function () {
-        if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
-          window.GlyphGrid.fonts.load({
-            sizePx: config.font.size,
-            glyphSet: config.glyphSet || 'ascii',
-            trustRequested: !!config.glyphSet,
-          });
-        }
+        swapFont(config);
       },
     });
     tip(_gsBinding, 'Atlas used by shape modes. `octant` (Unicode 16) gives the densest texture; `ascii` is widely compatible.');

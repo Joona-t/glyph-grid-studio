@@ -624,7 +624,43 @@
     }
   }
 
+  /* v0.2 Phase 4 (F10 Tier A): the same blend drawn onto a canvas-2D
+     context — one 1×1 source-over fillRect per lit pattern cell at alpha
+     `alpha * v/3`, i.e. dst·(1−a) + c·a like the RGBA loop above, so a
+     kawaii stack no longer forces a full-canvas getImageData. The host
+     owns save/restore of fillStyle/globalAlpha. */
+  function _kawaiiBlitCtx(ctx, w, h, pattern, pw, ph, px, py, r, g, b, alpha) {
+    const ox = (px - (pw >> 1)) | 0;
+    const oy = (py - (ph >> 1)) | 0;
+    ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+    for (let dy = 0; dy < ph; dy++) {
+      const yy = oy + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (let dx = 0; dx < pw; dx++) {
+        const v = pattern[dy * pw + dx];
+        if (v === 0) continue;
+        const xx = ox + dx;
+        if (xx < 0 || xx >= w) continue;
+        ctx.globalAlpha = alpha * (v / 3);
+        ctx.fillRect(xx, yy, 1, 1);
+      }
+    }
+  }
+
   function applyKawaii(rgba, w, h, opts, frameIdx) {
+    _kawaiiParticles(w, h, opts, frameIdx, function (pattern, pw, ph, px, py, r, g, b, a) {
+      _kawaiiBlit(rgba, w, h, pattern, pw, ph, px, py, r, g, b, a);
+    });
+  }
+
+  function applyKawaiiCtx(ctx, w, h, opts, frameIdx) {
+    _kawaiiParticles(w, h, opts, frameIdx | 0, function (pattern, pw, ph, px, py, r, g, b, a) {
+      _kawaiiBlitCtx(ctx, w, h, pattern, pw, ph, px, py, r, g, b, a);
+    });
+  }
+
+  /* Particle placement/twinkle shared by both blits (one source of truth). */
+  function _kawaiiParticles(w, h, opts, frameIdx, blit) {
     const intensity   = opts.intensity   != null ? opts.intensity   : 0.85;
     const heartCount  = opts.heartCount  != null ? opts.heartCount  : 12;
     const sparkleCount= opts.sparkleCount!= null ? opts.sparkleCount: 28;
@@ -648,7 +684,7 @@
       const phase = (frameIdx * speed * 0.06 + i * 0.5);
       const tw = Math.sin(phase) * 0.5 + 0.65;
       const a = Math.max(0, Math.min(1, intensity * tw));
-      _kawaiiBlit(rgba, w, h, KAWAII_HEART, 8, 8, px | 0, py | 0, hueR, hueG, hueB, a);
+      blit(KAWAII_HEART, 8, 8, px | 0, py | 0, hueR, hueG, hueB, a);
     }
 
     /* Sparkles — medium count, faster twinkle. Use the brighter "4-point"
@@ -664,7 +700,7 @@
       const phase = (frameIdx * speed * 0.18 + i * 0.7);
       const tw = Math.sin(phase) * 0.5 + 0.5;
       const a = Math.max(0, Math.min(1, intensity * tw * 0.9));
-      _kawaiiBlit(rgba, w, h, KAWAII_SPARKLE, 5, 5, px | 0, py | 0, spR, spG, spB, a);
+      blit(KAWAII_SPARKLE, 5, 5, px | 0, py | 0, spR, spG, spB, a);
     }
 
     /* Tiny twinkles — many, fastest. White-ish, brief flashes. */
@@ -679,7 +715,7 @@
       // Make them flicker — clamp at 0.4 floor for visibility
       const a = Math.max(0, Math.min(1, intensity * Math.pow(tw, 2.5)));
       if (a > 0.05) {
-        _kawaiiBlit(rgba, w, h, KAWAII_TWINKLE, 3, 3, px | 0, py | 0, twR, twG, twB, a);
+        blit(KAWAII_TWINKLE, 3, 3, px | 0, py | 0, twR, twG, twB, a);
       }
     }
   }
@@ -703,6 +739,7 @@
     applyVignette: applyVignette,
     applyGodRays: applyGodRays,
     applyLetterbox: applyLetterbox,
+    applyKawaiiCtx: applyKawaiiCtx,
     applyChain: applyChain,
     prerollFrames: prerollFrames,
     boxBlurLinear: boxBlurLinear,

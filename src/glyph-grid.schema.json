@@ -621,6 +621,10 @@
           "type": "boolean",
           "default": true
         },
+        "gpuPreprocess": {
+          "type": "boolean",
+          "default": true
+        },
         "breathing": {
           "type": "object",
           "properties": {

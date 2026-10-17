@@ -11,6 +11,8 @@
 #      per-cell EMA warm-up and therefore the pixels of the first ~15 frames),
 #   3. as a 2-job batch of identical jobs (job 2 used to inherit job 1's EMA
 #      and CRT state),
+#   4. (ITER-069) and checks the animated render reports the deterministic
+#      JS preprocess unless a preset sets studio.gpuPreprocess:true,
 # for a still source (tests/sources/cream-paper.png) and for an animated one
 # (a 12-frame GIF cut from the same PNG by ffmpeg, so no binary fixture is
 # checked in), decodes every output to raw RGBA with ffmpeg and requires the
@@ -131,6 +133,26 @@ check_identical "G6 batch: job 1 == job 2 (phosphorDecay on)" "$SCRATCH/batch-1.
 # One process per job vs one process for all jobs is not allowed to matter.
 render "$ANIM" "$SCRATCH/anim-spice.gif" 12 --palette spice --dither stbn
 check_identical "G7 batch job 3 == standalone render (same config)" "$SCRATCH/batch-3.gif" "$SCRATCH/anim-spice.gif" 12
+
+# G8-G9 (ITER-069): the WebGL2 preprocess (ITER-066) is GPU/driver-dependent,
+# so headless renders of an animated source must run -- and report -- the JS
+# preprocess unless the preset opts in with studio.gpuPreprocess:true.
+echo "=== Preprocess path — headless default vs explicit opt-in ==="
+G8_PP=$(grep -o 'preprocess:[a-z]*' "$SCRATCH/anim-a.gif.log.txt" 2>/dev/null | tail -1)
+if [[ "$G8_PP" == "preprocess:js" ]]; then
+  pass "G8 animated CLI render without the flag reports preprocess:js"
+else
+  fail "G8 animated CLI render without the flag reports preprocess:js" "got '${G8_PP}'"
+fi
+echo '{"studio": {"gpuPreprocess": true}}' > "$SCRATCH/gl-preset.json"
+render "$ANIM" "$SCRATCH/anim-gl.gif" 4 --preset "$SCRATCH/gl-preset.json"
+G9_PP=$(grep -o 'preprocess:[a-z]*' "$SCRATCH/anim-gl.gif.log.txt" 2>/dev/null | tail -1)
+if [[ "$G9_PP" == "preprocess:gl" ]] \
+   || { [[ "$G9_PP" == "preprocess:js" ]] && grep -q "GL preprocess latched" "$SCRATCH/anim-gl.gif.log.txt"; }; then
+  pass "G9 explicit studio.gpuPreprocess:true opts in (${G9_PP})"
+else
+  fail "G9 explicit studio.gpuPreprocess:true opts in" "got '${G9_PP}'"
+fi
 
 echo "  byte-identity: PASS $PASS FAIL $FAIL"
 [[ "$FAIL" == "0" ]] && exit 0 || exit 1
