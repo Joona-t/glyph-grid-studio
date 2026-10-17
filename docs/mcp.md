@@ -11,7 +11,7 @@ Exposes Glyph Grid Studio's rendering pipeline as MCP tools over stdio JSON-RPC.
 | Tool | Description | Required args | Optional args |
 |---|---|---|---|
 | `glyph_grid_render` | Render an image to an animated GIF (or MP4) | `in_path`, `out_path` | `frames`, `palette`, `color_mode`, `ramp`, `dither`, `selection_mode`, `glyph_set`, `sampling_strategy`, `postprocess[]`, `cols`, `rows`, `format`, `config`, `preset`, `timeout_s` |
-| `glyph_grid_batch` | Render N jobs in **one** app session (start-up paid once). Arguments are a `batch --manifest` object. Sends progress per finished job. | `in`, `jobs[]` | `frames`, `perf`, `timeout_s` |
+| `glyph_grid_batch` | Render N jobs in **one** app session (start-up paid once). Arguments are a `batch --manifest` object. Sends progress per finished job. | `in`, `jobs[]` | `frames`, `perf`, `timeout_s`, `resume` |
 | `glyph_grid_catalog` | List every available palette / ramp / dither / glyph set / postprocess stage. Returns JSON. | — | — |
 
 **Config layering (`glyph_grid_render`)**, lowest to highest priority: `preset` (absolute path to a preset JSON file, e.g. one exported from the GUI) → `config` (any partial CONFIG object, same shape as a preset — see `src/glyph-grid.schema.json`) → the named params. Objects deep-merge, so `config: {postprocess: {vignette: {strength: 0.9}}}` keeps the other vignette fields. Arguments are validated against the schema in-process, so a typo'd enum fails in milliseconds with a JSON path (`/dither/mode: ...`) instead of after a ~5 s app launch.
@@ -31,7 +31,7 @@ Exposes Glyph Grid Studio's rendering pipeline as MCP tools over stdio JSON-RPC.
 }
 ```
 
-Per job: `name`, `out` (absolute), optional `format` (`gif`/`mp4`, else from the extension), `in` (per-job source), `frames` (integer or `"auto"`), `capWidth`, `targetMaxBytes`, `border {width, bgColor?, style?, inkColor?}`, `config`. Every job config is validated before the app starts; one bad job refuses the whole batch (exit 2). The result has one line per job (`job 0 (spice): /abs/out/spice.gif (1493 KB)`).
+Per job: `name`, `out` (absolute), optional `format` (`gif`/`mp4`, else from the extension), `in` (per-job source), `frames` (integer or `"auto"`), `capWidth`, `targetMaxBytes`, `border {width, bgColor?, style?, inkColor?}`, `config`. The manifest is validated against `src/glyph-grid.manifest.schema.json` (unknown keys such as `capwidth` are errors — `path: "/jobs/0"`) and every job config against the preset schema before the app starts; one bad job refuses the whole batch (exit 2). `resume: true` skips jobs whose `out` is already a valid GIF/MP4 with the requested frame count (`batch --resume`). The result has one line per job (`job 0 (spice): /abs/out/spice.gif (1493 KB)`).
 
 **Progress.** Send `_meta: {"progressToken": <token>}` in the `tools/call` params and the server emits `notifications/progress`: `glyph_grid_batch` sends `progress: N, total: M` as each job finishes (`message` carries the job's `batch: N/M name → path` line); `glyph_grid_render` sends one per captured frame (`progress: frame, total: frames`, `message: "capture 12/120"`; it runs the CLI with `--progress`).
 

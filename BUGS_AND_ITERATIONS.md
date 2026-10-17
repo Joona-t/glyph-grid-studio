@@ -4,6 +4,27 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-061 — 2026-10-17 — v0.2 Phase 3: versioned manifest schema (fail-fast on typos) + `batch --resume` (F27)
+
+**Problem:** `run_headless_batch` checked only `in`, `jobs` and `jobs[].out`; every other key was read with `.unwrap_or` defaults, so a typo (`capwidth`, `target_max_bytes`) silently produced the wrong batch after minutes of rendering. No `version` field existed. `--resume`, filed as out of scope in ITER-024 (a 64-job run timed out at 39/64 and needed a hand-rolled `ghost_resume.py`), never landed.
+
+**Root cause:** the manifest had no contract of its own; ITER-056's schema covered job `config` objects only.
+
+**Fix:**
+- New hand-written `src/glyph-grid.manifest.schema.json` (draft 2020-12, embedded with `include_str!`): `additionalProperties: false` at manifest and job level, optional `"version": 1` (`const` — anything else is refused), typed `in` / `frames` (positive int or `"auto"`) / `perf` / `format` (`gif|mp4`) / `capWidth` / `targetMaxBytes` / `border` / `config`. `validate_manifest` runs first in `batch` (exit 2, every error with its JSON path, before any other check or Tauri) and in `validate` for manifests; job configs still go through the preset schema.
+- `batch --resume`: after validation, a job is dropped when its `out` exists and `output_frame_count` reads a valid file with the requested count — GIF via `gif` with `skip_frame_decoding` (no LZW decode; a truncated file errors), MP4 via the `mp4` crate's video-track sample count. `frames: "auto"` accepts any count ≥ 1 (the count is only resolved inside the WebView). All jobs done → `batch complete: nothing to do`, exit 0, no app launch.
+- MCP `glyph_grid_batch` gains `resume`; a manifest-schema failure maps to `invalid_arguments` with `path` = the job (`/jobs/0`).
+
+**Measured:**
+- Typo'd manifest (`capwidth`) and `version: 2` → exit 2 in **20–27 ms** warm (≈450 ms on a cold first exec of the binary — dyld, not validation; `--version` alone is 8 ms warm).
+- `--resume` on a 3-job batch: valid 2-frame GIF skipped (mtime unchanged), truncated MP4 and a 2-frame file standing in for a 3-frame job both re-rendered; second `--resume` → "skipped 3 of 3", exit 0 with no Tauri start.
+- Output gate (render path untouched): md5 `96fc9327…` (identical to ITER-057..060); vs `golden-p3.mp4` **37.62 dB**.
+- Timing (perf-sample, two runs, **under parallel load**, load avg ~22): wall 25.93 / 21.28 s, host 2.87 / 2.69 s; run 2 `suspect_foreign_xpc: false`: WebContent 17.09 s, GPU 7.53 s.
+
+**Gate:** cargo build 0 errors · cargo test **26/26** (+1 `manifest_schema_rejects_typos_and_unknown_versions`) · npm test ok · run-all **PASS 37 / FAIL 0** (`TEST_TIMEOUT=400`; +B22 typo/version fail fast, +B23 resume) · byte-identity **7/7** · MCP **24/24** (+C16 manifest typo → `/jobs/0`).
+
+**Gotchas:** (a) **Behaviour change:** manifests with extra keys that used to be ignored now exit 2 — add them to the schema if they are real. (b) `--resume` trusts file validity + frame count only, not the config that produced it; change a job's config and you must delete its output (or drop `--resume`). (c) gifski can merge identical consecutive frames, so a static-source GIF may hold fewer frames than requested and is then re-rendered on every resume (safe, just not skipped). (d) The catalog/applyConfig parts of F27 Tier B landed earlier (ITER-056/057); the sidecar-hash resume was not built. (e) B22/B23 are in the uncommitted tests/run-all.sh.
+
 ### ITER-060 — 2026-10-17 — v0.2 Phase 3: NDJSON `--progress`, SIGINT/SIGTERM clean exit, MCP per-frame progress + clean cancel (F26)
 
 **Problem:** progress existed in-process (`export-progress` events) but headless runs printed one line per finished job — an 18–56 s render was silent. Ctrl-C killed the process with whatever `.part` temp file was open, no handler at all (grep signal/ctrlc: 0 hits). MCP `glyph_grid_render` sent no progress, and an MCP cancel SIGKILLed the child (ITER-058), which skips any cleanup.

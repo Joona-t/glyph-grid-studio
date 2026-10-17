@@ -119,6 +119,10 @@ pub struct BatchParams {
     /// still times out).
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// Skip jobs whose `out` already holds a valid GIF/MP4 of the requested
+    /// frame count (`batch --resume`).
+    #[serde(default)]
+    pub resume: Option<bool>,
 }
 
 /// Temp JSON file (a preset for `config`, a manifest for `glyph_grid_batch`);
@@ -291,6 +295,11 @@ fn error_path(text: &str, batch: bool) -> Option<String> {
         if let Some(rest) = t.strip_prefix("config/") {
             let p = rest.split(':').next().unwrap_or("");
             return Some(format!("/config/{}", p));
+        }
+        // batch (ITER-061 manifest schema): `batch: manifest /jobs/0: Additional properties ...`
+        if let Some(i) = t.find("batch: manifest /") {
+            let p = t[i + "batch: manifest ".len()..].split(':').next().unwrap_or("");
+            return Some(p.to_string());
         }
         // batch: `batch: job 1 ("typo") config /selectionMode: ...`
         if let Some(i) = t.find("batch: job ") {
@@ -559,6 +568,9 @@ impl GlyphGridServer {
         };
         let mut cmd = Command::new(&exe);
         cmd.arg("batch").arg("--manifest").arg(&temp.0);
+        if p.resume == Some(true) {
+            cmd.arg("--resume");
+        }
         if let Some(v) = p.timeout_s {
             cmd.arg("--timeout").arg(v.to_string());
         }
@@ -658,6 +670,10 @@ mod tests {
         assert_eq!(
             error_path("render: cannot resolve --in \"x\": No such file", false).as_deref(),
             Some("/in_path")
+        );
+        assert_eq!(
+            error_path("batch: manifest /jobs/0: Additional properties are not allowed ('capwidth' was unexpected)", true).as_deref(),
+            Some("/jobs/0")
         );
         assert_eq!(error_path("glyph-grid-studio: render reported failure", false), None);
     }

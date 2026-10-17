@@ -160,7 +160,8 @@ fn parse_frames(s: &str) -> Result<FramesArg, String> {
 
 #[derive(Parser, Debug, Clone)]
 struct BatchArgs {
-    /// Path to a JSON manifest. Shape:
+    /// Path to a JSON manifest (schema: src/glyph-grid.manifest.schema.json;
+    /// unknown keys are errors, optional `"version": 1`). Shape:
     /// `{"in":"<source>","frames":<N|"auto">,"jobs":[{"name":"...","out":"...","format":"gif|mp4",
     /// "frames":<N|"auto">,"border":{"width":32,"bgColor":"auto"},"config":{...}}, ...]}`
     #[arg(long, value_name = "PATH")]
@@ -180,6 +181,12 @@ struct BatchArgs {
     /// the manifest job's `name`.
     #[arg(long)]
     progress: bool,
+
+    /// Skip jobs whose `out` already exists and is a valid GIF/MP4 with the
+    /// requested frame count (any count for `frames: "auto"`).  Re-run a
+    /// timed-out or interrupted batch with the same manifest + `--resume`.
+    #[arg(long)]
+    resume: bool,
 }
 
 fn main() {
@@ -252,7 +259,7 @@ fn main() {
             if args.progress {
                 app_lib::enable_progress_ndjson();
             }
-            let code = app_lib::run_headless_batch(args.manifest, args.show_window, args.timeout);
+            let code = app_lib::run_headless_batch(args.manifest, args.show_window, args.timeout, args.resume);
             std::process::exit(code);
         }
         Some(Command::Catalog) => {

@@ -384,6 +384,80 @@ pub fn validate_config(cfg: &serde_json::Value) -> Result<Vec<String>, Vec<Strin
     })
 }
 
+/* ---------- F27 (ITER-061): manifest schema + `--resume` ---------- */
+
+/// The batch manifest's own shape (versioned, unknown keys are errors);
+/// job configs are still checked against the preset schema.
+pub const MANIFEST_SCHEMA: &str = include_str!("../../src/glyph-grid.manifest.schema.json");
+
+fn manifest_validator() -> &'static jsonschema::Validator {
+    static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
+    VALIDATOR.get_or_init(|| {
+        let schema: serde_json::Value =
+            serde_json::from_str(MANIFEST_SCHEMA).expect("embedded manifest schema is JSON");
+        jsonschema::validator_for(&schema).expect("embedded manifest schema compiles")
+    })
+}
+
+/// Manifest-level errors as `"<json path>: <message>"` (empty = valid).
+pub fn validate_manifest(doc: &serde_json::Value) -> Vec<String> {
+    manifest_validator()
+        .iter_errors(doc)
+        .map(|e| {
+            let at = e.instance_path.to_string();
+            format!("{}: {}", if at.is_empty() { "/" } else { at.as_str() }, e)
+        })
+        .collect()
+}
+
+/// Frame count of an existing GIF / MP4, or why it is not a usable output.
+/// Cheap: GIF frames are counted without LZW decoding, MP4 samples come
+/// from the moov box.
+fn output_frame_count(path: &std::path::Path, format: &str) -> Result<u64, String> {
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
+    if format == "mp4" {
+        let size = file.metadata().map_err(|e| e.to_string())?.len();
+        let reader = mp4::Mp4Reader::read_header(std::io::BufReader::new(file), size)
+            .map_err(|e| format!("not a readable MP4: {}", e))?;
+        return reader
+            .tracks()
+            .values()
+            .find(|t| matches!(t.track_type(), Ok(mp4::TrackType::Video)))
+            .map(|t| u64::from(t.sample_count()))
+            .ok_or_else(|| "MP4 has no video track".to_string());
+    }
+    let mut opts = gif::DecodeOptions::new();
+    opts.skip_frame_decoding(true);
+    let mut decoder = opts
+        .read_info(std::io::BufReader::new(file))
+        .map_err(|e| format!("not a readable GIF: {}", e))?;
+    let mut n = 0u64;
+    while decoder
+        .read_next_frame()
+        .map_err(|e| format!("truncated / corrupt GIF after {} frames: {}", n, e))?
+        .is_some()
+    {
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// `--resume`: Some(reason) when job `out` already holds a valid output of
+/// the requested frame count (`frames: "auto"` → any frame count, since
+/// the count is only resolved inside the WebView).
+fn resume_skip_reason(out: &str, format: &str, frames: &serde_json::Value) -> Option<String> {
+    let path = std::path::Path::new(out);
+    if !path.is_file() {
+        return None;
+    }
+    let n = output_frame_count(path, format).ok()?;
+    match frames.as_u64() {
+        Some(want) if n == want => Some(format!("{} frames", n)),
+        None if n >= 1 => Some(format!("{} frames, frames:auto", n)),
+        _ => None,
+    }
+}
+
 /// `glyph-grid-studio validate <file>` — a preset (partial CONFIG) or a
 /// batch manifest (`{"jobs":[{config},...]}`: every job config is checked).
 /// Exit 0 when valid (warnings on stderr), 2 on any error.
@@ -403,8 +477,14 @@ pub fn run_validate(path: PathBuf) -> i32 {
         }
     };
     let mut targets: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut manifest_errors = 0usize;
     match doc.get("jobs").and_then(|j| j.as_array()) {
         Some(jobs) => {
+            // F27 (ITER-061): the manifest's own keys first.
+            for e in validate_manifest(&doc) {
+                eprintln!("validate: error: manifest {}", e);
+                manifest_errors += 1;
+            }
             for (i, j) in jobs.iter().enumerate() {
                 let name = j.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let cfg = j.get("config").cloned().unwrap_or(serde_json::json!({}));
@@ -423,7 +503,7 @@ pub fn run_validate(path: PathBuf) -> i32 {
             targets.push(("preset".into(), doc));
         }
     }
-    let (mut n_err, mut n_warn) = (0usize, 0usize);
+    let (mut n_err, mut n_warn) = (manifest_errors, 0usize);
     for (label, cfg) in &targets {
         match validate_config(cfg) {
             Ok(warnings) => {
@@ -676,7 +756,12 @@ fn exit_with_status(_app: tauri::AppHandle, state: tauri::State<CliJobState>, ok
 /// side via `CliJobState`.  The JS hook (`tryHeadlessRender`) detects the
 /// `batch: true` discriminator and runs `runBatchExport` with all jobs in
 /// a single Tauri session — no per-variant Tauri restarts.  See ITER-024.
-pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool, timeout_secs: Option<u64>) -> i32 {
+pub fn run_headless_batch(
+    manifest_path: PathBuf,
+    show_window: bool,
+    timeout_secs: Option<u64>,
+    resume: bool,
+) -> i32 {
     let raw = match fs::read_to_string(&manifest_path) {
         Ok(s) => s,
         Err(e) => {
@@ -691,6 +776,21 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool, timeout_sec
             return 2;
         }
     };
+    // F27 (ITER-061): the manifest schema (version, known keys, types)
+    // before anything else — a typo'd key (`capwidth`) used to be silently
+    // ignored and cost a full batch of the wrong thing.
+    let manifest_errors = validate_manifest(&manifest);
+    if !manifest_errors.is_empty() {
+        for e in &manifest_errors {
+            eprintln!("batch: manifest {}", e);
+        }
+        eprintln!(
+            "batch: manifest {:?} is invalid ({} error(s); see src/glyph-grid.manifest.schema.json) — refusing before any render runs",
+            manifest_path,
+            manifest_errors.len()
+        );
+        return 2;
+    }
 
     // Required: in (source path), frames, jobs (array)
     let in_path = manifest
@@ -877,6 +977,30 @@ pub fn run_headless_batch(manifest_path: PathBuf, show_window: bool, timeout_sec
             })
         })
         .collect();
+
+    // F27 (ITER-061): `--resume` drops jobs whose output already exists and
+    // is a valid GIF/MP4 of the requested frame count (ITER-024's
+    // out-of-scope item: a timed-out 64-job run resumes with one flag).
+    let mut jobs_js = jobs_js;
+    if resume {
+        let before = jobs_js.len();
+        jobs_js.retain(|j| {
+            let out = j["outPath"].as_str().unwrap_or("");
+            match resume_skip_reason(out, j["format"].as_str().unwrap_or("gif"), &j["frames"]) {
+                Some(why) => {
+                    let name = j["name"].as_str().unwrap_or("job");
+                    eprintln!("batch: resume: skip {:?} — {} already done ({})", name, out, why);
+                    false
+                }
+                None => true,
+            }
+        });
+        eprintln!("batch: resume: skipped {} of {} jobs", before - jobs_js.len(), before);
+        if jobs_js.is_empty() {
+            eprintln!("batch complete: nothing to do (every output is already done)");
+            return 0;
+        }
+    }
 
     let batch_json = serde_json::json!({
         "batch": true,
@@ -3326,6 +3450,22 @@ mod preset_schema_tests {
         .unwrap();
         assert_eq!(warns.len(), 1, "{:?}", warns);
         assert!(warns[0].starts_with("/palete:"));
+    }
+
+    #[test]
+    fn manifest_schema_rejects_typos_and_unknown_versions() {
+        let ok = serde_json::json!({"$schema": "x", "version": 1, "in": "/a.png", "frames": "auto",
+            "perf": false, "jobs": [{"name": "a", "out": "/a.gif", "format": "gif", "frames": 3,
+            "capWidth": 720, "targetMaxBytes": 1, "border": {"width": 8}, "config": {"palette": "spice"}}]});
+        assert!(validate_manifest(&ok).is_empty(), "{:?}", validate_manifest(&ok));
+        let typo = serde_json::json!({"in": "/a.png", "jobs": [{"out": "/a.gif", "capwidth": 720}]});
+        let errs = validate_manifest(&typo);
+        assert!(errs.len() == 1 && errs[0].starts_with("/jobs/0:") && errs[0].contains("capwidth"), "{:?}", errs);
+        let v2 = serde_json::json!({"version": 2, "in": "/a.png", "jobs": []});
+        assert!(validate_manifest(&v2).iter().any(|e| e.starts_with("/version:")));
+        let frames = serde_json::json!({"in": "/a.png", "frames": 0, "jobs": [{"out": "/a.gif", "format": "webm"}]});
+        assert_eq!(validate_manifest(&frames).len(), 2, "{:?}", validate_manifest(&frames));
+        assert!(!validate_manifest(&serde_json::json!({"jobs": []})).is_empty(), "`in` is required");
     }
 
     #[test]

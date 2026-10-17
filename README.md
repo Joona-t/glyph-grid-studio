@@ -87,11 +87,20 @@ glyph-grid-studio catalog | jq
 
 # Batch: render N variants of one or more sources in a SINGLE app session
 # (~10x faster than per-variant render calls — startup + decode paid once).
-# Manifest shape: {"in": "<default source>", "frames": N, "perf": false,
-#   "jobs": [{"name", "out", "format": "gif|mp4", "in": "<per-job source>",
-#             "capWidth": 720, "targetMaxBytes": 15728640, "config": {...}}]}
+# Manifest shape: {"version": 1, "in": "<default source>", "frames": N|"auto", "perf": false,
+#   "jobs": [{"name", "out", "format": "gif|mp4", "in": "<per-job source>", "frames": N|"auto",
+#             "capWidth": 720, "targetMaxBytes": 15728640, "border": {"width": 16}, "config": {...}}]}
 # capWidth 720 auto-targets Twitter's 15 MB cap (adaptive shrink ladder).
+# Schema: src/glyph-grid.manifest.schema.json — unknown keys (a typo like
+# "capwidth") and unknown versions fail with exit 2 in ~20 ms, before any render.
 glyph-grid-studio batch --manifest variants.json
+
+# Re-run an interrupted / timed-out batch: jobs whose `out` is already a valid
+# GIF/MP4 with the requested frame count are skipped.
+glyph-grid-studio batch --manifest variants.json --resume
+
+# Check a preset or manifest without rendering (exit 0 valid / 2 invalid)
+glyph-grid-studio validate variants.json
 
 # Bound the wall time: past --timeout the render is killed (exit 3)
 glyph-grid-studio render --in a.png --out a.gif --timeout 120

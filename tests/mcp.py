@@ -426,6 +426,21 @@ if pong is not None and "result" in pong:
 else:
     bad("C15b server answers after cancel", str(pong))
 
+# --- Test C16 (F27/ITER-061): a typo'd manifest key → isError with the job path, fast ---
+t0 = time.time()
+send(proc, {"jsonrpc": "2.0", "id": 18, "method": "tools/call", "params": {
+    "name": "glyph_grid_batch",
+    "arguments": {"in": TEST_IMG, "jobs": [
+        {"name": "a", "out": os.path.join(SCRATCH, "c16.gif"), "capwidth": 720}]},
+}})
+res, body = tool_result(recv(proc, timeout=20))
+if res.get("isError") is True and isinstance(body, dict) and body.get("code") == "invalid_arguments" \
+        and body.get("path") == "/jobs/0" and "capwidth" in body.get("message", "") + body.get("stderr_tail", "") \
+        and time.time() - t0 < 5 and not os.path.exists(os.path.join(SCRATCH, "c16.gif")):
+    ok("C16 batch manifest typo → invalid_arguments at /jobs/0 (%.1fs)" % (time.time() - t0))
+else:
+    bad("C16 batch manifest typo", str(res)[:240])
+
 shutdown(proc)
 print(f"  MCP: {PASS} passed, {FAIL} failed")
 sys.exit(0 if FAIL == 0 else 1)

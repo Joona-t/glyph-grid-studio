@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "glyph-grid.manifest.schema.json",
+  "title": "Glyph Grid Studio batch manifest",
+  "description": "Input of `glyph-grid-studio batch --manifest` and of the MCP glyph_grid_batch tool. Hand-written (F27, ITER-061); each job's `config` is validated separately against glyph-grid.schema.json (the preset schema). Unknown keys are errors: a typo like `capwidth` used to be silently ignored.",
+  "type": "object",
+  "required": ["in", "jobs"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": {
+      "description": "Manifest format version. Optional; this build reads version 1.",
+      "type": "integer",
+      "const": 1
+    },
+    "in": { "description": "Default source image for every job (absolute, or relative to the current directory).", "type": "string", "minLength": 1 },
+    "frames": { "$ref": "#/$defs/frames" },
+    "perf": { "description": "Emit PERF_JOB NDJSON timing lines on stderr.", "type": "boolean" },
+    "jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["out"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "out": { "description": "Output path (.gif or .mp4).", "type": "string", "minLength": 1 },
+          "format": { "enum": ["gif", "mp4"] },
+          "in": { "description": "Per-job source override.", "type": "string", "minLength": 1 },
+          "frames": { "$ref": "#/$defs/frames" },
+          "capWidth": { "description": "Downscale the output to at most this width (720 = Twitter-fit, 15 MB default target).", "type": "integer", "minimum": 0 },
+          "targetMaxBytes": { "description": "Adaptive shrink ladder target size (GIF).", "type": "integer", "minimum": 1 },
+          "border": { "description": "{width, bgColor?, style?, inkColor?} — checked by the batch CLI.", "type": "object" },
+          "config": { "description": "Partial CONFIG — validated against glyph-grid.schema.json.", "type": "object" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "frames": {
+      "description": "A positive integer, or \"auto\" (= animation.duration x effective fps).",
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "const": "auto" }
+      ]
+    }
+  }
+}
