@@ -594,8 +594,12 @@
       if (job && !isActiveExportJob(job)) { clearInterval(timer); return; }
       var rs = testHook.getRecState();
       if (!rs) { clearInterval(timer); return; }
-      if (rs.frameIdx !== lastIdx) {
-        lastIdx = rs.frameIdx;
+      /* Pipelined capture (ITER-041) advances frameIdx up to 3 frames ahead
+         of finished frames; report completed frames so progress never
+         runs backwards against onProgress. */
+      var cur = rs._completed != null ? rs._completed : rs.frameIdx;
+      if (cur !== lastIdx) {
+        lastIdx = cur;
         if (onProgress) onProgress(lastIdx, total);
         if (job) setExportPhase(job, 'capturing', lastIdx, total);
       }

@@ -1160,6 +1160,7 @@
       recState = {
         zip: new JSZip(),
         frameIdx: 0,
+        _completed: 0,
         total: Math.max(1, Math.round(CONFIG.animation.duration * CONFIG.animation.fps)),
         done: false,
       };
@@ -3386,7 +3387,11 @@
   let _edgeTileCps = [];
   let _edgeSprite = null, _edgeSpriteKey = null;
   function _ensureEdgeSprite(fontFamily, fontSizePx, ink) {
-    const key = 'edge:' + fontFamily + '|' + fontSizePx + '|' + ink;
+    /* Include font readiness so an atlas rasterised with the fallback font
+       is rebuilt once the real face finishes loading. */
+    let fontReady = 1;
+    try { fontReady = document.fonts && document.fonts.check(fontSizePx + 'px ' + fontFamily) ? 1 : 0; } catch (_) {}
+    const key = 'edge:' + fontFamily + '|' + fontSizePx + '|' + ink + '|' + fontReady;
     if (_edgeSpriteKey === key && _edgeSprite) return _edgeSprite;
     for (let k = 0; k < _edgeTileCps.length; k++) _edgeTile[_edgeTileCps[k]] = -1;
     const cps = [];
@@ -3763,11 +3768,15 @@
     if (post.vignette && post.vignette.enabled) {
       const strength = typeof post.vignette.strength === 'number' ? post.vignette.strength : 0.5;
       if (strength > 0.001) {
-        const overlay = _ensureVignetteOverlay(w, h, strength > 1 ? strength : 1);
+        /* Exports bake the exact per-strength mask (byte-identical to the
+           pre-ITER-043 output); live preview uses the size-keyed unit mask
+           scaled by globalAlpha so slider drags don't rebuild it. */
+        const baked = !!recState || strength > 1;
+        const overlay = _ensureVignetteOverlay(w, h, baked ? strength : 1);
         const prevOp = ctx.globalCompositeOperation;
         const prevAlpha = ctx.globalAlpha;
         ctx.globalCompositeOperation = 'multiply';
-        ctx.globalAlpha = strength > 1 ? 1 : strength;
+        ctx.globalAlpha = baked ? 1 : strength;
         ctx.drawImage(overlay.canvas, 0, 0);
         ctx.globalAlpha = prevAlpha;
         ctx.globalCompositeOperation = prevOp;
@@ -4041,6 +4050,7 @@
         zip: collectZip ? new JSZip() : null,
         framesB64: collectFrames ? [] : null,
         frameIdx: 0,
+        _completed: 0,
         total,
         done: false,
         cancelled: false,

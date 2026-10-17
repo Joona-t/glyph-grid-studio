@@ -4,6 +4,31 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-044 — 2026-10-17 — Review fixes for ITER-040..043
+
+**Problem:** An independent review of the perf diff found 5 defects:
+1. MP4 preprocess: a worker could check `stop`, miss the encoder's `notify_all`, and then park forever (lost wakeup).
+2. MP4 preprocess: a panic in a worker deadlocked the encoder, which kept waiting for that frame index.
+3. Edge-directional sprite atlas: an atlas rasterised before the font loaded was never rebuilt.
+4. GUI export progress could run backwards. Pipelined capture moves `frameIdx` up to 3 frames ahead of the completed count that `onProgress` reports.
+5. The alpha-scaled vignette drifted ±2 LSB from the old baked per-strength mask, including in exports.
+
+**Fix:**
+1. `stop` is now set while holding the `encoded` mutex.
+2. Each worker runs `preprocess` inside `catch_unwind` and reports a panic as an ordinary per-frame `Err`.
+3. The edge sprite key includes `document.fonts.check(...)`.
+4. `monitorCapture` reports `recState._completed`, which is initialised to 0.
+5. While `recState` is set (any export), the baked mask is used, so the output matches before ITER-043. The live preview keeps the cheap unit mask.
+
+**Gate:**
+- cargo test: 15/15.
+- npm test: ok.
+- run-all: PASS 24, FAIL 0; MCP 10/10.
+- worm-move 120f vs base2: PSNR 36.1 / 36.2 dB. The baseline's own run-to-run noise is 36–38 dB.
+- encode-mp4: 985 / 1065 ms. It was ~2.5 s before ITER-040.
+
+**Gotcha:** CLI renders hang (exit 124) while the macOS screen is locked, because WebKit stops drawing. Leftover `render` processes then block later runs. Unlock the screen and `pkill -f "glyph-grid-studio render"` before running the suite.
+
 ### ITER-043 — 2026-10-17 — GUI latency: single debounce for dropdowns, 64x64 invert probe, p5.Graphics leaks, alpha-scaled vignette
 
 - **Problem:** (a) structural dropdowns (renderer, samplingStrategy,

@@ -1712,7 +1712,12 @@ fn encode_mp4_h264(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = control.check_cancelled().and_then(|_| preprocess(idx));
+                // A panic here would leave the encoder waiting on this index
+                // forever; turn it into an ordinary per-frame error instead.
+                let result = control.check_cancelled().and_then(|_| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| preprocess(idx)))
+                        .unwrap_or_else(|_| Err(format!("frame {} preprocess panicked", idx)))
+                });
                 let failed = result.is_err();
                 if tx.send((idx, result)).is_err() || failed {
                     return;
@@ -1821,8 +1826,13 @@ fn encode_mp4_h264(
             Ok(())
         };
         let result = run();
-        // Release any worker parked on the window or blocked on send.
-        stop.store(true, Ordering::Relaxed);
+        // Release any worker parked on the window or blocked on send. Set the
+        // flag under the mutex so a worker can't check it, miss this notify,
+        // and park forever (lost wakeup).
+        {
+            let _g = encoded.0.lock().unwrap_or_else(|e| e.into_inner());
+            stop.store(true, Ordering::Relaxed);
+        }
         encoded.1.notify_all();
         drop(rx);
         result
