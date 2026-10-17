@@ -3619,6 +3619,14 @@
     });
   }
 
+  function bytesToBase64(bytes) {
+    const parts = [];
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+    }
+    return btoa(parts.join(''));
+  }
+
   function lazyFallbackZip(state) {
     if (state._zipPromise) return state._zipPromise;
     state._zipPromise = Promise.resolve().then(function () {
@@ -3659,30 +3667,46 @@
     if (typeof state.onError === 'function') state.onError(error);
   }
 
+  /* ITER-041: capture is pipelined. toBlob snapshots the canvas bitmap
+     when it is called (HTML spec; the PNG encode itself is async), so the
+     next logical frame may draw while frame N encodes/streams. Up to
+     CAPTURE_PIPELINE_DEPTH frames are in flight; at the cap the draw loop
+     pauses (noLoop) and resumes as the oldest frame settles. Consumers
+     (zip / framesB64 / onFrame IPC) run on one serial chain, so they still
+     see frames strictly in index order. */
+  const CAPTURE_PIPELINE_DEPTH = 3;
+
   function handleRecordFrame() {
     const state = recState;
     if (!state || state.cancelled || state._capturing) return;
-    state._capturing = true; // one-frame backpressure: never build a capture backlog
+    if (state.frameIdx >= state.total) return; // all captured; chain draining
     const idx = state.frameIdx;
     const name = `frame_${String(idx + 1).padStart(4, '0')}.png`;
     statusEl().textContent =
       `RECORDING ${idx + 1}/${state.total} (${CONFIG.scene} @ ${CONFIG.palette})`;
-    /* Freeze presentation until this frame has been encoded/consumed. This
-       is producer backpressure (queue depth one) and also prevents toBlob
-       from observing a later redraw of the same logical animation frame. */
-    try { noLoop(); } catch (_) {}
-    drawingContext.canvas.toBlob(function (blob) {
-      if (recState !== state || state.cancelled) return;
-      if (!blob) {
-        failRecording(state, new Error('canvas PNG capture returned no data'));
-        return;
-      }
+    const blobReady = new Promise(function (resolve, reject) {
+      drawingContext.canvas.toBlob(function (blob) {
+        if (blob) resolve(blob);
+        else reject(new Error('canvas PNG capture returned no data'));
+      }, 'image/png');
+    });
+    state.frameIdx++;           // the next draw renders the next logical frame
+    state._inFlight = (state._inFlight || 0) + 1;
+    if (state.frameIdx >= state.total || state._inFlight >= CAPTURE_PIPELINE_DEPTH) {
+      /* Backpressure (or nothing left to draw): pause until a frame settles. */
+      state._capturing = true;
+      try { noLoop(); } catch (_) {}
+    }
+    state._chain = (state._chain || Promise.resolve()).then(function () {
+      return blobReady;
+    }).then(function (blob) {
+      if (recState !== state || state.cancelled) return null;
       if (state.zip) state.zip.file(name, blob);
       /* ITER-040: onFrame consumers get the Blob and push raw bytes; only
          the retained-frames (non-staged) path still needs base64 here. */
       const needsBase64 = !!state.framesB64;
       const encoded = needsBase64 ? blobToBase64(blob) : Promise.resolve(null);
-      encoded.then(function (base64) {
+      return encoded.then(function (base64) {
         if (recState !== state || state.cancelled) return null;
         if (state.framesB64) state.framesB64.push(base64);
         if (state.onFrame) {
@@ -3692,23 +3716,25 @@
           });
         }
         return null;
-      }).then(function () {
-        if (recState !== state || state.cancelled) return;
-        state.frameIdx++;
-        state._capturing = false;
-        if (typeof state.onProgress === 'function') {
-          state.onProgress(state.frameIdx, state.total, state.jobId);
-        }
-        if (state.frameIdx >= state.total && !state.done) {
-          state.done = true;
-          finishRecording(state);
-        } else {
-          try { loop(); } catch (_) {}
-        }
-      }).catch(function (error) {
-        failRecording(state, error);
       });
-    }, 'image/png');
+    }).then(function () {
+      if (recState !== state || state.cancelled) return;
+      state._inFlight--;
+      state._completed = (state._completed || 0) + 1;
+      if (typeof state.onProgress === 'function') {
+        state.onProgress(state._completed, state.total, state.jobId);
+      }
+      if (state._completed >= state.total && !state.done) {
+        state.done = true;
+        finishRecording(state);
+      } else if (state._capturing && state.frameIdx < state.total) {
+        state._capturing = false;
+        try { loop(); } catch (_) {}
+      }
+    });
+    state._chain.catch(function (error) {
+      failRecording(state, error);
+    });
   }
 
   function finishRecording(state) {
@@ -3988,7 +4014,7 @@
          p50/p95. Ring is { stages: {name: ms, ...}, total: ms }[]. Caller
          already cleared the ring before recording started, so this captures
          only the just-finished job's frames. */
-      function snapshotPerf(jobName, jobFrames, framesB64) {
+      function snapshotPerf(jobName, jobFrames, anchorFrames) {
         const ring = (window.__perfRing && window.__perfRing()) || [];
         if (!ring.length) return null;
         const stageSums = {};
@@ -4006,13 +4032,9 @@
         totals.sort(function (a, b) { return a - b; });
         const p50 = totals[Math.floor(totals.length * 0.5)] || 0;
         const p95 = totals[Math.floor(totals.length * 0.95)] || totals[totals.length - 1] || 0;
-        const anchors = [];
-        if (framesB64 && framesB64.length) {
-          var idxs = [0, Math.floor(framesB64.length / 2), framesB64.length - 1];
-          for (var i = 0; i < idxs.length; i++) {
-            anchors.push(framesB64[idxs[i]] || '');
-          }
-        }
+        /* ITER-041: frames are streamed to Rust, so only the three anchor
+           PNGs (first / mid / last) are retained as base64 for perf mode. */
+        const anchors = (anchorFrames || []).map(function (b) { return b || ''; });
         /* Sutskever B2 — interactive switch latency: time from this
            job's config being applied to the first frame that reflects
            it (set by __pfCommit on the first recorded frame). null if
@@ -4020,7 +4042,7 @@
         var _lat = (window.__perfLastLatency && window.__perfLastLatency()) || null;
         return {
           name: jobName,
-          frames: jobFrames || (framesB64 ? framesB64.length : 0),
+          frames: jobFrames || 0,
           frames_seen: n,
           avg_ms: avgMs,
           p50: p50,
@@ -4153,7 +4175,51 @@
           try { window.__perfClear(); } catch (_) {}
         }
 
-        setTimeout(() => {
+        /* ITER-041: frames stream to Rust during capture through the staged
+           begin_export_capture → push_export_frame_raw → finish_* path (the
+           GUI path since v0.1.9) instead of being retained as base64 in JS
+           and shipped as one giant JSON IPC after capture. */
+        const inferred = (job.path || '').toLowerCase().endsWith('.mp4') ? 'mp4' : 'gif';
+        const fmt = (job.format || inferred).toLowerCase();
+        const jobId = 'batch-' + Date.now() + '-' + idx;
+        const frameTotal = captureBudget.total;
+        const anchorIdx = [0, Math.floor(frameTotal / 2), frameTotal - 1];
+        const anchorFrames = perfMode ? [null, null, null] : null;
+        let staged = false;
+        function cancelStaged() {
+          if (!staged) return;
+          staged = false;
+          Promise.resolve(tauri('cancel_export', { jobId: jobId })).catch(()=>{});
+        }
+        function pushFrame(frame) {
+          return frame.blob.arrayBuffer().then(function (buf) {
+            const bytes = new Uint8Array(buf);
+            /* perf mode keeps only the 3 PERF_JOB anchor PNGs as base64. */
+            if (anchorFrames) {
+              for (let i = 0; i < anchorIdx.length; i++) {
+                if (anchorIdx[i] === frame.index) anchorFrames[i] = bytesToBase64(bytes);
+              }
+            }
+            return tauri('push_export_frame_raw', bytes, {
+              headers: { 'x-job-id': jobId, 'x-index': String(frame.index) },
+            });
+          });
+        }
+
+        /* Register the staged capture during the settle window so
+           beginRecord still fires exactly when the settle timer does: an
+           extra IPC hop before it let additional live draws in, shifting
+           the per-cell EMA warm-up of the first recorded frames. */
+        let stagedError = null;
+        const stagedReady = Promise.resolve(
+          tauri('begin_export_capture', { jobId: jobId, total: frameTotal })
+        ).then(function () { staged = true; }, function (e) { stagedError = e || new Error('begin_export_capture failed'); });
+
+        function startCapture() {
+          if (stagedError) {
+            advanceCaptureFailure(stagedError, null, 'capture-start');
+            return;
+          }
           /* Sutskever B2 — mark the switch point AFTER the artificial
              settle, immediately before the first recorded draw. The
              first __pfCommit then yields __pfLastLatency = wall time of
@@ -4167,38 +4233,30 @@
           }
           try {
             self.beginRecord({
-              total: requestedFrames,
-              collectFrames: true,
+              total: frameTotal,
+              jobId: jobId,
+              collectFrames: false,
+              collectZip: false,
+              onFrame: pushFrame,
               onError(error) {
+                cancelStaged();
                 advanceCaptureFailure(error, error && error.capture, 'capture');
               },
               onFinish() {
-              const rs = self.getRecState();
-              const frames = (rs && rs.framesB64) || [];
-              if (!frames.length) {
-                console.warn('batch: empty frames for', job.name);
-                errors.push({ name: job.name, err: 'no-frames' });
-                CONFIG.animation.fps = savedFps;       // restore even on no-frames error
-                idx++;
-                setTimeout(next, 50);
-                return;
-              }
-              /* Format dispatch: GIF (default) → save_gif_to_path with
-                 delayMs; MP4 → save_mp4_to_path with fps.  Both honour the
+              /* Format dispatch: GIF (default) → finish_gif_export with
+                 delayMs; MP4 → finish_mp4_export with fps.  Both honour the
                  capWidth resize.  Format is also auto-derived from the
                  output path extension if `job.format` isn't set. */
-              const inferred = (job.path || '').toLowerCase().endsWith('.mp4') ? 'mp4' : 'gif';
-              const fmt = (job.format || inferred).toLowerCase();
-              const cmd = fmt === 'mp4' ? 'save_mp4_to_path' : 'save_gif_to_path';
+              const cmd = fmt === 'mp4' ? 'finish_mp4_export' : 'finish_gif_export';
               const args = fmt === 'mp4'
                 ? {
-                    frames: frames.map(b => ({ b64: b })),
+                    jobId: jobId,
                     fps: Math.round(effFps),
                     path: job.path,
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
                   }
                 : {
-                    frames: frames.map(b => ({ b64: b })),
+                    jobId: jobId,
                     delayMs: delayMs,
                     path: job.path,
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
@@ -4207,11 +4265,12 @@
               /* Sutskever B3 — export wall-time is the dominant real cost
                  (gifski encode 3–25 s/job, ITER-026) and no optimization
                  has ever measured it. Time the full encode round-trip
-                 (frame IPC serialize + Rust encode + adaptive shrink) —
+                 (Rust encode + adaptive shrink; frames already staged) —
                  exactly what a user waits on at export. */
               const _encT0 = performance.now();
               tauri(cmd, args)
               .then(p => {
+                staged = false;              // finish_* consumed the capture
                 const _encMs = performance.now() - _encT0;
                 console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);
                 tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p }).catch(()=>{});
@@ -4219,7 +4278,7 @@
                    parses this from the studio's stderr. */
                 if (perfMode) {
                   try {
-                    const snap = snapshotPerf(job.name, job.frames || 24, frames);
+                    const snap = snapshotPerf(job.name, job.frames || 24, anchorFrames);
                     if (snap) {
                       snap.encode_ms = _encMs;
                       tauri('cli_log', { msg: 'PERF_JOB ' + JSON.stringify(snap) }).catch(()=>{});
@@ -4233,6 +4292,7 @@
                 setTimeout(next, 50);
               })
               .catch(e => {
+                cancelStaged();
                 console.warn('batch: save failed', job.name, e);
                 tauri('cli_log', { msg: 'batch: save failed ' + job.name + ' fmt=' + fmt + ' err=' + String(e) }).catch(()=>{});
                 errors.push({ name: job.name, err: String(e) });
@@ -4243,8 +4303,14 @@
               }
             });
           } catch (error) {
+            cancelStaged();
             advanceCaptureFailure(error, error && error.capture, 'capture-start');
           }
+        }
+
+        setTimeout(() => {
+          if (staged || stagedError) startCapture();
+          else stagedReady.then(startCapture);
         }, settle);
       }  // _runJob
       }  // next

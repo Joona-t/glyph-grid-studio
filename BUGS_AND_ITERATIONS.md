@@ -4,6 +4,57 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-041 — 2026-10-17 — Capture pipeline: pipelined toBlob + staged batch/CLI frames
+
+- **Problem:** (a) `handleRecordFrame` held queue depth one: `noLoop()` →
+  `toBlob` → base64/IPC → only then `loop()`, so every frame paid draw + PNG
+  encode + consumer back to back. (b) `runBatchExport` (CLI `render`, `batch`,
+  perf bench) retained every frame as base64 in JS and shipped them in one
+  giant `save_*_to_path` JSON IPC after capture (≈3–4 copies of the frame set
+  at peak), while the GUI had used the staged path since v0.1.9.
+- **Root cause:** the one-deep backpressure was written to stop toBlob seeing
+  a later redraw, but toBlob snapshots the bitmap when called; the batch path
+  was never migrated to staging.
+- **Fix:** (a) capture is pipelined at depth 3: frameIdx advances right after
+  `toBlob` is called, the draw loop pauses only at the cap (or after the last
+  frame), and zip/base64/onFrame consumers run on one serial promise chain so
+  frames stay strictly in index order; finish runs after the last link, errors
+  and cancel still go through `failRecording` / `cancelRecord`. (b) batch jobs
+  call `begin_export_capture` (issued during the settle window so
+  `beginRecord` still fires exactly when the settle timer does — an extra IPC
+  hop there shifted the per-cell EMA warm-up), stream each PNG via
+  `push_export_frame_raw`, and finish with `finish_gif_export` /
+  `finish_mp4_export`; `cancel_export` on capture/encode failure. Perf mode
+  keeps only the 3 PERF_JOB anchor PNGs as base64.
+- **Measured (worm-move.gif, 120 frames, preset pB, mp4, interleaved A/B):**
+  output equivalent — PSNR vs base2.mp4 **inf / 38.54 / inf** (baseline binary
+  itself: 38.20 / 36.37 / 38.20; the first ~15 frames depend on how many live
+  draws preceded capture, in both). Wall time unchanged within noise: new
+  29.10 / 18.76 / 29.50 s vs base 28.20 / 28.71 / 28.26 s (user ≈2.6–3.0 s).
+  Instrumented runs show why: the capture is bound by WebKit throttling the
+  off-screen CLI window — rAF ≈5 Hz and the studio scene's per-source-frame
+  JS ≈320–400 ms/frame for the first ~30–40 frames (until the process gets
+  un-throttled, sometimes never), then ≈70–90 ms/frame. IPC push is 7–9 ms
+  and getImageData 6–10 ms, so encode/IPC were not the critical path.
+  Memory win stands: no retained base64 frame set, no giant JSON IPC.
+- **Tried and dropped (evidence, not shipped):** raw-RGBA capture
+  (`getImageData` + Rust fast-PNG; 92 → 72 ms/frame steady state but output
+  drifted to ~39 dB vs the toBlob path); worker-pool OffscreenCanvas PNG
+  encode (≈400 ms/frame, worse); driving draws by `redraw()` instead of rAF
+  (no gain, stayed throttled); `_setWindowOcclusionDetectionEnabled:NO` and an
+  NSProcessInfo LatencyCritical activity (no change in the throttled phase).
+- **Skipped — finding #20 (replace startup/settle sleeps with readiness
+  promises):** implemented and measured, then reverted. Removing the
+  1500/300/200/120 ms waits cuts the live draws before frame 0, and the
+  per-cell EMA (alpha 0.35) carries that state into the first ~15 recorded
+  frames: PSNR vs base2 fell to 33.5–34.4 dB (frame 1 ≈19–20 dB). Even
+  warm-up on frame 0 did not restore it. Needs an owner call on making the
+  warm-up deterministic (e.g. prime the EMA from the loop tail) before the
+  sleeps can go. Next lever for CLI wall time is the WebKit throttling of the
+  off-screen window, not the export path.
+- **Gate:** cargo build --release clean; npm test both ok; run-all PASS 24
+  FAIL 0, MCP 10/0 (B10 PERF_JOB anchors present).
+
 ### ITER-040 — 2026-10-17 — Rust export path: pipelined MP4 preprocess + raw-body frame IPC
 
 - **Problem:** (a) `encode_mp4_h264` ran PNG decode, border, Lanczos3 resize
