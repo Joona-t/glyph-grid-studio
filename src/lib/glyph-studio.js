@@ -259,6 +259,14 @@
     });
   }
 
+  /* p5.Graphics caches live in the DOM + pInst._elements until .remove();
+     a bare delete leaked one hidden canvas per import (ITER-043). */
+  function dropSceneCache(scene, key) {
+    var g = scene[key];
+    if (g && typeof g.remove === 'function') { try { g.remove(); } catch (e) {} }
+    delete scene[key];
+  }
+
   function setupImageDrop(imageRef, sceneCacheKeys, onSwap, config) {
     if (!imageRef) return;
     var overlay = document.createElement('div');
@@ -299,7 +307,7 @@
         if (sceneCacheKeys && window.SCENES) {
           for (var i = 0; i < sceneCacheKeys.length; i++) {
             for (var name in window.SCENES) {
-              if (window.SCENES[name][sceneCacheKeys[i]]) delete window.SCENES[name][sceneCacheKeys[i]];
+              if (window.SCENES[name][sceneCacheKeys[i]]) dropSceneCache(window.SCENES[name], sceneCacheKeys[i]);
             }
           }
         }
@@ -325,7 +333,7 @@
         for (var i = 0; i < sceneCacheKeys.length; i++) {
           for (var name in window.SCENES) {
             if (window.SCENES[name][sceneCacheKeys[i]]) {
-              delete window.SCENES[name][sceneCacheKeys[i]];
+              dropSceneCache(window.SCENES[name], sceneCacheKeys[i]);
             }
           }
         }
@@ -959,15 +967,26 @@
      toast suggesting the sketch-mode setting.  No auto-apply — the user
      might want the "filter" look intentionally.  Sampled every 16th pixel
      for speed (~1 ms on a 1024×574 frame). */
+  /* 64x64 probe: the mean only needs a thumbnail.  img.loadPixels() read
+     back the full-res source and pinned w*h*4 bytes on img.pixels for the
+     session (≈384 MB for a 12000x8000 import) — ITER-043. */
+  var _invertProbe = null;
   function maybeSuggestInvert(img, configRef) {
-    if (!img || !img.loadPixels) return;
+    var srcCanvas = img && (img.canvas || img.elt);
+    if (!srcCanvas) return;
     if (!configRef || configRef.invertSignal) return;
     try {
-      img.loadPixels();
-      var pixels = img.pixels;
-      if (!pixels || pixels.length < 64) return;
+      if (!_invertProbe) {
+        _invertProbe = document.createElement('canvas');
+        _invertProbe.width = 64;
+        _invertProbe.height = 64;
+      }
+      var pctx = _invertProbe.getContext('2d', { willReadFrequently: true });
+      pctx.clearRect(0, 0, 64, 64);
+      pctx.drawImage(srcCanvas, 0, 0, 64, 64);
+      var pixels = pctx.getImageData(0, 0, 64, 64).data;
       var sum = 0, n = 0;
-      for (var i = 0; i < pixels.length; i += 64) {
+      for (var i = 0; i < pixels.length; i += 4) {
         sum += 0.2126 * pixels[i] + 0.7152 * pixels[i + 1] + 0.0722 * pixels[i + 2];
         n++;
       }
@@ -981,7 +1000,7 @@
         );
       }
     } catch (e) {
-      /* loadPixels may fail mid-load; harmless. */
+      /* drawImage/getImageData may fail mid-load; harmless. */
     }
   }
   window.__glyphMaybeSuggestInvert = maybeSuggestInvert;
@@ -1139,6 +1158,26 @@
     var structuralPending = [];
     var structuralTimer = null;
     var nativePaneRefresh = pane.refresh.bind(pane);
+    /* Apply staged values and hand the redraw to the host.  The commit is
+       already coalesced (trailing debounce for sliders, single event for
+       dropdowns), so tell __markChange to skip its own structural resume
+       timer — otherwise discrete picks waited 125 + 100 ms (ITER-043). */
+    function commitStructural(pending) {
+      var scheduledByHost = false;
+      for (var i = 0; i < pending.length; i++) {
+        var item = pending[i];
+        var next = item.toTarget ? item.toTarget(item.pending) : item.pending;
+        item.target[item.key] = next;
+        if (item.onCommit) item.onCommit(next);
+        if (window.__markChange) {
+          scheduledByHost = true;
+          window.__markChange(item.label || item.key, { coalesced: true });
+        }
+      }
+      if (!scheduledByHost) {
+        try { if (typeof window.loop === 'function') window.loop(); else if (typeof loop === 'function') loop(); } catch (e) {}
+      }
+    }
     function scheduleStructuralCommit(state, value) {
       state.pending = value;
       if (structuralPending.indexOf(state) < 0) structuralPending.push(state);
@@ -1147,21 +1186,19 @@
         var pending = structuralPending.slice();
         structuralPending.length = 0;
         structuralTimer = null;
-        var scheduledByHost = false;
-        for (var i = 0; i < pending.length; i++) {
-          var item = pending[i];
-          var next = item.toTarget ? item.toTarget(item.pending) : item.pending;
-          item.target[item.key] = next;
-          if (item.onCommit) item.onCommit(next);
-          if (window.__markChange) {
-            scheduledByHost = true;
-            window.__markChange(item.label || item.key);
-          }
-        }
-        if (!scheduledByHost) {
-          try { if (typeof window.loop === 'function') window.loop(); else if (typeof loop === 'function') loop(); } catch (e) {}
-        }
+        commitStructural(pending);
       }, STRUCTURAL_DEBOUNCE_MS);
+    }
+    /* Dropdowns fire exactly one change per pick — nothing to coalesce, so
+       commit immediately (flushing any pending slider values with it). */
+    function commitStructuralNow(state, value) {
+      state.pending = value;
+      if (structuralPending.indexOf(state) < 0) structuralPending.push(state);
+      clearTimeout(structuralTimer);
+      structuralTimer = null;
+      var pending = structuralPending.slice();
+      structuralPending.length = 0;
+      commitStructural(pending);
     }
     function addStructuralInput(folder, target, key, params, options) {
       options = options || {};
@@ -1179,7 +1216,11 @@
       structuralStates.push(state);
       var binding = folder.addInput(state.staging, key, params || {});
       state.binding = binding;
-      binding.on('change', function (e) { scheduleStructuralCommit(state, e.value); });
+      var discrete = !!(params && params.options);
+      binding.on('change', function (e) {
+        if (discrete) commitStructuralNow(state, e.value);
+        else scheduleStructuralCommit(state, e.value);
+      });
       return binding;
     }
     function syncStructuralInputs() {

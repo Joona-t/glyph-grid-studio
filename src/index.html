@@ -627,10 +627,11 @@
           const sourceDrawH = sourceImg.height * sourceScale;
           const sourceDx = (W0 - sourceDrawW) / 2;
           const sourceDy = (H0 - sourceDrawH) / 2;
-          const buf = (this.__sourceProcessed
-            && this.__sourceProcessed.width === W0
-            && this.__sourceProcessed.height === H0)
-            ? this.__sourceProcessed : createGraphics(W0, H0);
+          let buf = this.__sourceProcessed;
+          if (!(buf && buf.width === W0 && buf.height === H0)) {
+            if (buf) { try { buf.remove(); } catch (_) {} }
+            buf = createGraphics(W0, H0);
+          }
           buf.pixelDensity(1);
           buf.clear();
           buf.image(sourceImg, sourceDx, sourceDy, sourceDrawW, sourceDrawH);
@@ -981,10 +982,16 @@
     __srcLayerKey = null;
     if (window.SCENES) {
       for (const name in window.SCENES) {
-        delete window.SCENES[name].__sourceProcessed;
-        delete window.SCENES[name].__sourceProcessedFrame;
-        delete window.SCENES[name].__sourceProcessedKey;
-        delete window.SCENES[name].__sourceDepth;
+        /* Keep the __sourceProcessed buffer (the scene reuses it when W×H
+           matches; the missing key forces a reprocess).  p5.Graphics must be
+           .remove()d or its hidden canvas leaks per import (ITER-043). */
+        const s = window.SCENES[name];
+        delete s.__sourceProcessedFrame;
+        delete s.__sourceProcessedKey;
+        if (s.__sourceDepth) {
+          try { s.__sourceDepth.remove(); } catch (_) {}
+          delete s.__sourceDepth;
+        }
       }
     }
   }
@@ -1017,12 +1024,19 @@
     }, 100);
   }
 
-  function scheduleConfigRender(key) {
+  function scheduleConfigRender(key, opts) {
     const generation = ++__renderGeneration;
     syncAnimationFrameRate();
     if (recState) return generation; // never disturb deterministic capture cadence
-    const structural = !key || key === 'unknown'
-      || /grid|font|renderer|glyph|source|canvas|scene|prefilter|sampling/i.test(String(key));
+    /* coalesced: the studio already debounced/committed this change once, so a
+       second 100 ms structural quiet period is pure idle latency (ITER-043). */
+    const coalesced = !!(opts && opts.coalesced);
+    if (coalesced && __renderResumeTimer) {
+      clearTimeout(__renderResumeTimer);
+      __renderResumeTimer = 0;
+    }
+    const structural = !coalesced && (!key || key === 'unknown'
+      || /grid|font|renderer|glyph|source|canvas|scene|prefilter|sampling/i.test(String(key)));
     if (structural) {
       if (__renderRaf) {
         try { cancelAnimationFrame(__renderRaf); } catch (_) {}
@@ -1227,7 +1241,8 @@
       return;
     }
 
-    /* Recreate canvas-pixel-sized buffers. */
+    /* Recreate canvas-pixel-sized buffers (free the old one — ITER-043). */
+    if (src) { try { src.remove(); } catch (_) {} }
     src = createGraphics(cw, ch);
     src.pixelDensity(1);
     __srcLayerKey = null;
@@ -1646,9 +1661,9 @@
 
   /* Public API: log every config change so we can compute switch latency.
      Studio-side wraps this in addInput onChange handlers. */
-  window.__markChange = function (key) {
+  window.__markChange = function (key, opts) {
     __pfLastChange = { key, t: performance.now() };
-    scheduleConfigRender(key);
+    scheduleConfigRender(key, opts);
   };
   window.__perfReport = function () {
     if (!__pfRing.length) { console.log('no frames recorded'); return; }
@@ -3653,8 +3668,13 @@
      rebuilt only when any of those changes — i.e. on canvas resize or
      strength slider adjustment. */
   let _vignetteOverlay = null;       // { canvas, key }
-  function _ensureVignetteOverlay(w, h, strength) {
-    const key = w + 'x' + h + ':' + strength;
+  /* Unit-strength mask, keyed on size only (for strength ≤ 1).  Strength is applied at draw
+     time via globalAlpha: multiply at alpha s gives c·(1 − s·r²), the old
+     per-strength mask up to ±2 LSB — so dragging the strength slider no
+     longer rebuilds a full-canvas overlay per tick (ITER-043).  globalAlpha
+     caps at 1, so strengths above 1 (slider max 1.5) keep a baked mask. */
+  function _ensureVignetteOverlay(w, h, maskStrength) {
+    const key = w + 'x' + h + ':' + maskStrength;
     if (_vignetteOverlay && _vignetteOverlay.key === key) return _vignetteOverlay;
     const canvas = document.createElement('canvas');
     canvas.width = w; canvas.height = h;
@@ -3669,8 +3689,7 @@
       for (let x = 0; x < w; x++) {
         const dx = x - cx;
         const r = Math.sqrt(dx * dx + dy2) / maxR;
-        const darken = 1 - strength * r * r;
-        const v = (darken * 255) | 0;
+        const v = ((1 - maskStrength * r * r) * 255) | 0;
         const i = (y * w + x) * 4;
         d[i] = v; d[i + 1] = v; d[i + 2] = v; d[i + 3] = 255;
       }
@@ -3744,10 +3763,13 @@
     if (post.vignette && post.vignette.enabled) {
       const strength = typeof post.vignette.strength === 'number' ? post.vignette.strength : 0.5;
       if (strength > 0.001) {
-        const overlay = _ensureVignetteOverlay(w, h, strength);
+        const overlay = _ensureVignetteOverlay(w, h, strength > 1 ? strength : 1);
         const prevOp = ctx.globalCompositeOperation;
+        const prevAlpha = ctx.globalAlpha;
         ctx.globalCompositeOperation = 'multiply';
+        ctx.globalAlpha = strength > 1 ? 1 : strength;
         ctx.drawImage(overlay.canvas, 0, 0);
+        ctx.globalAlpha = prevAlpha;
         ctx.globalCompositeOperation = prevOp;
       }
     }

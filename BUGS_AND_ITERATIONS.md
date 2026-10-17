@@ -4,6 +4,51 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-043 — 2026-10-17 — GUI latency: single debounce for dropdowns, 64x64 invert probe, p5.Graphics leaks, alpha-scaled vignette
+
+- **Problem:** (a) structural dropdowns (renderer, samplingStrategy,
+  prefilter mode, glyphSet, selectionMode) waited the 125 ms staging
+  debounce, and the regex-matched ones then another 100 ms structural resume
+  timer in `scheduleConfigRender`: ~225 ms of idle wait per pick, with only
+  the last ~100 ms visible in the `switch Xms` status. (b) `maybeSuggestInvert`
+  ran `img.loadPixels()` on the full-res import, pinning w*h*4 bytes on
+  `sourceImg.pixels` for the session (48 MB at 4000x3000, 384 MB at
+  12000x8000). (c) Every import deleted the scenes' `__sourceProcessed` /
+  `__sourceDepth` p5.Graphics and every aspect change replaced `src`
+  without `.remove()`, so a hidden canvas (~2.8 MB at 1024x683) leaked into
+  the DOM and `pInst._elements` each time. (d) The vignette overlay was keyed
+  on strength, so each strength-slider tick rebuilt a full-canvas mask
+  (new canvas + 700k-pixel sqrt loop + putImageData, ~1.35 ms loop alone).
+- **Root cause:** (a) the host's 100 ms quiet period was written for
+  un-debounced scrubs and never learned that the studio already coalesces;
+  a dropdown fires exactly one change, so neither timer coalesced anything.
+  (b) the probe reused p5's full readback for a mean. (c) p5 1.x graphics
+  live until `.remove()`; dropping the JS reference frees nothing.
+  (d) strength was baked into the mask instead of applied at draw time.
+- **Fix:** (a) `addStructuralInput` commits `options` inputs immediately
+  (`commitStructuralNow`, flushing any pending slider values); sliders keep
+  the 125 ms trailing debounce. Staged commits call
+  `__markChange(key, { coalesced: true })`, which cancels an armed resume
+  timer and takes the RAF path. (b) 64x64 cached scratch canvas,
+  drawImage + getImageData, mean over all 4096 pixels (16 KB). (c)
+  `clearSourceDerivedCaches` keeps `__sourceProcessed` (the scene reuses it
+  when WxH matches; the dropped key forces a reprocess) and `.remove()`s it
+  only on a size change; `__sourceDepth`, the studio-side `sceneCacheKeys`
+  drops (`dropSceneCache`) and the old `src` in `fitCanvasToImage` are
+  `.remove()`d. (d) Mask is unit-strength keyed on WxH; strength is applied
+  via `globalAlpha` under `multiply` (c·(1−s) + s·c·M = c·(1−s·r²)).
+  globalAlpha caps at 1, so strengths >1 (slider max 1.5) keep a baked mask.
+- **Measured:** 8-bit model of old vs new vignette at s=0.55 over all c and r:
+  max |Δ| **2 LSB** (80% exact, 20% ±1, 0.004% ±2). worm-move.gif 120 frames,
+  preset pB (vignette 0.4), vs base2.mp4: PSNR **38.85 dB** average (min
+  38.27; y 37.57) — the uniform ±1 LSB vignette rounding, everything else
+  unchanged; real **28.16 / 28.60 s**, user 2.63 / 2.68 s (render path not
+  targeted). Dropdown latency: ~225 ms → ~1 RAF of added wait by
+  construction; in-app timing not profiled (UNCERTAIN). Memory figures are
+  w*h*4 arithmetic, not heap snapshots.
+- **Gate:** cargo build --release clean; npm test both ok (frontend
+  contracts 14 invariants); run-all PASS 24 FAIL 0, MCP 10/0.
+
 ### ITER-042 — 2026-10-17 — Render loop: crtState persistence, still-source layer memo, shape selection cache, v1/edge fast paths
 
 - **Problem:** (a) with `crtState` null (any import/resize while postprocess
