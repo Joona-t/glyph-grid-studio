@@ -260,3 +260,25 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   assert.strictEqual(seen.composited, ctx._glCanvas, 'GL result is composited onto the p5 canvas');
   console.log('GL sprite-equivalent instance fill: ok');
 }
+
+/* ITER-066 (F8 Phase A): the WebGL2 preprocess port must keep every tuned
+   constant identical to the JS path it replaces, and only take animated
+   frames behind the CONFIG.studio.gpuPreprocess switch. */
+{
+  const gl = fs.readFileSync(require.resolve('../src/lib/glyph-preprocess-gl.js'), 'utf8');
+  const names = ['gainGlobal', 'midpoint', 'sharpenGlobal', 'sharpenFace', 'gainFace', 'fineSharpen',
+    'sharpAxis', 'sharpChip', 'sharpHand', 'gainAxis', 'gainChip', 'gainHand', 'midpoint2'];
+  const jsBody = html.slice(html.indexOf('1. base image preprocess'), html.indexOf('buf.updatePixels();'));
+  assert(jsBody.length > 1000, 'JS preprocess body located');
+  for (const n of names) {
+    const re = new RegExp('(?:const (?:float )?|, )' + n + '\\s*=\\s*([0-9.]+)');
+    const a = jsBody.match(re), b = gl.match(re);
+    assert(a && b, `constant ${n} present in both preprocess paths`);
+    assert.strictEqual(parseFloat(a[1]), parseFloat(b[1]), `constant ${n}: JS ${a[1]} vs GL ${b[1]}`);
+  }
+  assert(/<script src="lib\/glyph-preprocess-gl\.js"><\/script>/.test(html), 'GL preprocess module is loaded');
+  assert(/_curFrame >= 0 && config\.studio && config\.studio\.gpuPreprocess/.test(html),
+    'GL preprocess only runs for animated frames behind studio.gpuPreprocess');
+  assert(/gpuPreprocess: true,/.test(html), 'studio.gpuPreprocess default is declared');
+  console.log('GL preprocess constant parity: ok (' + names.length + ' constants)');
+}

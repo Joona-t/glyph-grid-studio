@@ -100,6 +100,8 @@
        output.webgl-canvas + perf instrumentation, source.pointer/keyboard,
        output.audio-synth. -->
   <script src="lib/glyph-wave6.js"></script>
+  <!-- v0.2 Phase 4 (F8): WebGL2 port of the studio source preprocess. -->
+  <script src="lib/glyph-preprocess-gl.js"></script>
   <!-- Tweakpane v3 (UMD) — used by lib/glyph-studio.js when CONFIG.studio.enabled = true. -->
   <script src="vendor/tweakpane-3.1.10/tweakpane.min.js"></script>
   <script src="lib/glyph-studio.js"></script>
@@ -299,6 +301,11 @@
          keep render cost predictable. Set false to keep canvas at the
          CONFIG.canvas dimensions regardless of source aspect. */
       fitCanvasToImage: true,
+      /* v0.2 Phase 4 (F8): run the per-frame source preprocess of ANIMATED
+         sources as three WebGL2 fragment passes (lib/glyph-preprocess-gl.js)
+         instead of ~10 JS loops. Stills keep the JS path (it runs once and
+         is cached). Falls back to JS when WebGL2 is unavailable. */
+      gpuPreprocess: true,
       breathing: {
         emaAlpha:  0.35,
         gainSwing: 0.30,
@@ -637,6 +644,51 @@
           buf.pixelDensity(1);
           buf.clear();
           buf.image(sourceImg, sourceDx, sourceDy, sourceDrawW, sourceDrawH);
+          const _tPre0 = performance.now();
+          /* Zone geometry shared by the JS passes below and the WebGL2 port
+             (F8). Face zone = upper rows; three soft masks — chip head,
+             tweezer axis, hand body — anchored in source-normalized coords:
+                chip tip:        (0.59, 0.42)
+                tweezer base:    (0.32, 0.70)
+                hand centre:     (0.22, 0.80) — palm/finger cluster */
+          const faceY1 = Math.max(0, Math.min(H0, Math.round(sourceDy + sourceDrawH * 0.45)));
+          const tipX  = sourceDx + sourceDrawW * 0.59, tipY  = sourceDy + sourceDrawH * 0.42;
+          const baseX = sourceDx + sourceDrawW * 0.32, baseY = sourceDy + sourceDrawH * 0.70;
+          const handX = sourceDx + sourceDrawW * 0.22, handY = sourceDy + sourceDrawH * 0.80;
+          const dx_axis = baseX - tipX, dy_axis = baseY - tipY;
+          const axisLen = Math.sqrt(dx_axis * dx_axis + dy_axis * dy_axis);
+          const ux = dx_axis / axisLen, uy = dy_axis / axisLen;
+          const bandHalf = sourceDrawW * 0.18;
+          const bandFlat = sourceDrawW * 0.04;
+          const chipRadius = sourceDrawW * 0.07;
+          /* Hand zone: elliptical (taller than wide), softer falloff so
+             knuckle / fingernail / finger creases get amplified gradually
+             across the whole hand without a visible perimeter. */
+          const handRx = sourceDrawW * 0.20;       /* x-axis of mask ellipse — fully fades here */
+          const handRy = sourceDrawH * 0.34;       /* y-axis of mask ellipse */
+          const handFlatR = 0.40;         /* normalized radius staying at full weight */
+
+          /* F8 Phase A: animated frames go through the GPU port; its output
+             replaces buf's pixels with one drawImage (no getImageData /
+             putImageData, no Float32 planes). Any GL miss → JS path. */
+          const _ppGL = (_curFrame >= 0 && config.studio && config.studio.gpuPreprocess
+              && window.GlyphGrid && GlyphGrid.preprocessGL && GlyphGrid.preprocessGL.available())
+            ? GlyphGrid.preprocessGL.run(buf.elt, W0, H0, {
+                faceY1: faceY1, tipX: tipX, tipY: tipY, ux: ux, uy: uy,
+                tLo: -sourceDrawW * 0.06, tHi: axisLen + sourceDrawW * 0.04,
+                bandHalf: bandHalf, bandFlat: bandFlat, chipRadius: chipRadius,
+                handX: handX, handY: handY, handRx: handRx, handRy: handRy, handFlatR: handFlatR,
+              })
+            : null;
+          if (_ppGL) {
+            const bctx = buf.drawingContext;
+            bctx.save();
+            bctx.setTransform(1, 0, 0, 1, 0, 0);
+            bctx.globalAlpha = 1;
+            bctx.globalCompositeOperation = 'copy';
+            bctx.drawImage(_ppGL, 0, 0);
+            bctx.restore();
+          } else {  /* JS path — body kept at its original indent */
           buf.loadPixels();
           const px = buf.pixels;
           const scratch = ensureSourceScratch(W0, H0);
@@ -671,7 +723,6 @@
              still recede the face plane. */
           const sharpenFace  = 1.85;
           const gainFace     = 1.12;
-          const faceY1 = Math.max(0, Math.min(H0, Math.round(sourceDy + sourceDrawH * 0.45)));
           for (let y = 0; y < H0; y++) {
             const inFace = y < faceY1;
             const gain    = inFace ? gainGlobal * gainFace : gainGlobal;
@@ -715,32 +766,12 @@
           }
           /* (Inversion removed.) */
 
-          /* Three soft-mask zones — chip head, tweezer axis, hand body.
-             All three blend smoothly into the surrounding image so no
-             visible boundaries.  The skill's preprocess receives a
-             per-pixel weight from each mask and applies a combined
-             sharpen + gain for that pixel.  Mask anchors (source
-             normalized):
-                chip tip:        (0.59, 0.42)
-                tweezer base:    (0.32, 0.70)
-                hand centre:     (0.22, 0.80) — palm/finger cluster
-          */
-          const tipX  = sourceDx + sourceDrawW * 0.59, tipY  = sourceDy + sourceDrawH * 0.42;
-          const baseX = sourceDx + sourceDrawW * 0.32, baseY = sourceDy + sourceDrawH * 0.70;
-          const handX = sourceDx + sourceDrawW * 0.22, handY = sourceDy + sourceDrawH * 0.80;
-          const dx_axis = baseX - tipX, dy_axis = baseY - tipY;
-          const axisLen = Math.sqrt(dx_axis * dx_axis + dy_axis * dy_axis);
-          const ux = dx_axis / axisLen, uy = dy_axis / axisLen;
-          const bandHalf = sourceDrawW * 0.18;
-          const bandFlat = sourceDrawW * 0.04;
-          const chipRadius = sourceDrawW * 0.07;
-          /* Hand zone: elliptical (taller than wide), softer falloff so
-             knuckle / fingernail / finger creases get amplified gradually
-             across the whole hand without a visible perimeter. */
-          const handRx = sourceDrawW * 0.20;       /* x-axis of mask ellipse — fully fades here */
-          const handRy = sourceDrawH * 0.34;       /* y-axis of mask ellipse */
-          const handFlatR = 0.40;         /* normalized radius staying at full weight */
-
+          /* Three soft-mask zones — chip head, tweezer axis, hand body
+             (geometry hoisted above, shared with the GL port). All three
+             blend smoothly into the surrounding image so no visible
+             boundaries.  The skill's preprocess receives a per-pixel
+             weight from each mask and applies a combined sharpen + gain
+             for that pixel. */
           const lumChip = scratch.lumChip;
           for (let i = 0, j = 0; j < lumChip.length; i += 4, j++) {
             lumChip[j] = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
@@ -808,6 +839,8 @@
             }
           }
           buf.updatePixels();
+          }
+          __pfAdd(_ppGL ? 'preprocess_gl' : 'preprocess_js', performance.now() - _tPre0);
           this.__sourceProcessed = buf;
           this.__sourceProcessedFrame = _curFrame;
           this.__sourceProcessedKey = _processedKey;
