@@ -4,6 +4,26 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-045 — 2026-10-17 — v0.2 Phase 0: XPC-aware perf sampler, PSNR gate, memory probe, re-baseline
+
+**Problem:** Every headless perf number before this entry (ITER-040..044, the `/usr/bin/time` table) counted only the Tauri host process. WebKit renders in two launchd-spawned XPC services (`com.apple.WebKit.WebContent`, `com.apple.WebKit.GPU`, ppid 1) that `time`/rusage cannot see, so "user ≈2.7 s on a 28 s wall" read as "throttled, mostly idle" and drove the OffscreenCanvas-worker / occlusion / LatencyCritical experiments in ITER-041 against a wrong model (research.md F1). Two smaller gaps: the PSNR comparison before each commit was typed by hand with no threshold or per-frame output (F5/F7), and the "do the caches grow?" question (F20) kept being answered by re-grepping seven sprite caches instead of by a number.
+
+**Root cause:** Measurement, not code. XPC children are not descendants of the CLI process, so no rusage-based tool can attribute their CPU; the only honest instrument is a pid diff + `ps` sampler.
+
+**Fix (instruments only, zero renderer changes):**
+1. `tests/perf-sample.sh <out.ndjson> -- <binary> <args...>` — pgrep-diffs the WebKit XPC pids after launch, samples `ps -o %cpu,time,state,pri,ni` at 1 Hz for host + XPC, final sweep on exit, prints `{wall_s, app_cpu_s, webcontent_cpu_s, gpu_cpu_s, frames, exit}`. `PERF_TIMEOUT` replaces the `timeout` wrapper. `run-all.sh` B8 now runs the batch through it; B10 fails unless the summary carries numeric XPC columns.
+2. `tests/psnr-gate.sh <new> <baseline> [min_db=35]` — ffmpeg PSNR, prints average + worst frame index, exit 1 below threshold, 2 on tooling errors.
+3. `GlyphGrid.memProbe()` / `__memReport()` (index.html, beside `__perfReport`) — sums retained bytes per cache: seven sprite canvases, per-scene `__sourceProcessed`/`__sourceDepth` (+ loaded pixels), the 6 Float32 preprocess scratch planes, `lumBuf`, `cellSignal`+EMA, `__sourceSignalCache`, the imported source (canvas + pixels + every decoded GIF frame), glyph-set atlas count, wave6 `atlasCache` (new `GlyphGrid.wave6.atlasCacheStats()` getter), recording ZIP entry count, perf ring length. No `performance.memory` — WKWebView does not implement it. Two frontend contracts guard it.
+4. Re-baseline in `tests/PERF-V0.2-BASELINE.md`.
+
+**Measured (worm-move 760×1024, 150×200, 120 frames, 3 runs):** wall 27.80 / 28.20 / 28.27 s; **WebContent 24.49 / 24.52 / 24.56 s** CPU (median 96 % busy, pri 47, ni 0); GPU 6.77 / 6.41 / 6.44 s (median 17 %); host 2.54 / 1.46 / 1.65 s. Per frame: 234 ms wall, 204 ms WebContent, 55 ms GPU. XPC CPU is 11× the host CPU that was being reported. Output unchanged: 38.18 dB vs golden (gate ≥ 35), run-to-run 37.95–38.18 dB; worst frame is #1 at 28.5–28.9 dB in every pairing (the F23 warm-up, Phase 1's job).
+
+**Decision for Phase 2:** WebContent is the bottleneck on the real preset (F1's sample on synthetic-noise 720×480 had GPU ahead; it does not transfer). First lever = raw RGBA capture (F2 step 2) + layer-memo extension (F2 step 3), then scene JS; GPU-process-canvas-off (F2 step 1, private API) deferred — GPU CPU is 6.5 s and never on the critical path.
+
+**Gate:** cargo build 0 errors · cargo test 15/15 · npm test ok (16 invariants) · run-all PASS 24 / FAIL 0, MCP 10/10 · psnr-gate 38.18 dB PASS.
+
+**Gotchas:** (a) `app_cpu_s` is noisier than the XPC columns — the host's only burst is the 1 s MP4 preprocess at the very end, so the last 1 Hz sample can miss part of it; trust it to ±1 s, trust the XPC columns to ±0.2 s. (b) The pid diff picks up any WebKit XPC process spawned in the window; each is logged with its command path so a stray one can be excluded. (c) `tests/run-all.sh` is on the loop-orchestrator pre-commit deny-list; this human-supervised edit was committed with `GLYPHLOOP_BYPASS=1` as the hook documents.
+
 ### ITER-044 — 2026-10-17 — Review fixes for ITER-040..043
 
 **Problem:** An independent review of the perf diff found 5 defects:

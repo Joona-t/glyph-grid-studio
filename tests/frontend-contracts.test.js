@@ -27,6 +27,8 @@ const contracts = [
   ['atlas commits reject stale generations', /requestedGeneration === __renderGeneration/],
   ['p5 cadence follows the live FPS setting', /frameRate\(fps\)/],
   ['CLI accepts metadata-bearing native image payloads', /typeof loaded === ['"]object['"]\)[\s\S]{0,100}loaded\.dataUrl/],
+  ['memory probe sums every audited cache (F20)', /GlyphGrid\.memProbe = function[\s\S]{0,6000}totalBytes: total/],
+  ['memory probe covers the wave6 atlas map', /wave6\.atlasCacheStats\(\)/],
 ];
 
 for (const [name, pattern] of contracts) {

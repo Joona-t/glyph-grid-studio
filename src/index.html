@@ -1686,6 +1686,91 @@
      that reflects it) as a first-class PERF_JOB objective term. */
   window.__perfLastLatency = () => __pfLastLatency;
 
+  /* v0.2 Phase 0 (F20) — memory probe. Sums the bytes retained by every
+     cache the audit named (all bounded by construction; this closes the
+     "does it grow?" question with a number instead of a re-grep).
+     WKWebView has no performance.memory, so this is the only JS-side
+     number we can get. Dev call: GlyphGrid.memProbe() returns
+     { bytes: {category: n}, counts: {...}, totalBytes }; __memReport()
+     console.tables it. Read-only, allocation-free apart from the result. */
+  function __memCanvasBytes(obj) {
+    if (!obj) return 0;
+    const c = obj.canvas || obj;
+    const w = Number(c.width) || 0, h = Number(c.height) || 0;
+    return w * h * 4;
+  }
+  function __memTypedBytes(a) { return a && a.byteLength ? a.byteLength : 0; }
+  window.GlyphGrid = window.GlyphGrid || {};
+  window.GlyphGrid.memProbe = function () {
+    const bytes = {};
+    const counts = {};
+    /* Seven single-slot sprite caches (index.html _ensure*Sprite). */
+    const sprites = [_spriteAtlas, _rampDuotoneSprite, _glyphDuotoneSprite,
+      _rampGradientSprite, _glyphGradientSprite, _rampSprite, _edgeSprite];
+    let sb = 0, sn = 0;
+    for (let i = 0; i < sprites.length; i++) { if (sprites[i]) { sn++; sb += __memCanvasBytes(sprites[i]); } }
+    bytes.spriteCanvases = sb; counts.spriteCanvases = sn;
+    /* Per-scene processed source + depth p5.Graphics (canvas + loaded pixels). */
+    let proc = 0, depth = 0, procN = 0;
+    for (const k in SCENES) {
+      const s = SCENES[k];
+      if (s.__sourceProcessed) {
+        procN++;
+        proc += __memCanvasBytes(s.__sourceProcessed) + __memTypedBytes(s.__sourceProcessed.pixels);
+      }
+      if (s.__sourceDepth) depth += __memCanvasBytes(s.__sourceDepth) + __memTypedBytes(s.__sourceDepth.pixels);
+    }
+    bytes.sourceProcessed = proc; counts.sourceProcessed = procN;
+    bytes.sourceDepth = depth;
+    /* Source preprocess scratch planes (6 × Float32 W×H). */
+    let scratch = 0;
+    if (__sourcePreprocessScratch) {
+      for (const k in __sourcePreprocessScratch) scratch += __memTypedBytes(__sourcePreprocessScratch[k]);
+    }
+    bytes.sourceScratch = scratch;
+    /* Signal buffers + the static-source signal cache. */
+    bytes.lumBuf = __memTypedBytes(lumBuf);
+    bytes.cellSignal = __memTypedBytes(cellSignal) + __memTypedBytes(cellSignalEma);
+    bytes.sourceSignalCache = __sourceSignalCache
+      ? __memTypedBytes(__sourceSignalCache.lum) + __memTypedBytes(__sourceSignalCache.cells) : 0;
+    /* The imported source: p5.Image canvas, its pixels (if loadPixels ran),
+       and every decoded GIF frame (ImageData). This is the real session
+       lever (F2), not the caches above. */
+    let src = 0, srcFrames = 0;
+    if (sourceImg) {
+      src += __memCanvasBytes(sourceImg) + __memTypedBytes(sourceImg.pixels);
+      const gp = sourceImg.gifProperties;
+      if (gp && gp.frames) {
+        for (let i = 0; i < gp.frames.length; i++) {
+          const im = gp.frames[i] && gp.frames[i].image;
+          if (im && im.data) { src += __memTypedBytes(im.data); srcFrames++; }
+        }
+      }
+    }
+    bytes.sourceImage = src; counts.sourceFrames = srcFrames;
+    /* Glyph-set atlases (bounded at the 6 shipped sets) and wave6's
+       Harri atlas map (≤2 KB per entry). */
+    counts.glyphSetAtlases = Object.keys(_atlasCache).length;
+    const w6 = window.GlyphGrid.wave6 && window.GlyphGrid.wave6.atlasCacheStats
+      ? window.GlyphGrid.wave6.atlasCacheStats() : { entries: 0, bytes: 0 };
+    bytes.wave6AtlasCache = w6.bytes; counts.wave6AtlasCache = w6.entries;
+    /* Recording state: ZIP entries held until finishRecording. */
+    counts.recordingZipEntries = recState && recState.zip ? Object.keys(recState.zip.files).length : 0;
+    counts.perfRing = __pfRing.length;
+    let total = 0;
+    for (const k in bytes) total += bytes[k];
+    return { bytes: bytes, counts: counts, totalBytes: total };
+  };
+  window.__memReport = function () {
+    const r = window.GlyphGrid.memProbe();
+    const rows = {};
+    for (const k in r.bytes) rows[k] = { bytes: r.bytes[k], MB: +(r.bytes[k] / 1048576).toFixed(2), count: r.counts[k] };
+    for (const k in r.counts) if (!rows[k]) rows[k] = { bytes: 0, MB: 0, count: r.counts[k] };
+    console.table(rows);
+    console.log('retained total: ' + (r.totalBytes / 1048576).toFixed(2) + ' MB');
+    return r;
+  };
+
   /* Detect whether v2 advanced pipeline is needed. Returns false when every
      new gate is inert, in which case we take the legacy path (byte-identical). */
   function usesAdvancedPipeline(cfg) {

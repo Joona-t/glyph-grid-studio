@@ -21,7 +21,7 @@ SCRATCH="tests/scratch"
 RESULTS="tests/RESULTS-V0.1.md"
 
 mkdir -p "$SCRATCH"
-rm -f "$SCRATCH"/*.gif "$SCRATCH"/*.json "$SCRATCH"/*.txt
+rm -f "$SCRATCH"/*.gif "$SCRATCH"/*.json "$SCRATCH"/*.ndjson "$SCRATCH"/*.txt
 
 PASS=0
 FAIL=0
@@ -212,7 +212,12 @@ cat > "$B8_MANIFEST" <<EOF
 }
 EOF
 B8_STDERR="$SCRATCH/b8-stderr.txt"
-if bin_t batch --manifest "$B8_MANIFEST" 2>"$B8_STDERR" >/dev/null \
+# v0.2 Phase 0 (ITER-045): the batch runs under tests/perf-sample.sh so the
+# WebKit XPC CPU (WebContent/GPU) is captured alongside PERF_JOB — `time`
+# never saw those processes. Same timeout as bin_t, applied by the sampler.
+B8_PERF="$SCRATCH/b8-perf.ndjson"
+if PERF_TIMEOUT="${TEST_TIMEOUT:-180}" bash tests/perf-sample.sh "$B8_PERF" -- \
+     "$BIN" batch --manifest "$B8_MANIFEST" 2>"$B8_STDERR" >"$SCRATCH/b8-stdout.txt" \
    && [[ -f "$SCRATCH/b8a.gif" && -f "$SCRATCH/b8b.mp4" ]]; then
   pass "B8 batch CLI: 2-job multi-source manifest renders both outputs"
 else
@@ -226,11 +231,24 @@ else
   fail "B9 MP4 export ftyp magic" "header: $(head -c 12 "$SCRATCH/b8b.mp4" 2>/dev/null | xxd -p 2>/dev/null | head -1)"
 fi
 
-# B10: PERF_JOB NDJSON emitted when manifest sets perf:true
-if grep -q "PERF_JOB {" "$B8_STDERR"; then
-  pass "B10 PERF_JOB NDJSON emitted in perf mode"
+# B10: PERF_JOB NDJSON emitted when manifest sets perf:true, AND the sampler
+# wrote a summary with the XPC columns (ITER-045). A headless perf number
+# without webcontent/gpu CPU is a gate failure from here on.
+B10_XPC=$(python3 - "$B8_PERF" <<'PY' 2>/dev/null
+import json, sys
+s = None
+for line in open(sys.argv[1]):
+    try: d = json.loads(line)
+    except ValueError: continue
+    if d.get('type') == 'summary': s = d
+ok = s and s['wall_s'] > 0 and all(isinstance(s[k], (int, float)) for k in ('app_cpu_s', 'webcontent_cpu_s', 'gpu_cpu_s')) and s['pids']['webcontent'] and s['pids']['gpu']
+print(f"wall {s['wall_s']}s app {s['app_cpu_s']}s webcontent {s['webcontent_cpu_s']}s gpu {s['gpu_cpu_s']}s" if ok else "")
+PY
+)
+if grep -q "PERF_JOB {" "$B8_STDERR" && [[ -n "$B10_XPC" ]]; then
+  pass "B10 PERF_JOB NDJSON + XPC sampler summary ($B10_XPC)"
 else
-  fail "B10 PERF_JOB NDJSON emitted" "no PERF_JOB line in batch stderr"
+  fail "B10 PERF_JOB NDJSON + XPC sampler summary" "PERF_JOB=$(grep -c 'PERF_JOB {' "$B8_STDERR") xpc='$B10_XPC'"
 fi
 
 # B11: an impossible twitter-fit target must fail closed instead of returning

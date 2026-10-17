@@ -744,6 +744,14 @@
     draw: function (r, canvas, instPos, glyphIdx, color, bg) {
       drawWebGL(r, canvas, instPos, glyphIdx, color, bg);
     },
+    /* v0.2 Phase 0 (F20): retained size of the Harri atlas map, for
+       GlyphGrid.memProbe(). Entries are ~chars×24 bytes; the key space is
+       finite (ramp × cell size × font), so no cap — just report it. */
+    atlasCacheStats: function () {
+      let bytes = 0;
+      atlasCache.forEach(function (a) { bytes += a.vecs ? a.vecs.byteLength : 0; });
+      return { entries: atlasCache.size, bytes: bytes };
+    },
   });
 
 })();
