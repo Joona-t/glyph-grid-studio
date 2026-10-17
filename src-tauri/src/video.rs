@@ -28,7 +28,7 @@ use openh264::OpenH264API;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -43,6 +43,10 @@ const RING: usize = 8;
    the SPS the decoder will actually honour) cannot buy a bigger
    allocation than the probe admitted. */
 pub const MAX_DIMENSION: u32 = 16384;
+/* ITER-081: the mp4 crate allocates a sample's (stsz) size and a metadata
+   box's (header) size before it reads a byte, so both are capped here. */
+pub const MAX_SAMPLE_BYTES: u32 = 64 << 20;
+pub const MAX_MOOV_BYTES: u64 = 64 << 20;
 pub const MAX_FRAMES: u32 = 480;
 pub const MAX_DECODED_PIXELS: u64 = 100_000_000;
 /// GlyphGrid.video.CACHE: decoded frames resident at once (JS LRU).
@@ -104,12 +108,30 @@ impl Bits<'_> {
     }
 }
 
-/// ITER-080: true if a NAL payload (after its header byte) holds 00 00 00
-/// or 00 00 01.  Emulation prevention keeps both out of valid H.264, but
-/// openh264's Annex-B splitter would cut a second NAL at an embedded
-/// 00 00 01 — one to_annexb's type check never saw.
+/// ITER-080: true if a NAL holds 00 00 00 or 00 00 01.  Emulation
+/// prevention keeps both out of valid H.264, but openh264's Annex-B
+/// splitter would cut a second NAL at an embedded 00 00 01 — one
+/// to_annexb's type check never saw.  ITER-081: the whole NAL is scanned;
+/// skipping the header byte let `00 00 01 67 ...` through as a "type 0" NAL.
 fn has_start_code(nal: &[u8]) -> bool {
-    nal.get(1..).map_or(false, |p| p.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] <= 1))
+    nal.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] <= 1)
+}
+
+/// ITER-081: why a NAL must not reach openh264, if it must not.  Besides a
+/// start code: a header with forbidden_zero_bit set or nal_unit_type 0
+/// (header 0x00 is both kinds of wrong), and a trailing zero byte (the
+/// rbsp stop bit keeps it out of valid H.264; openh264 would fold it into
+/// the next start code).
+fn nal_defect(nal: &[u8]) -> Option<&'static str> {
+    if has_start_code(nal) {
+        return Some("NAL payload contains a start code");
+    }
+    match nal.first() {
+        None => Some("empty NAL unit"),
+        Some(&h) if h & 0x80 != 0 || h & 0x1F == 0 => Some("NAL header is invalid (forbidden bit or type 0)"),
+        _ if nal.last() == Some(&0) => Some("NAL unit ends in a zero byte"),
+        _ => None,
+    }
 }
 
 /// Both picture sizes an SPS declares.  openh264 allocates `coded`
@@ -245,6 +267,8 @@ fn sps_parse(nal: &[u8]) -> Option<Option<SpsSize>> {
 /// The picture size every SPS in the avcC declares, checked against the
 /// container's own claims (tkhd, avc1 sample entry; 0 = not stated).
 /// ITER-080: no SPS/PPS entry may hide a start code (has_start_code).
+/// ITER-081: nor carry any other nal_defect, and an SPS entry must be
+/// type 7, a PPS entry type 8.
 fn stream_dimensions(track: &mp4::Mp4Track) -> Result<SpsSize, String> {
     let avc1 = track
         .trak
@@ -256,8 +280,16 @@ fn stream_dimensions(track: &mp4::Mp4Track) -> Result<SpsSize, String> {
         .as_ref()
         .ok_or("avc1 sample entry missing")?;
     let avcc = &avc1.avcc;
-    if avcc.sequence_parameter_sets.iter().chain(avcc.picture_parameter_sets.iter()).any(|n| has_start_code(&n.bytes)) {
-        return Err("NAL payload contains a start code".into());
+    for nal in avcc.sequence_parameter_sets.iter().chain(avcc.picture_parameter_sets.iter()) {
+        if let Some(e) = nal_defect(&nal.bytes) {
+            return Err(e.into());
+        }
+    }
+    if avcc.sequence_parameter_sets.iter().any(|n| n.bytes[0] & 0x1F != 7) {
+        return Err("avcC SPS entry is not an SPS (type 7)".into());
+    }
+    if avcc.picture_parameter_sets.iter().any(|n| n.bytes[0] & 0x1F != 8) {
+        return Err("avcC PPS entry is not a PPS (type 8)".into());
     }
     let mut dims: Option<SpsSize> = None;
     for sps in &avcc.sequence_parameter_sets {
@@ -302,6 +334,137 @@ pub struct VideoInfo {
     /// for the caller, not a fall-back to the WebView decoder.
     #[serde(skip)]
     pub rejected: bool,
+}
+
+/// One box header in `b` with `room` bytes left in its parent (or the
+/// file): (type, header length, total size).  size 1 = 64-bit largesize,
+/// size 0 = to the end of the parent.
+fn box_header(b: &[u8], room: u64) -> Result<([u8; 4], u64, u64), String> {
+    if b.len() < 8 {
+        return Err("truncated box header".into());
+    }
+    let typ: [u8; 4] = b[4..8].try_into().unwrap();
+    let name = String::from_utf8_lossy(&typ).into_owned();
+    let (hdr, size) = match u32::from_be_bytes(b[0..4].try_into().unwrap()) {
+        0 => (8, room),
+        1 => {
+            let l = b.get(8..16).ok_or("truncated box header")?;
+            match u64::from_be_bytes(l.try_into().unwrap()) {
+                0 => (16, room),
+                l => (16, l),
+            }
+        }
+        s => (8, s as u64),
+    };
+    if size < hdr {
+        return Err(format!("box '{}' is smaller than its header", name));
+    }
+    if size > room {
+        return Err(format!("box '{}' claims {} bytes, only {} remain", name, size, room));
+    }
+    Ok((typ, hdr, size))
+}
+
+/// Children of a container box: each must fit what is left of its parent.
+/// Recurses into the containers the mp4 crate descends into (meta: after
+/// its version/flags when present; ilst: every item, which holds `data`).
+fn walk_boxes(b: &[u8], depth: u32, in_ilst: bool) -> Result<(), String> {
+    if depth > 16 {
+        return Err("boxes nested too deep".into());
+    }
+    let mut o = 0usize;
+    while o < b.len() {
+        let rest = &b[o..];
+        // QuickTime lets a udta list end in a 32-bit zero.
+        if rest.len() < 8 && rest.iter().all(|&x| x == 0) {
+            break;
+        }
+        let (typ, hdr, size) = box_header(rest, rest.len() as u64)?;
+        let body = &rest[hdr as usize..size as usize];
+        let skip = match &typ {
+            _ if in_ilst => Some(0),
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"dinf" | b"udta" | b"mvex" | b"ilst" => Some(0),
+            b"meta" => Some(if body.get(0..4) == Some(&[0, 0, 0, 0]) { 4 } else { 0 }),
+            b"dref" => Some(8),
+            _ => None,
+        };
+        if let Some(k) = skip {
+            walk_boxes(body.get(k..).unwrap_or(&[]), depth + 1, &typ == b"ilst")?;
+        }
+        o += size as usize;
+    }
+    Ok(())
+}
+
+/// ITER-081: the mp4 crate sizes allocations from box headers before it
+/// checks them against anything (a meta child: `vec![0; size]`, size from
+/// a 64-bit largesize).  Walk the top-level boxes first: each must fit the
+/// file, the moov must fit MAX_MOOV_BYTES, and every box inside the moov
+/// must fit its parent — so no header can ask for more than the file holds.
+fn check_box_tree<R: Read + Seek>(r: &mut R, len: u64) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("cannot read box headers: {}", e);
+    let mut off = 0u64;
+    while off < len {
+        let mut head = [0u8; 16];
+        let n = (len - off).min(16) as usize;
+        r.seek(SeekFrom::Start(off)).map_err(io)?;
+        r.read_exact(&mut head[..n]).map_err(io)?;
+        let (typ, hdr, size) = box_header(&head[..n], len - off)?;
+        if &typ == b"moov" {
+            if size > MAX_MOOV_BYTES {
+                return Err(format!("moov is {} bytes (limit {})", size, MAX_MOOV_BYTES));
+            }
+            let mut body = vec![0u8; (size - hdr) as usize];
+            r.seek(SeekFrom::Start(off + hdr)).map_err(io)?;
+            r.read_exact(&mut body).map_err(io)?;
+            walk_boxes(&body, 1, false)?;
+        }
+        off += size;
+    }
+    Ok(())
+}
+
+/// Open `path` and parse its header (check_box_tree first).  Also returns
+/// the file length.
+fn read_mp4(path: &Path) -> Result<(Mp4Reader<BufReader<File>>, u64), String> {
+    let file = File::open(path).map_err(|e| format!("cannot open: {}", e))?;
+    let len = file.metadata().map_err(|e| format!("cannot open: {}", e))?.len();
+    let mut r = BufReader::new(file);
+    let bad = |e: String| format!("not a readable MP4/MOV: {}", e);
+    check_box_tree(&mut r, len).map_err(bad)?;
+    r.seek(SeekFrom::Start(0)).map_err(|e| bad(e.to_string()))?;
+    let reader = Mp4Reader::read_header(r, len).map_err(|e| bad(e.to_string()))?;
+    Ok((reader, len))
+}
+
+/// ITER-081: the stsz / stsc entries read_sample trusts.  The crate
+/// allocates `vec![0; sample_size]` before read_exact (one 0xFFFFFFFF entry
+/// = a 4 GiB zeroed allocation, an abort if it fails), divides by
+/// samples_per_chunk (0 = a panic, even in release) and subtracts 1 from
+/// first_chunk (0 underflows).
+fn sample_tables_fit(track: &mp4::Mp4Track, file_len: u64) -> Result<(), String> {
+    let stbl = &track.trak.mdia.minf.stbl;
+    let stsz = &stbl.stsz;
+    let big = |s: u32| s > MAX_SAMPLE_BYTES || s as u64 > file_len;
+    if big(stsz.sample_size) || stsz.sample_sizes.iter().any(|&s| big(s)) {
+        return Err(format!("stsz sample size exceeds the file or {} bytes", MAX_SAMPLE_BYTES));
+    }
+    if !stsc_fits(stbl.stsc.entries.iter().map(|e| (e.first_chunk, e.samples_per_chunk))) {
+        return Err("stsc has a zero or decreasing chunk entry (corrupt or crafted sample tables)".into());
+    }
+    Ok(())
+}
+
+/// (first_chunk, samples_per_chunk): both >= 1, first_chunk non-decreasing.
+fn stsc_fits(entries: impl Iterator<Item = (u32, u32)>) -> bool {
+    let mut prev = 1u32;
+    for (first, per) in entries {
+        if first == 0 || per == 0 || first < prev {
+            return false;
+        }
+        prev = first;
+    }
+    true
 }
 
 /// Container families we recognise as video (sniffed, extension fallback).
@@ -395,10 +558,7 @@ impl VideoDecoder {
         if sniff_container(path) == Some(Container::Webm) {
             return Err(unsupported("webm", "WebM/Matroska container (the Rust decoder reads MP4/MOV)".into()));
         }
-        let file = File::open(path).map_err(|e| unsupported("", format!("cannot open: {}", e)))?;
-        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let reader = Mp4Reader::read_header(BufReader::new(file), size)
-            .map_err(|e| unsupported("", format!("not a readable MP4/MOV: {}", e)))?;
+        let (reader, file_len) = read_mp4(path).map_err(|r| unsupported("", r))?;
         let mut ids: Vec<u32> = reader
             .tracks()
             .iter()
@@ -449,6 +609,7 @@ impl VideoDecoder {
         if samples == 0 {
             return Err(unsupported(codec, "video track has no samples".into()));
         }
+        sample_tables_fit(track, file_len).map_err(|r| unsupported(codec, r))?;
         let fps = track_fps(track);
         if !(fps.is_finite() && fps > 0.0) {
             return Err(unsupported(codec, "cannot determine the frame rate".into()));
@@ -623,8 +784,8 @@ impl VideoDecoder {
                 return Err("truncated NAL unit".into());
             }
             let nal = &avcc[i..i + len];
-            if has_start_code(nal) {
-                return Err("NAL payload contains a start code".into());
+            if let Some(e) = nal_defect(nal) {
+                return Err(e.into());
             }
             match nal.first().map(|h| h & 0x1F) {
                 Some(7) => {
@@ -793,9 +954,7 @@ fn yuv_rgba(y: &DecodedYUV<'_>, want: (u32, u32)) -> Result<Vec<u8>, String> {
 /// the dims are the SPS's, and a container that disagrees with them is an
 /// `Err` (the probe is what admits the clip past SOURCE_LIMITS).
 pub fn probe_mp4(path: &Path) -> Result<Option<VideoInfo>, String> {
-    let Some(file) = File::open(path).ok() else { return Ok(None) };
-    let Some(size) = file.metadata().ok().map(|m| m.len()) else { return Ok(None) };
-    let Ok(reader) = Mp4Reader::read_header(BufReader::new(file), size) else { return Ok(None) };
+    let Ok((reader, _)) = read_mp4(path) else { return Ok(None) };
     let mut ids: Vec<u32> = reader
         .tracks()
         .iter()
@@ -1253,7 +1412,7 @@ mod tests {
         let junk = with_inband("tiny.mp4", 0, &[0x67, 0x42], "spsjunk");
         let reason = VideoDecoder::open(&junk).err().and_then(|i| i.reason).unwrap_or_default();
         assert!(reason.contains("unparseable vs the admitted 160x90"), "{}", reason);
-        let svc = with_inband("tiny.mp4", 0, &[0x6F, 0x53, 0x00], "subset");
+        let svc = with_inband("tiny.mp4", 0, &[0x6F, 0x53, 0x80], "subset");
         let reason = VideoDecoder::open(&svc).err().and_then(|i| i.reason).unwrap_or_default();
         assert!(reason.contains("subset SPS"), "{}", reason);
 
@@ -1303,12 +1462,23 @@ mod tests {
     /// every enclosing box, the stco offset (moov before mdat) and the
     /// tkhd / avc1 dims (zeroed = "not stated") patched to match.
     fn with_avcc_sps(name: &str, sps: &[u8], tag: &str) -> PathBuf {
+        with_avcc_nal(name, false, sps, tag)
+    }
+
+    /// with_avcc_sps for the SPS (`pps` false) or the (single) PPS entry.
+    fn with_avcc_nal(name: &str, pps: bool, sps: &[u8], tag: &str) -> PathBuf {
         let mut b = std::fs::read(fixture(name)).unwrap();
         let be = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
         let pos = |b: &[u8], t: &[u8]| b.windows(4).rposition(|w| w == t).unwrap() - 4;
         let avcc = pos(&b, b"avcC");
         assert_eq!(b[avcc + 13], 0xE1, "{}: one SPS", name);
-        let old = u16::from_be_bytes([b[avcc + 14], b[avcc + 15]]) as usize;
+        let mut at = avcc + 14;
+        if pps {
+            at += 2 + u16::from_be_bytes([b[at], b[at + 1]]) as usize;
+            assert_eq!(b[at], 1, "{}: one PPS", name);
+            at += 1;
+        }
+        let old = u16::from_be_bytes([b[at], b[at + 1]]) as usize;
         let delta = sps.len() as i64 - old as i64;
         let grow = |b: &mut Vec<u8>, o: usize| {
             let v = (be(b, o) as i64 + delta) as u32;
@@ -1328,8 +1498,8 @@ mod tests {
         b[tkhd + 84..tkhd + 92].fill(0);
         let avc1 = pos(&b, b"avc1");
         b[avc1 + 32..avc1 + 36].fill(0);
-        b[avcc + 14..avcc + 16].copy_from_slice(&(sps.len() as u16).to_be_bytes());
-        b.splice(avcc + 16..avcc + 16 + old, sps.iter().copied());
+        b[at..at + 2].copy_from_slice(&(sps.len() as u16).to_be_bytes());
+        b.splice(at + 2..at + 2 + old, sps.iter().copied());
         let dir = std::env::temp_dir().join(format!("ggs-video-avcc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join(format!("{}-{}", tag, name));
@@ -1356,7 +1526,7 @@ mod tests {
         // 00 00 00 too; 00 00 03 (emulation prevention) and the header byte are fine.
         assert!(has_start_code(&[0x65, 1, 0, 0, 0, 2]));
         assert!(!has_start_code(&[0x65, 0, 0, 3, 0, 0, 3]));
-        assert!(!has_start_code(&[0x00, 0, 1]));
+        assert!(has_start_code(&[0x00, 0, 1]), "ITER-081: the header byte is scanned too");
 
         // The rewriter is sound: the fixture's own SPS put back decodes the same.
         let mut orig = VideoDecoder::open(&fixture("tiny.mp4")).unwrap();
@@ -1424,5 +1594,133 @@ mod tests {
         }
         assert!(checked, "openh264 produced no picture");
         d.ring.clear();
+    }
+
+    /// ITER-081 (18): the start-code scan covers the header byte, and a NAL
+    /// with a bad header or a trailing zero never reaches openh264.
+    #[test]
+    fn a_nal_with_a_bad_header_is_refused() {
+        // 00 00 01 67 <8192x8192 SPS>: before, the scan skipped byte 0.
+        let mut sc = vec![0x00, 0x00, 0x01];
+        sc.extend_from_slice(&sps_nal(512, 512));
+        let r = open_reason(&with_inband("tiny.mp4", 0, &sc, "hdr-sc"));
+        assert!(r.contains("NAL payload contains a start code"), "{}", r);
+        assert_eq!(nal_defect(&[0x00, 0x42]), Some("NAL header is invalid (forbidden bit or type 0)"));
+        assert_eq!(nal_defect(&[0xE5, 0x42]), Some("NAL header is invalid (forbidden bit or type 0)"));
+        assert_eq!(nal_defect(&[0x60, 0x42]), Some("NAL header is invalid (forbidden bit or type 0)"));
+        assert_eq!(nal_defect(&[0x65, 0x42, 0x00]), Some("NAL unit ends in a zero byte"));
+        assert_eq!(nal_defect(&[]), Some("empty NAL unit"));
+        assert_eq!(nal_defect(&[0x65, 0x88, 0x00, 0x00, 0x03, 0x01]), None);
+        let d = VideoDecoder::open(&fixture("tiny.mp4")).unwrap();
+        assert_eq!(d.to_annexb(&[0, 0, 0, 2, 0x65, 0x00], false).unwrap_err(), "NAL unit ends in a zero byte");
+        // avcC: the PPS slot holding a type-7 SPS is refused at open.
+        let r = VideoDecoder::open(&with_avcc_nal("tiny.mp4", true, &sps_nal(10, 6), "pps-is-sps")).err().unwrap();
+        assert_eq!(r.reason.as_deref(), Some("avcC PPS entry is not a PPS (type 8)"), "{:?}", r);
+        let mut pps_as_sps = sps_nal(10, 6);
+        pps_as_sps[0] = 0x68;
+        let r = open_reason(&with_avcc_sps("tiny.mp4", &pps_as_sps, "sps-is-pps"));
+        assert_eq!(r, "avcC SPS entry is not an SPS (type 7)");
+    }
+
+    /// ITER-081 (19, 20): stsz sizes and stsc chunk entries are checked
+    /// before read_sample sees them.
+    #[test]
+    fn sample_size_and_chunk_tables_are_bounded() {
+        // stsz entry 0 (at +20) = 0xFFFFFFFF: was a 4 GiB zeroed allocation.
+        for (off, tag) in [(20usize, "stsz-entry"), (12, "stsz-const")] {
+            let p = patched("tiny.mp4", b"stsz", move |_| off, u32::MAX, tag);
+            let i = VideoDecoder::open(&p).err().unwrap();
+            assert!(!i.rejected && i.reason.as_deref().unwrap_or("").contains("stsz sample size exceeds"), "{}: {:?}", tag, i);
+        }
+        // A sample larger than the file but under the cap.
+        let p = patched("tiny.mp4", b"stsz", |_| 20, 1 << 20, "stsz-file");
+        assert!(open_reason(&p).contains("stsz sample size exceeds"), "{}", open_reason(&p));
+        // stsc samples_per_chunk (+20) = 0 was a division by zero; first_chunk (+16) = 0 an underflow.
+        for (off, tag) in [(20usize, "stsc-per"), (16, "stsc-first")] {
+            let p = patched("tiny.mp4", b"stsc", move |_| off, 0, tag);
+            let r = open_reason(&p);
+            assert!(r.contains("stsc has a zero or decreasing chunk entry"), "{}: {}", tag, r);
+        }
+        assert!(stsc_fits([(1, 12)].into_iter()));
+        assert!(stsc_fits([(1, 4), (3, 2), (3, 1)].into_iter()));
+        assert!(!stsc_fits([(1, 4), (3, 2), (2, 1)].into_iter()), "decreasing");
+        assert!(!stsc_fits([(1, 4), (2, 0)].into_iter()));
+    }
+
+    /// A copy of `name` with `bytes` appended to the file, or to the end of
+    /// the moov (its size and, for a moov before the mdat, the stco grow).
+    fn with_extra(name: &str, in_moov: bool, bytes: &[u8], tag: &str) -> PathBuf {
+        let mut b = std::fs::read(fixture(name)).unwrap();
+        let be = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+        let pos = |b: &[u8], t: &[u8]| b.windows(4).rposition(|w| w == t).unwrap() - 4;
+        if in_moov {
+            let moov = pos(&b, b"moov");
+            let end = moov + be(&b, moov) as usize;
+            let grow = |b: &mut Vec<u8>, o: usize| {
+                let v = be(b, o) + bytes.len() as u32;
+                b[o..o + 4].copy_from_slice(&v.to_be_bytes());
+            };
+            grow(&mut b, moov);
+            if moov < pos(&b, b"mdat") {
+                let stco = pos(&b, b"stco");
+                assert_eq!(be(&b, stco + 12), 1);
+                grow(&mut b, stco + 16);
+            }
+            b.splice(end..end, bytes.iter().copied());
+        } else {
+            b.extend_from_slice(bytes);
+        }
+        let dir = std::env::temp_dir().join(format!("ggs-video-extra-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("{}-{}", tag, name));
+        std::fs::write(&out, b).unwrap();
+        out
+    }
+
+    /// ITER-081 (21): no box header may claim more than its parent (or the
+    /// file) holds, and the moov is capped, before read_header allocates.
+    #[test]
+    fn box_sizes_are_checked_before_the_header_is_parsed() {
+        let mut free40 = vec![0, 0, 0, 1];
+        free40.extend_from_slice(b"free");
+        free40.extend_from_slice(&(1u64 << 40).to_be_bytes());
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            let p = with_extra(name, false, &free40, "free40");
+            let r = open_reason(&p);
+            assert!(r.contains("box 'free' claims 1099511627776 bytes"), "{}: {}", name, r);
+            assert_eq!(probe_mp4(&p).unwrap(), None, "the probe hands it to the WebView");
+            // The moov claiming the whole file (it does not start at 0).
+            let len = std::fs::metadata(fixture(name)).unwrap().len() as u32;
+            let p = patched(name, b"moov", |_| 0, len, "moov-eof");
+            assert!(open_reason(&p).contains("box 'moov' claims"), "{}: {}", name, open_reason(&p));
+            // A meta child (non-mdir hdlr: the crate's vec![0; size] path) claiming 2^40.
+            let mut meta = vec![0, 0, 0, 0];
+            meta.extend_from_slice(b"meta");
+            meta.extend_from_slice(&[0, 0, 0, 0]);
+            meta.extend_from_slice(&[0, 0, 0, 33]);
+            meta.extend_from_slice(b"hdlr");
+            meta.extend_from_slice(&[0; 8]);
+            meta.extend_from_slice(b"xxxx");
+            meta.extend_from_slice(&[0; 13]);
+            meta.extend_from_slice(&[0, 0, 0, 1]);
+            meta.extend_from_slice(b"junk");
+            meta.extend_from_slice(&(1u64 << 40).to_be_bytes());
+            let n = meta.len() as u32;
+            meta[0..4].copy_from_slice(&n.to_be_bytes());
+            let r = open_reason(&with_extra(name, true, &meta, "meta40"));
+            assert!(r.contains("box 'junk' claims 1099511627776 bytes, only 16 remain"), "{}: {}", name, r);
+            // A well-formed extra box in the moov is fine.
+            let mut ok = vec![0, 0, 0, 12];
+            ok.extend_from_slice(b"free");
+            ok.extend_from_slice(&[1, 2, 3, 4]);
+            assert!(VideoDecoder::open(&with_extra(name, true, &ok, "moov-free")).is_ok(), "{}", name);
+        }
+        assert!(box_header(&[0, 0, 0, 4, b'f', b'r', b'e', b'e'], 100).unwrap_err().contains("smaller than its header"));
+        assert_eq!(box_header(&[0, 0, 0, 0, b'm', b'd', b'a', b't'], 100), Ok((*b"mdat", 8, 100)));
+        let mut cap = vec![0, 0, 0, 1];
+        cap.extend_from_slice(b"moov");
+        cap.extend_from_slice(&(MAX_MOOV_BYTES + 16).to_be_bytes());
+        let e = check_box_tree(&mut std::io::Cursor::new(cap), MAX_MOOV_BYTES + 16).unwrap_err();
+        assert!(e.contains("moov is 67108880 bytes (limit 67108864)"), "{}", e);
     }
 }
