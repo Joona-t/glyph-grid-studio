@@ -4,6 +4,25 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-082 — 2026-10-18 — video: top-level moof / emsg refused, ilst data boxes need their fixed fields
+
+**Problem:** three crate parse paths left open by ITER-081's box walk. (22) `Mp4Reader::read_header` parses every top-level `moof` into `track.trafs`, and the crate's fragment paths trust it: `sample_count()` sums trun counts with `expect()` (an overflow panics), trun `sample_size` feeds `vec![0; n]`, and `is_sync_sample` divides by `sample_count / trafs.len()` (zero when the truns are empty). (23) `EmsgBox::read_box` does an unchecked `size - size_without_message` and `Vec::with_capacity` on it, and reads its NUL-terminated strings with no box bound. (24) `walk_boxes` only required size >= 8; `DataBox::read_box` reads 8 fixed bytes past the header, then allocates `start + size - current`, so a 12-byte ilst item `data` box wraps to a huge allocation.
+
+**Root cause:** the box walk checked that sizes fit their parents, not that each box the crate decodes can hold the fields it reads. The Rust decoder reads stbl only, so the fragment and event-message structures it never uses were still being parsed from the file.
+
+**Fix:**
+1. `check_box_tree` refuses a top-level `moof` ("fragmented MP4 (moof) is not supported") and `emsg` ("box emsg is not supported") before `read_header` sees them. Both go to the WebView fallback (open: unsupported; probe: `Ok(None)`).
+2. Defence in depth: `open` returns unsupported and `probe_mp4` returns `Ok(None)` when `track.trafs` is non-empty, before any `sample_count()` call.
+3. `walk_boxes(b, depth, in_ilst, in_item)`: an ilst item's children are walked with `in_item`, and a `data` box there under 16 bytes is refused ("box data is smaller than its fixed fields").
+
+**Tests (cargo 70 → 71):** `fragment_emsg_and_short_data_boxes_are_refused` (both fixtures): an appended moof/mfhd/traf/tfhd/trun whose single sample size is 0xFFFFFFFF is refused with the moof reason and the probe returns None, so it never reaches the crate's allocation; an appended v0 emsg whose strings run past its declared 16 bytes is refused (probe None); a moov-level meta(mdir)/ilst/©nam/data of size 12 is refused; the same tree with a well-formed 19-byte data box still opens. The ITER-080 FNV-1a pins for tiny.mp4 / tiny-bframes.mp4 still pass.
+
+**Measured:** golden render (worm-move.gif, 120 frames, pB, `--mp4-quality archive`) vs golden-p3-iter057.mp4: PSNR inf over 120/120 frames, real 19.55 s, user 2.27 s. Gate: cargo build --release 0 errors (1 pre-existing `Shell::open` deprecation), cargo 71/71, npm test ok, run-all PASS 49 / FAIL 0 (`TEST_TIMEOUT=400`), MCP 34/34, byte-identity 9/9.
+
+**Gotchas:** fragmented MP4s (DASH/CMAF segments, some screen recorders) now always take the WebView path, even when they also carry a full stbl. Only data boxes inside an ilst item are size-checked, which matches where the crate calls `DataBox::read_box`.
+
+---
+
 ### ITER-081 — 2026-10-18 — video: whole-NAL header checks, bounded stsz / stsc, box sizes walked before the header parse
 
 **Problem:** four holes left in `video.rs` after ITER-080. (18) `has_start_code` skipped the header byte (`nal.get(1..)`), so a sample NAL `00 00 01 67 <8192x8192 SPS>` passed: its own header reads as nal_unit_type 0, which to_annexb never type-checks, and openh264's Annex-B splitter then sees the SPS behind it. avcC entries were not type-checked either (a type-7 SPS in the PPS slot went straight into `params`). (19) stsz sizes were unbounded: the mp4 crate does `vec![0; sample_size]` before `read_exact`, so one 0xFFFFFFFF entry is a 4 GiB zeroed allocation (an abort if it fails). (20) stsc `samples_per_chunk == 0` is a division by zero in the crate's `sample_offset` (a panic in release too), and `first_chunk == 0` underflows `chunk_id - 1`. (21) `read_header` allocates from file-supplied box sizes (a non-mdir `meta` child: `vec![0; size]`, size from a 64-bit largesize) before checking them against anything but the whole file length.

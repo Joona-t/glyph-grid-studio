@@ -368,7 +368,8 @@ fn box_header(b: &[u8], room: u64) -> Result<([u8; 4], u64, u64), String> {
 /// Children of a container box: each must fit what is left of its parent.
 /// Recurses into the containers the mp4 crate descends into (meta: after
 /// its version/flags when present; ilst: every item, which holds `data`).
-fn walk_boxes(b: &[u8], depth: u32, in_ilst: bool) -> Result<(), String> {
+/// `in_ilst`: the children are ilst items; `in_item`: they are an item's.
+fn walk_boxes(b: &[u8], depth: u32, in_ilst: bool, in_item: bool) -> Result<(), String> {
     if depth > 16 {
         return Err("boxes nested too deep".into());
     }
@@ -381,6 +382,11 @@ fn walk_boxes(b: &[u8], depth: u32, in_ilst: bool) -> Result<(), String> {
         }
         let (typ, hdr, size) = box_header(rest, rest.len() as u64)?;
         let body = &rest[hdr as usize..size as usize];
+        // ITER-082: DataBox::read_box reads 8 fixed bytes past the header,
+        // then allocates `start + size - current` unchecked (size 12 wraps).
+        if in_item && &typ == b"data" && size < 16 {
+            return Err("box data is smaller than its fixed fields".into());
+        }
         let skip = match &typ {
             _ if in_ilst => Some(0),
             b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"dinf" | b"udta" | b"mvex" | b"ilst" => Some(0),
@@ -389,7 +395,7 @@ fn walk_boxes(b: &[u8], depth: u32, in_ilst: bool) -> Result<(), String> {
             _ => None,
         };
         if let Some(k) = skip {
-            walk_boxes(body.get(k..).unwrap_or(&[]), depth + 1, &typ == b"ilst")?;
+            walk_boxes(body.get(k..).unwrap_or(&[]), depth + 1, &typ == b"ilst", in_ilst)?;
         }
         o += size as usize;
     }
@@ -410,6 +416,16 @@ fn check_box_tree<R: Read + Seek>(r: &mut R, len: u64) -> Result<(), String> {
         r.seek(SeekFrom::Start(off)).map_err(io)?;
         r.read_exact(&mut head[..n]).map_err(io)?;
         let (typ, hdr, size) = box_header(&head[..n], len - off)?;
+        // ITER-082: the crate parses these into structures it then trusts
+        // (trun counts summed with expect(), trun sizes fed to vec![0; n],
+        // emsg's unchecked size subtraction and unbounded strings).  The
+        // decoder reads stbl only, so a fragmented file goes to the WebView.
+        if &typ == b"moof" {
+            return Err("fragmented MP4 (moof) is not supported".into());
+        }
+        if &typ == b"emsg" {
+            return Err("box emsg is not supported".into());
+        }
         if &typ == b"moov" {
             if size > MAX_MOOV_BYTES {
                 return Err(format!("moov is {} bytes (limit {})", size, MAX_MOOV_BYTES));
@@ -417,7 +433,7 @@ fn check_box_tree<R: Read + Seek>(r: &mut R, len: u64) -> Result<(), String> {
             let mut body = vec![0u8; (size - hdr) as usize];
             r.seek(SeekFrom::Start(off + hdr)).map_err(io)?;
             r.read_exact(&mut body).map_err(io)?;
-            walk_boxes(&body, 1, false)?;
+            walk_boxes(&body, 1, false, false)?;
         }
         off += size;
     }
@@ -585,6 +601,11 @@ impl VideoDecoder {
         // allocates), not the cropped one it outputs.
         let size = stream_dimensions(track).map_err(|r| rejected(codec, r))?;
         let (sw, sh) = size.cropped;
+        // ITER-082: sample_count() sums trafs with expect() (check_box_tree
+        // already refuses moof; this keeps the crate's fragment path shut).
+        if !track.trafs.is_empty() {
+            return Err(unsupported(codec, "fragmented MP4 (moof) is not supported".into()));
+        }
         check_limits(size.coded.0, size.coded.1, track.sample_count()).map_err(|r| rejected(codec, r))?;
         let avcc = &track
             .trak
@@ -964,6 +985,9 @@ pub fn probe_mp4(path: &Path) -> Result<Option<VideoInfo>, String> {
     ids.sort();
     let Some(id) = ids.first() else { return Ok(None) };
     let track = &reader.tracks()[id];
+    if !track.trafs.is_empty() {
+        return Ok(None); // ITER-082: fragmented; the WebView path handles it
+    }
     let samples = track.sample_count();
     let fps = track_fps(track);
     let codec = match track.media_type() {
@@ -1722,5 +1746,51 @@ mod tests {
         cap.extend_from_slice(&(MAX_MOOV_BYTES + 16).to_be_bytes());
         let e = check_box_tree(&mut std::io::Cursor::new(cap), MAX_MOOV_BYTES + 16).unwrap_err();
         assert!(e.contains("moov is 67108880 bytes (limit 67108864)"), "{}", e);
+    }
+
+    /// A box: 32-bit size, type, body.
+    fn mp4_box(typ: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(typ);
+        b.extend_from_slice(body);
+        b
+    }
+
+    /// ITER-082 (22-24): top-level moof / emsg and an ilst `data` box too
+    /// small for its fixed fields are refused before read_header parses them.
+    #[test]
+    fn fragment_emsg_and_short_data_boxes_are_refused() {
+        // moof/traf/trun with one sample of size 0xFFFFFFFF (the crate's
+        // vec![0; sample_size] path) — refused at the box walk, no allocation.
+        let mut trun = vec![0, 0, 0x02, 0x00, 0, 0, 0, 1];
+        trun.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        let traf = [mp4_box(b"tfhd", &[0, 0, 0, 0, 0, 0, 0, 1]), mp4_box(b"trun", &trun)].concat();
+        let moof = mp4_box(b"moof", &[mp4_box(b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 1]), mp4_box(b"traf", &traf)].concat());
+        // emsg v0 whose NUL-terminated strings run past its declared 16 bytes.
+        let mut emsg = mp4_box(b"emsg", &[0, 0, 0, 0, b'a', b'b', b'c', b'd']);
+        emsg.extend_from_slice(b"efghijkl");
+        // meta(mdir)/ilst/(c)nam/data with data size 12 (< 16 fixed bytes).
+        let mut hdlr = vec![0; 8];
+        hdlr.extend_from_slice(b"mdir");
+        hdlr.extend_from_slice(&[0; 13]);
+        let meta_with = |data: &[u8]| {
+            let ilst = mp4_box(b"ilst", &mp4_box(&[0xA9, b'n', b'a', b'm'], data));
+            mp4_box(b"meta", &[&[0, 0, 0, 0][..], &mp4_box(b"hdlr", &hdlr), &ilst].concat())
+        };
+        let short = meta_with(&[0, 0, 0, 12, b'd', b'a', b't', b'a', 0, 0, 0, 1]);
+        let good = meta_with(&mp4_box(b"data", &[0, 0, 0, 1, 0, 0, 0, 0, b'a', b'b', b'c']));
+        for name in ["tiny.mp4", "tiny-bframes.mp4"] {
+            let p = with_extra(name, false, &moof, "moof");
+            let r = open_reason(&p);
+            assert!(r.contains("fragmented MP4 (moof) is not supported"), "{}: {}", name, r);
+            assert_eq!(probe_mp4(&p).unwrap(), None, "the probe hands it to the WebView");
+            let p = with_extra(name, false, &emsg, "emsg");
+            let r = open_reason(&p);
+            assert!(r.contains("box emsg is not supported"), "{}: {}", name, r);
+            assert_eq!(probe_mp4(&p).unwrap(), None);
+            let r = open_reason(&with_extra(name, true, &short, "data12"));
+            assert!(r.contains("box data is smaller than its fixed fields"), "{}: {}", name, r);
+            assert!(VideoDecoder::open(&with_extra(name, true, &good, "data-ok")).is_ok(), "{}", name);
+        }
     }
 }
