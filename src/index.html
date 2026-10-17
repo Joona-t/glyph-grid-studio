@@ -908,6 +908,13 @@
      ================================================================= */
   let src;
   let recState = null;
+  /* ITER-046 (F23): beginRecord primes the per-cell EMA from the loop tail
+     with PRIME_FRAMES signal-only passes so frame 0 is a pure function of
+     (source, config, seed) instead of inheriting however many live draws the
+     machine managed before capture.  0.65^11 < 1% residual at the default
+     emaAlpha 0.35.  __primeOnly makes draw() stop after the EMA stage. */
+  const PRIME_FRAMES = 11;
+  let __primeOnly = false;
   let streamRecorder = null;       /* v2 streaming recorder, if active */
   let crtState = null;              /* phosphor-decay state, if active */
   let glyphAtlas = null;            /* shape-vector atlas, if loaded */
@@ -1466,6 +1473,14 @@
     /* 2. Pipeline dispatch. */
     const isV2 = window.GlyphGrid && GlyphGrid.compat.isV2(CONFIG);
     const advanced = isV2 && usesAdvancedPipeline(CONFIG);
+
+    /* ITER-046 priming pass: only the v2 signal + EMA stages run (the v1
+       path keeps no cross-frame state).  No glyph draw, no postprocess, no
+       status bar, no capture. */
+    if (__primeOnly) {
+      if (advanced) drawGlyphGridV2(src, t, recState ? recState.frameIdx : (frameCount - 1));
+      return;
+    }
 
     if (advanced) {
       drawGlyphGridV2(src, t, recState ? recState.frameIdx : (frameCount - 1));
@@ -2208,6 +2223,9 @@
       cellSignal[i] = _v < 0 ? 0 : _v > 1 ? 1 : _v;
     }
     if (__pfFrame) __pfFrame.stages._ema = performance.now() - _t_ema0;
+    /* ITER-046: priming stops here — the EMA is the only cross-frame state
+       the signal stages hold; everything below is per-frame. */
+    if (__primeOnly) return;
 
     /* v2.1 — optional depth downsample.  Respects CONFIG.depth.invert /
        range so scenes can author depth maps with arbitrary polarity. */
@@ -4105,6 +4123,63 @@
     }
   }
 
+  /* ITER-046 (F23): make the capture a pure function of (source, config,
+     seed).  Three buffers carry state across draws — the per-cell EMA
+     (cellSignalEma), the CRT phosphor/beam state (crtState) and the
+     temporal-stability hysteresis (_stab*).  Before ITER-046 none of them
+     was touched by beginRecord, so frame 0 inherited whatever the live
+     rAF loop reached during the pre-capture sleeps (~10 draws off-screen,
+     ~127 with --show-window) and job N+1 of a batch inherited job N's
+     tail.  ITER-044 measured the drift at 33.5–34.4 dB (frame 1 ≈ 19 dB).
+
+     Reset all three, then run PRIME_FRAMES signal-only passes over the
+     loop tail (frameIdx total-K .. total-1, wrapping for short loops) so
+     frame 0 starts from the state the loop itself would have produced —
+     deterministic and seamless at the wrap.  Still sources see the same
+     passes against a constant signal (lum/cell caches make them ~EMA-only).
+     Phosphor and stability restart from scratch at frame 0 — deterministic,
+     and identical to what a fresh process did before. */
+  function primeTemporalState(total) {
+    if (!sourceImg || !sourceImg.width || window.PIPELINE) return;
+    const want = CONFIG.grid.cols * CONFIG.grid.rows;
+    if (!cellSignalEma || cellSignalEma.length !== want) cellSignalEma = new Float32Array(want);
+    cellSignalEma.fill(0.5);
+    crtState = null;        /* applyPostprocess re-makes it on first use */
+    _stabKey = '';          /* _ensureStabBuf re-allocates to -1 */
+    const n = Math.max(1, total | 0);
+    const t0 = performance.now();
+    const passMs = [];
+    __primeOnly = true;
+    try {
+      for (let i = 0; i < PRIME_FRAMES; i++) {
+        recState.frameIdx = (((n - PRIME_FRAMES + i) % n) + n) % n;
+        const tp = performance.now();
+        redraw();
+        passMs.push(+(performance.now() - tp).toFixed(1));
+      }
+    } finally {
+      __primeOnly = false;
+      recState.frameIdx = 0;
+    }
+    /* Diagnostics for the headless log (batch startCapture emits it): the
+       primed EMA mean is the one number that tells a blank capture (signal
+       read from an unpainted source, mean ≈ 0) from a real render. */
+    let sum = 0;
+    for (let i = 0; i < cellSignalEma.length; i++) sum += cellSignalEma[i];
+    const stages = {};
+    if (__pfFrame && __pfFrame.stages) {
+      for (const k in __pfFrame.stages) stages[k] = +__pfFrame.stages[k].toFixed(1);
+    }
+    __lastPrime = {
+      frames: PRIME_FRAMES,
+      ms: Math.round(performance.now() - t0),
+      emaMean: +(sum / cellSignalEma.length).toFixed(4),
+      passMs: passMs,     /* wall ms per priming pass */
+      lastPass: stages,   /* per-stage ms of the final priming pass */
+    };
+  }
+  let __lastPrime = null;
+
   /* =================================================================
      Test hooks. getConfig now returns a deep clone (EC-4).
      ================================================================= */
@@ -4148,6 +4223,9 @@
          finishRecording → noLoop() is still in effect.  Without this,
          batch-mode runBatchExport stalls after the first job. */
       try { loop(); } catch (e) {}
+      /* ITER-046: deterministic warm-up, synchronous — the first live draw
+         after this call is frame 0. */
+      primeTemporalState(total);
       return recState.jobId;
     },
     cancelRecord(jobId, reason) {
@@ -4610,6 +4688,14 @@
               });
               }
             });
+            /* ITER-046: one line per job so a blank capture is diagnosable
+               from the CLI log (emaMean ≈ 0 ⇒ signal came from an unpainted
+               source) and the priming cost is on record. */
+            if (__lastPrime) {
+              Promise.resolve(tauri('cli_log', {
+                msg: 'prime: ' + job.name + ' ' + JSON.stringify(__lastPrime),
+              })).catch(()=>{});
+            }
           } catch (error) {
             cancelStaged();
             advanceCaptureFailure(error, error && error.capture, 'capture-start');

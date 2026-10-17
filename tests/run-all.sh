@@ -356,6 +356,17 @@ for g in "$SCRATCH"/*.gif; do
 done
 $ALL_VALID && pass "F4 all test GIFs validate as GIF89a"
 
+# ---------- Phase G: Determinism (v0.2 Phase 1, ITER-046) ----------
+section "Phase G — Byte-identity"
+
+# G1-G7: same job twice headless, once --show-window, 2-job batch of twins,
+# still + animated source, GIF + MP4 — decoded RGBA must match exactly.
+if BIN="$BIN" TEST_TIMEOUT="${TEST_TIMEOUT:-180}" bash tests/byte-identity.sh "$SCRATCH/byte-identity" 2>&1; then
+  pass "G1-G7 byte-identity: headless output is a pure function of (source, config, seed)"
+else
+  fail "G1-G7 byte-identity" "see byte-identity output above"
+fi
+
 # ---------- Summary ----------
 section "Summary"
 echo "  PASS: $PASS"
