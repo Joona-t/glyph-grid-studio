@@ -1,6 +1,6 @@
 {
   "name": "glyph-grid-studio",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "private": true,
   "description": "A real-time character-grid image renderer for macOS — convert any image into a tunable mosaic of typeset Unicode glyphs.",
   "license": "MIT",
