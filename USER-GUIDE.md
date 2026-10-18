@@ -39,7 +39,7 @@ A friendly walkthrough for both **non-technical readers** (drop a GIF in, get gl
 **System requirements:**
 - macOS 11+ (Apple Silicon or Intel)
 - ~50 MB free disk space (~10 MB app, ~30 MB working space for renders)
-- An image to render — supported: PNG, JPG, WebP, GIF (animated), BMP, TIFF, AVIF
+- An image to render — supported: PNG, JPG, WebP, GIF (animated), BMP, TIFF, AVIF — or a video clip: MP4, MOV, M4V, WebM
 
 > **Under the hood**
 > The pipeline samples each source pixel into an `M × N` cell grid, picks a glyph per cell from either a luminance ramp or a 6-D shape-vector nearest-neighbour lookup, and typesets the result. Front end: p5.js sketch in a Tauri 2 WKWebView. Back end: Rust (gifski for GIF, openh264 + mp4 for MP4). UI: Tweakpane v3 with 70+ live-tunable bindings. See `README.md` for the algorithmic citations.
@@ -115,6 +115,22 @@ Each source frame plays in real time. The studio computes the right source frame
 > sourceImg.setFrame(srcIdx)
 > ```
 > This wraps cleanly on loop (no stutter at the seam) and supports recording the GIF straight back to MP4/GIF at any duration.
+
+### Video clips (MP4, MOV, M4V, WebM)
+Drop a clip or pick it with `Pick image…`. Each studio frame shows the clip frame for the current time, and the loop length becomes the clip's length, as with a GIF.
+
+- **H.264 clips** (most `.mp4` files, screen recordings, many phone clips) are decoded by the app itself. Every export of the same clip and settings comes out the same. The status bar says `video=12/120 (openh264)`.
+- **Other codecs** (HEVC from iPhones, WebM / VP9) play through the system video decoder. While exporting, the studio seeks to each frame and waits for it, so exports still get every frame in order, only slower. The status bar says `(webview)`.
+- The same limits as images apply before anything is decoded: at most 480 frames (16 s at 30 fps) and 64 MB. Trim longer clips first. 4K clips are rejected by the pixel limit; 1080p is fine.
+- Audio is dropped.
+
+#### Video folder (collapsed by default)
+- `decode`: `auto` uses the built-in H.264 decoder when it can and the system decoder otherwise. `native` only uses the built-in one and refuses other codecs. `webview` always uses the system decoder. It applies to the next clip you open.
+- `camera (beta)`: uses the webcam as the source while it is on. Turning it off brings back the previous image or clip. macOS asks for camera permission the first time. Camera exports are a live recording, so two exports are not identical. This is experimental: it needs the bundled app (the camera permission string lives in its Info.plist) and has not been tested in an automated run.
+- `mirror`: flips the camera picture left to right (selfie view).
+
+> **Under the hood**
+> Frame index = floor(t × clip fps) mod frame count (variable-frame-rate clips use their average rate). The built-in path is `video_open` / `video_frame` in `src-tauri/src/video.rs`: the `mp4` crate reads the container, `openh264` decodes, and the frame crosses to the page as raw RGBA. It handles B-frames and needs closed GOPs (an open-GOP stream falls back to the system decoder). The page keeps the last 16 decoded frames. While exporting, a frame that is not decoded yet pauses the draw loop until it is, so the speed of the decoder never changes the output.
 
 ### Aspect-ratio auto-fit
 When `studio.fitCanvasToImage = true` (default), loading an image resizes the canvas to match the source aspect, capping the long edge at 1024 px. This keeps render cost predictable while preserving framing.
@@ -346,6 +362,26 @@ Whether the exported GIF loops. MP4 always plays once per cycle (IG / X auto-loo
 > **Under the hood**
 > `exportPlan()` in glyph-studio.js computes `delayMs = max(20, round(1000/fps/10) × 10)` (centisecond floor), `effFps = 1000/delayMs`, `frames = max(2, round(duration × effFps))`, `dur = frames × delayMs / 1000`. The Export GIF and Export MP4 buttons override `CONFIG.animation.fps` to `effFps` for the duration of the recording so studio frame timing matches encoded frame timestamps — without this, GIFs stutter at the loop wrap because the encoded fps and the studio's playback fps disagree.
 
+#### Timeline (collapsed by default)
+Keyframe tracks that change settings over the loop: a palette that morphs from cream-paper to spice, breathing that swells halfway through, a grid that sharpens from 80 to 200 columns. Tracks come from a preset (`"timeline"` key), the CLI (`--timeline 'palette=0:(cream-paper),1:(spice)'`), a batch manifest or MCP. The sliders elsewhere keep showing your base values. The timeline is applied on top of them each frame, and exports use it too.
+- `enabled` plays the loaded tracks; off renders the panel values as-is.
+- `tracks` lists the keyed settings and how many keys each has.
+- `scrub u` previews one moment (0 = start, 1 = end) and pauses playback; `Resume loop` plays again.
+
+Numbers glide between keys (`linear` or `inOutSine`), the palette blends in OKLab, and grid size, glyph set, selection mode and dither mode jump at their key (`step`). Under reduced motion the live preview holds the start of the timeline; exports are unaffected.
+
+#### Text (collapsed by default)
+Type a word and it becomes the picture: the letters are drawn every frame and then turned into glyphs like any image, so a title or a lyric line is made of the glyph grid itself.
+- `text source` turns it on. Typing in the box turns it on too. Each new line in the box is a new row.
+- `font`: Cascadia Mono and IBM VGA8 are bundled and look the same on every machine. The system fonts listed are the ones installed on this Mac.
+- `size` (px at the 512 px text canvas), `weight`, `align`, `x` / `y` (where the text sits, 0..1).
+- `anim`: `typewriter` types the letters in, `rise` slides up, `fade` fades in, `scale` grows in, `none` cuts. `in (s)` / `out (s)` are how long the entrance and the exit take (the exit only plays for lines with an end time).
+- `text colour` / `background`.
+- `blend` only matters with an image loaded: `replace` shows the text alone, `multiply` darkens the image with the letters, `screen` lightens it, `mask` shows the image only inside the letters.
+- `Import SRT/LRC…` loads subtitles or lyrics. Each cue appears at its time, and the loop length is set to the last cue's end. `Clear lines` removes them.
+
+If the letters get thinner than one glyph cell they start to dissolve. The status bar then says `warn: text stroke … cells`. Make the text bigger or lower the column count.
+
 ---
 
 ### 5.10 Perf (collapsed by default)
@@ -417,6 +453,22 @@ Records `frames` frames, encodes via gifski (Rust), pops save dialog. Quantizati
 
 #### `Export MP4`
 Records `frames` frames, encodes via openh264 + mp4 (Rust), pops save dialog. H.264 Constrained Baseline yuv420p — IG-compatible. Smaller than GIF (~3× smaller for kaneki: 13 MB GIF → 4.3 MB MP4).
+
+#### `Export SVG (vector)` / `Export TXT (plain text)`
+The current frame as vector text (SVG) or plain text, in every selection mode.
+
+#### `Export ANSI (terminal)`
+The current frame as 24-bit colour terminal text (`.ans`). Open a terminal and `cat` the file. Runs of the same colour share one escape, so a monochrome frame stays small.
+
+#### `Export .cast (asciinema)`
+Records `frames` frames (same duration × fps as Export GIF) as an asciinema v2 recording. Play it with `asciinema play file.cast`, or upload it to asciinema.org. Only the rows that change between frames are redrawn.
+
+#### `Export HTML (single file)`
+Records `frames` frames into one self-contained web page: every cell is a real character, the bundled font is inlined (no tofu on other machines), and Play / Step buttons drive the animation. With *reduce motion* switched on in your OS it does not autoplay.
+
+> **Octant and sextant glyph sets** need a font that has Unicode 16 octants / Unicode 13 sextants. HTML brings its own; a terminal usually does not, so ANSI and .cast exports of those sets show a warning (code CR-8) and will look like boxes in most terminals. Use `blockElements` or `ascii` for terminal output.
+
+The CLI and MCP do the same with `--format txt|ansi|cast|html` (or the output extension). TXT and ANSI are always one still frame.
 
 > **Under the hood**
 > Both buttons override `CONFIG.animation.fps = effFps` for the recording duration, restore on completion. Frame collection is identical (base64-encoded PNGs sent over IPC). The Rust encoders differ:

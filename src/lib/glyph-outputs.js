@@ -3,14 +3,14 @@
  * Registers:
  *   output.frame-zip    — capture per-frame PNGs into a JSZip → download
  *   output.svg          — emit one-frame SVG <text>-per-cell, trigger download
- *   output.gif-encoded  — in-browser animated GIF via gifenc (lazy CDN load)
+ *   output.gif-encoded  — in-browser animated GIF via host-provided window.gifenc
  *   output.mp4          — canvas.captureStream via MediaRecorder
  *   output.png-frame    — save current canvas as a single PNG
  *
  * All outputs are TERMINAL — they return { ok: true, kind: '...' } or a
  * Promise of it. They do not mutate the signal.
  *
- * Lazy-load policy: heavy libs (gifenc) only fetched on first use.
+ * No network loads (ITER-069): gifenc must be provided by the host.
  * JSZip + fflate are already loaded by render.html globally.
  */
 
@@ -195,22 +195,23 @@
   }, { label: 'Emit one-frame SVG (one <text> per cell)' });
 
   /* ====================================================================
-     output.gif-encoded — animated GIF via gifenc (lazy CDN load).
+     output.gif-encoded — animated GIF via gifenc (host-provided window.gifenc).
 
      State aggregates frames across draw calls; once `total` frames have
      been captured, it encodes and triggers download.
      ==================================================================== */
 
-  const GIFENC_URL = 'https://unpkg.com/gifenc@1.0.3/dist/gifenc.esm.js';
   const gifStates = new WeakMap();
 
   async function ensureGifenc() {
     if (window.gifenc) return window.gifenc;
-    /* gifenc ships as ESM. Use dynamic import() since plain <script> won't
-       expose module exports. All modern browsers support this via Blob URL. */
-    const mod = await import(GIFENC_URL);
-    window.gifenc = mod;
-    return mod;
+    /* ITER-069: the unpkg import() fallback is gone — the app boots and
+       renders offline (ITER-063), and gifenc is not vendored. A host that
+       wants this stage sets window.gifenc first; the studio's own GIF
+       export goes through the Rust encoder instead. */
+    throw new window.GlyphGrid.GlyphGridError('STAGE_MISSING_HOST', 'gif-encoded', 'output', {
+      message: 'gifenc is not bundled (offline build); provide window.gifenc or use the studio GIF export.',
+    });
   }
 
   rt.register('output', 'gif-encoded', async function (_in, ctx, stage) {

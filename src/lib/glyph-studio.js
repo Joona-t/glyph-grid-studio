@@ -28,7 +28,7 @@
   'use strict';
 
   /* ----------------------------------------------------------------
-   * 1.  Tweakpane availability check + CDN-load fallback
+   * 1.  Tweakpane availability check + vendored-load fallback
    * ---------------------------------------------------------------- */
   function ensureTweakpane(cb) {
     /* Tweakpane 3.x ships UMD (works with <script>); 4.x is ESM-only.
@@ -37,13 +37,29 @@
        this lib uses addInput throughout. */
     if (window.Tweakpane && window.Tweakpane.Pane) { cb(window.Tweakpane.Pane); return; }
     var s = document.createElement('script');
-    s.src = 'https://cdn.jsdelivr.net/npm/tweakpane@3.1.10/dist/tweakpane.min.js';
+    /* ITER-069: the vendored copy (ITER-063), never a CDN — offline boot. */
+    s.src = 'vendor/tweakpane-3.1.10/tweakpane.min.js';
     s.onload = function () {
       if (window.Tweakpane && window.Tweakpane.Pane) cb(window.Tweakpane.Pane);
       else console.warn('glyph-studio: Tweakpane loaded but no Pane export found');
     };
-    s.onerror = function () { console.warn('glyph-studio: Tweakpane CDN unreachable'); };
+    s.onerror = function () { console.warn('glyph-studio: vendored Tweakpane failed to load'); };
     document.head.appendChild(s);
+  }
+
+  /* ITER-069: font swaps go through the host's __glyphFontSwap so the
+     idle detector (ITER-062) sees them pending and re-arms the loop when
+     the face resolves; bare fonts.load is the fallback for other hosts. */
+  function swapFont(config) {
+    var opts = {
+      sizePx: config.font.size,
+      glyphSet: config.glyphSet || 'ascii',
+      trustRequested: !!config.glyphSet,
+    };
+    if (typeof window.__glyphFontSwap === 'function') { window.__glyphFontSwap(opts); return; }
+    if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
+      window.GlyphGrid.fonts.load(opts);
+    }
   }
 
   /* ----------------------------------------------------------------
@@ -51,6 +67,13 @@
    * ---------------------------------------------------------------- */
   var PRESET_PREFIX = 'glyph-studio:';
   function presetKey(n) { return PRESET_PREFIX + n; }
+  /* R7 (ITER-056): preset format version + the $id of the generated
+     src/glyph-grid.schema.json.  scripts/gen-schema.js reads both from
+     here, so bump PRESET_SCHEMA_VERSION when a preset key changes meaning
+     and regenerate the schema (run-all A9 fails until you do). */
+  var PRESET_SCHEMA_VERSION = 1;
+  var PRESET_SCHEMA_ID = 'https://github.com/Joona-t/glyph-grid-studio/schema/preset/v' +
+    PRESET_SCHEMA_VERSION + '.json';
 
   /* Rust-backed persistence mirror (BUG-006, audit 2026-06-10).
      WKWebView does NOT persist localStorage for Tauri's custom-scheme
@@ -119,24 +142,72 @@
       'temporalStability', 'flow',
       /* BUG-011 (v0.1.8): these are live panel inputs but were missing
          from the preset whitelist, so save → reload silently dropped them. */
-      'invertSignal', 'bgThreshold', 'dispersal', 'scene'];
-    var out = {};
+      'invertSignal', 'bgThreshold', 'dispersal', 'scene',
+      /* ITER-077: video decode path (camera is stripped below). */
+      'video',
+      /* ITER-075: keyframe tracks (CONFIG.timeline). */
+      'timeline',
+      /* ITER-076: kinetic typography (CONFIG.textSource). */
+      'textSource'];
+    /* R7: stamp the schema so editors autocomplete and `validate` knows
+       which preset format it is reading. */
+    var out = { $schema: PRESET_SCHEMA_ID, version: PRESET_SCHEMA_VERSION };
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
       if (config[k] !== undefined) out[k] = JSON.parse(JSON.stringify(config[k]));
     }
+    /* A preset must not switch a webcam on when someone loads it. */
+    if (out.video) delete out.video.camera;
+    return out;
+  }
+  /* F24 (ITER-057): THE config merge — objects merge key by key, every
+     other value (scalar, array, null) replaces.  Shared by the GUI preset
+     path, the CLI's setConfig and the batch driver's applyConfig (they were
+     three mergers, two of them one level deep, so `--postprocess vignette`
+     dropped vignette.strength), and mirrored by json_deep_merge in Rust. */
+  function deepMerge(t, s) {
+    for (var k in s) {
+      if (s[k] !== null && typeof s[k] === 'object' && !Array.isArray(s[k])) {
+        if (!t[k] || typeof t[k] !== 'object') t[k] = {};
+        deepMerge(t[k], s[k]);
+      } else { t[k] = s[k]; }
+    }
+    return t;
+  }
+  /* ITER-078 (privacy): keys that are runtime state, not config — today
+     only video.camera (a webcam switch).  Stripped on every inbound path
+     (applyPreset here, setConfig / the batch applyConfig in index.html;
+     Rust strips it for --preset / --set / batch / MCP), belt-and-braces
+     on top of the camera living outside CONFIG.  Copy-on-write: the
+     caller's object is not mutated. */
+  function stripRuntimeOnly(src) {
+    if (!src || typeof src !== 'object' || !src.video || typeof src.video !== 'object'
+        || !Object.prototype.hasOwnProperty.call(src.video, 'camera')) return src;
+    var out = Object.assign({}, src);
+    out.video = Object.assign({}, src.video);
+    delete out.video.camera;
     return out;
   }
   function applyPreset(config, preset) {
-    function deepMerge(t, s) {
-      for (var k in s) {
-        if (s[k] !== null && typeof s[k] === 'object' && !Array.isArray(s[k])) {
-          if (!t[k] || typeof t[k] !== 'object') t[k] = {};
-          deepMerge(t[k], s[k]);
-        } else { t[k] = s[k]; }
-      }
+    if (!preset || typeof preset !== 'object') return;
+    preset = stripRuntimeOnly(preset);
+    /* R7 (ITER-056): $schema / version are preset metadata, not CONFIG.
+       Unknown top-level keys are applied as before (schema policy
+       x-unknown-key-policy: warn — share URLs from other builds must keep
+       loading) but surfaced, so a typo'd key is no longer silent. */
+    var body = {}, unknown = [];
+    for (var k in preset) {
+      if (k === '$schema' || k === 'version') continue;
+      if (!(k in config)) unknown.push(k);
+      body[k] = preset[k];
     }
-    deepMerge(config, preset);
+    deepMerge(config, body);
+    var notes = [];
+    if (unknown.length) notes.push('unknown key' + (unknown.length > 1 ? 's ' : ' ') + unknown.join(', '));
+    if (typeof preset.version === 'number' && preset.version > PRESET_SCHEMA_VERSION) {
+      notes.push('made by a newer preset format (v' + preset.version + ')');
+    }
+    if (notes.length) exportFeedback('Preset: ' + notes.join('; ') + ' — applied as-is.', true);
   }
   function exportJSON(snap, filename) {
     var blob = new Blob([JSON.stringify(snap, null, 2)], { type: 'application/json' });
@@ -201,7 +272,7 @@
   var _sourceLoadGeneration = 0;
   var MAX_SOURCE_BYTES = 64 * 1024 * 1024;
   var WARN_SOURCE_BYTES = 24 * 1024 * 1024;
-  var SUPPORTED_IMAGE_MIME = /^image\/(png|jpe?g|webp|gif|bmp|tiff?|avif)$/i;
+  var SUPPORTED_IMAGE_MIME = /^(image\/(png|jpe?g|webp|gif|bmp|tiff?|avif)|video\/(mp4|quicktime|webm))$/i;  // ITER-077: + video
 
   function beginSourceLoad() { return ++_sourceLoadGeneration; }
   function isCurrentSourceLoad(token) { return token === _sourceLoadGeneration; }
@@ -246,6 +317,8 @@
     return validateSourceMeta({ sizeBytes: file.size || 0, mimeType: file.type || '' }, file.name);
   }
   function discardStaleImage(img) {
+    /* ITER-077: a video source also owns a <video> + decode cache. */
+    try { if (img && img.__ggsVideo && window.GlyphGrid && window.GlyphGrid.video) window.GlyphGrid.video.dispose(img.__ggsVideo); } catch (e) {}
     try { if (img && typeof img.remove === 'function') img.remove(); } catch (e) {}
   }
   function loadImageLatest(source, token, onSuccess, onError) {
@@ -256,6 +329,51 @@
     }, function (err) {
       if (!isCurrentSourceLoad(token)) return;
       if (onError) onError(err);
+    });
+  }
+
+  /* ITER-064 (F18): native sources skip the base64 data URL.  The header
+     probe (probe_image_file) runs validateSourceMetadata on the logical
+     size + frame count so an over-limit GIF is rejected before p5 decodes
+     one ImageData per frame; then the webview streams the file from disk
+     via the asset protocol.  Falls back to an inline data URL when
+     convertFileSrc is unavailable. */
+  function loadNativeImageLatest(path, imageRef, label, token, onSuccess, onError) {
+    var core = window.__TAURI__.core;
+    core.invoke('probe_image_file', { path: path }).then(function (probe) {
+      if (!isCurrentSourceLoad(token)) return null;
+      var isVideo = !!(probe && probe.kind === 'video');
+      if (probe && probe.probed && imageRef && typeof imageRef.validate === 'function') {
+        var checked = imageRef.validate({
+          width: probe.width, height: probe.height,
+          numFrames: function () { return probe.frames; },
+        }, { sizeBytes: probe.sizeBytes || 0, video: isVideo });
+        if (checked && !checked.ok) {
+          exportFeedback((isVideo ? 'Video' : 'Image') + ' rejected: ' + label + ' — ' + checked.reason + '.', true);
+          return null;
+        }
+      }
+      /* ITER-077 (R4): a clip becomes a video FrameSource (index.html
+         openVideoSource: Rust openh264 for H.264, else a hidden <video>). */
+      if (isVideo) {
+        if (typeof window.__ggsOpenVideo !== 'function') throw new Error('video sources need the studio page');
+        exportFeedback('Opening video ' + label + '…');
+        return window.__ggsOpenVideo(path, probe).then(function (g) {
+          if (!isCurrentSourceLoad(token)) { discardStaleImage(g); return null; }
+          onSuccess(g);
+          return null;
+        });
+      }
+      if (typeof core.convertFileSrc === 'function') return core.convertFileSrc(path);
+      return core.invoke('read_image_file', { path: path, inline: true }).then(function (r) {
+        return sourcePayload(r).dataUrl || null;
+      });
+    }).then(function (url) {
+      if (url) loadImageLatest(url, token, onSuccess, onError);
+    }, function (err) {
+      if (!isCurrentSourceLoad(token)) return;
+      if (onError) onError(err);
+      else exportFeedback('Could not read ' + label + '.', true);
     });
   }
 
@@ -294,7 +412,21 @@
       overlay.style.borderColor = 'transparent';
       overlay.style.pointerEvents = 'none';
       var file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-      if (!file || !validateBrowserFile(file)) return;
+      if (!file) return;
+      /* ITER-078: a clip is never handed to p5 loadImage.  It needs the
+         Tauri video path (probe → Rust / <video> decoder), which works
+         from a file path — the native drop event gives one; a DOM File
+         only does when the webview exposes `file.path`. */
+      if (/^video\//.test(file.type || '') || (window.GlyphGrid && window.GlyphGrid.video && window.GlyphGrid.video.isVideoPath(file.name))) {
+        if (typeof file.path === 'string' && file.path && window.__TAURI__ && window.__TAURI__.core) {
+          loadFromFilePath(file.path);
+        } else {
+          exportFeedback('Video files cannot be dropped here: open ' + (file.name || 'the clip') +
+            ' with "Pick image…" (or drop it on the app window) so it decodes as a video.', true);
+        }
+        return;
+      }
+      if (!validateBrowserFile(file)) return;
       var token = beginSourceLoad();
       var url = URL.createObjectURL(file);
       loadImageLatest(url, token, function (img) {
@@ -349,8 +481,8 @@
         .then(function (result) {
           if (!isCurrentSourceLoad(token)) return;
           var meta = sourcePayload(result);
-          if (!validateSourceMeta(meta, basename(absPath)) || !meta.dataUrl) return;
-          loadImageLatest(meta.dataUrl, token, function (img) {
+          if (!validateSourceMeta(meta, basename(absPath))) return;
+          loadNativeImageLatest(absPath, imageRef, basename(absPath), token, function (img) {
             if (imageRef.set(img, { sizeBytes: meta.sizeBytes || 0 }) === false) {
               discardStaleImage(img);
               return;
@@ -368,7 +500,9 @@
             } catch (e) {}
           }, function (err) {
             console.warn('glyph-studio: image decode failed', err);
-            try { exportFeedback('Not a readable image: ' + String(absPath).split('/').pop(), true); } catch (e) {}
+            /* ITER-078: Tauri rejects with a plain string (e.g. a video
+               whose header disagrees with its SPS) — show it too. */
+            try { exportFeedback('Not a readable image: ' + String(absPath).split('/').pop() + (err ? ' — ' + ((err && err.message) || err) : ''), true); } catch (e) {}
           });
         })
         .catch(function (e) {
@@ -726,7 +860,7 @@
     monitorCapture(testHook, frameTotal, onProgress, job);
   }
 
-  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border, job, destinationPath, staged) {
+  function recordMP4(testHook, total, onProgress, onDone, fps, capWidth, border, job, destinationPath, staged, mp4Quality) {
     if (!testHook) return;
     var inTauri = !!_tauriInvoke;
     var frameTotal = total || 24;
@@ -778,6 +912,8 @@
           path: destinationPath || undefined,
           capWidth: (typeof capWidth === 'number' && capWidth > 0) ? capWidth : null,
           border: (border && border.enabled) ? border : null,
+          // ITER-070: the panel's rate-control pick; Rust defaults to upload.
+          mp4Quality: mp4Quality === 'archive' ? 'archive' : 'upload',
         }).then(function (path) {
           if (job && !isActiveExportJob(job)) return;
           if (path) console.log('glyph-studio: saved MP4 to', path);
@@ -859,7 +995,7 @@
     }
     return false;
   }
-  function pickImageNative(loadIntoP5) {
+  function pickImageNative(loadIntoP5, imageRef) {
     if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
       var token = beginSourceLoad();
       /* Use the path-aware variant so we can record the load in
@@ -869,13 +1005,13 @@
         .then(function (result) {
           if (!isCurrentSourceLoad(token)) return;
           var meta = sourcePayload(result);
-          if (meta.dataUrl && validateSourceMeta(meta, basename(result && result.path))) {
-            loadImageLatest(meta.dataUrl, token, function (img) {
+          if (result && result.path && validateSourceMeta(meta, basename(result.path))) {
+            loadNativeImageLatest(result.path, imageRef, basename(result.path), token, function (img) {
               if (loadIntoP5(img, meta) !== false) {
                 try { addRecentSource(result.path); } catch (e) {}
               }
-            }, function () {
-              exportFeedback('Could not decode ' + basename(result && result.path) + '.', true);
+            }, function (err) {
+              exportFeedback('Could not decode ' + basename(result && result.path) + ((err && err.message) ? ' — ' + err.message : '.'), true);
             });
           }
         })
@@ -1311,7 +1447,7 @@
         } catch (e) {}
         return true;
       };
-      if (pickImageNative(swap)) return;
+      if (pickImageNative(swap, opts.imageRef)) return;
       var inp = document.createElement('input');
       inp.type = 'file'; inp.accept = 'image/*';
       inp.onchange = function () {
@@ -1364,8 +1500,8 @@
         .then(function (result) {
           if (!isCurrentSourceLoad(token)) return;
           var meta = sourcePayload(result);
-          if (!meta.dataUrl || !validateSourceMeta(meta, basename(result && result.path))) return;
-          loadImageLatest(meta.dataUrl, token, function (img) {
+          if (!(result && result.path) || !validateSourceMeta(meta, basename(result.path))) return;
+          loadNativeImageLatest(result.path, opts.imageRef, basename(result.path), token, function (img) {
             if (opts.imageRef && opts.imageRef.set && opts.imageRef.set(img, {
               sizeBytes: meta.sizeBytes || 0,
             }) === false) {
@@ -1432,8 +1568,8 @@
           .then(function (result) {
             if (!isCurrentSourceLoad(token)) return;
             var meta = sourcePayload(result);
-            if (!meta.dataUrl || !validateSourceMeta(meta, basename(e.value))) return;
-            loadImageLatest(meta.dataUrl, token, function (img) {
+            if (!validateSourceMeta(meta, basename(e.value))) return;
+            loadNativeImageLatest(e.value, opts.imageRef, basename(e.value), token, function (img) {
               if (opts.imageRef && opts.imageRef.set && opts.imageRef.set(img, {
                 sizeBytes: meta.sizeBytes || 0,
               }) === false) {
@@ -1490,13 +1626,7 @@
     if (!config.font) config.font = { family: 'monospace', size: 8 };
     tip(addStructuralInput(fGrid, config.font, 'size', { min: 3, max: 14, step: 1 }, {
       onCommit: function () {
-        if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
-          window.GlyphGrid.fonts.load({
-            sizePx: config.font.size,
-            glyphSet: config.glyphSet || 'ascii',
-            trustRequested: !!config.glyphSet,
-          });
-        }
+        swapFont(config);
       },
     }),
         'Glyph pixel size. Tune until characters bleed into neighbours and the grid pattern dissolves.');
@@ -1550,7 +1680,7 @@
           bayer8: 'bayer8',
           blueNoise: 'blueNoise',
           temporal: 'temporal',
-          stbn: 'stbn (smooth temporal blue noise)',
+          'stbn (smooth temporal blue noise)': 'stbn',
           floydSteinberg: 'floydSteinberg',
           atkinson: 'atkinson',
           jarvisJudiceNinke: 'jarvisJudiceNinke',
@@ -1582,7 +1712,7 @@
       options: {
         brightness: 'brightness', shape: 'shape',
         'shape-edge-aware': 'shape-edge-aware', 'edge-directional': 'edge-directional',
-        flow: 'flow (ETF)',
+        'flow (ETF)': 'flow',
       },
     }), 'How glyphs are picked per cell. `brightness` = fast ramp lookup. `shape-edge-aware` = best aesthetic, ~4× slower. `flow` = strokes follow the image contours (structure-tensor ETF).');
     /* Flow (ETF) tuning — v0.1.6. */
@@ -1602,13 +1732,7 @@
       fromTarget: function (value) { return value || 'null'; },
       toTarget: function (value) { return value === 'null' ? null : value; },
       onCommit: function () {
-        if (window.GlyphGrid && window.GlyphGrid.fonts && window.GlyphGrid.fonts.load) {
-          window.GlyphGrid.fonts.load({
-            sizePx: config.font.size,
-            glyphSet: config.glyphSet || 'ascii',
-            trustRequested: !!config.glyphSet,
-          });
-        }
+        swapFont(config);
       },
     });
     tip(_gsBinding, 'Atlas used by shape modes. `octant` (Unicode 16) gives the densest texture; `ascii` is widely compatible.');
@@ -1717,6 +1841,152 @@
         'Anti-flicker: a cell only swaps characters when its brightness clearly crosses into another bucket. Kills shimmer in animated exports; breathing alpha is unaffected.');
     tip(fAnim.addInput(config.temporalStability, 'strength', { min: 0, max: 2, step: 0.05 }),
         'Hysteresis width. Higher = steadier glyphs, slower to react to real changes.');
+
+    /* Timeline (ITER-075, R2) — keyframe tracks on CONFIG paths, evaluated
+       per frame into a shadow config (index.html draw()), so the sliders
+       above keep showing base values.  Tracks come from presets, the CLI
+       (`--timeline`), batch manifests and MCP; v1 UI is enable + a u scrub
+       that pauses the loop, no canvas timeline yet. */
+    if (!config.timeline) config.timeline = { enabled: false, tracks: {} };
+    if (!config.timeline.tracks) config.timeline.tracks = {};
+    var fTl = pane.addFolder({ title: 'Timeline', expanded: false });
+    tip(fTl.addInput(config.timeline, 'enabled'),
+        'Play the keyframe tracks loaded from a preset or the CLI. Off = the panel values render as-is.');
+    var tlState = {
+      u: 0,
+      get tracks() {
+        var t = config.timeline.tracks || {};
+        var ks = Object.keys(t);
+        return ks.length ? ks.map(function (k) {
+          return k + ' (' + ((t[k] && t[k].length) || 0) + ')';
+        }).join(', ') : 'none';
+      },
+    };
+    fTl.addMonitor(tlState, 'tracks', { label: 'tracks', interval: 1000 });
+    var tlScrub = fTl.addInput(tlState, 'u', { min: 0, max: 1, step: 0.001, label: 'scrub u' });
+    tlScrub.on('change', function (e) {
+      if (window.__timelineScrub) window.__timelineScrub(e.value);
+    });
+    tip(tlScrub, 'Preview the timeline at this loop position (0 = start, 1 = end). Pauses playback until Resume.');
+    fTl.addButton({ title: 'Resume loop' }).on('click', function () {
+      if (window.__timelineScrub) window.__timelineScrub(null);
+    });
+
+    /* Text (ITER-076, R3) — kinetic typography as the source.  The raster
+       is built in index.html (syncTextSource / the 'text' FrameSource);
+       this folder edits CONFIG.textSource.  The textarea edits line 1 (rows
+       split on newlines); Import SRT/LRC replaces the lines with timed cues.
+       Font list: the bundled faces + the system fonts that are really there
+       (document.fonts.check, then a width test against two generic
+       fallbacks — check() alone answers true for a family it has no face
+       for). */
+    var TXT = window.GlyphGrid && window.GlyphGrid.text;
+    if (TXT && config.textSource) {
+      var ts = config.textSource;
+      if (!Array.isArray(ts.lines)) ts.lines = [];
+      var kickText = function () { if (window.__textSourceKick) window.__textSourceKick(); };
+      var fText = pane.addFolder({ title: 'Text', expanded: false });
+      fText.on('change', kickText);
+      tip(fText.addInput(ts, 'enabled', { label: 'text source' }),
+          'Render the text below as the source (instead of, or composited onto, the image).');
+      var area = document.createElement('textarea');
+      area.rows = 3;
+      area.placeholder = 'Type a title… (new line = new row)';
+      area.setAttribute('aria-label', 'Text source, line 1');
+      area.style.cssText = 'box-sizing:border-box;width:calc(100% - 8px);margin:4px;resize:vertical;'
+        + 'font:12px ui-monospace,Menlo,monospace;background:var(--tp-input-background-color,#222);'
+        + 'color:var(--tp-input-foreground-color,#ddd);border:1px solid rgba(127,127,127,.45);border-radius:2px;';
+      area.value = (ts.lines[0] && ts.lines[0].text) || '';
+      area.addEventListener('input', function () {
+        if (!ts.lines.length) ts.lines.push({ text: '', start: 0 });
+        ts.lines[0].text = area.value;
+        if (area.value && !ts.enabled) { ts.enabled = true; pane.refresh(); }
+        kickText();
+      });
+      var fTextBody = fText.element && fText.element.querySelector('.tp-fldv_c');
+      if (fTextBody) fTextBody.appendChild(area);
+      var txtState = {
+        get cues() { return ts.lines.length + (ts.lines.length === 1 ? ' line' : ' lines'); },
+      };
+      fText.addMonitor(txtState, 'cues', { label: 'lines', interval: 1000 });
+      var fontOpts = {};
+      var fontAvailable = function (f) {
+        try {
+          if (document.fonts && !document.fonts.check('12px "' + f + '"')) return false;
+          var c = document.createElement('canvas').getContext('2d');
+          c.font = '24px "' + f + '", monospace';
+          var a = c.measureText('mmmmmmmmmmlli1WQ').width;
+          c.font = '24px "' + f + '", serif';
+          return a === c.measureText('mmmmmmmmmmlli1WQ').width;
+        } catch (e) { return false; }
+      };
+      TXT.BUNDLED_FONTS.forEach(function (f) { fontOpts[f + ' (bundled)'] = f; });
+      TXT.SYSTEM_FONTS.forEach(function (f) { if (fontAvailable(f)) fontOpts[f] = f; });
+      if (ts.font && Object.keys(fontOpts).map(function (k) { return fontOpts[k]; }).indexOf(ts.font) < 0) fontOpts[ts.font] = ts.font;
+      tip(fText.addInput(ts, 'font', { options: fontOpts }),
+          'Bundled faces render the same on every machine; system fonts depend on what is installed.');
+      tip(fText.addInput(ts, 'size', { min: 8, max: 400, step: 1 }),
+          'Font size in px at the text canvas height (' + ts.h + ' px). The status bar warns when stems get thinner than one glyph cell.');
+      fText.addInput(ts, 'weight', { options: { regular: 400, bold: 700, black: 900 } });
+      fText.addInput(ts, 'align', { options: { left: 'left', center: 'center', right: 'right' } });
+      fText.addInput(ts, 'x', { min: 0, max: 1, step: 0.01 });
+      fText.addInput(ts, 'y', { min: 0, max: 1, step: 0.01 });
+      var animOpts = {};
+      TXT.ANIMS.forEach(function (a) { animOpts[a] = a; });
+      tip(fText.addInput(ts, 'anim', { options: animOpts }),
+          'How each line enters (and leaves, when it has an end time): typewriter, rise, fade, scale.');
+      fText.addInput(ts, 'easeIn', { min: 0, max: 5, step: 0.05, label: 'in (s)' });
+      fText.addInput(ts, 'easeOut', { min: 0, max: 5, step: 0.05, label: 'out (s)' });
+      fText.addInput(ts, 'fg', { label: 'text colour' });
+      fText.addInput(ts, 'bg', { label: 'background' });
+      var blendOpts = {};
+      TXT.BLENDS.forEach(function (b) { blendOpts[b] = b; });
+      tip(fText.addInput(ts, 'blend', { options: blendOpts }),
+          'With an image loaded: replace = text only; multiply darkens the image with the letters; screen lightens; mask shows the image only inside the letters.');
+      fText.addButton({ title: 'Import SRT/LRC…' }).on('click', function () {
+        var inp = document.createElement('input');
+        inp.type = 'file'; inp.accept = '.srt,.lrc,text/plain';
+        inp.onchange = function () {
+          var f = inp.files && inp.files[0];
+          if (!f) return;
+          f.text().then(function (body) {
+            var n = window.__textSourceImport(body, f.name, { replace: true });
+            area.value = (ts.lines[0] && ts.lines[0].text) || '';
+            if (opts.__refreshPane) opts.__refreshPane(); else pane.refresh();
+            exportFeedback('Imported ' + n + ' cues from ' + f.name + '; loop set to the last cue.', false);
+          }).catch(function (e) {
+            exportFeedback('Could not import ' + f.name + ': ' + ((e && e.message) || e), true);
+          });
+        };
+        inp.click();
+      });
+      fText.addButton({ title: 'Clear lines' }).on('click', function () {
+        ts.lines = [];
+        area.value = '';
+        kickText();
+      });
+    }
+
+    /* Video (ITER-077, R4).  Clips load like images (Pick image… or
+       drag-drop an mp4 / mov / m4v / webm).  decode picks the decoder for
+       the NEXT clip opened; camera swaps the webcam in as the source while
+       it is on (experimental — needs the macOS camera permission).
+       ITER-078: camera binds the runtime-only opts.cameraState, never
+       config — a loaded preset cannot flip it. */
+    if (window.GlyphGrid && window.GlyphGrid.video && config.video) {
+      var fVideo = pane.addFolder({ title: 'Video', expanded: false });
+      var kickCam = function () { if (window.__videoCameraKick) window.__videoCameraKick(); };
+      var vOpts = {};
+      window.GlyphGrid.video.DECODERS.forEach(function (d) { vOpts[d] = d; });
+      tip(fVideo.addInput(config.video, 'decode', { options: vOpts }),
+          'auto: H.264 MP4/MOV decode frame-exactly in Rust (openh264); other codecs (HEVC, WebM) use the WebView. native: Rust only. webview: always the WebView seek path. Applies to the next clip you open.');
+      if (opts.cameraState) {
+        tip(fVideo.addInput(opts.cameraState, 'camera', { label: 'camera (beta)' }).on('change', kickCam),
+            'Use the webcam as the source (GUI only, experimental). Turning it off restores the previous source. Live camera exports are not frame-reproducible. Never saved in presets.');
+      }
+      tip(fVideo.addInput(config.video, 'mirror').on('change', kickCam),
+          'Mirror the camera image horizontally (selfie view).');
+    }
 
     /* Perf — Phase 0 instrumentation. Live rolling averages of per-stage
        frame time + last switch latency. Click "Report (console)" to
@@ -1858,8 +2128,8 @@
     /* ── Vector + plain-text export (v0.1.6, SOTA feature 2) ─────────
        The grid IS typeset characters — export it in its native forms:
        SVG (infinite-resolution vector for print/posters/plotters) and
-       plain text.  Brightness selection mode only (shape/edge picks
-       aren't persisted per-cell); the hook returns null otherwise. */
+       plain text.  Every selection mode: the hook reads the GlyphFrame IR
+       the drawers fill (ITER-073); null only before a frame is painted. */
     function xmlEsc(ch) {
       if (ch === '&') return '&amp;';
       if (ch === '<') return '&lt;';
@@ -1905,7 +2175,7 @@
       var snap = opts.testHook && opts.testHook.captureGridSnapshot
         ? opts.testHook.captureGridSnapshot() : null;
       if (!snap) {
-        exportFeedback('Vector/text export needs selectionMode "brightness" and a loaded image.', true);
+        exportFeedback('Vector/text export needs a loaded image and a rendered frame.', true);
         return;
       }
       var body = kind === 'svg' ? buildSvg(snap) : buildTxt(snap);
@@ -1917,7 +2187,10 @@
         }).then(function (path) {
           if (path) exportFeedback('Saved ' + kind.toUpperCase() + ' → ' + path);
         }).catch(function (e) {
-          if (e !== 'cancelled') exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
+          /* ITER-078: a cancelled dialog still settles through
+             exportFeedback so the status-bar hold is released (as GIF). */
+          if (String(e) === 'cancelled') exportFeedback('');
+          else exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
         });
       } else {
         var blob = new Blob([body], { type: kind === 'svg' ? 'image/svg+xml' : 'text/plain' });
@@ -1925,11 +2198,107 @@
       }
     }
     var btnSvg = fExp.addButton({ title: 'Export SVG (vector)' });
-    tip(btnSvg, 'Infinite-resolution vector export — every glyph is real text. Perfect for print, posters, laser engraving. Brightness selection mode only.');
+    tip(btnSvg, 'Infinite-resolution vector export — every glyph is real text. Perfect for print, posters, laser engraving. Works in every selection mode.');
     btnSvg.on('click', function () { exportGridAs('svg'); });
     var btnTxt = fExp.addButton({ title: 'Export TXT (plain text)' });
-    tip(btnTxt, 'The grid as actual text — paste into a terminal, README, or anywhere monospace lives. Brightness selection mode only.');
+    tip(btnTxt, 'The grid as actual text — paste into a terminal, README, or anywhere monospace lives. Works in every selection mode.');
     btnTxt.on('click', function () { exportGridAs('txt'); });
+    /* ── Terminal-native export (ITER-074, research R2) ──────────────
+       ANSI = the live frame as 24-bit colour escapes (`cat` it).  .cast and
+       HTML record the export plan's frames (Animation › duration x fps) as
+       GlyphFrame IR copies — no pixels — and build an asciinema v2 file or a
+       single-file HTML player (bundled font inlined, reduced-motion aware).
+       Same writers as the CLI `--format ansi|cast|html`. */
+    function saveTextExport(kind, body, base) {
+      var ext = kind === 'ansi' ? 'ans' : kind;
+      var name = base + '.' + ext;
+      if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+        var b64 = bytesToBase64(new TextEncoder().encode(body));
+        return window.__TAURI__.core.invoke('save_blob', {
+          bytesB64: b64, suggestedName: name, extension: ext,
+        }).then(function (path) {
+          if (path) exportFeedback('Saved ' + kind.toUpperCase() + ' → ' + path);
+        }).catch(function (e) {
+          /* ITER-078: a cancelled dialog still settles through
+             exportFeedback so the status-bar hold is released (as GIF). */
+          if (String(e) === 'cancelled') exportFeedback('');
+          else exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true);
+        });
+      }
+      saveBlobBrowser(new Blob([body], { type: kind === 'html' ? 'text/html' : 'text/plain' }), name);
+      return Promise.resolve();
+    }
+    function textCompatNote(kind) {
+      var issues = (window.GlyphGrid && GlyphGrid.compat)
+        ? GlyphGrid.compat.validate(config, { format: kind }) : [];
+      for (var i = 0; i < issues.length; i++) {
+        if (issues[i].code === 'CR-8') return ' — ' + issues[i].message;
+      }
+      return '';
+    }
+    function exportTextFormat(kind) {
+      var hook = opts.testHook;
+      var TEXT = window.GlyphGrid && GlyphGrid.textExport;
+      if (!hook || !TEXT || !hook.captureTextSnapshot) {
+        exportFeedback('Text export is unavailable; reload the application and try again.', true);
+        return;
+      }
+      if (!hasSource()) { exportFeedback('Load an image before exporting.', true); return; }
+      var base = 'glyph-grid_' + config.palette + '_' + config.grid.cols + 'x' + config.grid.rows;
+      var note = textCompatNote(kind);
+      if (kind === 'ansi') {
+        var snap = hook.captureTextSnapshot();
+        if (!snap) { exportFeedback('ANSI export needs a rendered frame.', true); return; }
+        saveTextExport(kind, TEXT.build('ansi', [snap]), base).then(function () {
+          if (note) exportFeedback('Saved ANSI' + note, true);
+        });
+        return;
+      }
+      if (hook.getRecState && hook.getRecState()) {
+        exportFeedback('Another export is running. Cancel it before starting a new one.', true);
+        return;
+      }
+      var p = exportPlan();
+      if (p.frames > 600) {
+        exportFeedback('Export plan is too large (' + p.frames + ' frames). Shorten the duration or lower FPS.', true);
+        return;
+      }
+      var snaps = [];
+      var savedFps = config.animation.fps;
+      config.animation.fps = p.effFps;    // same clean-loop rule as GIF export
+      function restore() { config.animation.fps = savedFps; try { pane.refresh(); } catch (e) {} }
+      try {
+        hook.beginRecord({
+          total: p.frames,
+          collectFrames: false, collectZip: false,
+          rawFrames: true, captureIr: true, irOnly: true,
+          onFrame: function (frame) { snaps[frame.index] = frame.ir; },
+          onError: function (error) { restore(); exportFeedback(kind.toUpperCase() + ' capture failed: ' + error, true); },
+          onFinish: function () {
+            restore();
+            (kind === 'html' && hook.getInlineFontBase64 ? hook.getInlineFontBase64() : Promise.resolve(null))
+              .then(function (fontBase64) {
+                var body = TEXT.build(kind, snaps, { fps: p.effFps, fontBase64: fontBase64, title: base });
+                return saveTextExport(kind, body, base);
+              }).then(function () {
+                if (note) exportFeedback('Saved ' + kind.toUpperCase() + note, true);
+              }).catch(function (e) { exportFeedback(kind.toUpperCase() + ' export failed: ' + e, true); });
+          },
+        });
+      } catch (e) {
+        restore();
+        exportFeedback('Could not start ' + kind.toUpperCase() + ' export: ' + e, true);
+      }
+    }
+    var btnAnsi = fExp.addButton({ title: 'Export ANSI (terminal)' });
+    tip(btnAnsi, 'The current frame as 24-bit colour terminal text — `cat` it in any truecolor terminal. Octant/sextant sets need a terminal font that has them.');
+    btnAnsi.on('click', function () { exportTextFormat('ansi'); });
+    var btnCast = fExp.addButton({ title: 'Export .cast (asciinema)' });
+    tip(btnCast, 'The animation as an asciinema v2 recording — plays in any terminal (`asciinema play`) or on asciinema.org. Uses the export duration and fps.');
+    btnCast.on('click', function () { exportTextFormat('cast'); });
+    var btnHtml = fExp.addButton({ title: 'Export HTML (single file)' });
+    tip(btnHtml, 'A self-contained web page: every cell is a real character, the font is inlined, Play/Step controls; no autoplay under reduced motion.');
+    btnHtml.on('click', function () { exportTextFormat('html'); });
     /* Compute the frame count + per-frame delay we'll actually pass to
        the GIF encoder.  The GIF format stores delays in centiseconds
        (10 ms units), so e.g. 30 fps wants 33.33 ms but the encoder
@@ -1998,6 +2367,14 @@
       label: 'output size',
       options: { 'full (no cap)': 0, '720px (Twitter)': 720, '480px (small)': 480 },
     }), 'Cap output width before encoding. Smaller = smaller file, no quality loss for mobile viewing.');
+    /* ITER-070: MP4 rate control (ITER-050).  `upload` = ~5 Mbps bitrate
+       target (a few MB per loop); `archive` = fixed QP, near-lossless,
+       ~30-60 Mbps.  Same two values as the CLI --mp4-quality flag. */
+    sizeOpts.mp4Quality = 'upload';
+    tip(fExp.addInput(sizeOpts, 'mp4Quality', {
+      label: 'mp4 quality',
+      options: { 'upload (small)': 'upload', 'archive (near-lossless)': 'archive' },
+    }), 'MP4 only. Upload keeps files small for social posts; archive keeps near-lossless detail at a much larger size.');
 
     /* Bordered export — palette-aware matte added to the encoded frame.
        Frames out at (w + 2*borderWidth) × (h + 2*borderWidth), rounded to
@@ -2063,10 +2440,11 @@
          exportRun('mp4',  720)  — mobile-fit MP4
        `capOverride === null` means "honour the panel dropdown".
        `capOverride > 0` means "force this exact capWidth, ignore dropdown".
-       `targetMaxBytes` (ITER-026): when > 0, the Rust encoder retries
-       smaller caps (600→540→480→420→360) until output ≤ N. Used by the
-       Twitter-fit button to target 15 MB; Rust returns an error when even
-       the smallest configured attempt cannot meet that target. */
+       `targetMaxBytes` (ITER-026): when > 0, the Rust encoder retries at a
+       width predicted from the first pass (plus at most one correction,
+       floor 360 px; ITER-051) until output ≤ N. Used by the Twitter-fit
+       button to target 15 MB; Rust returns an error when even the
+       narrowest attempt cannot meet that target. */
     function exportRun(format, capOverride, targetMaxBytes) {
       /* BUG-010 (v0.1.8): block GIF/MP4 export before any image is loaded.
          draw() early-returns in the empty state, so the recorder would
@@ -2120,7 +2498,7 @@
             var encFps = Math.round(p.effFps);
             console.log('glyph-studio: recording MP4', p.frames, 'frames @', encFps, 'fps =', p.dur.toFixed(2), 's' + (capW > 0 ? ' (capped at ' + capW + 'px wide)' : '') + '; studio fps ' + savedFps + ' → ' + p.effFps.toFixed(2));
             recordMP4(opts.testHook, p.frames, onProgress, onDone, encFps,
-              capW > 0 ? capW : null, border, job, destinationPath, staged);
+              capW > 0 ? capW : null, border, job, destinationPath, staged, sizeOpts.mp4Quality);
           } else {
             var fitNote = (targetMaxBytes > 0)
               ? ' (twitter-fit ' + (targetMaxBytes / 1024 / 1024).toFixed(0) + ' MB target; auto-shrinks if needed)'
@@ -2292,6 +2670,10 @@
     init: init,
     snapshotConfig: snapshotConfig,
     applyPreset: applyPreset,
+    deepMerge: deepMerge,
+    stripRuntimeOnly: stripRuntimeOnly,
+    presetSchemaId: PRESET_SCHEMA_ID,
+    presetSchemaVersion: PRESET_SCHEMA_VERSION,
     listPresets: listPresets,
     savePreset: savePreset,
     loadPreset: loadPreset,

@@ -132,9 +132,29 @@
   }
 
   /* Validators — called at setup() to fail loudly on known bad combos.
-     Each returns an array of { level: 'warn' | 'error', code, message }. */
-  function validate(config) {
+     Each returns an array of { level: 'warn' | 'error', code, message }.
+     ctx (optional) = { format } — the output format of the export being
+     validated (ITER-074: terminal export). */
+  function validate(config, ctx) {
     const issues = [];
+    /* CR-8 (ITER-074): ANSI / .cast output is displayed by the reader's
+       terminal font, and no OS ships one with Unicode 16 octants
+       (U+1CD00-1CDE5) — sextants (U+1FB00) are patchy too.  The bytes are
+       right; most terminals show tofu.  Warn instead of rewriting the set
+       (TXT keeps the codepoints for tools; HTML inlines a font that has
+       them).  Checked before the v1 early-out; it only fires on a glyphSet. */
+    const fmt = ctx && ctx.format;
+    const gs = config && config.glyphSet;
+    if ((fmt === 'ansi' || fmt === 'cast') && (gs === 'octant' || gs === 'sextant')) {
+      issues.push({
+        level: 'warn',
+        code: 'CR-8',
+        message: 'glyphSet "' + gs + '" needs a terminal font with Unicode ' +
+                 (gs === 'octant' ? '16 octants (U+1CD00-1CDE5)' : '13 sextants (U+1FB00-1FB3B)') +
+                 '; most terminals will show tofu in ' + fmt.toUpperCase() + ' output. ' +
+                 'Use glyphSet "blockElements" or "ascii", or export html (font inlined).',
+      });
+    }
     if (isV1(config)) return issues;
 
     const mode = resolveSelectionMode(config);

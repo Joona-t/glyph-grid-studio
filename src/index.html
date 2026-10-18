@@ -64,15 +64,18 @@
 <body aria-label="glyph-grid render canvas">
   <div id="status" role="status" aria-live="polite"></div>
 
-  <!-- p5.js core (unchanged from v1). -->
-  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
+  <!-- p5.js core (unchanged from v1).  ITER-063: all four third-party libs are
+       vendored, pinned and sha256-checked in vendor/ (see vendor/README.md) —
+       the app and the headless CLI never touch the network to boot. -->
+  <script src="vendor/p5-1.11.2/p5.min.js"></script>
   <!-- JSZip stays as the legacy-fallback recorder; new streaming recorder
        prefers File System Access API, then fflate. -->
-  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+  <script src="vendor/jszip-3.10.1/jszip.min.js"></script>
+  <script src="vendor/fflate-0.8.2/index.js"></script>
 
   <!-- glyph-grid skill libs (v2). All IIFEs that attach to window.GlyphGrid. -->
   <script src="lib/glyph-compat.js"></script>
+  <script src="lib/glyph-text-export.js"></script>
   <script src="lib/glyph-fonts.js"></script>
   <script src="lib/glyph-record.js"></script>
   <script src="lib/glyph-dither.js"></script>
@@ -80,6 +83,9 @@
   <script src="lib/glyph-edge.js"></script>
   <script src="lib/glyph-xdog.js"></script>
   <script src="lib/glyph-palette-morph.js"></script>
+  <script src="lib/glyph-timeline.js"></script>
+  <script src="lib/glyph-text-source.js"></script>
+  <script src="lib/glyph-video-source.js"></script>
   <script src="lib/glyph-crt.js"></script>
   <!-- Wave 1 runtime (load AFTER all primitive libs; order-sensitive). -->
   <script src="lib/glyph-runtime.js"></script>
@@ -98,8 +104,10 @@
        output.webgl-canvas + perf instrumentation, source.pointer/keyboard,
        output.audio-synth. -->
   <script src="lib/glyph-wave6.js"></script>
+  <!-- v0.2 Phase 4 (F8): WebGL2 port of the studio source preprocess. -->
+  <script src="lib/glyph-preprocess-gl.js"></script>
   <!-- Tweakpane v3 (UMD) — used by lib/glyph-studio.js when CONFIG.studio.enabled = true. -->
-  <script src="https://cdn.jsdelivr.net/npm/tweakpane@3.1.10/dist/tweakpane.min.js"></script>
+  <script src="vendor/tweakpane-3.1.10/tweakpane.min.js"></script>
   <script src="lib/glyph-studio.js"></script>
 
   <script>
@@ -129,14 +137,19 @@
        - CONFIG.renderer — "cpu" (default) | "gpu".
        - CONFIG.zones — scene-contract v2 zone-variable pipeline.
        - CONFIG.paletteMorph — OKLab interpolation across palettes over time.
+       - CONFIG.timeline — keyframe tracks on any CONFIG path (lib/glyph-timeline.js).
+       - CONFIG.textSource — kinetic type / SRT / LRC as the source (lib/glyph-text-source.js).
        - CONFIG.recording — streaming output via File System Access API.
      ================================================================= */
 
   /* =================================================================
      CONFIG — defaults preserve v1 behavior. New v2 fields default to
      inactive (all gates return false).
+     ITER-075: `let`, not `const` — while a timeline is active draw() points
+     CONFIG at a per-frame shadow (see draw()) and back at CONFIG_BASE, the
+     object Tweakpane, presets and every setter hold.
      ================================================================= */
-  const CONFIG = {
+  let CONFIG = {
     /* --- v2 gate (single switch) --- */
     compat: 'v2',
 
@@ -264,6 +277,29 @@
     depth: { enabled: false },
 
     paletteMorph: null,
+    /* ITER-075 (R2): keyframe tracks keyed by dotted CONFIG path, evaluated
+       per frame into a shadow config.  tracks: { '<path>': [{u, v, ease}] },
+       u in [0,1] of animation.duration; ease linear | inOutSine | step. */
+    timeline: { enabled: false, tracks: {} },
+    /* ITER-076 (R3): text rendered per frame as the source raster (or
+       composited onto the loaded image when blend != replace).  Block-level
+       font..easeOut are defaults for lines that omit them; line times are
+       seconds, end null = until the loop ends.  See lib/glyph-text-source.js. */
+    textSource: {
+      enabled: false, w: 1024, h: 512, bg: '#000000', fg: '#ffffff', blend: 'replace',
+      font: 'Cascadia Mono', size: 160, weight: 700, align: 'center', x: 0.5, y: 0.5,
+      anim: 'none', easeIn: 0.3, easeOut: 0.2,
+      lines: [],
+    },
+    /* ITER-077 (R4): video sources (mp4 / mov / m4v / webm via --in, the
+       picker or drag-drop; see lib/glyph-video-source.js).  decode: auto =
+       H.264 MP4/MOV through the Rust openh264 decoder (frame-exact), other
+       codecs through a hidden <video>; native = Rust only (a non-H.264
+       clip is an error); webview = always the <video> seek path.  mirror:
+       the camera image.  ITER-078: the camera switch itself is NOT config —
+       it lives in the runtime-only CAMERA below, so no preset / batch /
+       MCP config / --set can turn a webcam on. */
+    video: { decode: 'auto', mirror: true },
     /* v0.1.6: anti-flicker Schmitt trigger on ramp index (off = legacy). */
     temporalStability: { enabled: false, strength: 0.75 },
     /* v0.1.6: ETF flow mode tuning (selectionMode: 'flow'). */
@@ -297,6 +333,11 @@
          keep render cost predictable. Set false to keep canvas at the
          CONFIG.canvas dimensions regardless of source aspect. */
       fitCanvasToImage: true,
+      /* v0.2 Phase 4 (F8): run the per-frame source preprocess of ANIMATED
+         sources as three WebGL2 fragment passes (lib/glyph-preprocess-gl.js)
+         instead of ~10 JS loops. Stills keep the JS path (it runs once and
+         is cached). Falls back to JS when WebGL2 is unavailable. */
+      gpuPreprocess: true,
       breathing: {
         emaAlpha:  0.35,
         gainSwing: 0.30,
@@ -305,6 +346,7 @@
       },
     },
   };
+  const CONFIG_BASE = CONFIG;
 
   /* =================================================================
      RAMPS — v1 legacy density strings. v2's glyphSet supersedes this
@@ -635,6 +677,61 @@
           buf.pixelDensity(1);
           buf.clear();
           buf.image(sourceImg, sourceDx, sourceDy, sourceDrawW, sourceDrawH);
+          const _tPre0 = performance.now();
+          /* Zone geometry shared by the JS passes below and the WebGL2 port
+             (F8). Face zone = upper rows; three soft masks — chip head,
+             tweezer axis, hand body — anchored in source-normalized coords:
+                chip tip:        (0.59, 0.42)
+                tweezer base:    (0.32, 0.70)
+                hand centre:     (0.22, 0.80) — palm/finger cluster */
+          const faceY1 = Math.max(0, Math.min(H0, Math.round(sourceDy + sourceDrawH * 0.45)));
+          const tipX  = sourceDx + sourceDrawW * 0.59, tipY  = sourceDy + sourceDrawH * 0.42;
+          const baseX = sourceDx + sourceDrawW * 0.32, baseY = sourceDy + sourceDrawH * 0.70;
+          const handX = sourceDx + sourceDrawW * 0.22, handY = sourceDy + sourceDrawH * 0.80;
+          const dx_axis = baseX - tipX, dy_axis = baseY - tipY;
+          const axisLen = Math.sqrt(dx_axis * dx_axis + dy_axis * dy_axis);
+          const ux = dx_axis / axisLen, uy = dy_axis / axisLen;
+          const bandHalf = sourceDrawW * 0.18;
+          const bandFlat = sourceDrawW * 0.04;
+          const chipRadius = sourceDrawW * 0.07;
+          /* Hand zone: elliptical (taller than wide), softer falloff so
+             knuckle / fingernail / finger creases get amplified gradually
+             across the whole hand without a visible perimeter. */
+          const handRx = sourceDrawW * 0.20;       /* x-axis of mask ellipse — fully fades here */
+          const handRy = sourceDrawH * 0.34;       /* y-axis of mask ellipse */
+          const handFlatR = 0.40;         /* normalized radius staying at full weight */
+
+          /* F8 Phase A: animated frames go through the GPU port; its output
+             replaces buf's pixels with one drawImage (no getImageData /
+             putImageData, no Float32 planes). Any GL miss → JS path. */
+          const _ppWantGL = _curFrame >= 0 && config.studio && config.studio.gpuPreprocess
+              && window.GlyphGrid && GlyphGrid.preprocessGL && GlyphGrid.preprocessGL.available();
+          const _ppGL = _ppWantGL
+            ? GlyphGrid.preprocessGL.run(buf.elt, W0, H0, {
+                faceY1: faceY1, tipX: tipX, tipY: tipY, ux: ux, uy: uy,
+                tLo: -sourceDrawW * 0.06, tHi: axisLen + sourceDrawW * 0.04,
+                bandHalf: bandHalf, bandFlat: bandFlat, chipRadius: chipRadius,
+                handX: handX, handY: handY, handRx: handRx, handRy: handRy, handFlatR: handFlatR,
+              })
+            : null;
+          /* ITER-069: the path that actually ran is reported per job
+             (batch line + PERF_JOB); a GL latch is forwarded to the CLI
+             log so a headless run never silently mixes the two paths. */
+          window.__preprocessPath = _ppGL ? 'gl' : 'js';
+          if (_ppWantGL && !_ppGL && window.__TAURI__ && window.__TAURI__.core) {
+            Promise.resolve(window.__TAURI__.core.invoke('cli_log', {
+              msg: 'warn: GL preprocess latched the JS path: ' + (GlyphGrid.preprocessGL.lastError() || 'unknown'),
+            })).catch(function () {});
+          }
+          if (_ppGL) {
+            const bctx = buf.drawingContext;
+            bctx.save();
+            bctx.setTransform(1, 0, 0, 1, 0, 0);
+            bctx.globalAlpha = 1;
+            bctx.globalCompositeOperation = 'copy';
+            bctx.drawImage(_ppGL, 0, 0);
+            bctx.restore();
+          } else {  /* JS path — body kept at its original indent */
           buf.loadPixels();
           const px = buf.pixels;
           const scratch = ensureSourceScratch(W0, H0);
@@ -669,7 +766,6 @@
              still recede the face plane. */
           const sharpenFace  = 1.85;
           const gainFace     = 1.12;
-          const faceY1 = Math.max(0, Math.min(H0, Math.round(sourceDy + sourceDrawH * 0.45)));
           for (let y = 0; y < H0; y++) {
             const inFace = y < faceY1;
             const gain    = inFace ? gainGlobal * gainFace : gainGlobal;
@@ -713,32 +809,12 @@
           }
           /* (Inversion removed.) */
 
-          /* Three soft-mask zones — chip head, tweezer axis, hand body.
-             All three blend smoothly into the surrounding image so no
-             visible boundaries.  The skill's preprocess receives a
-             per-pixel weight from each mask and applies a combined
-             sharpen + gain for that pixel.  Mask anchors (source
-             normalized):
-                chip tip:        (0.59, 0.42)
-                tweezer base:    (0.32, 0.70)
-                hand centre:     (0.22, 0.80) — palm/finger cluster
-          */
-          const tipX  = sourceDx + sourceDrawW * 0.59, tipY  = sourceDy + sourceDrawH * 0.42;
-          const baseX = sourceDx + sourceDrawW * 0.32, baseY = sourceDy + sourceDrawH * 0.70;
-          const handX = sourceDx + sourceDrawW * 0.22, handY = sourceDy + sourceDrawH * 0.80;
-          const dx_axis = baseX - tipX, dy_axis = baseY - tipY;
-          const axisLen = Math.sqrt(dx_axis * dx_axis + dy_axis * dy_axis);
-          const ux = dx_axis / axisLen, uy = dy_axis / axisLen;
-          const bandHalf = sourceDrawW * 0.18;
-          const bandFlat = sourceDrawW * 0.04;
-          const chipRadius = sourceDrawW * 0.07;
-          /* Hand zone: elliptical (taller than wide), softer falloff so
-             knuckle / fingernail / finger creases get amplified gradually
-             across the whole hand without a visible perimeter. */
-          const handRx = sourceDrawW * 0.20;       /* x-axis of mask ellipse — fully fades here */
-          const handRy = sourceDrawH * 0.34;       /* y-axis of mask ellipse */
-          const handFlatR = 0.40;         /* normalized radius staying at full weight */
-
+          /* Three soft-mask zones — chip head, tweezer axis, hand body
+             (geometry hoisted above, shared with the GL port). All three
+             blend smoothly into the surrounding image so no visible
+             boundaries.  The skill's preprocess receives a per-pixel
+             weight from each mask and applies a combined sharpen + gain
+             for that pixel. */
           const lumChip = scratch.lumChip;
           for (let i = 0, j = 0; j < lumChip.length; i += 4, j++) {
             lumChip[j] = 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
@@ -806,6 +882,8 @@
             }
           }
           buf.updatePixels();
+          }
+          __pfAdd(_ppGL ? 'preprocess_gl' : 'preprocess_js', performance.now() - _tPre0);
           this.__sourceProcessed = buf;
           this.__sourceProcessedFrame = _curFrame;
           this.__sourceProcessedKey = _processedKey;
@@ -908,10 +986,46 @@
      ================================================================= */
   let src;
   let recState = null;
+  /* ITER-046 (F23): beginRecord primes the per-cell EMA from the loop tail
+     with PRIME_FRAMES signal-only passes so frame 0 is a pure function of
+     (source, config, seed) instead of inheriting however many live draws the
+     machine managed before capture.  0.65^11 < 1% residual at the default
+     emaAlpha 0.35.  __primeOnly makes draw() stop after the EMA stage. */
+  const PRIME_FRAMES = 11;
+  let __primeOnly = false;
   let streamRecorder = null;       /* v2 streaming recorder, if active */
   let crtState = null;              /* phosphor-decay state, if active */
   let glyphAtlas = null;            /* shape-vector atlas, if loaded */
   let fontDescriptor = null;        /* glyph-fonts.load result */
+  /* ITER-047 (F3): readiness promises replace the headless wall-clock sleeps.
+     __setupReady resolves at the end of p5 setup(); __fontLoadPromise is the
+     v2 font cascade started there; __assetsReady() (below, with the atlas
+     cache) waits for both plus any glyph-set atlas the config needs. */
+  let __setupReadyResolve = null;
+  let __setupReadyReject = null;
+  const __setupReady = new Promise(function (res, rej) { __setupReadyResolve = res; __setupReadyReject = rej; });
+  /* ITER-049: setup() rejects the promise when it throws (e.g. a compat
+     validator error) so tryHeadlessRender exits instead of hanging forever.
+     The no-op handler keeps GUI mode free of an unhandled-rejection report;
+     each await still sees the rejection. */
+  __setupReady.catch(function () {});
+  let __fontLoadPromise = null;
+  /* ITER-069 (ITER-062 follow-up): studio-panel font swaps (glyph-studio.js)
+     route through window.__glyphFontSwap so the idle detector counts them
+     as pending, and the loop re-arms when the face lands — otherwise a
+     parked still kept painting the old face until the next config edit. */
+  let __fontSwapPending = 0;
+  window.__glyphFontSwap = function (opts) {
+    if (!(window.GlyphGrid && GlyphGrid.fonts && GlyphGrid.fonts.load)) return null;
+    __fontSwapPending++;
+    const p = __fontLoadPromise = Promise.resolve(GlyphGrid.fonts.load(opts))
+      .then(function (d) { if (d) fontDescriptor = d; });
+    p.catch(function () {}).then(function () {
+      __fontSwapPending--;
+      if (!recState) { try { loop(); } catch (_) {} }
+    });
+    return p;
+  };
   let retroResolved = null;         /* retro-merged CONFIG, if modeset */
   let gradientStopsCache = null;    /* { key, stops } — parsed OKLab stops for gradient colorMode */
   let sceneResult = null;           /* captured scene return: { zones?, depth? } */
@@ -952,12 +1066,16 @@
       if (img && typeof img.numFrames === 'function') frames = Math.max(1, Number(img.numFrames()) || 1);
       else if (img && img.gifProperties && img.gifProperties.numFrames) frames = Math.max(1, Number(img.gifProperties.numFrames) || 1);
     } catch (_) {}
+    /* ITER-077: a video is streamed — at most GlyphGrid.video.CACHE
+       decoded frames exist at once, whatever its length. */
+    const streamed = !!(img && img.__ggsVideo) || !!(extra && extra.video);
+    const resident = streamed ? Math.min(frames, (window.GlyphGrid && GlyphGrid.video) ? GlyphGrid.video.CACHE : 16) : frames;
     return {
       width,
       height,
       frames,
       sizeBytes: Number(extra && extra.sizeBytes) || 0,
-      decodedPixels: width * height * frames,
+      decodedPixels: width * height * resident,
     };
   }
 
@@ -1083,6 +1201,47 @@
   let cellSignalEma = null;  /* Float32Array, per-cell EMA — pixel breathing */
   let cellCpGrid = null;  /* Uint16Array, per-cell chosen codepoint/idx */
   let cellDepth = null;   /* Float32Array, per-cell depth in [0,1] (v2.1 depth channel) */
+
+  /* ITER-073 (Phase 5.0): GlyphFrame IR — the last painted grid AS DATA.
+     Every drawer (v1, brightness CPU/GL fast paths, shape, edge-directional,
+     flow) writes the cell it just placed — codepoint, ink rgb, alpha 0..255 —
+     at the point it already knows the pick; cp 0 = nothing drawn (space or
+     skipped cell).  fg is interleaved rgb (N*3).  Uint32 because octants
+     live at U+1CD00.  Grow-only typed arrays: zero allocation per frame once
+     sized.  Pure side channel — nothing on the canvas reads it — so headless
+     output is unchanged.  Consumers: captureGridSnapshot (TXT/SVG in every
+     selection mode) and the Phase 5 exporters.  ROI overdraw and dispersal
+     offsets are raster-only and not represented. */
+  const glyphFrame = {
+    cols: 0, rows: 0,
+    cp: new Uint32Array(0), fg: new Uint8Array(0), alpha: new Uint8Array(0),
+    bgHex: '', font: '', mode: '', seq: 0,
+  };
+  function irBegin(cols, rows, font, mode) {
+    const n = cols * rows;
+    if (glyphFrame.cp.length < n) {
+      glyphFrame.cp = new Uint32Array(n);
+      glyphFrame.fg = new Uint8Array(n * 3);
+      glyphFrame.alpha = new Uint8Array(n);
+    } else {
+      glyphFrame.cp.fill(0, 0, n);
+    }
+    glyphFrame.cols = cols; glyphFrame.rows = rows;
+    glyphFrame.bgHex = PALETTES[CONFIG.palette].bg;
+    glyphFrame.font = font; glyphFrame.mode = mode;
+    glyphFrame.seq++;
+  }
+  /* rgb in [0,255] (Uint8 store truncates like the old snapshot's `| 0`);
+     a is the drawn opacity in [0,1] before clamping. */
+  function irPut(i, cp, r, g, b, a) {
+    glyphFrame.cp[i] = cp;
+    const fg = glyphFrame.fg, o = i * 3;
+    fg[o] = r; fg[o + 1] = g; fg[o + 2] = b;
+    glyphFrame.alpha[i] = a >= 1 ? 255 : (a > 0 ? (a * 255 + 0.5) | 0 : 0);
+  }
+  /* applyCellFill's resolved ink, for the slow paths' irPut. */
+  let _irR = 0, _irG = 0, _irB = 0, _irA = 1;
+
   /* F10 — persistent ditherOpts object reused across all frames in
      the dither dispatch.  Mutated in place each frame, never replaced. */
   const _persistentDitherOpts = {
@@ -1090,6 +1249,17 @@
   };
 
   function setup() {
+    /* ITER-049: a throw still propagates to the console as before, but
+       __setupReady must settle either way. */
+    try {
+      setupBody();
+    } catch (e) {
+      if (__setupReadyReject) __setupReadyReject(e);
+      throw e;
+    }
+  }
+
+  function setupBody() {
     createCanvas(CONFIG.canvas.w, CONFIG.canvas.h);
     pixelDensity(1);
     /* a11y (audit 2026-06-10): the p5 canvas is the app's primary
@@ -1120,7 +1290,7 @@
        so octants/sextants/braille actually paint when the WOFF2 is slow to decode. */
     if (window.GlyphGrid && GlyphGrid.fonts && GlyphGrid.compat.isV2(CONFIG)) {
       const requested = CONFIG.glyphSet || 'ascii';
-      GlyphGrid.fonts.load({
+      __fontLoadPromise = GlyphGrid.fonts.load({
         sizePx: CONFIG.font.size,
         glyphSet: requested,
         trustRequested: requested !== 'ascii',
@@ -1191,6 +1361,7 @@
         console.error('[glyph-grid runtime init] ' + (e.message || e));
       }
     }
+    if (__setupReadyResolve) __setupReadyResolve();
   }
 
   /* =========================================================================
@@ -1285,7 +1456,36 @@
     }
     if (!taggedGeneration) ++__sourceImportGeneration;
 
+    /* ITER-077: retire the outgoing video / camera (its <video>, decode
+       cache, camera tracks) unless the camera toggle keeps it to restore. */
+    function retireOne(old) {
+      if (!old || old === img || !old.__ggsVideo) return;
+      if (old.__ggsVideo.camera && !(img && img === __cameraPrev)) {
+        if (__cameraPrev && __cameraPrev !== img) disposeVideoSource(__cameraPrev);
+        __cameraPrev = null;
+        CAMERA.camera = false;
+      }
+      disposeVideoSource(old);
+    }
+    function retireVideo() {
+      const old = sourceImg;
+      if (options.keepPrevious) {
+        if (old && old !== img && old.__ggsVideo && old.__ggsVideo.video) { try { old.__ggsVideo.video.pause(); } catch (_) {} }
+        return;
+      }
+      /* ITER-078: under a text source the clip / camera is the text's
+         base, not sourceImg — retire it too, or its <video> / camera
+         stream outlives the swap. */
+      if (old && old === __textCanvas && __textBase && __textBase !== img) {
+        const base = __textBase;
+        __textBase = null;
+        retireOne(base);
+      }
+      retireOne(old);
+    }
+
     if (!img) {
+      retireVideo();
       sourceImg = null;
       ++__sourceRevision;
       clearSourceDerivedCaches();
@@ -1302,6 +1502,7 @@
       return false;
     }
 
+    retireVideo();
     sourceImg = img;
     ++__sourceRevision;
     window.__glyphLastImportError = null;
@@ -1313,6 +1514,11 @@
     try {
       if (img.gifProperties && img.numFrames && img.numFrames() > 1) {
         const props = img.gifProperties;
+        /* ITER-047 (F21 pulled forward): p5 advances a playing GIF by wall
+           clock inside image() (_animateGif), racing the frame draw() pins
+           with setFrame().  Pause it — our animation time is the only
+           driver, so animated output stops depending on draw timing. */
+        if (typeof img.pause === 'function') img.pause();
         let totalMs = 0;
         for (let i = 0; i < props.numFrames; i++) totalMs += (props.frames[i].delay || 100);
         if (totalMs > 0) {
@@ -1323,6 +1529,11 @@
         }
       }
     } catch (e) { console.warn('animated-source auto-tune failed:', e); }
+    /* ITER-077: a clip sets the loop to its own length, as a GIF does. */
+    if (img.__ggsVideo && !img.__ggsVideo.camera && img.__ggsVideo.fps > 0) {
+      CONFIG.animation.duration = img.__ggsVideo.frames / img.__ggsVideo.fps;
+      CONFIG.animation.loop = true;
+    }
 
     statusEl().textContent = 'Loaded ' + checked.meta.width + '×' + checked.meta.height
       + (checked.meta.frames > 1 ? ' · ' + checked.meta.frames + ' frames' : '');
@@ -1330,11 +1541,481 @@
     return true;
   }
 
+  /* ITER-062 (F17 part 2): static-frame detector.  A still source with a
+     time-independent config (no breathing, no frame-hashed dither, no
+     dispersal, no CRT pixel stages, no sigma sweep) paints the same frame
+     forever, yet the loop kept re-rendering it at 30 fps.  After each
+     painted live frame, idleCheck() parks the loop (noLoop) once the frame
+     is provably static AND the cross-frame state has settled: the per-cell
+     EMA step is below IDLE_EMA_EPS and the stability debounce has had
+     enough frames.  Anything unknown counts as time-dependent.  Every
+     config path already re-arms with loop()/redraw() (scheduleConfigRender,
+     acceptSourceImage, the studio preset buttons, beginRecord); a parked
+     redraw() that turns out dynamic re-arms the loop itself.  Never engages
+     while recording, priming or under window.PIPELINE. */
+  const IDLE_EMA_EPS = 1e-4;
+  const IDLE_SETTLE_FRAMES = 8;
+  const IDLE_STATIC_DITHER = ['none', 'bayer4', 'bayer8', 'floydSteinberg', 'atkinson', 'jarvisJudiceNinke'];
+  let __emaMaxDelta = 0;      // largest per-cell EMA step of the last v2 frame (0 on v1)
+  let __idleStreak = 0;       // consecutive static + settled frames
+  let __idleParked = false;   // true while the detector holds the loop stopped
+  function frameIsTimeDependent() {
+    if (recState || window.PIPELINE || __primeOnly) return true;
+    if (__tlScrubU === null && window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.active(CONFIG)
+        && !__prefersReducedMotion()) return true;               // ITER-075 timeline
+    if (!sourceImg || !sourceImg.width) return true;
+    if (window.__sourceFrameIdx !== -1                            // animated source
+        && !(__frameSource && __frameSource.kind === 'text' && !__frameSource.dynamic)) return true;
+    if (CONFIG.scene !== 'studio') return true;                    // generative scenes animate on t
+    if (__fontLoadPromise && !fontDescriptor) return true;         // face swap still pending
+    if (__fontSwapPending > 0) return true;                        // studio font swap in flight
+    for (const _id in _atlasInflight) return true;                 // atlas commit pending
+    if (CONFIG.glyphSet && !_atlasCache[CONFIG.glyphSet]) return true;
+    if (CONFIG.prefilter && CONFIG.prefilter.mode === 'xdog') return true;  // studioSigmaSweep
+    const rm = __prefersReducedMotion();
+    const disp = CONFIG.dispersal || {};
+    if (!rm && disp.enabled && disp.endT > disp.startT) return true;
+    if (!(window.GlyphGrid && GlyphGrid.compat)) return true;
+    if (!GlyphGrid.compat.isV2(CONFIG)) return false;              // v1 path: no t, no frame state
+    if (usesAdvancedPipeline(CONFIG)) {
+      const br = (CONFIG.studio && CONFIG.studio.breathing) || {};
+      const swing = (typeof br.gainSwing === 'number') ? br.gainSwing : 0.30;
+      const jit = (typeof br.jitter === 'number') ? br.jitter : 0.05;
+      if (!rm && (swing > 0 || jit > 0)) return true;
+      if (!rm && GlyphGrid.compat.gateDither(CONFIG)
+          && IDLE_STATIC_DITHER.indexOf(CONFIG.dither.mode) < 0) return true;
+    }
+    if (GlyphGrid.compat.gatePostprocess(CONFIG) && _hasImgDataStages(CONFIG.postprocess)) return true;
+    return false;
+  }
+  function idleCheck() {
+    if (__tlScrubU !== null) return;   /* ITER-075: a scrub owns the paused loop */
+    if (__idleParked && isLooping()) { __idleParked = false; __idleStreak = 0; } // re-armed elsewhere
+    if (frameIsTimeDependent() || !(__emaMaxDelta < IDLE_EMA_EPS)) {
+      __idleStreak = 0;
+      if (__idleParked) {
+        /* A bare redraw() painted a frame that still has to evolve.  Re-arm
+           outside this draw: p5's loop() draws synchronously. */
+        __idleParked = false;
+        setTimeout(function () {
+          if (!recState && !__renderResumeTimer) { try { loop(); } catch (_) {} }
+        }, 0);
+      }
+      return;
+    }
+    if (__idleParked) return;
+    if (++__idleStreak >= Math.max(IDLE_SETTLE_FRAMES, _stabDebounceK + 2)) {
+      __idleStreak = 0;
+      __idleParked = true;
+      noLoop();
+      if (!window.__statusHold) statusEl().textContent += ' | idle';
+    }
+  }
+  window.__idleState = function () {
+    return { parked: __idleParked, streak: __idleStreak, emaMaxDelta: __emaMaxDelta,
+             timeDependent: frameIsTimeDependent() };
+  };
+
+  /* ITER-073 (Phase 5.0): FrameSource adapter — the one seam an input
+     goes through to become this frame's source image.
+       { kind: 'still'|'gif', durationMs, frameAt(tMs) → p5.Image,
+         index, revision }
+     `index` is the source frame frameAt() just selected (-1 for a still);
+     draw() publishes it as window.__sourceFrameIdx, so the ITER-042/052
+     memo busting keyed on that global is unchanged.  durationMs is the
+     source's own loop length (0 = none).  Rebuilt when sourceImg or
+     __sourceRevision changes.  Video / camera / text sources (R3/R4) add an
+     adapter here; nothing else in draw() moves. */
+  let __frameSource = null;
+  function makeFrameSource(img, revision) {
+    if (img && img.__ggsTextSource) return makeTextFrameSource(img, revision);   // ITER-076
+    if (img && img.__ggsVideo) return GlyphGrid.video.adapter(img, img.__ggsVideo, revision, __videoHooks);   // ITER-077
+    if (img && img.gifProperties && img.numFrames && img.numFrames() > 1) {
+      const props = img.gifProperties;
+      let totalMs = 0;
+      for (let i = 0; i < props.numFrames; i++) totalMs += (props.frames[i].delay || 100);
+      return {
+        kind: 'gif', img: img, revision: revision, durationMs: totalMs, index: -1,
+        /* The source frame whose delay window contains tMs mod loop. */
+        frameAt(tMs) {
+          const loopT = tMs % totalMs;
+          let acc = 0, target = props.numFrames - 1;
+          for (let i = 0; i < props.numFrames; i++) {
+            acc += (props.frames[i].delay || 100);
+            if (loopT < acc) { target = i; break; }
+          }
+          if (target !== props.displayIndex) img.setFrame(target);
+          this.index = target;
+          return img;
+        },
+      };
+    }
+    return {
+      kind: 'still', img: img, revision: revision, durationMs: 0, index: -1,
+      frameAt() { return img; },
+    };
+  }
+  function frameSourceFor(img) {
+    if (!__frameSource || __frameSource.img !== img || __frameSource.revision !== __sourceRevision) {
+      __frameSource = makeFrameSource(img, __sourceRevision);
+    }
+    return __frameSource;
+  }
+
+  /* ITER-077 (R4): video sources.  sourceImg is a p5.Graphics tagged
+     __ggsVideo (the clip's state from GlyphGrid.video.open); the 'video'
+     adapter repaints it from a decoded-frame cache.  Recording is
+     frame-exact: beginRecord prefetches the priming frames before it
+     primes, and drawFrame skips (and re-arms after the decode) any captured
+     draw whose frame is not decoded yet.  A text source composited onto a
+     video gates on the inner video the same way. */
+  const __videoHooks = {
+    invoke: function (cmd, args) { return window.__TAURI__.core.invoke(cmd, args); },
+    recording: function () { return !!recState; },
+  };
+  function videoAdapterOf(fsrc) {
+    if (!fsrc) return null;
+    if (fsrc.kind === 'video') return fsrc.video.camera ? null : fsrc;
+    if (fsrc.kind === 'text' && fsrc.inner && fsrc.inner.kind === 'video' && !fsrc.inner.video.camera) return fsrc.inner;
+    return null;
+  }
+  function awaitVideoFrame(vsrc, tMs, state) {
+    if (state._srcWait) return;
+    state._srcWait = true;
+    try { noLoop(); } catch (_) {}
+    vsrc.load(tMs).then(function () {
+      if (recState !== state || state.cancelled) return;
+      state._srcWait = false;
+      try { loop(); } catch (_) {}
+    }, function (e) { failRecording(state, e); });
+  }
+  /* beginRecord: the priming passes run synchronously, so every frame they
+     and frame 0 touch must be decoded first.  Returns null when nothing is
+     missing (images, GIFs, cached clips). */
+  function prefetchCaptureFrames(total) {
+    if (!sourceImg || window.PIPELINE) return null;
+    const vsrc = videoAdapterOf(frameSourceFor(sourceImg));
+    if (!vsrc) return null;
+    const times = GlyphGrid.video.primeTimes(total, PRIME_FRAMES, CONFIG.animation.fps);
+    if (times.every(function (tm) { return vsrc.ready(tm); })) return null;
+    return vsrc.prefetch(times);
+  }
+  function disposeVideoSource(img) {
+    if (!img || !img.__ggsVideo) return;
+    GlyphGrid.video.dispose(img.__ggsVideo);
+    try { img.remove(); } catch (_) {}
+  }
+  function cliLog(msg) {
+    console.log(msg);
+    try {
+      if (window.__TAURI__ && window.__TAURI__.core) {
+        Promise.resolve(window.__TAURI__.core.invoke('cli_log', { msg: msg })).catch(function () {});
+      }
+    } catch (_) {}
+  }
+  /* path + header probe → a p5.Graphics with frame 0 painted, ready for
+     acceptSourceImage (which validates and installs it).  The GUI importer
+     (glyph-studio.js) and _cliLoadSource both come through here. */
+  async function openVideoSource(path, probe, decodeOverride, headless) {
+    const core = window.__TAURI__.core;
+    const decode = decodeOverride || (CONFIG_BASE.video && CONFIG_BASE.video.decode) || 'auto';
+    const vs = await GlyphGrid.video.open({
+      path: path,
+      url: (typeof core.convertFileSrc === 'function') ? core.convertFileSrc(path) : '',
+      probe: probe, decode: decode, preview: !headless,
+      invoke: __videoHooks.invoke, log: cliLog,
+    });
+    const g = createGraphics(vs.width, vs.height);
+    g.pixelDensity(1);
+    g.__ggsVideo = vs;
+    g.numFrames = function () { return vs.frames; };
+    try {
+      const f0 = await GlyphGrid.video.load(vs, 0, __videoHooks.invoke);
+      g.drawingContext.putImageData(f0, 0, 0);
+      vs.painted = 0;
+      vs.epoch = 1;
+    } catch (e) {
+      GlyphGrid.video.dispose(vs);
+      try { g.remove(); } catch (_) {}
+      throw e;
+    }
+    vs.onPresent = function () { if (!recState && __idleParked) { try { loop(); } catch (_) {} } };
+    cliLog('video: ' + String(path).split('/').pop() + ' ' + vs.width + 'x' + vs.height + ', ' + vs.frames
+      + ' frames @ ' + vs.fps + ' fps, ' + (vs.codec || '?') + ' via '
+      + (vs.backend === 'rust' ? 'Rust openh264' : 'WebView <video>'));
+    return g;
+  }
+  window.__ggsOpenVideo = openVideoSource;
+  /* GUI Video folder: camera on → the webcam is the source; the previous
+     source comes back when it goes off.  Experimental: the WKWebView
+     media-capture permission path is not verified headlessly. */
+  let __cameraPrev = null;
+  /* ITER-078 (privacy): runtime-only camera switch.  Never part of CONFIG,
+     never serialised or deep-merged; only the GUI Video folder's toggle
+     (bound here through GlyphStudio.init's cameraState) writes it. */
+  const CAMERA = { camera: false };
+  window.__videoCameraKick = async function () {
+    const want = !!CAMERA.camera;
+    const live = !!(sourceImg && sourceImg.__ggsVideo && sourceImg.__ggsVideo.camera);
+    if (want && !live) {
+      try {
+        const vs = await GlyphGrid.video.openCamera({ mirror: CONFIG_BASE.video.mirror });
+        const g = createGraphics(vs.width, vs.height);
+        g.pixelDensity(1);
+        g.__ggsVideo = vs;
+        g.numFrames = function () { return 1; };
+        const prev = sourceImg;
+        if (acceptSourceImage(g, { keepPrevious: true })) __cameraPrev = prev;
+        else { GlyphGrid.video.dispose(vs); try { g.remove(); } catch (_) {} }
+      } catch (e) {
+        CAMERA.camera = false;
+        statusEl().textContent = 'Camera unavailable: ' + ((e && e.message) || e);
+      }
+    } else if (!want && live) {
+      const prev = __cameraPrev;
+      __cameraPrev = null;
+      acceptSourceImage(prev || null);
+    } else if (live) {
+      sourceImg.__ggsVideo.mirror = !!CONFIG_BASE.video.mirror;
+    }
+  };
+
+  /* ITER-076 (R3): text source.  While CONFIG.textSource.enabled, a
+     p5.Graphics text raster IS sourceImg (tagged __ggsTextSource), so the
+     whole pipeline — fit-to-image, priming, the studio scene, the layer and
+     lum memos, captureGridSnapshot — sees an ordinary source.  The image the
+     user loaded is kept as __textBase and restored when text is switched
+     off; a new image dropped while text is on becomes the new base on the
+     next draw.  Per frame the FrameSource adapter (kind 'text') lays the
+     lines out for t, re-renders the raster only when that state changes
+     (layout() quantises progress to 1/255) and then bumps its index, which
+     draw() publishes as __sourceFrameIdx — so a settled title keeps the
+     ITER-042/052 memo.  blend != replace with a base loaded composites the
+     text onto the base (its current GIF frame) in linear light. */
+  let __textCanvas = null;     // p5.Graphics, sourceImg while installed
+  let __textMask = null;       // <canvas> coverage mask for composites
+  let __textBase = null;       // the user's image under the text (null = text only)
+  let __textLinesSig = null;   // start/end signature the duration was derived from
+  let __textEpoch = 0;         // adapter index: bumps on every rendered-state change
+  let __textFontEpoch = 0;     // bumps when a webfont finishes loading
+  let __textStrokeWarned = '';
+  try {
+    if (document.fonts && document.fonts.addEventListener) {
+      document.fonts.addEventListener('loadingdone', function () { __textFontEpoch++; });
+    }
+  } catch (_) {}
+  function textSourceDims(ts, base) {
+    const clampDim = function (v, d) { v = Math.round(Number(v) || d); return Math.max(16, Math.min(4096, v - (v % 2))); };
+    const w = clampDim(ts.w, 1024), h = clampDim(ts.h, 512);
+    if (!base || !base.width || !base.height || ts.blend === 'replace') return [w, h];
+    /* Composite: the base's aspect at the text block's long edge (a 4K
+       photo is not composited at 4K per changed frame). */
+    const L = Math.max(w, h), a = base.width / base.height;
+    return a >= 1 ? [L, clampDim(L / a, h)] : [clampDim(L * a, w), L];
+  }
+  /* Install / resize / uninstall the text raster to match CONFIG_BASE.
+     force: re-derive animation.duration from the cues even if they did not
+     change (batch jobs reset CONFIG to the baseline first). */
+  function syncTextSource(force) {
+    const ts = CONFIG_BASE.textSource;
+    const on = !!(ts && ts.enabled) && !window.PIPELINE;
+    const installed = !!__textCanvas && sourceImg === __textCanvas;
+    if (!on) {
+      if (installed) {
+        sourceImg = __textBase;
+        __textBase = null;
+        ++__sourceRevision;
+        clearSourceDerivedCaches();
+        if (sourceImg) { try { fitCanvasToImage(sourceImg); } catch (e) { console.warn(e); } }
+      }
+      __textLinesSig = null;
+      return;
+    }
+    const base = installed ? __textBase : sourceImg;
+    const dims = textSourceDims(ts, base);
+    if (!installed || __textCanvas.width !== dims[0] || __textCanvas.height !== dims[1]) {
+      if (__textCanvas) { try { __textCanvas.remove(); } catch (_) {} }
+      /* ITER-078: a previous base the new one replaces (a video / camera)
+         is disposed, not dropped with its <video> still playing. */
+      if (__textBase && __textBase !== base && __textBase !== __cameraPrev) disposeVideoSource(__textBase);
+      __textCanvas = createGraphics(dims[0], dims[1]);
+      __textCanvas.pixelDensity(1);
+      __textCanvas.__ggsTextSource = true;
+      __textBase = base || null;
+      sourceImg = __textCanvas;
+      ++__sourceRevision;
+      clearSourceDerivedCaches();
+      try { fitCanvasToImage(__textCanvas); } catch (e) { console.warn(e); }
+    }
+    /* Timed cues set the loop length, as an animated GIF's delays do. */
+    const sig = JSON.stringify((ts.lines || []).map(function (l) { return [l && l.start, l && l.end]; }));
+    if (force || sig !== __textLinesSig) {
+      __textLinesSig = sig;
+      const end = GlyphGrid.text.lastEnd(ts.lines);
+      if (end > 0) CONFIG_BASE.animation.duration = end;
+    }
+  }
+  function renderTextFrame(g, ops, ts, baseImg) {
+    const w = g.width, h = g.height;
+    const ctx = g.drawingContext;
+    if (!baseImg) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = ts.bg || '#000000';
+      ctx.fillRect(0, 0, w, h);
+      GlyphGrid.text.drawOps(ctx, ops, ts.fg || '#ffffff');
+      ctx.restore();
+      return;
+    }
+    g.clear();
+    g.image(baseImg, 0, 0, w, h);
+    if (!__textMask) __textMask = document.createElement('canvas');
+    if (__textMask.width !== w || __textMask.height !== h) { __textMask.width = w; __textMask.height = h; }
+    const mctx = __textMask.getContext('2d', { willReadFrequently: true });
+    mctx.setTransform(1, 0, 0, 1, 0, 0);
+    mctx.clearRect(0, 0, w, h);
+    GlyphGrid.text.drawOps(mctx, ops, '#ffffff');
+    const basePx = ctx.getImageData(0, 0, w, h);
+    const maskPx = mctx.getImageData(0, 0, w, h);
+    GlyphGrid.text.compositeLinear(basePx.data, maskPx.data, ts.blend,
+      GlyphGrid.text.hexRgb(ts.fg), GlyphGrid.text.hexRgb(ts.bg));
+    ctx.putImageData(basePx, 0, 0);
+  }
+  function makeTextFrameSource(img, revision) {
+    const inner = __textBase ? makeFrameSource(__textBase, revision) : null;
+    return {
+      kind: 'text', img: img, revision: revision, durationMs: 0, index: -1,
+      key: null, dynamic: true, strokeCells: Infinity, inner: inner,
+      frameAt(tMs) {
+        const ts = CONFIG.textSource;
+        const composite = !!inner && ts.blend !== 'replace';
+        if (composite) inner.frameAt(tMs);
+        const ops = GlyphGrid.text.layout(ts, tMs / 1000, img.width, img.height);
+        const key = JSON.stringify(ops) + '|' + ts.bg + '|' + ts.fg + '|'
+          + (composite ? ts.blend + '|' + inner.index : '') + '|' + __textFontEpoch;
+        if (key !== this.key) {
+          this.key = key;
+          renderTextFrame(img, ops, ts, composite ? inner.img : null);
+          this.index = ++__textEpoch;
+        }
+        this.durationMs = GlyphGrid.text.lastEnd(ts.lines) * 1000;
+        this.dynamic = GlyphGrid.text.isDynamic(ts) || (composite && (inner.kind === 'gif' || inner.kind === 'video'));
+        this.strokeCells = GlyphGrid.text.minStrokeCells(ts, img.width, img.height,
+          CONFIG.canvas.w, CONFIG.grid.cols);
+        return img;
+      },
+    };
+  }
+  /* GUI / CLI import: SRT or LRC text → CONFIG_BASE.textSource.lines
+     (appended, so a --text title survives an --srt).  Throws on garbage. */
+  /* GUI Text folder: any edit re-syncs the raster and re-arms the loop
+     (the idle detector may have parked it on a static title). */
+  window.__textSourceKick = function () {
+    syncTextSource(false);
+    if (!recState) { try { loop(); } catch (_) {} }
+  };
+  /* Headless twin of the status-bar warning: one stderr line per job. */
+  function textStrokeCheck() {
+    const ts = CONFIG_BASE.textSource;
+    if (!(ts && ts.enabled && __textCanvas && window.__TAURI__ && window.__TAURI__.core)) return;
+    const sc = GlyphGrid.text.minStrokeCells(ts, __textCanvas.width, __textCanvas.height,
+      CONFIG_BASE.canvas.w, CONFIG_BASE.grid.cols);
+    if (!(sc < GlyphGrid.text.MIN_STROKE_CELLS)) return;
+    Promise.resolve(window.__TAURI__.core.invoke('cli_log', {
+      msg: 'text: warn: smallest stroke is ' + sc.toFixed(2) + ' glyph cells (< '
+        + GlyphGrid.text.MIN_STROKE_CELLS + '); letters may dissolve. Raise textSource.size or lower grid.cols.',
+    })).catch(function () {});
+  }
+  window.__textSourceImport = function (body, nameHint, opts) {
+    const cues = GlyphGrid.text.parseCues(body, nameHint);
+    const ts = CONFIG_BASE.textSource;
+    ts.lines = ((opts && opts.replace) ? [] : (ts.lines || [])).concat(cues);
+    ts.enabled = true;
+    syncTextSource(true);
+    if (!recState) { try { loop(); redraw(); } catch (_) {} }
+    return cues.length;
+  };
+
+  /* ITER-075 (R2): timeline.  With CONFIG.timeline active, every draw —
+     live, captured, and the Phase-1 priming passes (primeTemporalState
+     redraws through here) — renders against a shadow config built by
+     GlyphGrid.timeline.frameConfig: copy-on-write along the tracked paths,
+     so the Tweakpane-bound CONFIG_BASE keeps the user's base values and is
+     never written.  u comes from the same t the frame uses (recording:
+     frameIdx / fps, so it is deterministic), or from the Timeline folder's
+     scrub (live only; the loop stays paused while scrubbing).  Structural
+     tracks (grid.cols/rows, glyphSet, selectionMode, dither.mode) step, and
+     drawGlyphGridV2's grid-resize branch carries the EMA across a cols/rows
+     change with its overlap copy, as it does for a slider scrub.  A palette
+     blend is registered as one synthetic PALETTES entry whose name encodes
+     its colours (the lum/cell caches key on the palette name); the previous
+     one is dropped.  Timeline off: draw() is drawFrame(), unchanged. */
+  let __tlScrubU = null;
+  let __tlPaletteName = null;
+  function timelineU(t) {
+    const d = CONFIG_BASE.animation.duration;
+    if (!(d > 0)) return 0;
+    const u = t / d;
+    return CONFIG_BASE.animation.loop ? (u - Math.floor(u)) : Math.min(1, u);
+  }
   function draw() {
+    if (__textCanvas || (CONFIG_BASE.textSource && CONFIG_BASE.textSource.enabled)) syncTextSource(false);
+    if (!(window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.active(CONFIG_BASE))) {
+      drawFrame();
+      return;
+    }
+    const fps = CONFIG_BASE.animation.fps;
+    const t = recState
+      ? (recState.frameIdx / fps)
+      : ((frameCount - 1) / fps) % CONFIG_BASE.animation.duration;
+    const scrub = !recState && __tlScrubU !== null;
+    /* Reduced motion stills the live preview (as breathing does); captures
+       and an explicit scrub keep their u. */
+    const u = scrub ? __tlScrubU
+      : (!recState && __prefersReducedMotion()) ? 0 : timelineU(t);
+    const fr = GlyphGrid.timeline.frameConfig(CONFIG_BASE, u, PALETTES);
+    if (__tlPaletteName && __tlPaletteName !== fr.config.palette) delete PALETTES[__tlPaletteName];
+    __tlPaletteName = null;
+    if (fr.palette) {
+      PALETTES[fr.config.palette] = fr.palette;
+      __tlPaletteName = fr.config.palette;
+    }
+    CONFIG = fr.config;
+    try {
+      drawFrame();
+    } finally {
+      CONFIG = CONFIG_BASE;
+    }
+    if (scrub) noLoop();
+  }
+  /* Timeline folder scrub: a u in [0,1] pins the preview and pauses the
+     loop; null resumes playback. */
+  window.__timelineScrub = function (u) {
+    __tlScrubU = (typeof u === 'number' && isFinite(u)) ? Math.max(0, Math.min(1, u)) : null;
+    if (recState) return;
+    try {
+      if (__tlScrubU === null) loop();
+      else { noLoop(); redraw(); }
+    } catch (_) {}
+  };
+
+  function drawFrame() {
     /* CONFIG.animation.fps is live-mutated by Tweakpane and batch jobs.
        Keep p5's actual timer cadence in sync with the animation math. */
     syncAnimationFrameRate();
     if (recState && recState.done) { noLoop(); return; }
+    /* ITER-047: a draw that cannot be captured must not happen at all.
+       p5's _draw draws unconditionally once _loop is false and never cancels
+       a pending rAF, so the pipeline's backpressure pause (handleRecordFrame
+       → noLoop) still lets one draw through at a timing-dependent frame;
+       every stage below mutates cross-frame state (EMA, phosphor,
+       stability), so that stray draw shifted every later frame.  Priming
+       passes (__primeOnly) run with recState set but never while capturing. */
+    if (recState && recState._capturing && !__primeOnly) return;
+    /* ITER-077: a video frame this capture needs is still decoding. */
+    if (recState && recState._srcWait && !__primeOnly) return;
     if (!CONFIG.animation.loop && !recState && frameCount > 1) { noLoop(); return; }
 
     const t = recState
@@ -1378,28 +2059,20 @@
 
        The scene's __sourceProcessed cache is busted via the global
        `__sourceFrameIdx` watcher (scenes that compare against this
-       reset their cache when the source frame changes). */
-    if (sourceImg && sourceImg.gifProperties && sourceImg.numFrames && sourceImg.numFrames() > 1) {
-      const props = sourceImg.gifProperties;
-      const totalMs = props.__totalMs || (function () {
-        let s = 0;
-        for (let i = 0; i < props.numFrames; i++) s += (props.frames[i].delay || 100);
-        props.__totalMs = s;
-        return s;
-      })();
-      const loopT = (t * 1000) % totalMs;
-      let acc = 0, target = props.numFrames - 1;
-      for (let i = 0; i < props.numFrames; i++) {
-        acc += (props.frames[i].delay || 100);
-        if (loopT < acc) { target = i; break; }
-      }
-      if (target !== props.displayIndex) {
-        sourceImg.setFrame(target);
-      }
-      window.__sourceFrameIdx = target;
-    } else {
-      window.__sourceFrameIdx = -1;
+       reset their cache when the source frame changes).  ITER-073: the
+       selection itself lives in the FrameSource adapter (makeFrameSource). */
+    /* ITER-077 (R4): frame-exact video.  frameAt() only paints decoded
+       frames, so a captured draw whose frame is not cached yet is skipped
+       — the loop pauses until the decode lands, then this frame draws.
+       Nothing above mutates cross-frame state, so the skip is invisible. */
+    const _vsrc = videoAdapterOf(frameSourceFor(sourceImg));
+    if (_vsrc && recState && !__primeOnly && !_vsrc.ready(t * 1000)) {
+      awaitVideoFrame(_vsrc, t * 1000, recState);
+      return;
     }
+    const _fsrc = frameSourceFor(sourceImg);
+    _fsrc.frameAt(t * 1000);
+    window.__sourceFrameIdx = _fsrc.index;
 
     /* Wave 1 opt-in path: a piece may declare `window.PIPELINE = pipeline()...`
        to run through the new runtime. When present, it fully replaces the
@@ -1433,11 +2106,14 @@
        depth), so when its identity key and cached buffers are unchanged
        we keep last frame's src + src.pixels and skip both the repaint
        and the full-canvas getImageData readback.  Only the scene's
-       config side effect (xdog sigma sweep) still has to run. */
+       config side effect (xdog sigma sweep) still has to run.
+       ITER-052 (F2 step 3): an animated source is a still between GIF
+       frame changes — the studio scene keys its preprocess on the same
+       frame index and paints nothing time-dependent after it — so the
+       frame index joins the key instead of disqualifying it. */
     const studio = SCENES.studio;
-    const layerKey = (CONFIG.scene === 'studio' && sourceImg
-        && window.__sourceFrameIdx === -1)
-      ? (__sourceRevision + '|' + src.width + 'x' + src.height + '|'
+    const layerKey = (CONFIG.scene === 'studio' && sourceImg)
+      ? (__sourceRevision + '|' + window.__sourceFrameIdx + '|' + src.width + 'x' + src.height + '|'
          + bgColor(CONFIG) + '|' + !!(CONFIG.depth && CONFIG.depth.enabled))
       : null;
     const reuseLayer = layerKey !== null && layerKey === __srcLayerKey
@@ -1447,7 +2123,14 @@
     if (reuseLayer) {
       studioSigmaSweep(t, CONFIG);
     } else {
-      sceneResult = SCENES[CONFIG.scene](src, t, CONFIG) || null;
+      /* ITER-052: call the scene with itself as `this`.  `SCENES[name](…)`
+         bound `this` to SCENES, so every scene's `this.__sourceProcessed`
+         / `__sourceDepth` cache lived on the shared container while the
+         layer memo above, clearSourceDerivedCaches, memProbe and the GUI's
+         sceneCacheKeys all read SCENES[name] — the ITER-042 memo never hit
+         and a source swap never dropped the depth buffer. */
+      const sceneFn = SCENES[CONFIG.scene];
+      sceneResult = sceneFn.call(sceneFn, src, t, CONFIG) || null;
       depthImg = (sceneResult && sceneResult.depth && sceneResult.depth.width > 0)
         ? sceneResult.depth : null;
     }
@@ -1466,6 +2149,14 @@
     /* 2. Pipeline dispatch. */
     const isV2 = window.GlyphGrid && GlyphGrid.compat.isV2(CONFIG);
     const advanced = isV2 && usesAdvancedPipeline(CONFIG);
+
+    /* ITER-046 priming pass: only the v2 signal + EMA stages run (the v1
+       path keeps no cross-frame state).  No glyph draw, no postprocess, no
+       status bar, no capture. */
+    if (__primeOnly) {
+      if (advanced) drawGlyphGridV2(src, t, recState ? recState.frameIdx : (frameCount - 1));
+      return;
+    }
 
     if (advanced) {
       drawGlyphGridV2(src, t, recState ? recState.frameIdx : (frameCount - 1));
@@ -1500,6 +2191,21 @@
           ? window.__sourceFrameIdx : sourceImg.gifProperties.displayIndex;
         animTag = ` | gif=${idx + 1}/${sourceImg.numFrames()}`;
       }
+      /* ITER-077: video frame + which decoder is serving it. */
+      if (_fsrc.kind === 'video') {
+        const vs = _fsrc.video;
+        animTag = vs.camera ? ' | camera'
+          : ` | video=${typeof vs.painted === 'number' ? vs.painted + 1 : 'live'}/${vs.frames} (${vs.backend === 'rust' ? 'openh264' : 'webview'})`;
+      }
+      /* ITER-076: legibility floor — a stem under MIN_STROKE_CELLS glyph
+         cells tends to dissolve.  Warned here and once per state on the CLI. */
+      if (_fsrc.kind === 'text') {
+        const sc = _fsrc.strokeCells;
+        animTag += ' | text';
+        if (sc < GlyphGrid.text.MIN_STROKE_CELLS) {
+          animTag += ` | warn: text stroke ${sc.toFixed(2)} cells — raise size or lower cols`;
+        }
+      }
       /* Rolling-average fps from the perf ring (last 30 frames, ~1s).
          "is the build keeping up?" answer in one glance.  total can be 0
          on the first frame before __pfCommit fires; show '—' then. */
@@ -1514,14 +2220,19 @@
          GIF → …") survive on the bar while the draw loop runs underneath.
          finishRecording sets it; exportFeedback releases it. */
       if (!window.__statusHold) statusEl().textContent =
-        `${CONFIG.scene} | ${CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
+        `${CONFIG.scene} | ${__tlPaletteName === CONFIG.palette ? 'timeline blend' : CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
         `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag}${animTag}${fpsTag} | ` +
-        `t=${t.toFixed(2)}s | compat=${CONFIG.compat}`;
+        `t=${t.toFixed(2)}s | compat=${CONFIG.compat}` +
+        /* ITER-078: a palette track under colorMode preserve is a no-op. */
+        ((window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.paletteIgnored(CONFIG_BASE))
+          ? ' | ⚠ palette track ignored (colorMode preserve)' : '');
     }
 
     /* 4. Record capture. */
     if (recState) {
       handleRecordFrame();
+    } else {
+      idleCheck();
     }
   }
 
@@ -1622,6 +2333,12 @@
   function __prefersReducedMotion() {
     if (!__rmQuery && window.matchMedia) {
       __rmQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+      /* ITER-062: a parked static frame must wake when the OS setting flips. */
+      try {
+        __rmQuery.addEventListener('change', function () {
+          if (__idleParked && !recState) { try { loop(); } catch (_) {} }
+        });
+      } catch (_) {}
     }
     return !!(__rmQuery && __rmQuery.matches);
   }
@@ -1634,6 +2351,14 @@
     const now = performance.now();
     __pfFrame.stages[name] = now - __pfLastT;
     __pfLastT = now;
+  }
+  /* v0.2 Phase 4 (F6 step 0): sub-stage timers that nest inside a __pf
+     stage without moving its mark — e.g. the GL grid's fill / draw /
+     composite split inside 'grid', or the capture's toBlob call after
+     the frame committed. Accumulates (a stage can run twice a frame). */
+  function __pfAdd(name, ms) {
+    if (!__pfFrame) return;
+    __pfFrame.stages[name] = (__pfFrame.stages[name] || 0) + ms;
   }
   function __pfCommit(total) {
     __pfFrame.total = total;
@@ -1686,6 +2411,91 @@
      that reflects it) as a first-class PERF_JOB objective term. */
   window.__perfLastLatency = () => __pfLastLatency;
 
+  /* v0.2 Phase 0 (F20) — memory probe. Sums the bytes retained by every
+     cache the audit named (all bounded by construction; this closes the
+     "does it grow?" question with a number instead of a re-grep).
+     WKWebView has no performance.memory, so this is the only JS-side
+     number we can get. Dev call: GlyphGrid.memProbe() returns
+     { bytes: {category: n}, counts: {...}, totalBytes }; __memReport()
+     console.tables it. Read-only, allocation-free apart from the result. */
+  function __memCanvasBytes(obj) {
+    if (!obj) return 0;
+    const c = obj.canvas || obj;
+    const w = Number(c.width) || 0, h = Number(c.height) || 0;
+    return w * h * 4;
+  }
+  function __memTypedBytes(a) { return a && a.byteLength ? a.byteLength : 0; }
+  window.GlyphGrid = window.GlyphGrid || {};
+  window.GlyphGrid.memProbe = function () {
+    const bytes = {};
+    const counts = {};
+    /* Seven single-slot sprite caches (index.html _ensure*Sprite). */
+    const sprites = [_spriteAtlas, _rampDuotoneSprite, _glyphDuotoneSprite,
+      _rampGradientSprite, _glyphGradientSprite, _rampSprite, _edgeSprite];
+    let sb = 0, sn = 0;
+    for (let i = 0; i < sprites.length; i++) { if (sprites[i]) { sn++; sb += __memCanvasBytes(sprites[i]); } }
+    bytes.spriteCanvases = sb; counts.spriteCanvases = sn;
+    /* Per-scene processed source + depth p5.Graphics (canvas + loaded pixels). */
+    let proc = 0, depth = 0, procN = 0;
+    for (const k in SCENES) {
+      const s = SCENES[k];
+      if (s.__sourceProcessed) {
+        procN++;
+        proc += __memCanvasBytes(s.__sourceProcessed) + __memTypedBytes(s.__sourceProcessed.pixels);
+      }
+      if (s.__sourceDepth) depth += __memCanvasBytes(s.__sourceDepth) + __memTypedBytes(s.__sourceDepth.pixels);
+    }
+    bytes.sourceProcessed = proc; counts.sourceProcessed = procN;
+    bytes.sourceDepth = depth;
+    /* Source preprocess scratch planes (6 × Float32 W×H). */
+    let scratch = 0;
+    if (__sourcePreprocessScratch) {
+      for (const k in __sourcePreprocessScratch) scratch += __memTypedBytes(__sourcePreprocessScratch[k]);
+    }
+    bytes.sourceScratch = scratch;
+    /* Signal buffers + the static-source signal cache. */
+    bytes.lumBuf = __memTypedBytes(lumBuf);
+    bytes.cellSignal = __memTypedBytes(cellSignal) + __memTypedBytes(cellSignalEma);
+    bytes.sourceSignalCache = __sourceSignalCache
+      ? __memTypedBytes(__sourceSignalCache.lum) + __memTypedBytes(__sourceSignalCache.cells) : 0;
+    /* The imported source: p5.Image canvas, its pixels (if loadPixels ran),
+       and every decoded GIF frame (ImageData). This is the real session
+       lever (F2), not the caches above. */
+    let src = 0, srcFrames = 0;
+    if (sourceImg) {
+      src += __memCanvasBytes(sourceImg) + __memTypedBytes(sourceImg.pixels);
+      const gp = sourceImg.gifProperties;
+      if (gp && gp.frames) {
+        for (let i = 0; i < gp.frames.length; i++) {
+          const im = gp.frames[i] && gp.frames[i].image;
+          if (im && im.data) { src += __memTypedBytes(im.data); srcFrames++; }
+        }
+      }
+    }
+    bytes.sourceImage = src; counts.sourceFrames = srcFrames;
+    /* Glyph-set atlases (bounded at the 6 shipped sets) and wave6's
+       Harri atlas map (≤2 KB per entry). */
+    counts.glyphSetAtlases = Object.keys(_atlasCache).length;
+    const w6 = window.GlyphGrid.wave6 && window.GlyphGrid.wave6.atlasCacheStats
+      ? window.GlyphGrid.wave6.atlasCacheStats() : { entries: 0, bytes: 0 };
+    bytes.wave6AtlasCache = w6.bytes; counts.wave6AtlasCache = w6.entries;
+    /* Recording state: ZIP entries held until finishRecording. */
+    counts.recordingZipEntries = recState && recState.zip ? Object.keys(recState.zip.files).length : 0;
+    counts.perfRing = __pfRing.length;
+    let total = 0;
+    for (const k in bytes) total += bytes[k];
+    return { bytes: bytes, counts: counts, totalBytes: total };
+  };
+  window.__memReport = function () {
+    const r = window.GlyphGrid.memProbe();
+    const rows = {};
+    for (const k in r.bytes) rows[k] = { bytes: r.bytes[k], MB: +(r.bytes[k] / 1048576).toFixed(2), count: r.counts[k] };
+    for (const k in r.counts) if (!rows[k]) rows[k] = { bytes: 0, MB: 0, count: r.counts[k] };
+    console.table(rows);
+    console.log('retained total: ' + (r.totalBytes / 1048576).toFixed(2) + ' MB');
+    return r;
+  };
+
   /* Detect whether v2 advanced pipeline is needed. Returns false when every
      new gate is inert, in which case we take the legacy path (byte-identical). */
   function usesAdvancedPipeline(cfg) {
@@ -1724,6 +2534,7 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(CONFIG.font.family);
+    irBegin(cols, rows, CONFIG.font.family, 'brightness');
 
     /* Monochrome fast path (dither:none / compat:v1 configs land here).
        Same signal math and the same fill()+text() calls as the loop
@@ -1739,6 +2550,7 @@
         && palette.inks && palette.inks[0]
         && strategy !== 'nearest' && strategy !== 'edge-weighted') {
       const ink = color(palette.inks[0]);
+      const inkR = ink.levels[0], inkG = ink.levels[1], inkB = ink.levels[2];
       for (let row = 0; row < rows; row++) {
         const y0 = Math.floor(row * cellH);
         const cy = y0 + cellH / 2;
@@ -1767,6 +2579,7 @@
           ink.setAlpha(255 * Math.min(1, curved * 1.1));
           fill(ink);
           text(ch, x0 + cellW / 2, cy);
+          irPut(row * cols + col, ramp.charCodeAt(idx), inkR, inkG, inkB, curved * 1.1);
         }
       }
       return;
@@ -1793,6 +2606,7 @@
         if (ch === ' ') continue;
         applyCellFill(sample, palette, curved, bgR, bgG, bgB);
         text(ch, cx, cy);
+        irPut(row * cols + col, ramp.charCodeAt(idx), _irR, _irG, _irB, _irA);
       }
     }
   }
@@ -1856,12 +2670,14 @@
         const r = Math.max(0, Math.min(255, bgR + dr * s));
         const g = Math.max(0, Math.min(255, bgG + dg * s));
         const b = Math.max(0, Math.min(255, bgB + db * s));
+        _irR = r; _irG = g; _irB = b; _irA = 1;
         fill(r, g, b);
         return;
       }
       if (mode === 'monochrome') {
         const c = color(palette.inks[0]);
         c.setAlpha(255 * Math.min(1, curved * 1.1));
+        _irR = c.levels[0]; _irG = c.levels[1]; _irB = c.levels[2]; _irA = curved * 1.1;
         fill(c);
         return;
       }
@@ -1869,6 +2685,7 @@
         const a = color(palette.inks[0]);
         const b = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
         const lerped = lerpColor(a, b, Math.min(1, curved));
+        _irR = lerped.levels[0]; _irG = lerped.levels[1]; _irB = lerped.levels[2]; _irA = 1;
         fill(lerped);
         return;
       }
@@ -1879,10 +2696,12 @@
           const curve = typeof gmap.curve === 'number' ? gmap.curve : 1.0;
           const u = Math.pow(Math.min(1, Math.max(0, curved)), curve);
           const rgb = GlyphGrid.paletteMorph.interpAtU(stops, u);
+          _irR = rgb[0]; _irG = rgb[1]; _irB = rgb[2]; _irA = 1;
           fill(rgb[0], rgb[1], rgb[2]);
           return;
         }
       }
+      _irR = 255; _irG = 255; _irB = 255; _irA = 1;
       fill(255);
       return;
     }
@@ -1933,6 +2752,7 @@
     r = r * (1 - tf) + fr * tf;
     g = g * (1 - tf) + fg * tf;
     b = b * (1 - tf) + fb * tf;
+    _irR = r; _irG = g; _irB = b; _irA = alpha / 255;
     fill(r, g, b, alpha);
   }
 
@@ -2107,7 +2927,13 @@
     const _gainSwing = _rmStill ? 0 : ((typeof _br.gainSwing === 'number') ? _br.gainSwing : 0.30);
     const _jitterAmt = _rmStill ? 0 : ((typeof _br.jitter === 'number') ? _br.jitter : 0.05);
     const _pulseHz = (typeof _br.pulseHz === 'number') ? _br.pulseHz : 0.7;
-    const _frameIdx = recState ? recState.frameIdx : (frameCount - 1);
+    /* ITER-048 (F17 part 1, WCAG 2.3.3): zeroing swing/jitter was not enough —
+       the frame-hashed seed and the temporal dither phase still re-rolled
+       every frame, so a "still" source kept shimmering under
+       prefers-reduced-motion.  Pin the frame index to 0 for still sources in
+       the live view; animated sources and recordings keep their timeline. */
+    const _rmPinned = _rmStill && window.__sourceFrameIdx === -1;
+    const _frameIdx = _rmPinned ? 0 : (recState ? recState.frameIdx : (frameCount - 1));
     const _loopPhase = (_frameIdx / CONFIG.animation.fps) / CONFIG.animation.duration * Math.PI * 2;
     const _breatheGain = 1.0 + _gainSwing * Math.sin(_loopPhase * _pulseHz);
     const _seed = (CONFIG.seed | 0) ^ ((_frameIdx + 1) * 2654435761) >>> 0;
@@ -2115,14 +2941,22 @@
     // F8 (audit): branchless clamp replaces Math.max/Math.min function-call
     // pair per cell. 28,800 iters × 2 fewer calls/iter at default 240×120 grid.
     // Semantics identical for all finite values (NaN → NaN in both paths).
+    let _emaMaxD = 0;   /* ITER-062: largest EMA step this frame (idle detector) */
     for (let i = 0; i < cellSignal.length; i++) {
+      const _emaPrev = cellSignalEma[i];
       cellSignalEma[i] = (1 - _emaA) * cellSignalEma[i] + _emaA * cellSignal[i];
+      const _emaD = cellSignalEma[i] - _emaPrev;
+      if (_emaD > _emaMaxD) _emaMaxD = _emaD; else if (-_emaD > _emaMaxD) _emaMaxD = -_emaD;
       const h = ((i * 2246822519) ^ _seed) >>> 0;
       const jitter = ((h & 0xff) - 128) * _jScale;
       const _v = cellSignalEma[i] * _breatheGain + jitter;
       cellSignal[i] = _v < 0 ? 0 : _v > 1 ? 1 : _v;
     }
+    __emaMaxDelta = _emaMaxD;
     if (__pfFrame) __pfFrame.stages._ema = performance.now() - _t_ema0;
+    /* ITER-046: priming stops here — the EMA is the only cross-frame state
+       the signal stages hold; everything below is per-frame. */
+    if (__primeOnly) return;
 
     /* v2.1 — optional depth downsample.  Respects CONFIG.depth.invert /
        range so scenes can author depth maps with arbitrary polarity. */
@@ -2147,7 +2981,7 @@
       _persistentDitherOpts.mode = CONFIG.dither.mode;
       _persistentDitherOpts.levels = levels;
       _persistentDitherOpts.seed = CONFIG.seed;
-      _persistentDitherOpts.frameIdx = frameIdx;
+      _persistentDitherOpts.frameIdx = _rmPinned ? 0 : frameIdx;   /* ITER-048 */
       _persistentDitherOpts.asSourcePrefilter = CONFIG.dither.asSourcePrefilter;
       cellIndex = GlyphGrid.dither.apply(cellSignal, cols, rows, _persistentDitherOpts);
       if (__pfFrame) __pfFrame.stages._dither = performance.now() - _t_dith0;
@@ -2633,50 +3467,50 @@
      through to the unchanged CPU code below. */
   let _glOk = true;
   let _glCanvas = null;
-  let _glInstPos = null, _glGlyphIdx = null, _glColor = null;  // grow-only
-
-  function _glEnsureBuffers(n) {
-    if (!_glInstPos || _glInstPos.length < n * 4) {
-      _glInstPos = new Float32Array(n * 4);
-      _glColor   = new Float32Array(n * 3);
-    }
-    if (!_glGlyphIdx || _glGlyphIdx.length < n) {
-      _glGlyphIdx = new Float32Array(n);
-    }
-  }
+  let _glInst = null;  // grow-only Float32Array(N*4): x0, y0, glyphIdx, alpha
 
   /* Returns true if it rendered via WebGL (caller returns), false to
      fall through to the CPU path. Never throws — GL failure latches
-     _glOk=false and returns false. */
+     _glOk=false and returns false.
+     v0.2 Phase 4 (F7): output-equivalent to the CPU monochrome sprite
+     blit below — same `_ensureRampSprite` atlas, same tile size, same
+     `|0`-snapped origins, same space-glyph skip and draw order, per-cell
+     alpha composited source-over (wave6.drawSprite). Before ITER-065 this
+     read the caller's `bgR`/`_stabOnInt` locals, threw a ReferenceError on
+     its first frame and silently latched the CPU path (dead since v0.1.6). */
   function drawGridWebGL(cellIndex, signal, cols, rows, cellW, cellH,
-                         palette, ramp, rampLast) {
+                         palette, ramp, rampLast, _stabOnInt) {
     try {
       const wave6 = window.GlyphGrid && window.GlyphGrid.wave6;
-      if (!wave6) { _glOk = false; return false; }
+      if (!wave6 || !wave6.makeSprite) { _glOk = false; return false; }
       const W = width | 0, H = height | 0;
-      if (!_glCanvas) _glCanvas = document.createElement('canvas');
+      if (!_glCanvas) {
+        _glCanvas = document.createElement('canvas');
+        /* ITER-069: a lost context (GPU reset, driver update, tab pressure)
+           draws nothing without throwing — latch the CPU sprite path for
+           this frame and every later one instead of compositing blanks. */
+        _glCanvas.addEventListener('webglcontextlost', function () { _glOk = false; });
+      }
       if (_glCanvas.width !== W || _glCanvas.height !== H) {
         _glCanvas.width = W; _glCanvas.height = H;
       }
-      const fontPx = CONFIG.font.size;
-      const fam = fontFamilyForActive();
-      // Atlas tile ~ the CPU sprite tile metrics so glyph size matches.
-      const aCW = Math.max(4, Math.ceil(fontPx * 1.1));
-      const aCH = Math.max(4, Math.ceil(fontPx * 1.4));
-      const r = wave6.make(_glCanvas, ramp, fam, fontPx, aCW, aCH);
+      const sprite = _ensureRampSprite(
+        ramp, fontFamilyForActive(), CONFIG.font.size, palette.inks[0]
+      );
+      const r = wave6.makeSprite(_glCanvas);
+      if (r.gl.isContextLost()) { _glOk = false; return false; }
 
+      const _tFill0 = performance.now();
       const N = cols * rows;
-      _glEnsureBuffers(N);
-      const instPos = _glInstPos, glyphIdx = _glGlyphIdx, color = _glColor;
-      const cw = W / cols, ch = H / rows;
-      // monochrome: glyph stamped in ink, intensity = curved*1.1 folded
-      // into the per-cell colour as bg→ink lerp (the shader has no
-      // per-cell alpha; pre-dimming the colour reproduces the CPU
-      // globalAlpha=curved*1.1 look exactly).
-      const ink = (palette.inks && palette.inks[0]) || '#000';
-      const _ic = _hexToRgb(ink);
-      const inkR = _ic[0], inkG = _ic[1], inkB = _ic[2];
+      if (!_glInst || _glInst.length < N * 4) _glInst = new Float32Array(N * 4);
+      const inst = _glInst;
+      const spaceMask = _rampSpriteSpaceMask;
+      const halfTW = sprite.halfW, halfTH = sprite.halfH;
+      const halfCellW = cellW * 0.5, halfCellH = cellH * 0.5;
+      const _ic = _hexToRgb(palette.inks[0] || '#000');
+      let n = 0;
       for (let rr = 0; rr < rows; rr++) {
+        const y0 = ((((rr * cellH) | 0) + halfCellH) - halfTH) | 0;
         const rowI = rr * cols;
         for (let c = 0; c < cols; c++) {
           const i = rowI + c;
@@ -2693,27 +3527,28 @@
             else if (idx < 0) idx = 0;
             if (_stabOn) idx = _stableIdx(_stabIdx, i, curved * rampLast, idx);
           }
-          let a = curved * 1.1; if (a > 1) a = 1; else if (a < 0) a = 0;
-          const o4 = i * 4, o3 = i * 3;
-          instPos[o4]     = (c + 0.5) * cw;
-          instPos[o4 + 1] = (rr + 0.5) * ch;
-          instPos[o4 + 2] = cw;
-          instPos[o4 + 3] = ch;
-          glyphIdx[i]     = idx;
-          color[o3]     = (bgR + (inkR - bgR) * a) / 255;
-          color[o3 + 1] = (bgG + (inkG - bgG) * a) / 255;
-          color[o3 + 2] = (bgB + (inkB - bgB) * a) / 255;
+          if (spaceMask[idx]) continue;
+          /* globalAlpha semantics: a > 1 clamps to 1; a <= 0 draws nothing. */
+          const a = curved * 1.1;
+          irPut(i, ramp.charCodeAt(idx), _ic[0], _ic[1], _ic[2], a);
+          const o = n * 4;
+          inst[o]     = ((((c * cellW) | 0) + halfCellW) - halfTW) | 0;
+          inst[o + 1] = y0;
+          inst[o + 2] = idx;
+          inst[o + 3] = a > 1 ? 1 : (a > 0 ? a : 0);
+          n++;
         }
       }
-      // The renderer's drawArraysInstanced uses instPos.length/4 as the
-      // instance count — pass exact-length views when the grow-only
-      // buffer is larger than N.
-      const ip = instPos.length === N * 4 ? instPos : instPos.subarray(0, N * 4);
-      const gi = glyphIdx.length === N ? glyphIdx : glyphIdx.subarray(0, N);
-      const cl = color.length === N * 3 ? color : color.subarray(0, N * 3);
-      wave6.draw(r, _glCanvas, ip, gi, cl,
-                 [bgR / 255, bgG / 255, bgB / 255]);
+      const _tDraw0 = performance.now();
+      wave6.drawSprite(r, _glCanvas, sprite.canvas, sprite.tileW, sprite.tileH, inst, n,
+                       [_ic[0] / 255, _ic[1] / 255, _ic[2] / 255]);
+      if (!_glOk || r.gl.isContextLost()) { _glOk = false; return false; }  // lost mid-draw
+      const _tComp0 = performance.now();
       drawingContext.drawImage(_glCanvas, 0, 0);
+      const _tEnd = performance.now();
+      __pfAdd('gl_fill', _tDraw0 - _tFill0);
+      __pfAdd('gl_draw', _tComp0 - _tDraw0);
+      __pfAdd('gl_composite', _tEnd - _tComp0);
       return true;
     } catch (e) {
       console.warn('glyph-studio: WebGL path failed, latching CPU fallback:', e);
@@ -2741,6 +3576,7 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(fontFamilyForActive());
+    irBegin(cols, rows, fontFamilyForActive(), 'brightness');
     const ramp = RAMPS[CONFIG.ramp];
     const rampLast = ramp.length - 1;
     const gamma = CONFIG.brightnessGamma;
@@ -2864,10 +3700,10 @@
        a successful GL draw; _glOk latches false on GL failure. */
     if (CONFIG.renderer === 'webgl' && _glOk
         && colorMode === 'monochrome' && !depthFogActive && !_dispActive
-        && !(typeof _hasImgDataStages === 'function'
-             && _hasImgDataStages(CONFIG.postprocess))) {
+        && !(typeof _needsImgDataReadback === 'function'
+             && _needsImgDataReadback(CONFIG.postprocess))) {
       if (drawGridWebGL(cellIndex, signal, cols, rows, cellW, cellH,
-                        palette, ramp, rampLast)) {
+                        palette, ramp, rampLast, _stabOnInt)) {
         currentCellDepth = -1;
         return;
       }
@@ -2887,6 +3723,7 @@
       const spriteCanvas = sprite.canvas;
       const spaceMask = _rampSpriteSpaceMask;
       const prevAlpha = ctx.globalAlpha;
+      const _tBlit0 = performance.now();
       for (let r = 0; r < rows; r++) {
         const yBase = (r * cellH) | 0;
         const cy_base = yBase + halfCellH;
@@ -2935,6 +3772,7 @@
             }
           }
 
+          irPut(i, ramp.charCodeAt(idx), monoR, monoG, monoB, a);
           ctx.globalAlpha = a > 1 ? 1 : a;
           ctx.drawImage(
             spriteCanvas, idx * tileW, 0, tileW, tileH,
@@ -2943,6 +3781,7 @@
         }
       }
       ctx.globalAlpha = prevAlpha;
+      __pfAdd('cpu_blit', performance.now() - _tBlit0);
       currentCellDepth = -1;
       return;
     }
@@ -2981,6 +3820,8 @@
           const cx = ((c * cellW) | 0) + halfCellW;
           const t = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
           const stepIdx = (t * stepsLast + 0.5) | 0;
+          irPut(i, ramp.charCodeAt(idx), dueR0 + (dueR1 - dueR0) * t,
+                dueG0 + (dueG1 - dueG0) * t, dueB0 + (dueB1 - dueB0) * t, 1);
           ctx.drawImage(
             spriteCanvas, idx * tileW, stepIdx * tileH, tileW, tileH,
             (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
@@ -3027,6 +3868,8 @@
           const cx = ((c * cellW) | 0) + halfCellW;
           const cClamped = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
           const stepIdx = (cClamped * stepsLast + 0.5) | 0;
+          const lo = ((cClamped * 255) | 0) * 3;
+          irPut(i, ramp.charCodeAt(idx), _gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2], 1);
           ctx.drawImage(
             spriteCanvas, idx * tileW, stepIdx * tileH, tileW, tileH,
             (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
@@ -3068,6 +3911,7 @@
         currentCellDepth = cellDepth[i];
         applyCellFill(_sampleObj, palette, curved, bgR, bgG, bgB);
         text(ch, cx, cy);
+        irPut(i, ch.charCodeAt(0), _irR, _irG, _irB, _irA);
       }
     }
     currentCellDepth = -1;
@@ -3134,6 +3978,7 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(fontFamilyForActive());
+    irBegin(cols, rows, fontFamilyForActive(), edgeAware ? 'shape-edge-aware' : 'shape');
     const pixels = g.pixels;
     const srcW = g.width;
     const srcH = g.height;
@@ -3231,6 +4076,7 @@
           const sig = cellSignal[i];
           const sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
           const a = sigQ * 1.1;
+          irPut(i, glyph.cp, monoR, monoG, monoB, a);
           ctx.globalAlpha = a > 1 ? 1 : a;
           ctx.drawImage(
             spriteCanvas, gi * tileW, 0, tileW, tileH,
@@ -3267,6 +4113,8 @@
           const sig = cellSignal[i];
           const t = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
           const stepIdx = (t * stepsLast + 0.5) | 0;
+          irPut(i, glyph.cp, dueR0 + (dueR1 - dueR0) * t,
+                dueG0 + (dueG1 - dueG0) * t, dueB0 + (dueB1 - dueB0) * t, 1);
           ctx.drawImage(
             spriteCanvas, gi * tileW, stepIdx * tileH, tileW, tileH,
             (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
@@ -3302,6 +4150,8 @@
           const sig = cellSignal[i];
           const sigC = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
           const stepIdx = (sigC * stepsLast + 0.5) | 0;
+          const lo = ((sigC * 255) | 0) * 3;
+          irPut(i, glyph.cp, _gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2], 1);
           ctx.drawImage(
             spriteCanvas, gi * tileW, stepIdx * tileH, tileW, tileH,
             (cx - halfTW) | 0, (cy - halfTH) | 0, tileW, tileH
@@ -3331,6 +4181,7 @@
         currentCellDepth = cellDepth[i];
         applyCellFill(_sampleObj, palette, cellSignal[i], bgR, bgG, bgB);
         text(glyph.s, cx, cy);
+        irPut(i, glyph.cp, _irR, _irG, _irB, _irA);
       }
     }
     currentCellDepth = -1;
@@ -3420,6 +4271,7 @@
     textAlign(CENTER, CENTER);
     textSize(CONFIG.font.size);
     textFont(fontFamilyForActive());
+    irBegin(cols, rows, fontFamilyForActive(), cpsOverride ? 'flow' : 'edge-directional');
     const pixels = src.pixels;
     const srcW = src.width;
     const srcH = src.height;
@@ -3488,6 +4340,7 @@
           const cx = ((c * cellW) | 0) + halfCellW;
           const sig = cellSignal[i];
           const sigQ = sig < 0 ? 0 : (sig > 1 ? 1 : sig);
+          irPut(i, cp, monoR, monoG, monoB, sigQ * 1.1);
           const tile = _edgeTile[cp];
           if (tile < 0) {
             const a = sigQ * 280.5;
@@ -3523,6 +4376,7 @@
           const a = sigQ * 280.5;
           fill(monoR, monoG, monoB, a > 255 ? 255 : a);
           text(String.fromCodePoint(cp), cx, cy);
+          irPut(i, cp, monoR, monoG, monoB, sigQ * 1.1);
         }
       }
       currentCellDepth = -1;
@@ -3545,6 +4399,7 @@
           const fb = dueB0 + (dueB1 - dueB0) * t;
           fill(fr, fg, fb);
           text(String.fromCodePoint(cp), cx, cy);
+          irPut(i, cp, fr, fg, fb, 1);
         }
       }
       currentCellDepth = -1;
@@ -3565,6 +4420,7 @@
           const lo = ((sigC * 255) | 0) * 3;
           fill(_gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2]);
           text(String.fromCodePoint(cp), cx, cy);
+          irPut(i, cp, _gradColorLut[lo], _gradColorLut[lo + 1], _gradColorLut[lo + 2], 1);
         }
       }
       currentCellDepth = -1;
@@ -3587,6 +4443,7 @@
         currentCellDepth = cellDepth[i];
         applyCellFill(_sampleObj, palette, cellSignal[i], bgR, bgG, bgB);
         text(String.fromCodePoint(cp), cx, cy);
+        irPut(i, cp, _irR, _irG, _irB, _irA);
       }
     }
     currentCellDepth = -1;
@@ -3647,6 +4504,46 @@
     sets.forEach(function (s) {
       if (!_atlasCache[s] && !_atlasInflight[s]) loadAtlasAsync(s, { warmOnly: true });
     });
+  }
+
+  /* ITER-047: everything a capture needs that loads asynchronously — the
+     font cascade from setup() and the atlas for CONFIG.glyphSet (pre-warm
+     usually has it; a slow machine may still be fetching).  Headless callers
+     await this instead of sleeping; the live preview never waits (draw()
+     already falls back per frame).  Never rejects: atlas failures are logged
+     inside loadAtlasAsync and draw() falls back to brightness. */
+  function __assetsReady() {
+    const waits = [];
+    if (__fontLoadPromise) waits.push(__fontLoadPromise.catch(function () {}));
+    for (const id in _atlasInflight) waits.push(_atlasInflight[id]);
+    if (CONFIG.glyphSet && !_atlasCache[CONFIG.glyphSet] && !_atlasInflight[CONFIG.glyphSet]) {
+      waits.push(loadAtlasAsync(CONFIG.glyphSet, { warmOnly: true }));
+    }
+    /* ITER-075: a glyphSet timeline track switches atlases mid-capture; a
+       cache miss there falls back to brightness for that frame, so every
+       keyed set must be loaded before frame 0. */
+    const _tlSets = GlyphGrid.timeline && GlyphGrid.timeline.active(CONFIG)
+      && CONFIG.timeline.tracks.glyphSet;
+    if (Array.isArray(_tlSets)) {
+      for (const kf of _tlSets) {
+        const id = kf && kf.v;
+        if (typeof id === 'string' && !_atlasCache[id] && !_atlasInflight[id]) {
+          waits.push(loadAtlasAsync(id, { warmOnly: true }));
+        }
+      }
+    }
+    /* ITER-076: every face a text line names, at its size, before frame 0
+       (a fallback face for the first frames would change the output). */
+    const _ts = CONFIG.textSource;
+    if (_ts && _ts.enabled && Array.isArray(_ts.lines) && document.fonts && document.fonts.load) {
+      const specs = {};
+      for (const line of _ts.lines) {
+        const r = GlyphGrid.text.resolveLine(line, _ts);
+        specs[GlyphGrid.text.fontSpec(r.weight, r.size, r.font)] = r.text;
+      }
+      for (const spec in specs) waits.push(document.fonts.load(spec, specs[spec]).catch(function () {}));
+    }
+    return Promise.all(waits).then(function () {});
   }
 
   /* ---- post-process (v2 only). ----
@@ -3712,7 +4609,7 @@
   // NOT trigger the full getImageData + putImageData round-trip (~5 ms/frame
   // combined on default canvas). Mirrors the _stageActive helper in
   // glyph-compat.js — same source of truth as gatePostprocess.
-  function _hasImgDataStages(p) {
+  function _hasImgDataStages(p, skipOverlayable) {
     if (!p) return false;
     function _on(s, ks) {
       if (!s || !s.enabled) return false;
@@ -3727,10 +4624,44 @@
            _on(p.halation, ['intensity', 'strength']) ||
            _on(p.bloom, ['intensity', 'strength']) ||
            _on(p.godRays, ['strength', 'intensity']) ||
-           _on(p.scanlines, ['intensity', 'strength']) ||
+           (!skipOverlayable && _on(p.scanlines, ['intensity', 'strength'])) ||
            _on(p.chromaticAberration, ['amount']) ||
            _on(p.barrel, ['amount']) ||
-           _on(p.kawaii, ['intensity']);
+           (!skipOverlayable && _on(p.kawaii, ['intensity']));
+  }
+
+  /* v0.2 Phase 4 (F10 Tier A): scanlines and kawaii are drawn as canvas-2D
+     composites when they are the ONLY imgData stages, so such stacks skip
+     the full-canvas getImageData/putImageData. True when a stage that still
+     needs the RGBA readback is active. `_hasImgDataStages` keeps its meaning
+     (any per-pixel CRT stage — the idle detector uses it: kawaii twinkles). */
+  function _needsImgDataReadback(p) {
+    if (!p || !_hasImgDataStages(p)) return false;
+    const sl = p.scanlines;
+    const slOn = !!(sl && sl.enabled);
+    const slI = slOn ? (sl.intensity == null ? 0.25 : sl.intensity) : 0;
+    if (slOn && !(slI >= 0)) return true;  /* negative/NaN intensity brightens — CPU only */
+    return _hasImgDataStages(p, true);
+  }
+
+  /* Scanline darken mask: opaque black on the rows applyScanlines darkens,
+     transparent elsewhere; drawn source-over at globalAlpha = intensity it
+     gives c·(1 − intensity) on those rows (±1 LSB vs the RGBA multiply).
+     Cached by (w, h, period, phase). */
+  let _scanlineOverlay = null;       // { canvas, key }
+  function _ensureScanlineOverlay(w, h, period, phase) {
+    const key = w + 'x' + h + ':' + period + ':' + phase;
+    if (_scanlineOverlay && _scanlineOverlay.key === key) return _scanlineOverlay;
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#000';
+    for (let y = 0; y < h; y++) {
+      if ((y + phase) % period === 0) continue;   /* same row test as applyScanlines */
+      ctx.fillRect(0, y, w, 1);
+    }
+    _scanlineOverlay = { canvas: canvas, key: key };
+    return _scanlineOverlay;
   }
 
   // HOT-PATH: applyPostprocess — pixel-stage round-trip. Optimization loop
@@ -3744,8 +4675,9 @@
       : (frameCount - 1);
     const reduced = __prefersReducedMotion();
 
-    /* Phase A — only when any imgData stage is active. */
-    if (_hasImgDataStages(post)) {
+    /* Phase A — only when an imgData stage that needs the RGBA buffer is
+       active (applyChain then also runs scanlines/kawaii in-buffer). */
+    if (_needsImgDataReadback(post)) {
       const imgData = ctx.getImageData(0, 0, w, h);
       /* Stateful stages need a host-owned state: applyChain's own lazy
          init only rebinds its local, so a null crtState meant a fresh
@@ -3762,6 +4694,26 @@
         skipOverlays: true,            /* vignette + letterbox handled below */
       });
       ctx.putImageData(imgData, 0, 0);
+    } else if (_hasImgDataStages(post)) {
+      /* Tier A — scanlines then kawaii, the order applyChain uses, both
+         before the vignette/letterbox overlays like the Phase A path. */
+      const prevAlpha = ctx.globalAlpha, prevFill = ctx.fillStyle;
+      const prevOp = ctx.globalCompositeOperation;
+      ctx.globalCompositeOperation = 'source-over';
+      const sl = post.scanlines;
+      if (sl && sl.enabled) {
+        const intensity = sl.intensity == null ? 0.25 : sl.intensity;
+        if (intensity > 0) {
+          const period = Math.max(1, sl.period | 0 || 2);
+          const phase = reduced ? 0 : (sl.phase || 0);
+          ctx.globalAlpha = intensity > 1 ? 1 : intensity;
+          ctx.drawImage(_ensureScanlineOverlay(w, h, period, phase).canvas, 0, 0);
+        }
+      }
+      const kw = post.kawaii;
+      if (kw && kw.enabled) GlyphGrid.crt.applyKawaiiCtx(ctx, w, h, kw, frameIdx);
+      ctx.globalAlpha = prevAlpha; ctx.fillStyle = prevFill;
+      ctx.globalCompositeOperation = prevOp;
     }
 
     /* Phase B — overlays. drawImage with composite op; no readback. */
@@ -3814,7 +4766,10 @@
      imperceptible — frames are still in temporal order. */
   let __recordJobSequence = 0;
   const MAX_CAPTURE_FRAMES = 600;
-  const MAX_CAPTURE_PIXELS = 100 * 1000 * 1000;
+  /* ITER-054: no total pixel budget. The Rust GIF/MP4 encoders decode
+     through a bounded window, so decode memory no longer grows with frames;
+     Rust bounds what it retains (256 MB of PNG, 1 GiB of raw RGBA) and
+     guards single frames. Only the frame count is checked here. */
 
   function validateCaptureBudget(requestedTotal, captureWidth, captureHeight) {
     const total = Math.max(1, Math.round(Number(requestedTotal) || 1));
@@ -3825,9 +4780,6 @@
     if (total > MAX_CAPTURE_FRAMES) {
       code = 'capture-frame-limit';
       message = 'Export frame limit exceeded (' + total + ' > ' + MAX_CAPTURE_FRAMES + ')';
-    } else if (!Number.isSafeInteger(pixels) || pixels > MAX_CAPTURE_PIXELS) {
-      code = 'capture-pixel-limit';
-      message = 'Export pixel budget exceeded; lower duration, FPS, or output size';
     }
     return { ok: !code, code, message, total, pixels };
   }
@@ -3906,12 +4858,42 @@
     const name = `frame_${String(idx + 1).padStart(4, '0')}.png`;
     statusEl().textContent =
       `RECORDING ${idx + 1}/${state.total} (${CONFIG.scene} @ ${CONFIG.palette})`;
-    const blobReady = new Promise(function (resolve, reject) {
-      drawingContext.canvas.toBlob(function (blob) {
-        if (blob) resolve(blob);
-        else reject(new Error('canvas PNG capture returned no data'));
-      }, 'image/png');
-    });
+    /* ITER-052 (F2 step 2): raw capture reads the canvas back with
+       getImageData, synchronously and before the next draw, and hands the
+       onFrame consumer straight RGBA — no PNG.  WebKit's toBlob does the
+       GPU readback AND the PNG encode synchronously inside the call
+       (research F2: ~40 % of the WebContent main thread), so the pipeline
+       below never overlapped it.  The canvas is opaque, so getImageData's
+       un-premultiplied bytes equal what the PNG round-trip decoded to.
+       F6 step 0 stages: cap_toBlob_call = the synchronous capture call
+       (getImageData on the raw path), cap_toBlob_async = PNG callback. */
+    const _pfCapFrame = __pfFrame;
+    const _tCap0 = performance.now();
+    /* ITER-074: text-family exports take a copy of the GlyphFrame IR here,
+       synchronously, for the same reason getImageData runs here — the next
+       draw overwrites it.  irOnly skips the pixel readback entirely. */
+    const irSnap = state.captureIr ? GlyphGrid.textExport.snapFromIr(glyphFrame) : null;
+    let blobReady;
+    if (state.irOnly) {
+      blobReady = Promise.resolve(null);
+    } else if (state.rawFrames) {
+      try {
+        const cv = drawingContext.canvas;
+        blobReady = Promise.resolve(drawingContext.getImageData(0, 0, cv.width, cv.height));
+      } catch (e) {
+        blobReady = Promise.reject(e);
+      }
+    } else {
+      blobReady = new Promise(function (resolve, reject) {
+        drawingContext.canvas.toBlob(function (blob) {
+          /* F6 step 0: snapshot→PNG latency (async; off the draw thread). */
+          if (_pfCapFrame) _pfCapFrame.stages.cap_toBlob_async = performance.now() - _tCap0;
+          if (blob) resolve(blob);
+          else reject(new Error('canvas PNG capture returned no data'));
+        }, 'image/png');
+      });
+    }
+    __pfAdd('cap_toBlob_call', performance.now() - _tCap0);
     state.frameIdx++;           // the next draw renders the next logical frame
     state._inFlight = (state._inFlight || 0) + 1;
     if (state.frameIdx >= state.total || state._inFlight >= CAPTURE_PIPELINE_DEPTH) {
@@ -3931,6 +4913,14 @@
       return encoded.then(function (base64) {
         if (recState !== state || state.cancelled) return null;
         if (state.framesB64) state.framesB64.push(base64);
+        if (state.onFrame && state.rawFrames) {
+          return state.onFrame({
+            jobId: state.jobId, index: idx, name, blob: null, b64: null,
+            rgba: blob ? blob.data : null, width: blob ? blob.width : 0,
+            height: blob ? blob.height : 0, ir: irSnap,
+            total: state.total,
+          });
+        }
         if (state.onFrame) {
           return state.onFrame({
             jobId: state.jobId, index: idx, name, blob, b64: base64,
@@ -4020,6 +5010,92 @@
     }
   }
 
+  /* ITER-046 (F23): make the capture a pure function of (source, config,
+     seed).  Three buffers carry state across draws — the per-cell EMA
+     (cellSignalEma), the CRT phosphor/beam state (crtState) and the
+     temporal-stability hysteresis (_stab*).  Before ITER-046 none of them
+     was touched by beginRecord, so frame 0 inherited whatever the live
+     rAF loop reached during the pre-capture sleeps (~10 draws off-screen,
+     ~127 with --show-window) and job N+1 of a batch inherited job N's
+     tail.  ITER-044 measured the drift at 33.5–34.4 dB (frame 1 ≈ 19 dB).
+
+     Reset all three, then run PRIME_FRAMES signal-only passes over the
+     loop tail (frameIdx total-K .. total-1, wrapping for short loops) so
+     frame 0 starts from the state the loop itself would have produced —
+     deterministic and seamless at the wrap.  Still sources see the same
+     passes against a constant signal (lum/cell caches make them ~EMA-only).
+     Phosphor and stability restart from scratch at frame 0 — deterministic,
+     and identical to what a fresh process did before. */
+  function primeTemporalState(total) {
+    __lastPrime = null;     /* ITER-049: never report a previous job's prime */
+    if (!sourceImg || !sourceImg.width || window.PIPELINE) return;
+    const want = CONFIG.grid.cols * CONFIG.grid.rows;
+    if (!cellSignalEma || cellSignalEma.length !== want) cellSignalEma = new Float32Array(want);
+    cellSignalEma.fill(0.5);
+    crtState = null;        /* applyPostprocess re-makes it on first use */
+    _stabKey = '';          /* _ensureStabBuf re-allocates to -1 */
+    const n = Math.max(1, total | 0);
+    const t0 = performance.now();
+    const passMs = [];
+    __primeOnly = true;
+    try {
+      for (let i = 0; i < PRIME_FRAMES; i++) {
+        recState.frameIdx = (((n - PRIME_FRAMES + i) % n) + n) % n;
+        const tp = performance.now();
+        redraw();
+        passMs.push(+(performance.now() - tp).toFixed(1));
+      }
+    } finally {
+      __primeOnly = false;
+      recState.frameIdx = 0;
+    }
+    /* Diagnostics for the headless log (batch startCapture emits it): the
+       primed EMA mean is the one number that tells a blank capture (signal
+       read from an unpainted source, mean ≈ 0) from a real render. */
+    let sum = 0;
+    for (let i = 0; i < cellSignalEma.length; i++) sum += cellSignalEma[i];
+    const stages = {};
+    if (__pfFrame && __pfFrame.stages) {
+      for (const k in __pfFrame.stages) stages[k] = +__pfFrame.stages[k].toFixed(1);
+    }
+    __lastPrime = {
+      frames: PRIME_FRAMES,
+      ms: Math.round(performance.now() - t0),
+      emaMean: +(sum / cellSignalEma.length).toFixed(4),
+      passMs: passMs,     /* wall ms per priming pass */
+      lastPass: stages,   /* per-stage ms of the final priming pass */
+    };
+  }
+  let __lastPrime = null;
+
+  /* ITER-074: the bundled Cascadia subset (ASCII, blocks, braille,
+     sextants, octants) as base64, for the HTML export's inline @font-face.
+     Fetched once from the app bundle; null when unreachable (file:// preview)
+     — the HTML then falls back to the viewer's monospace. */
+  let __inlineFontPromise = null;
+  function loadInlineFontBase64() {
+    if (!__inlineFontPromise) {
+      __inlineFontPromise = fetch('fonts/cascadia-mono-subset.woff2')
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+        .then(function (buf) { return bytesToBase64(new Uint8Array(buf)); })
+        .catch(function (e) { console.warn('inline font unavailable:', e); return null; });
+    }
+    return __inlineFontPromise;
+  }
+
+  /* ITER-074: output format from an output path's extension (Rust passes an
+     explicit format; this covers direct runBatchExport callers). */
+  function formatFromPath(path) {
+    const m = /\.([a-z0-9]+)$/i.exec(path || '');
+    const ext = m ? m[1].toLowerCase() : '';
+    if (ext === 'mp4') return 'mp4';
+    if (ext === 'txt') return 'txt';
+    if (ext === 'ans' || ext === 'ansi') return 'ansi';
+    if (ext === 'cast') return 'cast';
+    if (ext === 'html' || ext === 'htm') return 'html';
+    return 'gif';
+  }
+
   /* =================================================================
      Test hooks. getConfig now returns a deep clone (EC-4).
      ================================================================= */
@@ -4042,6 +5118,11 @@
       const onFrame = (typeof opts.onFrame === 'function') ? opts.onFrame : null;
       const collectZip = opts.collectZip === true
         || (opts.collectZip !== false && !collectFrames && !onFrame);
+      /* ITER-052: raw RGBA frames only for a pure streaming consumer — the
+         ZIP and retained-base64 paths still need PNG files. */
+      const rawFrames = opts.rawFrames === true && !!onFrame && !collectZip && !collectFrames;
+      /* ITER-074: IR snapshots per frame (frame.ir); irOnly = no pixels. */
+      const captureIr = opts.captureIr === true && rawFrames;
       /* A pending settings redraw must never fire between noLoop() and the
          asynchronous toBlob callback. Capture becomes the sole loop owner. */
       cancelScheduledConfigRender();
@@ -4055,10 +5136,41 @@
         done: false,
         cancelled: false,
         onFrame,
+        rawFrames,
+        captureIr,
+        irOnly: captureIr && opts.irOnly === true,
         onProgress: opts.onProgress,
         onError: opts.onError,
         onFinish: opts.onFinish || onFinishOverride,
       };
+      /* ITER-046: deterministic warm-up, synchronous — the first live draw
+         after this call is frame 0.  ITER-049: it runs BEFORE loop() —
+         p5's loop() is `_loop = true; _draw()`, which can draw synchronously
+         when the previous job's noLoop() is still in effect, and recState is
+         already installed above, so that draw would have been captured as
+         frame 0 from un-primed state. */
+      /* ITER-077: a video source decodes the priming frames + frame 0
+         first (the priming redraws are synchronous); the loop stays parked
+         (_srcWait) until they are in, then primes and starts as below. */
+      const _prefetch = prefetchCaptureFrames(total);
+      if (_prefetch) {
+        const state = recState;
+        state._srcWait = true;
+        try { noLoop(); } catch (_) {}
+        _prefetch.then(function () {
+          if (recState !== state || state.cancelled) return;
+          state._srcWait = false;
+          primeTemporalState(total);
+          if (__pfLastChange) __pfLastChange.t = performance.now();
+          try { loop(); } catch (e) {}
+        }, function (e) { failRecording(state, e); });
+        return recState.jobId;
+      }
+      primeTemporalState(total);
+      /* ITER-049: the perf switch-point stamp (__markChange in startCapture)
+         predates the priming passes; re-stamp it so switch_ms measures the
+         first captured frame alone, not PRIME_FRAMES passes of priming. */
+      if (__pfLastChange) __pfLastChange.t = performance.now();
       /* Re-engage the p5 draw loop in case a previous recording's
          finishRecording → noLoop() is still in effect.  Without this,
          batch-mode runBatchExport stalls after the first job. */
@@ -4078,18 +5190,12 @@
     },
     getConfig: () => JSON.parse(JSON.stringify(CONFIG)),
     setConfig: (overrides) => {
-      /* Deep-merge object values so partial overrides like
-         { dither: { mode: 'stbn' } } don't blow away the rest of dither.* */
-      for (const k in overrides) {
-        const v = overrides[k];
-        if (v && typeof v === 'object' && !Array.isArray(v)
-            && CONFIG[k] && typeof CONFIG[k] === 'object' && !Array.isArray(CONFIG[k])) {
-          Object.assign(CONFIG[k], v);
-        } else {
-          CONFIG[k] = v;
-        }
-      }
-      scheduleConfigRender(Object.keys(overrides).join(','));
+      /* F24 (ITER-057): the shared recursive merge (GlyphStudio.deepMerge,
+         same as the GUI preset path).  The old one-level Object.assign
+         replaced nested blocks: { postprocess: { vignette: { enabled } } }
+         dropped vignette.strength. */
+      window.GlyphStudio.deepMerge(CONFIG, window.GlyphStudio.stripRuntimeOnly(overrides || {}));
+      scheduleConfigRender(Object.keys(overrides || {}).join(','));
     },
     getRecState: () => recState,
     getSourceLimits: () => Object.assign({}, SOURCE_LIMITS),
@@ -4101,97 +5207,32 @@
     getRenderGeneration: () => __renderGeneration,
     getSkillVersion: () => (window.GlyphGrid && GlyphGrid.compat ? GlyphGrid.compat.SKILL_VERSION : '1.x'),
 
-    /* ── captureGridSnapshot (v0.1.6, SOTA feature 2) ──────────────────
+    /* ── captureGridSnapshot (v0.1.6; ITER-073 reads the GlyphFrame IR) ──
        Vector/text export needs the grid AS DATA, not pixels.  Reads the
-       PERSISTENT cellSignal buffer (the post-EMA brightness the last
-       frame rendered from) and replays the brightness-mode glyph +
-       colour selection OUTSIDE the draw loop — zero cost to the hot
-       paths.  Honors temporal stability (reads the displayed _stabIdx).
-       Brightness selection mode only; shape/edge modes return null
-       (their per-cell picks aren't persisted) — callers show a hint. */
+       glyphFrame IR the last painted frame's drawer filled, so it works in
+       every selection mode (brightness, shape, shape-edge-aware,
+       edge-directional, flow) and on the v1 + GL paths, and honours
+       temporal stability by construction (the IR holds the displayed pick).
+       Zero cost to the hot paths beyond the IR stores.  null until a frame
+       has been painted at the current grid size. */
     captureGridSnapshot() {
       try {
-        const mode = GlyphGrid.compat.resolveSelectionMode(CONFIG);
-        if (mode !== 'brightness') return null;
-        if (!cellSignal || !sourceImg) return null;
+        const f = glyphFrame;
         const cols = CONFIG.grid.cols, rows = CONFIG.grid.rows;
-        if (cellSignal.length !== cols * rows) return null;
-        const ramp = RAMPS[CONFIG.ramp];
-        const rampLast = ramp.length - 1;
-        _buildGammaLut(CONFIG.brightnessGamma);
-        const palette = PALETTES[CONFIG.palette];
-        const bgC = color(palette.bg);
-        const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
-        const colorMode = CONFIG.colorMode;
+        if (!sourceImg || !f.seq || f.cols !== cols || f.rows !== rows) return null;
         const cellW = width / cols, cellH = height / rows;
-        const cellPxW = Math.max(1, Math.floor(cellW));
-        const cellPxH = Math.max(1, Math.floor(cellH));
-        const gSrc = src, pixels = gSrc.pixels, srcW = gSrc.width;
-        const stride = srcW * 4;
-        /* Colour hoists mirroring drawBrightnessGrid. */
-        let monoR = 0, monoG = 0, monoB = 0;
-        if (colorMode === 'monochrome' && palette.inks && palette.inks[0]) {
-          const ic = color(palette.inks[0]);
-          monoR = red(ic); monoG = green(ic); monoB = blue(ic);
-        }
-        let dueR0 = 0, dueG0 = 0, dueB0 = 0, dueR1 = 0, dueG1 = 0, dueB1 = 0;
-        if (colorMode === 'duotone' && palette.inks && palette.inks.length > 0) {
-          const c0 = color(palette.inks[0]);
-          const c1 = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
-          dueR0 = red(c0); dueG0 = green(c0); dueB0 = blue(c0);
-          dueR1 = red(c1); dueG1 = green(c1); dueB1 = blue(c1);
-        }
-        let useGrad = false;
-        if (colorMode === 'gradient') {
-          const gStops = resolveGradientStops(palette);
-          if (gStops && gStops.length > 0) {
-            const gmap = CONFIG.gradientColorMap || {};
-            _ensureGradColorLut(gStops, gmap.blend || 'oklab',
-                                (typeof gmap.curve === 'number') ? gmap.curve : 1.0);
-            useGrad = true;
-          }
-        }
-        const stab = (CONFIG.temporalStability && CONFIG.temporalStability.enabled
-                      && _stabIdx && _stabIdx.length === cols * rows) ? _stabIdx : null;
+        const cp = f.cp, fg = f.fg, al = f.alpha;
         const cells = [];
         for (let r = 0; r < rows; r++) {
           for (let c = 0; c < cols; c++) {
             const i = r * cols + c;
-            const sigI = cellSignal[i];
-            const sigQ = sigI < 0 ? 0 : (sigI > 1 ? 1 : sigI);
-            const curved = _gammaLut[(sigQ * 255) | 0];
-            let idx = (curved * rampLast + 0.0001) | 0;
-            if (idx > rampLast) idx = rampLast; else if (idx < 0) idx = 0;
-            if (stab && stab[i] >= 0) idx = stab[i];
-            const ch = ramp.charAt(idx);
-            if (ch === ' ') continue;
-            let fr, fg, fb, fo = 1;
-            if (colorMode === 'monochrome') {
-              fr = monoR; fg = monoG; fb = monoB;
-              fo = Math.min(1, curved * 1.1);
-            } else if (colorMode === 'duotone') {
-              const t = curved < 0 ? 0 : (curved > 1 ? 1 : curved);
-              fr = dueR0 + (dueR1 - dueR0) * t;
-              fg = dueG0 + (dueG1 - dueG0) * t;
-              fb = dueB0 + (dueB1 - dueB0) * t;
-            } else if (colorMode === 'gradient' && useGrad) {
-              const o = ((curved * 255) | 0) * 3;
-              fr = _gradColorLut[o]; fg = _gradColorLut[o + 1]; fb = _gradColorLut[o + 2];
-            } else {
-              /* preserve — sample + contrast-stretch (applyCellFill math) */
-              const x0 = (c * cellW) | 0, y0 = (r * cellH) | 0;
-              sampleCellInto(_sampleObj, pixels, stride, x0, y0, cellPxW, cellPxH, srcW, gSrc.height);
-              const dr = _sampleObj.r - bgR, dg = _sampleObj.g - bgG, db = _sampleObj.b - bgB;
-              const m = Math.max(Math.abs(dr), Math.abs(dg), Math.abs(db), 1);
-              const sc = 255 / m;
-              fr = Math.max(0, Math.min(255, bgR + dr * sc));
-              fg = Math.max(0, Math.min(255, bgG + dg * sc));
-              fb = Math.max(0, Math.min(255, bgB + db * sc));
-            }
+            const code = cp[i];
+            if (code === 0 || code === 0x20) continue;
+            const o = i * 3;
             cells.push({
-              c: ch, col: c, row: r,
-              f: 'rgb(' + (fr | 0) + ',' + (fg | 0) + ',' + (fb | 0) + ')',
-              o: Math.round(fo * 1000) / 1000,
+              c: String.fromCodePoint(code), col: c, row: r,
+              f: 'rgb(' + fg[o] + ',' + fg[o + 1] + ',' + fg[o + 2] + ')',
+              o: Math.round(al[i] / 255 * 1000) / 1000,
             });
           }
         }
@@ -4200,8 +5241,9 @@
           w: width, h: height,
           cellW: cellW, cellH: cellH,
           fontSize: CONFIG.font.size,
-          fontFamily: (CONFIG.font && CONFIG.font.family) || 'monospace',
-          bg: palette.bg,
+          fontFamily: f.font || (CONFIG.font && CONFIG.font.family) || 'monospace',
+          bg: f.bgHex || PALETTES[CONFIG.palette].bg,
+          mode: f.mode,
           ramp: CONFIG.ramp,
           palette: CONFIG.palette,
           cells: cells,
@@ -4211,13 +5253,30 @@
         return null;
       }
     },
+    /* ITER-073: the live GlyphFrame IR (read-only by convention — Phase 5
+       exporters copy what they need) and the active FrameSource. */
+    getGlyphFrame: () => glyphFrame,
+    /* ITER-074: a self-contained copy of the last painted IR in the
+       GlyphGrid.textExport snapshot shape, or null (same guard as
+       captureGridSnapshot). */
+    captureTextSnapshot() {
+      const f = glyphFrame;
+      if (!sourceImg || !f.seq || f.cols !== CONFIG.grid.cols || f.rows !== CONFIG.grid.rows) return null;
+      return GlyphGrid.textExport.snapFromIr(f);
+    },
+    getInlineFontBase64: () => loadInlineFontBase64(),
+    getFrameSource: () => (__frameSource
+      ? { kind: __frameSource.kind, durationMs: __frameSource.durationMs,
+          index: __frameSource.index, revision: __frameSource.revision }
+      : null),
 
     /* Batch GIF export — drive hundreds of variations unattended.
        Each `job` is { name: 'human-label', path: '/abs/path/foo.gif',
        config: { palette: 'spice', colorMode: 'duotone', dither: {mode:'stbn'} },
        frames: 24 }.
        opts: { onProgress(idx,total,name), onComplete({ ok, errors }),
-              settleMs:120, perf:false }.
+              perf:false }.  (settleMs went away in ITER-047: capture
+       starts when the staged job and the config's assets are ready.)
        When opts.perf === true: clears the __pfRing before each job, snapshots
        per-stage timings + p50/p95 totals after each job, and emits a
        `PERF_JOB <json>` NDJSON line via the cli_log Tauri command (stderr).
@@ -4227,7 +5286,6 @@
       const total = jobs.length;
       const errors = [];
       let idx = 0;
-      const settle = opts.settleMs != null ? opts.settleMs : 120;
       const perfMode = !!opts.perf;
       const tauri = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
       if (!tauri) { console.warn('batch: not in Tauri, aborting'); return; }
@@ -4276,17 +5334,24 @@
         };
       }
 
+      /* F24 (ITER-057): same merge as setConfig and the GUI presets. */
       function applyConfig(cfg) {
         if (!cfg) return;
-        for (const k in cfg) {
-          const v = cfg[k];
-          if (v && typeof v === 'object' && !Array.isArray(v)
-              && CONFIG[k] && typeof CONFIG[k] === 'object' && !Array.isArray(CONFIG[k])) {
-            Object.assign(CONFIG[k], v);
-          } else {
-            CONFIG[k] = v;
-          }
-        }
+        window.GlyphStudio.deepMerge(CONFIG, window.GlyphStudio.stripRuntimeOnly(cfg));
+      }
+
+      /* ITER-057: manifest `border` → the BorderConfig the encoders take.
+         bgColor "auto"/absent = this job's palette bg (the GUI default). */
+      function resolveJobBorder(b) {
+        if (!b || b.enabled === false || !b.width) return null;
+        const pal = PALETTES[CONFIG.palette] || {};
+        return {
+          enabled: true,
+          width: Math.round(b.width),
+          style: b.style || 'solid',
+          bgColor: (!b.bgColor || b.bgColor === 'auto') ? (pal.bg || '#E8DDC8') : b.bgColor,
+          inkColor: b.inkColor || (pal.inks && pal.inks[0]) || '#0E0805',
+        };
       }
 
       /* Audit 2026-06-10: jobs with PARTIAL configs used to inherit
@@ -4317,11 +5382,14 @@
            Keeps the batch in ONE Tauri session even when N source
            images need exercising (autonomous loop bench: 4 sources × 5
            configs in a single studio process, not 4). */
-        const wantSrc = job.inPath || null;
-        if (wantSrc && wantSrc !== __cliCurrentSource
+        /* ITER-077: a clip re-opens when the job asks for another decoder. */
+        const wantDecode = _jobVideoDecode(job.config, baselineConfig);
+        const decodeSwap = __cliCurrentDecode !== null && wantDecode !== __cliCurrentDecode;
+        const wantSrc = job.inPath || (decodeSwap ? __cliCurrentSource : null);
+        if (wantSrc && (wantSrc !== __cliCurrentSource || decodeSwap)
             && typeof _cliLoadSource === 'function'
             && window.__TAURI__ && window.__TAURI__.core) {
-          _cliLoadSource(wantSrc).then(function () {
+          _cliLoadSource(wantSrc, wantDecode).then(function () {
             _runJob();
           }).catch(function (e) {
             console.warn('batch: source swap failed for', job.name, e);
@@ -4336,6 +5404,13 @@
       function _runJob() {
         resetToBaseline();          // audit 2026-06-10: no cross-job leakage
         applyConfig(job.config);
+        /* ITER-076: (un)install this job's text source + its cue duration
+           before frames 'auto' and the capture size are resolved. */
+        syncTextSource(true);
+        textStrokeCheck();
+        /* ITER-078: headless twin of the status-bar palette-track note. */
+        const _tlNote = GlyphGrid.timeline && GlyphGrid.timeline.paletteIgnored(CONFIG_BASE);
+        if (_tlNote) tauri('cli_log', { msg: 'warn: ' + _tlNote }).catch(()=>{});
         // Force loop on so draw() advances
         try { loop(); } catch (e) {}
 
@@ -4352,7 +5427,13 @@
         const effFps = 1000 / delayMs;
         const savedFps = CONFIG.animation.fps;
         CONFIG.animation.fps = effFps;
-        const requestedFrames = job.frames || 24;
+        /* ITER-057: frames "auto" = the GUI export plan — this job's
+           resolved duration × effective fps (exportPlan in glyph-studio.js),
+           so the output lasts exactly animation.duration. */
+        const requestedFrames = job.frames === 'auto'
+          ? Math.max(2, Math.round(((CONFIG.animation && CONFIG.animation.duration) || 6) * effFps))
+          : (job.frames || 24);
+        const jobBorder = resolveJobBorder(job.border);
         let captureFailureHandled = false;
 
         function advanceCaptureFailure(error, budget, phase) {
@@ -4380,10 +5461,82 @@
           setTimeout(next, 50);
         }
 
-        /* Fail before the settle timer when dimensions/frame count already
+        /* Fail before staging when dimensions/frame count already
            exceed the same envelope enforced by beginRecord/Rust.  This is
            especially important in headless mode: an uncaught timer error
            otherwise leaves exit_with_status waiting forever. */
+        /* ITER-074: txt | ansi | cast | html — the grid as text, built from
+           per-frame GlyphFrame IR copies; no pixels, no encoder staging. */
+        const textFmt = String(job.format || formatFromPath(job.path)).toLowerCase();
+        if (GlyphGrid.textExport.FORMATS.indexOf(textFmt) >= 0) {
+          runTextJob(textFmt);
+          return;
+        }
+
+        function runTextJob(tfmt) {
+          const TEXT = GlyphGrid.textExport;
+          /* txt / ansi are one still (frame 0); cast / html animate. */
+          const want = TEXT.STILL_FORMATS.indexOf(tfmt) >= 0 ? 1 : requestedFrames;
+          const budget = self.validateRecord(want, width, height);
+          if (!budget.ok) {
+            const preflightError = new Error(budget.message);
+            preflightError.code = budget.code;
+            advanceCaptureFailure(preflightError, budget, 'capture-preflight');
+            return;
+          }
+          /* CR-8: octant/sextant sets under ansi/cast warn on stderr. */
+          GlyphGrid.compat.validate(CONFIG, { format: tfmt }).forEach(function (is) {
+            if (is.code !== 'CR-8') return;
+            console.warn('compat:', is.code, is.message);
+            Promise.resolve(tauri('cli_log', {
+              msg: 'compat: ' + is.level + ' ' + is.code + ' (' + job.name + '): ' + is.message,
+            })).catch(()=>{});
+          });
+          const snaps = [];
+          function textFailed(e) {
+            console.warn('batch: save failed', job.name, e);
+            tauri('cli_log', { msg: 'batch: save failed ' + job.name + ' fmt=' + tfmt + ' err=' + String(e) }).catch(()=>{});
+            errors.push({ name: job.name, err: String(e) });
+            CONFIG.animation.fps = savedFps;
+            idx++;
+            setTimeout(next, 50);
+          }
+          __assetsReady().then(function () {
+            try {
+              self.beginRecord({
+                total: budget.total,
+                jobId: 'text-' + Date.now() + '-' + idx,
+                collectFrames: false,
+                collectZip: false,
+                rawFrames: true,
+                captureIr: true,
+                irOnly: true,
+                onFrame(frame) { snaps[frame.index] = frame.ir; },
+                onError(error) { advanceCaptureFailure(error, error && error.capture, 'capture'); },
+                onFinish() {
+                  (tfmt === 'html' ? loadInlineFontBase64() : Promise.resolve(null)).then(function (fontBase64) {
+                    if (!snaps.length || snaps.some(function (f) { return !f || !f.cols; })) {
+                      throw new Error('no grid frame was painted');
+                    }
+                    const body = TEXT.build(tfmt, snaps, { fps: effFps, fontBase64: fontBase64, title: job.name });
+                    return tauri('save_text_export', {
+                      path: job.path, bytesB64: bytesToBase64(new TextEncoder().encode(body)),
+                    });
+                  }).then(function (p) {
+                    console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p, 'format:' + tfmt);
+                    tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p + ' format:' + tfmt }).catch(()=>{});
+                    CONFIG.animation.fps = savedFps;
+                    idx++;
+                    setTimeout(next, 50);
+                  }).catch(textFailed);
+                },
+              });
+            } catch (error) {
+              advanceCaptureFailure(error, error && error.capture, 'capture-start');
+            }
+          });
+        }
+
         const captureBudget = self.validateRecord(requestedFrames, width, height);
         if (!captureBudget.ok) {
           const preflightError = new Error(captureBudget.message);
@@ -4414,7 +5567,38 @@
           staged = false;
           Promise.resolve(tauri('cancel_export', { jobId: jobId })).catch(()=>{});
         }
+        /* ITER-052: perf mode's 3 anchor PNGs, rebuilt from a raw frame on
+           a scratch canvas (only those 3 frames pay for a PNG encode). */
+        function rgbaToPngBase64(frame) {
+          const cv = document.createElement('canvas');
+          cv.width = frame.width;
+          cv.height = frame.height;
+          cv.getContext('2d').putImageData(new ImageData(frame.rgba, frame.width, frame.height), 0, 0);
+          return new Promise(function (resolve, reject) {
+            cv.toBlob(function (b) { b ? resolve(b) : reject(new Error('anchor PNG encode failed')); }, 'image/png');
+          }).then(function (b) { return b.arrayBuffer(); })
+            .then(function (buf) { return bytesToBase64(new Uint8Array(buf)); });
+        }
         function pushFrame(frame) {
+          if (frame.rgba) {
+            /* ITER-052: straight RGBA + its size; Rust skips the PNG decode. */
+            const anchored = !anchorFrames || anchorIdx.indexOf(frame.index) < 0 ? Promise.resolve()
+              : rgbaToPngBase64(frame).then(function (b64) {
+                  for (let i = 0; i < anchorIdx.length; i++) {
+                    if (anchorIdx[i] === frame.index) anchorFrames[i] = b64;
+                  }
+                });
+            return anchored.then(function () {
+              const px = frame.rgba;
+              return tauri('push_export_frame_raw',
+                new Uint8Array(px.buffer, px.byteOffset, px.byteLength), {
+                  headers: {
+                    'x-job-id': jobId, 'x-index': String(frame.index),
+                    'x-format': 'rgba', 'x-width': String(frame.width), 'x-height': String(frame.height),
+                  },
+                });
+            });
+          }
           return frame.blob.arrayBuffer().then(function (buf) {
             const bytes = new Uint8Array(buf);
             /* perf mode keeps only the 3 PERF_JOB anchor PNGs as base64. */
@@ -4429,13 +5613,24 @@
           });
         }
 
-        /* Register the staged capture during the settle window so
-           beginRecord still fires exactly when the settle timer does: an
-           extra IPC hop before it let additional live draws in, shifting
-           the per-cell EMA warm-up of the first recorded frames. */
+        /* Register the staged capture first; beginRecord fires as soon as
+           the IPC round-trip and the config's assets are ready (ITER-047).
+           Live draws in that window no longer matter — beginRecord primes
+           the per-cell EMA itself (ITER-046). */
         let stagedError = null;
+        /* ITER-053: a GIF job hands its encode settings to begin_export_capture
+           so Rust runs gifski DURING capture (frames stream into the encoder as
+           they are pushed) and finish_gif_export only waits for the tail. The
+           same object is spread into the finish args, which must match. */
+        const gifStream = fmt === 'mp4' ? null : {
+          path: job.path,
+          delayMs: delayMs,
+          capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+          border: jobBorder,  // ITER-057 per-job border; finish repeats it
+          targetMaxBytes: (typeof job.targetMaxBytes === 'number' && job.targetMaxBytes > 0) ? job.targetMaxBytes : null,
+        };
         const stagedReady = Promise.resolve(
-          tauri('begin_export_capture', { jobId: jobId, total: frameTotal })
+          tauri('begin_export_capture', { jobId: jobId, total: frameTotal, gifStream: gifStream, label: job.name })
         ).then(function () { staged = true; }, function (e) { stagedError = e || new Error('begin_export_capture failed'); });
 
         function startCapture() {
@@ -4443,14 +5638,14 @@
             advanceCaptureFailure(stagedError, null, 'capture-start');
             return;
           }
-          /* Sutskever B2 — mark the switch point AFTER the artificial
-             settle, immediately before the first recorded draw. The
-             first __pfCommit then yields __pfLastLatency = wall time of
-             the first frame that reflects this job's config (atlas
-             rebuild / buffer realloc included). That is exactly the
-             interactive "slider → visible" cost; the artificial settle
-             delay is deliberately excluded so switch_ms reflects felt
-             latency, not the bench's pacing. */
+          /* Sutskever B2 — mark the switch point immediately before the
+             first recorded draw (after staging/readiness, which replaced
+             the artificial settle in ITER-047). The first __pfCommit then
+             yields __pfLastLatency = wall time of the first frame that
+             reflects this job's config (atlas rebuild / buffer realloc
+             included). That is exactly the interactive "slider → visible"
+             cost; the signal-only priming passes (ITER-046) never commit a
+             perf frame, so switch_ms still reflects felt latency. */
           if (perfMode && typeof window.__markChange === 'function') {
             try { window.__markChange('job:' + job.name); } catch (_) {}
           }
@@ -4460,6 +5655,7 @@
               jobId: jobId,
               collectFrames: false,
               collectZip: false,
+              rawFrames: true,
               onFrame: pushFrame,
               onError(error) {
                 cancelStaged();
@@ -4477,14 +5673,10 @@
                     fps: Math.round(effFps),
                     path: job.path,
                     capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
+                    border: jobBorder,
+                    mp4Quality: job.mp4Quality || null,  // ITER-050: 'upload' (default) | 'archive'
                   }
-                : {
-                    jobId: jobId,
-                    delayMs: delayMs,
-                    path: job.path,
-                    capWidth: (typeof job.capWidth === 'number' && job.capWidth > 0) ? job.capWidth : null,
-                    targetMaxBytes: (typeof job.targetMaxBytes === 'number' && job.targetMaxBytes > 0) ? job.targetMaxBytes : null,
-                  };
+                : Object.assign({ jobId: jobId }, gifStream);
               /* Sutskever B3 — export wall-time is the dominant real cost
                  (gifski encode 3–25 s/job, ITER-026) and no optimization
                  has ever measured it. Time the full encode round-trip
@@ -4495,15 +5687,19 @@
               .then(p => {
                 staged = false;              // finish_* consumed the capture
                 const _encMs = performance.now() - _encT0;
-                console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p);
-                tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p }).catch(()=>{});
+                /* ITER-069: which preprocess path produced this job — headless
+                   output is only reproducible across machines on 'js'. */
+                const _pp = window.__preprocessPath || 'js';
+                console.log('batch:', (idx + 1) + '/' + total, job.name, '→', p, 'preprocess:' + _pp);
+                tauri('cli_log', { msg: 'batch: ' + (idx + 1) + '/' + total + ' ' + job.name + ' → ' + p + ' preprocess:' + _pp }).catch(()=>{});
                 /* Emit PERF_JOB NDJSON when in perf mode — orchestrator
                    parses this from the studio's stderr. */
                 if (perfMode) {
                   try {
-                    const snap = snapshotPerf(job.name, job.frames || 24, anchorFrames);
+                    const snap = snapshotPerf(job.name, requestedFrames, anchorFrames);
                     if (snap) {
                       snap.encode_ms = _encMs;
+                      snap.preprocess = _pp;
                       tauri('cli_log', { msg: 'PERF_JOB ' + JSON.stringify(snap) }).catch(()=>{});
                     }
                   } catch (e) {
@@ -4525,16 +5721,25 @@
               });
               }
             });
+            /* ITER-046: one line per job so a blank capture is diagnosable
+               from the CLI log (emaMean ≈ 0 ⇒ signal came from an unpainted
+               source) and the priming cost is on record. */
+            if (__lastPrime) {
+              Promise.resolve(tauri('cli_log', {
+                msg: 'prime: ' + job.name + ' ' + JSON.stringify(__lastPrime),
+              })).catch(()=>{});
+            }
           } catch (error) {
             cancelStaged();
             advanceCaptureFailure(error, error && error.capture, 'capture-start');
           }
         }
 
-        setTimeout(() => {
-          if (staged || stagedError) startCapture();
-          else stagedReady.then(startCapture);
-        }, settle);
+        /* ITER-047: no settle timer.  stagedReady never rejects (errors land
+           in stagedError and startCapture reports them); __assetsReady covers
+           a glyph-set atlas this job's config may have just switched to.
+           Pre-capture live draws cannot affect output any more (ITER-046). */
+        stagedReady.then(__assetsReady).then(startCapture);
       }  // _runJob
       }  // next
       next();
@@ -4912,10 +6117,12 @@
     ramps: RAMPS,
     testHook: window.__glyphGridTest,
     sceneCacheKeys: ['__sourceProcessed'],
+    cameraState: CAMERA,
     imageRef: {
       name: 'sourceImg',
       begin: beginSourceImport,
       set: function (img, options) { return acceptSourceImage(img, options); },
+      validate: function (img, extra) { return validateSourceMetadata(img, extra); },
     },
   });
 
@@ -4930,25 +6137,61 @@
      =========================================================================== */
   /* CLI/batch source loader — shared by tryHeadlessRender (initial load)
      and runBatchExport (per-job source swap when manifest jobs have
-     heterogeneous `in` fields). Awaits decode + fit + one settle frame
-     so the caller can immediately apply config and begin recording. */
+     heterogeneous `in` fields). Awaits decode + fit (ITER-047 dropped
+     the settle sleep) so the caller can apply config and begin recording. */
   let __cliCurrentSource = null;
-  async function _cliLoadSource(inPath) {
-    const importGeneration = beginSourceImport(inPath);
-    const loaded = await window.__TAURI__.core.invoke('read_image_file', { path: inPath });
-    /* v0.1.9 native reads return metadata with the data URL.  Accept the
-       legacy string response so older binaries/headless fixtures remain
-       compatible during rollout. */
-    const dataUrl = (loaded && typeof loaded === 'object')
-      ? (loaded.dataUrl || loaded.data_url) : loaded;
-    if (!dataUrl) throw new Error('read_image_file returned no image data');
-    const sourceBytes = loaded && typeof loaded === 'object'
-      ? (loaded.sizeBytes || loaded.size_bytes || 0) : 0;
-    if (sourceBytes > SOURCE_LIMITS.maxFileBytes) {
-      throw new Error('source exceeds the ' + Math.round(SOURCE_LIMITS.maxFileBytes / 1048576) + ' MB limit');
+  let __cliCurrentDecode = null;   // ITER-077: video.decode the open clip used (null = not a video)
+  /* A job's video.decode — the source is loaded before the job's config is
+     applied, so the decoder choice is read off the config up front. */
+  function _jobVideoDecode(cfg, base) {
+    if (cfg && cfg.video && typeof cfg.video.decode === 'string') return cfg.video.decode;
+    if (base && base.video && typeof base.video.decode === 'string') return base.video.decode;
+    return 'auto';
+  }
+  /* ITER-077 (R4): the video FrameSource (Rust openh264 for H.264, else
+     the WebView <video>), installed through the same acceptSourceImage. */
+  async function _cliLoadVideo(inPath, probe, decode, importGeneration, sourceBytes) {
+    const g = await openVideoSource(inPath, probe, decode, true);
+    if (!acceptSourceImage(g, { generation: importGeneration, sizeBytes: sourceBytes })) {
+      disposeVideoSource(g);
+      throw new Error((window.__glyphLastImportError && window.__glyphLastImportError.reason)
+        || 'source load was superseded');
     }
+    __cliCurrentSource = inPath;
+    __cliCurrentDecode = decode || 'auto';
+  }
+  async function _cliLoadSource(inPath, decode) {
+    const importGeneration = beginSourceImport(inPath);
+    const core = window.__TAURI__.core;
+    /* ITER-064 (F18): probe the file headers first so an over-limit
+       animation/still is rejected before p5 allocates any frame. */
+    const probe = await core.invoke('probe_image_file', { path: inPath });
+    const sourceBytes = (probe && probe.sizeBytes) || 0;
+    const isVideo = !!(probe && probe.kind === 'video');
+    if (probe && probe.probed) {
+      const checked = validateSourceMetadata({
+        width: probe.width, height: probe.height,
+        numFrames: function () { return probe.frames; },
+      }, { sizeBytes: sourceBytes, video: isVideo });
+      if (!checked.ok) {
+        window.__glyphLastImportError = checked;
+        throw new Error('source rejected before decode: ' + checked.reason);
+      }
+    }
+    /* ITER-077 (R4): mp4 / mov / m4v / webm → the video FrameSource. */
+    if (isVideo) return _cliLoadVideo(inPath, probe, decode, importGeneration, sourceBytes);
+    /* The webview streams the file from disk via the asset protocol (no
+       base64 data URL across IPC).  Fallback: inline data URL. */
+    let sourceUrl = '';
+    if (typeof core.convertFileSrc === 'function') {
+      sourceUrl = core.convertFileSrc(inPath);
+    } else {
+      const loaded = await core.invoke('read_image_file', { path: inPath, inline: true });
+      sourceUrl = (loaded && typeof loaded === 'object') ? (loaded.dataUrl || loaded.data_url) : loaded;
+    }
+    if (!sourceUrl) throw new Error('read_image_file returned no image data');
     await new Promise(function (resolve, reject) {
-      window.loadImage(dataUrl, function (img) {
+      window.loadImage(sourceUrl, function (img) {
         const accepted = acceptSourceImage(img, {
           generation: importGeneration,
           sizeBytes: sourceBytes,
@@ -4961,8 +6204,20 @@
       });
     });
     __cliCurrentSource = inPath;
-    // Settle one or two frames so the canvas reflects the loaded image.
-    await new Promise(function (r) { setTimeout(r, 300); });
+    __cliCurrentDecode = null;
+    /* ITER-047: no settle sleep — acceptSourceImage already fitted the canvas
+       and painted once, and beginRecord primes the temporal state itself
+       (ITER-046), so pre-capture live draws no longer influence output. */
+  }
+
+  /* ITER-069: headless output must stay a pure function of (source, config,
+     seed). The WebGL2 preprocess (ITER-066) is driver-dependent, so headless
+     runs (CLI render/batch, MCP — which spawns `render` — and window.PIPELINE
+     pieces) default to the JS preprocess; a preset or manifest job opts back
+     in with an explicit studio.gpuPreprocess:true, applied on top of this.
+     The GUI keeps CONFIG's GL default for interactive speed. */
+  function __headlessPreprocessDefault() {
+    if (CONFIG.studio) CONFIG.studio.gpuPreprocess = false;
   }
 
   async function tryHeadlessRender() {
@@ -4982,6 +6237,7 @@
       return;
     }
     console.log('CLI: render job received', job);
+    __headlessPreprocessDefault();
 
     // Pick the initial source — top-level `inPath`, or first job's `in`
     // (multi-source manifests may omit the top-level field).
@@ -4989,19 +6245,42 @@
     if (!initialSource && job.batch && Array.isArray(job.jobs) && job.jobs.length) {
       initialSource = job.jobs[0].inPath || null;
     }
-    if (!initialSource) {
+    /* ITER-076: `render --text/--srt` needs no --in — the text raster is
+       the source. */
+    const textOnly = !initialSource && !job.batch
+      && ((job.config && job.config.textSource && job.config.textSource.enabled) || job.textImport);
+    if (!initialSource && !textOnly) {
       console.error('CLI: no source path in manifest');
       try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
     }
 
+    /* ITER-047: readiness instead of the 1500 ms start-up sleep — p5 setup()
+       done (canvas, buffers, loadImage bound) and the font cascade settled.
+       ITER-049: a setup() throw rejects __setupReady — exit non-zero rather
+       than leave the CLI waiting for a render that can never start. */
     try {
-      await _cliLoadSource(initialSource);
+      await __setupReady;
     } catch (e) {
-      console.error('CLI: initial loadImage failed:', e);
+      console.error('CLI: p5 setup failed:', e);
+      try { await window.__TAURI__.core.invoke('cli_log', { msg: 'setup failed: ' + ((e && e.message) || e) }); } catch (_) {}
       try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
       return;
     }
+    await __assetsReady();
+
+    try {
+      if (!textOnly) {
+        const firstCfg = (job.batch && Array.isArray(job.jobs) && job.jobs.length) ? job.jobs[0].config : job.config;
+        await _cliLoadSource(initialSource, _jobVideoDecode(firstCfg, CONFIG_BASE));
+      }
+    } catch (e) {
+      console.error('CLI: initial loadImage failed:', e);
+      try { await window.__TAURI__.core.invoke('cli_log', { msg: 'source load failed: ' + ((e && e.message) || e) }); } catch (_) {}
+      try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
+      return;
+    }
+
 
     /* Batch mode (ITER-024 + multi-source extension): the Rust side may
        pass `batch:true` with a jobs array.  Each job may carry its own
@@ -5015,11 +6294,13 @@
           name:           j.name || 'job',
           path:           j.outPath,
           inPath:         j.inPath || null,
-          frames:         job.frames || 24,
+          frames:         j.frames || job.frames || 24,   // ITER-057: per-job, number or 'auto'
+          border:         j.border || null,
           format:         j.format,
           config:         j.config || {},
           capWidth:       (j.capWidth && j.capWidth > 0) ? j.capWidth : 0,
           targetMaxBytes: (j.targetMaxBytes && j.targetMaxBytes > 0) ? j.targetMaxBytes : null,
+          mp4Quality:     j.mp4Quality || null,
         };
       });
       console.log('CLI: batch mode — ' + batchJobs.length + ' jobs queued' + (job.perf ? ' (perf:on)' : ''));
@@ -5049,15 +6330,32 @@
       }
     }
 
-    // Settle once more so the new config takes effect on the next frame.
-    await new Promise(function (r) { setTimeout(r, 200); });
+    /* ITER-076: --srt / MCP srt_path ship the raw cue file; parse it here
+       with the same parser the GUI import uses, then install the raster. */
+    if (job.textImport && typeof job.textImport.body === 'string') {
+      try {
+        const n = window.__textSourceImport(job.textImport.body, job.textImport.name || '');
+        console.log('CLI: text import — ' + n + ' cues');
+      } catch (e) {
+        console.error('CLI: text import failed:', e);
+        try { await window.__TAURI__.core.invoke('cli_log', { msg: 'text import failed: ' + ((e && e.message) || e) }); } catch (_) {}
+        try { await window.__TAURI__.core.invoke('exit_with_status', { ok: false }); } catch (_) {}
+        return;
+      }
+    }
+    syncTextSource(true);
+
+    // ITER-047: the config may name a glyph set whose atlas is still being
+    // pre-warmed — wait for the asset, not for the clock.
+    await __assetsReady();
 
     // Run a single-job batch export to the requested output path.
     __glyphGridTest.runBatchExport([{
       name: 'cli',
       path: job.outPath,
-      frames: job.frames || 24,
+      frames: job.frames || 24,   // number, or 'auto' (resolved per job, ITER-057)
       format: job.format,  // 'gif' (default) | 'mp4' — Rust pre-resolves
+      mp4Quality: job.mp4Quality || null,  // --mp4-quality (ITER-050)
       config: {},  // already applied above
     }], {
       onComplete: function (result) {
@@ -5068,10 +6366,10 @@
     });
   }
 
-  // Wait for the p5 setup() + studio init + font load before polling.
-  // 1500ms is generous; the actual setup is usually done by ~300ms.
+  // tryHeadlessRender awaits __setupReady / __assetsReady itself (ITER-047),
+  // so it can start as soon as the document is parsed.
   window.addEventListener('DOMContentLoaded', function () {
-    setTimeout(tryHeadlessRender, 1500);
+    tryHeadlessRender();
   });
   </script>
 </body>

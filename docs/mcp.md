@@ -4,14 +4,64 @@
 
 ## What it does
 
-Exposes Glyph Grid Studio's rendering pipeline as MCP tools over stdio JSON-RPC. Each tool call spawns a fresh subprocess that runs the headless `render` CLI internally, writes the GIF, and returns. The MCP server itself is a thin dispatcher; the actual rendering is the same code path used by the GUI.
+Exposes Glyph Grid Studio's rendering pipeline as MCP tools over stdio JSON-RPC. Each render tool call spawns a subprocess that runs the headless `render` (or `batch`) CLI internally, writes the output, and returns. The MCP server itself is a thin dispatcher; the actual rendering is the same code path used by the GUI.
 
 ## Tools
 
 | Tool | Description | Required args | Optional args |
 |---|---|---|---|
-| `glyph_grid_render` | Render an image to an animated GIF | `in_path`, `out_path` | `frames`, `palette`, `color_mode`, `ramp`, `dither`, `selection_mode`, `glyph_set`, `sampling_strategy`, `postprocess[]`, `cols`, `rows` |
-| `glyph_grid_catalog` | List every available palette / ramp / dither / glyph set / postprocess stage. Returns JSON. | — | — |
+| `glyph_grid_render` | Render an image, a video clip (or text: `text` / `srt_path`) to an animated GIF, MP4, or the grid as text (`format`: `txt`/`ansi`/`cast`/`html`) | `out_path`; `in_path` unless a text source is given | `text`, `srt_path`, `text_options`, `video_decode`, `frames`, `palette`, `color_mode`, `ramp`, `dither`, `selection_mode`, `glyph_set`, `sampling_strategy`, `postprocess[]`, `cols`, `rows`, `format`, `config`, `preset`, `timeout_s` |
+| `glyph_grid_batch` | Render N jobs in **one** app session (start-up paid once). Arguments are a `batch --manifest` object. Sends progress per finished job. | `in`, `jobs[]` | `frames`, `perf`, `timeout_s`, `resume` |
+| `glyph_grid_catalog` | List every available palette / ramp / dither / glyph set / postprocess stage / output format. Returns JSON. | — | — |
+
+**Config layering (`glyph_grid_render`)**, lowest to highest priority: `preset` (absolute path to a preset JSON file, e.g. one exported from the GUI) → `config` (any partial CONFIG object, same shape as a preset — see `src/glyph-grid.schema.json`) → the named params. Objects deep-merge, so `config: {postprocess: {vignette: {strength: 0.9}}}` keeps the other vignette fields. Arguments are validated against the schema in-process, so a typo'd enum fails in milliseconds with a JSON path (`/dither/mode: ...`) instead of after a ~5 s app launch.
+
+Video sources (ITER-077): `in_path` may be an `.mp4` / `.mov` / `.m4v` / `.webm` clip. H.264 is decoded in Rust (openh264) and is frame-exact, so the same call gives the same bytes. Other codecs (HEVC, VP9) go through the WebView `<video>` with a seek per frame. `video_decode`: `auto` (default) | `native` (Rust only, a non-H.264 clip fails the render) | `webview`. A bad value is `invalid_arguments` at `/video_decode`. The loop is the clip's length; `frames` (default 24) is how many output frames sample it from the start. Clips over 480 frames or 64 MB are refused before decoding.
+
+Text sources (ITER-076): `text: "DROP"` or `srt_path: "/abs/lyrics.srt"` (.srt or .lrc) renders the text as the source, so `in_path` can be left out. `text_options` is a partial `textSource` block (`anim`: `typewriter|rise|fade|scale|none`, `font`, `size`, `weight`, `align`, `x`, `y`, `easeIn`, `easeOut`, `fg`, `bg`, `blend`: `replace|multiply|screen|mask`, `lines[]`) deep-merged onto `config`. With `in_path` and a `blend` other than `replace` the text is composited onto the image. A bad value is an `invalid_arguments` error at `/text_options/<key>`; no image and no text is `invalid_arguments` at `/in_path`. Pair it with `format: "txt"` to read the word back as text.
+
+Keyframes (ITER-075) ride in `config` too: `config: {timeline: {enabled: true, tracks: {"palette": [{"u": 0, "v": "cream-paper"}, {"u": 1, "v": "spice"}], "grid.cols": [{"u": 0, "v": 80}, {"u": 0.5, "v": 200}]}}}`. Tracks are keyed by dotted CONFIG path; `u` is the loop position in [0, 1]; `ease` is `linear` (default), `inOutSine` or `step`. A bad ease or out-of-range `u` is an `invalid_arguments` error at `/config/timeline/tracks/<path>/<i>/...`. The CLI's `--timeline 'palette=0:(cream-paper),1:(spice)'` strings produce the same JSON.
+
+**Text output (`format`).** `gif` (default) and `mp4` are pixels; `txt` (rows × cols characters), `ansi` (24-bit colour escapes), `cast` (asciinema v2, `frames` frames) and `html` (one self-contained page, bundled font inlined) are the grid as text — every selection mode, read from the per-cell glyph buffer. Omit `format` and the `out_path` extension decides (`.txt`, `.ans`/`.ansi`, `.cast`, `.html`; anything else is GIF). `txt` and `ansi` are one still frame, and their body comes back inline as a second text item after `Rendered <path> (N KB)` when it is at most 64 KB — so a model without vision can read the render. An unknown `format` fails in-process with `path: "/format"`. Octant/sextant `glyph_set` under `ansi`/`cast` logs a CR-8 warning (terminal fonts usually lack them).
+
+**`glyph_grid_batch` arguments** — the same shape as a `batch --manifest` file:
+
+```json
+{
+  "in": "/abs/source.png",
+  "frames": 24,
+  "jobs": [
+    {"name": "spice",    "out": "/abs/out/spice.gif",    "config": {"palette": "spice"}},
+    {"name": "phosphor", "out": "/abs/out/phosphor.mp4", "config": {"palette": "phosphor"}},
+    {"name": "framed",   "out": "/abs/out/framed.gif",   "frames": "auto", "border": {"width": 16},
+     "in": "/abs/other-source.gif"}
+  ]
+}
+```
+
+Per job: `name`, `out` (absolute), optional `format` (`gif`/`mp4`/`txt`/`ansi`/`cast`/`html`, else from the extension), `in` (per-job source), `frames` (integer or `"auto"`), `capWidth`, `targetMaxBytes`, `border {width, bgColor?, style?, inkColor?}`, `config`. The manifest is validated against `src/glyph-grid.manifest.schema.json` (unknown keys such as `capwidth` are errors — `path: "/jobs/0"`) and every job config against the preset schema before the app starts; one bad job refuses the whole batch (exit 2). `resume: true` skips jobs that are already done (`batch --resume`): a job is done when its `<out>.ggs.json` sidecar (written as each output lands) records the same requested frames, config hash and output size; an output without a sidecar falls back to a validity check (GIF with 1..=requested frames — gifski merges identical frames — or MP4 with exactly the requested count). The result has one line per job (`job 0 (spice): /abs/out/spice.gif (1493 KB)`).
+
+**Progress.** Send `_meta: {"progressToken": <token>}` in the `tools/call` params and the server emits `notifications/progress`: `glyph_grid_batch` sends `progress: N, total: M` as each job finishes (`message` carries the job's `batch: N/M name → path` line); `glyph_grid_render` sends one per captured frame (`progress: frame, total: frames`, `message: "capture 12/120"`; it runs the CLI with `--progress`).
+
+**Errors.** A failed call is a tool result with `isError: true`; its text (and `structuredContent`) is one JSON object:
+
+```json
+{"code": "invalid_arguments", "path": "/config/dither/mode",
+ "message": "invalid arguments: invalid config: ... \"STBN\" is not one of [...]"}
+```
+
+| `code` | When |
+|---|---|
+| `invalid_arguments` | Rejected before or by the CLI (exit 2): schema violation, missing `in_path`, unreadable `preset`, bad manifest. `path` is a JSON pointer into the tool arguments (`/config/dither/mode`, `/jobs/1/config/selectionMode`, `/in_path`) when known: a named param that caused it is reported as itself (`/palette`, `/dither`, `/cols`), a violation inside the `preset` file as `/preset/<pointer>` — never `/config/...` for a `config` the caller did not send. |
+| `timeout` | `timeout_s` elapsed, or the render made no progress for 300 s (exit 3). |
+| `render_failed` | The render or encode failed (exit 1). |
+| `no_output` | The CLI exited 0 but `out_path` does not exist. |
+| `interrupted` / `cancelled` | The child was killed by a signal / the call was cancelled. |
+| `internal` | The server could not spawn its render subprocess. |
+
+Child failures also carry `exit_code` and `stderr_tail` (last 20 stderr lines). A failed `glyph_grid_batch` adds a second content item with the per-job report (which outputs exist). Success results stay plain text (`Rendered /abs/out.gif (1493 KB)`).
+
+**Cancellation.** A `notifications/cancelled` for an in-flight call stops its render subprocess: SIGTERM first (the child removes its `.part` temp files and exits 143 within ~0.1 s), SIGKILL if it is still alive after 2 s. The server keeps answering (pings, other calls) while renders run.
 
 JSON Schemas for the tools are auto-generated by `schemars` and exposed to clients via the standard MCP `tools/list` response. Optional fields use `null` defaults; `postprocess` defaults to `[]`.
 
@@ -30,7 +80,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop. The tools appear as `glyph_grid_render` and `glyph_grid_catalog` in any chat.
+Restart Claude Desktop. The tools appear as `glyph_grid_render`, `glyph_grid_batch` and `glyph_grid_catalog` in any chat.
 
 After v0.2's Homebrew cask, the `command` simplifies to `glyph-grid-studio` (PATH lookup).
 
@@ -65,7 +115,7 @@ Or, agentic exploration:
 
 > *"Try this image with three different palettes — spice, cream-paper, and amber-phosphor. Which one makes the subject look most like a charcoal drawing?"*
 
-The agent renders three variants in sequence (or parallel via concurrent tool calls), reads each GIF back, picks a winner.
+The agent renders the three variants with one `glyph_grid_batch` call (one app start-up instead of three), reads each GIF back, picks a winner.
 
 ## Manual smoke test (no AI client needed)
 
@@ -100,10 +150,10 @@ Expect: `init` returns `protocolVersion: "2024-11-05"` and server info; `catalog
 
 ## Architecture notes
 
-- **Why subprocess per call**: a Tauri runtime can only exist once per process. The MCP server is itself a long-running process, so it can't host a Tauri runtime *and* spawn renders inside it. Spawning a fresh subprocess per call cleanly isolates each render. Cost: ~5s of process startup overhead per render. Worth it for reliability.
+- **Why subprocess per call**: a Tauri runtime can only exist once per process. The MCP server is itself a long-running process, so it can't host a Tauri runtime *and* spawn renders inside it. Spawning a fresh subprocess per call cleanly isolates each render. Cost: ~5s of process startup overhead per call — use `glyph_grid_batch` for several renders (ITER-024 measured 6.2 s/job in one session vs ~3 s extra start-up per spawned render).
 - **Why stdio transport**: Claude Desktop / Cursor expect MCP servers to speak stdio JSON-RPC. The `rmcp::transport::stdio()` helper handles framing.
-- **Concurrency**: each MCP tool call blocks until its subprocess returns. Concurrent tool calls from the same client are serialized server-side. If you need parallel rendering, either (a) make the tool return immediately with a job ID and add a `glyph_grid_status` tool, or (b) wait for v0.4 HTTP server which can run multiple renders in parallel. v0.3 keeps it simple.
-- **Headless render reuses CLI**: each `glyph_grid_render` call essentially runs the same `glyph-grid-studio render --in ... --out ...` you can run in a shell. Same flags, same code path.
+- **Concurrency**: the tools are async (`tokio::process`), so a running render does not block the server: pings, cancellations and other tool calls are serviced meanwhile. Concurrent render calls are not queued — each spawns its own app subprocess (not load-tested); prefer one `glyph_grid_batch` over parallel renders.
+- **Headless render reuses CLI**: each `glyph_grid_render` call essentially runs the same `glyph-grid-studio render --in ... --out ...` you can run in a shell (a `config`/merged preset travels as a temp `--preset` file); `glyph_grid_batch` writes its arguments to a temp manifest and runs `glyph-grid-studio batch --manifest <tmp>`. Same flags, same code path. Temp files are deleted when the call returns.
 
 ## Future tools (not yet wired)
 

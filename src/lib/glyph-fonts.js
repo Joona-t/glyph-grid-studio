@@ -220,9 +220,15 @@
     }
 
     injectFaces();
-    return waitForFace(FONT_FAMILY, sizePx, 3000)
-      .then(function () { return waitForFace(FONT_FAMILY + '-Fallback', sizePx, 1500); })
-      .then(function () { return waitForFace('PxPlusIBMVGA8', sizePx, 1500); })
+    /* ITER-063 (F19): the three local faces load in parallel behind one
+       readiness promise (was a sequential 3000 + 1500 + 1500 ms chain).
+       Each wait still resolves the moment its face is ready; the caps only
+       bound a stalled decode, now at 3000 ms total instead of 6000 ms. */
+    return Promise.all([
+      waitForFace(FONT_FAMILY, sizePx, 3000),
+      waitForFace(FONT_FAMILY + '-Fallback', sizePx, 1500),
+      waitForFace('PxPlusIBMVGA8', sizePx, 1500),
+    ])
       .then(function () {
         if (trust) {
           // Skip the cascade entirely — the user has asked for a specific set.

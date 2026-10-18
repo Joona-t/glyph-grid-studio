@@ -9,6 +9,7 @@ function loadStudio(invokeImpl) {
   const clicked = [];
   const buttons = new Map();
   const monitors = new Map();
+  const inputs = new Map();
   function element(tag) {
     return {
       tagName: tag,
@@ -45,7 +46,7 @@ function loadStudio(invokeImpl) {
   };
   function Folder() { this.children = []; this.handlers = {}; }
   Folder.prototype.addFolder = function () { const child = new Folder(); this.children.push(child); return child; };
-  Folder.prototype.addInput = function (_obj, key) { const api = new Binding(key); this.children.push(api); return api; };
+  Folder.prototype.addInput = function (_obj, key) { const api = new Binding(key); this.children.push(api); inputs.set(key, _obj); return api; };
   Folder.prototype.addMonitor = function (_obj, key) {
     const api = new Binding(key);
     this.children.push(api);
@@ -120,6 +121,7 @@ function loadStudio(invokeImpl) {
     clicked,
     buttons,
     monitors,
+    inputs,
     window,
     zipConstructs: () => zipConstructs,
   };
@@ -443,6 +445,57 @@ async function stagedFramesPushRawBytesWithBase64Fallback(rawAvailable) {
   }
 }
 
+// ITER-070: the export panel's mp4Quality select (default upload) must
+// reach the staged MP4 finish call; before it the GUI always sent nothing
+// and Rust silently encoded every GUI MP4 in upload mode.
+async function mp4QualitySelectReachesFinish() {
+  for (const pick of [null, 'archive', 'upload']) {
+    const calls = [];
+    const env = loadStudio((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === 'kv_load_all') return Promise.resolve('{}');
+      if (cmd === 'choose_export_path') return Promise.resolve('/tmp/q.mp4');
+      if (cmd === 'begin_export_capture') return Promise.resolve();
+      if (cmd === 'push_export_frame_raw' || cmd === 'push_export_frame') return Promise.resolve();
+      if (cmd === 'finish_mp4_export') return Promise.resolve('/tmp/q.mp4');
+      return Promise.reject(new Error('unexpected command ' + cmd));
+    });
+    let recState = null;
+    const hook = {
+      beginRecord(options) {
+        recState = { frameIdx: 0, done: false };
+        Promise.resolve().then(() => {
+          recState.done = true;
+          options.onFinish(null, { getFrames: () => [] });
+          recState = null;
+        });
+      },
+      cancelRecord() { recState = null; return true; },
+      getRecState() { return recState; },
+      getConfig() { return { animation: { fps: 25 } }; },
+    };
+    env.window.__glyphGridTest = hook;
+    env.studio.init({
+      config: {
+        studio: { enabled: true }, animation: { fps: 25, duration: 0.08, loop: true },
+        grid: { cols: 80, rows: 40 }, font: { family: 'monospace', size: 8 },
+        ramp: 'gradient', brightnessGamma: 1, samplingStrategy: 'average',
+        colorMode: 'monochrome', palette: 'cream-paper', selectionMode: 'brightness', glyphSet: null,
+      },
+      testHook: hook,
+    });
+    const opts = env.inputs.get('mp4Quality');
+    assert(opts, 'export panel must expose an mp4Quality select');
+    assert.strictEqual(opts.mp4Quality, 'upload', 'mp4Quality defaults to upload');
+    if (pick) opts.mp4Quality = pick;
+    env.buttons.get('Export MP4').fire('click');
+    for (let i = 0; i < 6; i++) await settle();
+    const finish = calls.filter((call) => call.cmd === 'finish_mp4_export');
+    assert.strictEqual(finish.length, 1, 'staged MP4 export must call finish_mp4_export once');
+    assert.strictEqual(finish[0].args.mp4Quality, pick || 'upload');
+  }
+}
+
 function twitterFitCopyDoesNotPromiseSuccess() {
   const source = fs.readFileSync(require.resolve('../src/lib/glyph-studio.js'), 'utf8');
   assert(!/GUARANTEES output|GUARANTEE < 15 MB/.test(source));
@@ -450,7 +503,87 @@ function twitterFitCopyDoesNotPromiseSuccess() {
   assert(source.includes('The 15 MB target was not met'));
 }
 
+/* R7 (ITER-056): exported presets carry $schema + version; applying one
+   strips that metadata and surfaces unknown keys instead of silently
+   writing them into CONFIG. */
+function presetSchemaStampAndUnknownKeys() {
+  const { studio } = loadStudio(() => Promise.resolve());
+  const config = { palette: 'cream-paper', postprocess: { vignette: { enabled: true, strength: 0.55 } } };
+  const snap = studio.snapshotConfig(config);
+  assert.strictEqual(snap.$schema, studio.presetSchemaId);
+  assert.strictEqual(snap.version, studio.presetSchemaVersion);
+  assert(/\/schema\/preset\/v\d+\.json$/.test(snap.$schema));
+  const schema = JSON.parse(fs.readFileSync(require.resolve('../src/glyph-grid.schema.json'), 'utf8'));
+  assert.strictEqual(schema.$id, studio.presetSchemaId, 'regenerate src/glyph-grid.schema.json');
+
+  studio.applyPreset(config, { $schema: snap.$schema, version: 1, palette: 'spice',
+    postprocess: { vignette: { enabled: false } }, palete: 'typo' });
+  assert.strictEqual(config.palette, 'spice');
+  assert.strictEqual(config.postprocess.vignette.strength, 0.55, 'nested params survive');
+  assert.strictEqual(config.postprocess.vignette.enabled, false);
+  assert(!('$schema' in config) && !('version' in config), 'preset metadata is not CONFIG');
+  assert.strictEqual(config.palete, 'typo', 'unknown keys still apply (warn policy)');
+}
+
+/* ITER-057 (F24): the merge the CLI, batch and GUI now share. */
+function sharedDeepMerge() {
+  const { studio } = loadStudio(() => Promise.resolve());
+  const cfg = { grid: { cols: 240, rows: 120 }, glyphSet: null, inks: [1, 2],
+    postprocess: { vignette: { enabled: true, strength: 0.55 } } };
+  const out = studio.deepMerge(cfg, { grid: { cols: 80 }, inks: [3], glyphSet: 'octant',
+    postprocess: { vignette: { enabled: false }, bloom: { enabled: true } } });
+  assert.strictEqual(out, cfg, 'merges in place');
+  assert.strictEqual(JSON.stringify(cfg.grid), JSON.stringify({ cols: 80, rows: 120 }));
+  assert.strictEqual(JSON.stringify(cfg.postprocess.vignette), JSON.stringify({ enabled: false, strength: 0.55 }));
+  assert.strictEqual(JSON.stringify(cfg.postprocess.bloom), JSON.stringify({ enabled: true }));
+  assert.strictEqual(JSON.stringify(cfg.inks), JSON.stringify([3]));
+  assert.strictEqual(cfg.glyphSet, 'octant');
+  studio.deepMerge(cfg, { glyphSet: null });
+  assert.strictEqual(cfg.glyphSet, null);
+}
+
+/* ITER-078 (privacy): the camera is runtime-only.  An imported preset,
+   share URL, batch config or setConfig carrying video.camera:true never
+   reaches CONFIG nor the GUI toggle, so the kick never calls
+   getUserMedia; the GUI toggle (opts.cameraState) is the only switch. */
+function cameraIsRuntimeOnly() {
+  const env = loadStudio(() => Promise.resolve('{}'));
+  let gum = 0;
+  const cameraState = { camera: false };
+  env.window.GlyphGrid = { video: { DECODERS: ['auto', 'native', 'webview'] } };
+  /* index.html's __videoCameraKick reads CAMERA.camera only (contract in
+     glyph-video-source.test.js); this stub has the same gate. */
+  env.window.__videoCameraKick = function () { if (cameraState.camera) gum++; };
+  const config = {
+    studio: { enabled: true }, animation: { fps: 25, duration: 1, loop: true },
+    grid: { cols: 80, rows: 40 }, font: { family: 'monospace', size: 8 },
+    ramp: 'gradient', brightnessGamma: 1, samplingStrategy: 'average',
+    colorMode: 'monochrome', palette: 'cream-paper', selectionMode: 'brightness', glyphSet: null,
+    video: { decode: 'auto', mirror: true },
+  };
+  env.studio.init({ config, cameraState, testHook: { getRecState() { return null; } } });
+  assert.strictEqual(env.inputs.get('camera'), cameraState, 'the camera toggle binds the runtime state, not CONFIG.video');
+  const preset = { video: { camera: true, decode: 'webview', mirror: false } };
+  env.studio.applyPreset(config, preset);
+  assert.strictEqual(preset.video.camera, true, 'the caller\'s preset object is not mutated');
+  assert(!('camera' in config.video), 'applyPreset strips video.camera');
+  assert.strictEqual(config.video.decode, 'webview', 'the rest of video still applies');
+  assert.strictEqual(cameraState.camera, false);
+  const setCfg = env.studio.stripRuntimeOnly({ video: { camera: true }, palette: 'spice' });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(setCfg)), { video: {}, palette: 'spice' });
+  assert.strictEqual(env.studio.stripRuntimeOnly(null), null);
+  assert(!('camera' in (env.studio.snapshotConfig(Object.assign({}, config, { video: { camera: true } })).video)));
+  env.window.__videoCameraKick();
+  assert.strictEqual(gum, 0, 'a preset with video.camera:true never reaches getUserMedia');
+  cameraState.camera = true;  // the user flips the GUI toggle
+  env.window.__videoCameraKick();
+  assert.strictEqual(gum, 1);
+}
+
 (async function run() {
+  presetSchemaStampAndUnknownKeys();
+  sharedDeepMerge();
+  cameraIsRuntimeOnly();
   await nativeSuccessSkipsZip();
   await nativeFailureBuildsFallbackOnce();
   await stagedUiFlowStreamsWithoutRetainingFrames();
@@ -459,6 +592,7 @@ function twitterFitCopyDoesNotPromiseSuccess() {
   await cancelledSaveDialogSettlesVisiblePhase();
   await stagedFramesPushRawBytesWithBase64Fallback(true);
   await stagedFramesPushRawBytesWithBase64Fallback(false);
+  await mp4QualitySelectReachesFinish();
   twitterFitCopyDoesNotPromiseSuccess();
   console.log('glyph-studio export tests: ok');
 })().catch((error) => {
