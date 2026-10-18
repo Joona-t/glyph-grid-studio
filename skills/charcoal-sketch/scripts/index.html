@@ -1,0 +1,1002 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>charcoal sketch — glyph-grid</title>
+  <style>
+    /* Page chrome only — the canvas paints its own paper background. */
+    html, body {
+      margin: 0; padding: 0;
+      background: #1a1612;
+      color: #b8a98c;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      min-height: 100vh;
+    }
+    body {
+      display: grid;
+      place-items: center;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    canvas { display: block; box-shadow: 0 8px 32px rgba(0,0,0,0.6); }
+    #status {
+      position: fixed;
+      bottom: 10px; left: 12px;
+      font-size: 11px;
+      opacity: 0.55;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    #drop-zone {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      pointer-events: none;
+      transition: opacity 0.4s ease;
+      z-index: 10;
+    }
+    #drop-zone.hidden { opacity: 0; visibility: hidden; }
+    #drop-zone .panel {
+      pointer-events: auto;
+      background: #efe3cf;
+      color: #1f1612;
+      padding: 28px 36px;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 13px;
+      cursor: pointer;
+      border: 2px dashed #1f1612;
+      text-align: center;
+      letter-spacing: 0.02em;
+    }
+    #drop-zone .panel small {
+      display: block;
+      opacity: 0.55;
+      margin-top: 6px;
+      font-size: 11px;
+    }
+    #drop-zone.dragover .panel {
+      background: #1f1612;
+      color: #efe3cf;
+      border-color: #efe3cf;
+    }
+    #file-input { display: none; }
+    #swap-hint {
+      position: fixed;
+      top: 12px; right: 14px;
+      font-size: 11px;
+      opacity: 0.4;
+      pointer-events: none;
+    }
+    #record-btn {
+      position: fixed;
+      top: 12px; left: 14px;
+      background: #efe3cf;
+      color: #1f1612;
+      border: 1px solid #1f1612;
+      padding: 6px 12px;
+      font: 11px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      letter-spacing: 0.04em;
+      cursor: pointer;
+      opacity: 0.7;
+      z-index: 20;
+    }
+    #record-btn:hover { opacity: 1; }
+    #record-btn:disabled { cursor: wait; opacity: 0.4; }
+    #record-btn.hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div id="status"></div>
+  <div id="swap-hint">drop another image to re-render</div>
+  <button id="record-btn" type="button" class="hidden">record GIF</button>
+  <div id="drop-zone">
+    <label class="panel" for="file-input">
+      drop an image, or click to choose
+      <small>renders as a charcoal-style glyph grid</small>
+    </label>
+    <input id="file-input" type="file" accept="image/*">
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.2/lib/p5.min.js"></script>
+  <script>
+  /* =================================================================
+     charcoal-sketch — glyph-grid configured for monochrome image-to-
+     character rendering. Adapted from the skill's render.html template.
+
+     Two-layer composite:
+       1. The user's image is drawn into an offscreen p5.Graphics buffer
+          (after a grayscale + contrast preprocess pass).
+       2. The glyph-grid sampling pass walks an N×M grid over that buffer,
+          measures each cell's RGB distance from the cream paper bg,
+          picks a glyph from a dense ramp by curved signal, and renders
+          it in warm-black ink with brightness-driven alpha.
+
+     Result reads as a charcoal sketch: paper showing through highlights,
+     scratchy mid-tones, dense dark masses in shadow.
+     ================================================================= */
+
+  const CONFIG = {
+    // Canvas dimensions — overwritten on image load to match aspect.
+    canvas: { w: 1200, h: 800 },
+
+    // Grid density — overwritten on image load to keep ~8px square cells.
+    grid: { cols: 150, rows: 100 },
+
+    font: {
+      family: 'monospace',
+      size: 7,                       // a touch under cell width (denser grid)
+    },
+
+    ramp: 'charcoal',
+
+    // Slightly steeper curve to match the denser grid; mid-tones stay
+    // expressive without crushing as 0.55 would when combined with
+    // jitter, directional hatching, and shadow buildup downstream.
+    brightnessGamma: 0.62,
+
+    // 'tone+edge' returns avg color + Sobel magnitude AND angle. The
+    // pipeline still uses magnitude as a signal boost (same as
+    // 'edge-weighted'); the angle drives directional cross-hatching.
+    samplingStrategy: 'tone+edge',
+
+    colorMode: 'monochrome',         // charcoal is mono by definition
+
+    palette: 'charcoal',
+
+    scene: 'imageScene',
+
+    animation: {
+      fps: 30,
+      duration: 6.0,                 // loop period for breathing jitter
+      loop: true,                    // marks oscillate around static positions
+    },
+
+    // Dust — microscopic specs that rise from the figure shapes, fading
+    // as they drift up. Stateless: each particle's position/alpha is a
+    // deterministic function of (col, row, p, t), so the layer loops
+    // seamlessly with the main animation. Emission is gated by the same
+    // per-cell signal used by the glyph grid, so dust only rises from
+    // the silhouette — never from blank paper. Reads as the figures
+    // fragmenting into the universe.
+    dust: {
+      enabled: true,
+      signalThreshold: 0.25,         // 0=everywhere, 1=nowhere; gate by silhouette
+      particlesPerCell: 3,           // 1–4: density of the dust plume
+      riseDistance: 28.0,            // ×cellH: how tall the rising plume is
+      driftAmplitude: 1.6,           // ×cellW: sideways sway as specs ascend
+      alphaMax: 170,                 // 0–255: peak opacity of a particle
+      sizeMult: 0.7,                 // ×CONFIG.font.size: small but visible
+      glyphs: '.,\'',                // tiny ramp the particles sample from (ASCII only)
+      mode: 'all',                   // 'edge' = emit only from the silhouette outline
+      edgeRadius: 2,                 // cells inward from the outline that count as edge
+    },
+
+    // Target cell size in px. Smaller = more glyphs = finer grain.
+    // 6px at a 1400px canvas is the tuning the Paul piece used; when the
+    // render is downscaled to ~600px for GIF, marks read as charcoal dust.
+    targetCell: 6,
+
+    seed: 1337,
+    record: false,
+  };
+
+  // URL overrides for headless automation (scripts/render.mjs) and quick
+  // experiments. Applied in setup() once PALETTES exists.
+  //   ?src=input.jpg  ?mode=still|record  ?palette=charcoal  ?cell=6
+  //   ?fps=12  ?duration=6  ?dust=0  ?maxdim=1400
+  const PARAMS = new URLSearchParams(location.search);
+  function applyParams() {
+    const pal = PARAMS.get('palette');
+    if (pal) {
+      if (!PALETTES[pal]) throw new Error('unknown palette: ' + pal + ' (have: ' + Object.keys(PALETTES).join(', ') + ')');
+      CONFIG.palette = pal;
+    }
+    const num = (k) => (PARAMS.has(k) ? Number(PARAMS.get(k)) : null);
+    if (num('cell'))     CONFIG.targetCell = num('cell');
+    if (num('fps'))      CONFIG.animation.fps = num('fps');
+    if (num('duration')) CONFIG.animation.duration = num('duration');
+    if (num('maxdim'))   CONFIG.maxDim = num('maxdim');
+    const dust = PARAMS.get('dust');
+    if (dust === '0' || dust === 'off') CONFIG.dust.enabled = false;
+    else if (dust === 'edge' || dust === 'all') CONFIG.dust.mode = dust;
+  }
+
+  // =================================================================
+  // RAMPS — ordered dark→light glyph density strings.
+  // =================================================================
+  const RAMPS = {
+    classic: ' .·:-=+*#%@',
+    dense: ' .,:;i1tfLCG08@',
+    sparse: ' .:+#@',
+    'unicode-block': ' ░▒▓█',
+    // Charcoal — scratchy strokes from feathered paper marks to heavy
+    // crosshatched solids. Skews mid-heavy because charcoal's hand
+    // doesn't leave wide tonal "holes" — even a light area has texture.
+    charcoal: " .,'`\":;-+/\\xtfLG$#@",
+  };
+
+  // =================================================================
+  // PALETTES
+  // =================================================================
+  const PALETTES = {
+    monochrome: { bg: '#000000', inks: ['#FFFFFF'] },
+    phosphor:   { bg: '#001100', inks: ['#33FF66', '#88FFAA'] },
+    bauhaus:    { bg: '#F2EBDA', inks: ['#D62828', '#1D3557', '#F4C430'] },
+    lovespark:  { bg: '#000000', inks: ['#FFB7C5', '#E91E8C', '#7FFFD4'] },
+    'mono-amber': { bg: '#1A0D00', inks: ['#FFB000'] },
+    // Warm charcoal — slightly aged cream paper, deep warm-black mark.
+    // The warmth in both bg and ink keeps tonal masses from feeling
+    // sterile / printer-like — closer to paper + compressed willow.
+    charcoal: { bg: '#EFE3CF', inks: ['#1F1612'] },
+    // Y2K bubblegum — light strawberry-cream paper, deep mauve mark.
+    // Same charcoal/dust feel but pink, for the LoveSpark wordmark hero.
+    'y2k-pink': { bg: '#FFE6F2', inks: ['#8A4259'] },
+    // Y2K pastel — pastel pink "paper" with vibrant fuchsia ink.
+    // Bg matches the lovespark.love site bg exactly so the hero video has
+    // no visible rectangle around it; ink is deep enough that H.264's
+    // chroma subsampling (yuv420p) doesn't wash it out.
+    'y2k-pastel': { bg: '#FFE0EC', inks: ['#E91E8C'] },
+    // Y2K neon — same pastel paper bg, but with deep-pink neon ink for the
+    // heart hero. Slightly more red/saturated than the wordmark fuchsia so
+    // the heart reads as a separate visual beat from the wordmark below it.
+    'y2k-neon': { bg: '#FFE0EC', inks: ['#FF1493'] },
+  };
+
+  function inkColor(config, i) {
+    const inks = PALETTES[config.palette].inks;
+    return inks[i % inks.length];
+  }
+  function bgColor(config) { return PALETTES[config.palette].bg; }
+
+  // =================================================================
+  // Image scene — draws the loaded user image into the source buffer.
+  // The "scene" is degenerate (no time-evolution), but it satisfies the
+  // contract and the glyph-grid pass treats it identically to procedural
+  // scenes. Per technique.md: "If you want image-to-ASCII, draw the image
+  // into the source buffer in a scene function."
+  // =================================================================
+  let userImage = null;            // p5.Image set on file pick
+  let imageDirty = false;          // forces one redraw after load
+
+  // Pre-process the loaded image once: grayscale + a slight contrast
+  // curve so the glyph-grid signal reads a wider tonal range. Done at
+  // load time so the per-frame scene call stays a single g.image() blit.
+  function preprocessImage(img) {
+    img.loadPixels();
+    const px = img.pixels;
+    for (let i = 0; i < px.length; i += 4) {
+      const lum = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+      // Contrast curve: gentler than 1.15 because the downstream pipeline
+      // (denser grid, edge boost, directional hatching, shadow buildup)
+      // already amplifies tonal range. A heavier preprocess on top
+      // crushes highlights into the paper.
+      const norm = lum / 255;
+      const curved = Math.pow(norm, 1.10) * 255;
+      px[i] = px[i + 1] = px[i + 2] = curved;
+    }
+    img.updatePixels();
+  }
+
+  const SCENES = {
+    imageScene(g, t, config) {
+      g.background(bgColor(config));
+      if (!userImage) return;
+      // Canvas was resized to image aspect on load, so a full-buffer
+      // blit fills the frame with no letterboxing.
+      g.image(userImage, 0, 0, g.width, g.height);
+    },
+  };
+
+  // =================================================================
+  // p5 sketch — global mode
+  // =================================================================
+  let src;
+  const statusEl = () => document.getElementById('status');
+  const dropZoneEl = () => document.getElementById('drop-zone');
+
+  function setup() {
+    applyParams();
+    createCanvas(CONFIG.canvas.w, CONFIG.canvas.h);
+    pixelDensity(1);
+    src = createGraphics(CONFIG.canvas.w, CONFIG.canvas.h);
+    src.pixelDensity(1);
+
+    randomSeed(CONFIG.seed);
+    noiseSeed(CONFIG.seed);
+    src.randomSeed(CONFIG.seed);
+    src.noiseSeed(CONFIG.seed);
+
+    textFont(CONFIG.font.family);
+    textSize(CONFIG.font.size);
+    textAlign(CENTER, CENTER);
+
+    frameRate(CONFIG.animation.fps);
+    background(bgColor(CONFIG));
+
+    setupFilePicker();
+  }
+
+  function setupFilePicker() {
+    const input = document.getElementById('file-input');
+    const dz = dropZoneEl();
+
+    const handleFile = (file) => {
+      if (!file || !file.type.startsWith('image/')) return;
+      loadSource(URL.createObjectURL(file), true);
+    };
+
+    input.addEventListener('change', (e) => {
+      if (e.target.files[0]) handleFile(e.target.files[0]);
+    });
+    document.body.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dz.classList.remove('hidden');
+      dz.classList.add('dragover');
+    });
+    document.body.addEventListener('dragleave', (e) => {
+      // Only react when the cursor actually leaves the window.
+      if (e.relatedTarget === null) {
+        dz.classList.remove('dragover');
+        if (userImage) dz.classList.add('hidden');
+      }
+    });
+    document.body.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dz.classList.remove('dragover');
+      if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    });
+
+    // Record button — appears after first image load.
+    const btn = document.getElementById('record-btn');
+    btn.addEventListener('click', () => { startRecording(); });
+
+    // Headless automation (scripts/render.mjs): ?src=<image>&mode=still|record
+    if (PARAMS.get('src')) loadSource(PARAMS.get('src'), false);
+  }
+
+  // Load an image URL (object URL from the picker, or a served path from
+  // ?src=), preprocess it, and size canvas + grid to its aspect.
+  function loadSource(url, revoke) {
+    const dz = dropZoneEl();
+      loadImage(
+        url,
+        (img) => {
+          userImage = img;
+          preprocessImage(img);
+          if (revoke) URL.revokeObjectURL(url);
+
+          // Resize canvas to match image aspect (capped at 1400 long edge
+          // so very large source images don't blow up the page).
+          const maxDim = CONFIG.maxDim || 1400;
+          let cw, ch;
+          if (img.width >= img.height) {
+            cw = Math.min(maxDim, img.width);
+            ch = Math.round(cw * img.height / img.width);
+          } else {
+            ch = Math.min(maxDim, img.height);
+            cw = Math.round(ch * img.width / img.height);
+          }
+          resizeCanvas(cw, ch);
+          src.resizeCanvas(cw, ch);
+
+          // Keep grid cells roughly square at ~6px for denser detail —
+          // ~1.78× more cells than the 8px baseline, which combined with
+          // jitter, directional hatching, and shadow buildup gives the
+          // intricate hand-drawn feel without crossing the perf budget.
+          const targetCell = CONFIG.targetCell;
+          CONFIG.canvas.w = cw;
+          CONFIG.canvas.h = ch;
+          CONFIG.grid.cols = Math.max(20, Math.round(cw / targetCell));
+          CONFIG.grid.rows = Math.max(20, Math.round(ch / targetCell));
+
+          // Re-set text properties after canvas reset.
+          textFont(CONFIG.font.family);
+          textSize(CONFIG.font.size);
+          textAlign(CENTER, CENTER);
+
+          imageDirty = true;
+          dz.classList.add('hidden');
+
+          const mode = PARAMS.get('mode');
+          if (mode === 'still') { renderStill(); return; }
+          if (mode === 'record') { startRecording(); return; }
+
+          document.getElementById('record-btn').classList.remove('hidden');
+          loop(); // resume draw — handleDraw runs once and noLoops itself.
+        },
+        (err) => {
+          console.error('image load failed', err);
+          window.__charcoalError = 'image load failed: ' + url;
+          if (revoke) URL.revokeObjectURL(url);
+        }
+      );
+  }
+
+  // =================================================================
+  // One frame of the full pipeline at an explicit t. Shared by the live
+  // draw loop, still export, and recording so all three are identical.
+  //   Layer 1   paper grain     — faint marks so blank paper isn't flat
+  //   Layer 1.5 dust            — specks rising off the silhouette, drawn
+  //                               UNDER the glyphs so only escapees show
+  //   Layers 2–4 glyph grid     — jittered marks, edge hatching, buildup
+  // =================================================================
+  function renderFrame(t) {
+    SCENES[CONFIG.scene](src, t, CONFIG);
+    src.loadPixels();
+    background(bgColor(CONFIG));
+    drawPaperGrain();
+    drawDust(src, t);
+    drawGlyphGrid(src, t);
+  }
+
+  async function postCanvas(path) {
+    const dataUrl = document.querySelector('canvas').toDataURL('image/png');
+    const resp = await fetch(`/save?path=${encodeURIComponent(path)}`, {
+      method: 'POST',
+      body: dataUrl,
+      headers: { 'Content-Type': 'text/plain' },
+    });
+    if (!resp.ok) throw new Error(`save ${path}: HTTP ${resp.status}`);
+  }
+
+  function reseed() {
+    randomSeed(CONFIG.seed); noiseSeed(CONFIG.seed);
+    src.randomSeed(CONFIG.seed); src.noiseSeed(CONFIG.seed);
+  }
+
+  // Still export: frame at t=0 → still.png. Needs the /save endpoint
+  // (scripts/render.mjs serves it); otherwise right-click → Save image.
+  async function renderStill() {
+    noLoop();
+    reseed();
+    try {
+      renderFrame(0);
+      await postCanvas('still.png');
+      statusEl().textContent = 'done: still.png';
+      window.__charcoalDone = true;
+    } catch (e) {
+      window.__charcoalError = String(e.message || e);
+    }
+  }
+  window.renderStill = renderStill;
+
+  // =================================================================
+  // Recording — frames at deterministic t = i/total*duration, so the
+  // last frame flows back into the first (seamless loop). Each frame is
+  // POSTed to /save → frames/frame_NNNN.png; scripts/render.mjs then
+  // stitches them with ffmpeg.
+  // =================================================================
+  let isRecording = false;
+
+  async function startRecording() {
+    if (isRecording || !userImage) return;
+    isRecording = true;
+    noLoop();
+
+    const fps = CONFIG.animation.fps;
+    const duration = CONFIG.animation.duration;
+    const totalFrames = Math.round(duration * fps);
+
+    const btn = document.getElementById('record-btn');
+    const status = statusEl();
+    btn.disabled = true;
+    btn.textContent = 'recording…';
+    reseed();
+
+    const startTime = performance.now();
+    let lastError = null;
+
+    for (let i = 0; i < totalFrames; i++) {
+      renderFrame((i / totalFrames) * duration);
+      try {
+        await postCanvas(`frames/frame_${String(i).padStart(4, '0')}.png`);
+      } catch (e) {
+        lastError = `frame ${i}: ${e.message}`;
+        break;
+      }
+      const elapsed = (performance.now() - startTime) / 1000;
+      const eta = (elapsed / (i + 1)) * (totalFrames - i - 1);
+      window.__charcoalProgress = `${i + 1}/${totalFrames}`;
+      status.textContent =
+        `recording ${i + 1}/${totalFrames} — elapsed ${elapsed.toFixed(0)}s, eta ${eta.toFixed(0)}s`;
+    }
+
+    if (lastError) {
+      status.textContent = `recording failed: ${lastError}`;
+      window.__charcoalError = lastError;
+    } else {
+      status.textContent = `done: ${totalFrames} frames in frames/`;
+      window.__charcoalDone = true;
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'record GIF';
+    isRecording = false;
+    if (!PARAMS.get('mode')) loop();
+  }
+  window.startRecording = startRecording;
+
+  function draw() {
+    // No image yet: just paint the paper background and idle.
+    if (!userImage) {
+      background(bgColor(CONFIG));
+      return;
+    }
+    // Static-frame mode: render once after each load, then halt.
+    if (!CONFIG.animation.loop && !imageDirty) {
+      noLoop();
+      return;
+    }
+
+    const t = ((frameCount - 1) / CONFIG.animation.fps) % CONFIG.animation.duration;
+
+    const t0 = performance.now();
+    renderFrame(t);
+    const t1 = performance.now();
+
+    statusEl().textContent =
+      `${CONFIG.scene} | ${CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
+      `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms`;
+
+    imageDirty = false;
+  }
+
+  // =================================================================
+  // Glyph-grid sampling pass — unchanged from the skill template.
+  // For each cell: sample → bg-distance signal → gamma curve → glyph
+  // pick → fill color from palette + mode → text() on visible canvas.
+  // =================================================================
+  const MAX_RGB_DIST = Math.sqrt(255 * 255 * 3);
+
+  // Deterministic per-cell hash in [0, 1). Different `salt` values
+  // de-correlate the layers (rotation, position-x, position-y, dither,
+  // angle dither, buildup offset). Stable across re-renders so jitter
+  // doesn't shimmer if the page is reflowed.
+  function cellHash(col, row, salt) {
+    let h = (col * 73856093) ^ (row * 19349663) ^ (salt * 83492791);
+    h = ((h >>> 0) * 2654435761) >>> 0;
+    return (h % 100000) / 100000;
+  }
+
+  // Layer 1 — paper-grain dither pre-pass. Faint sparse marks across the
+  // cream paper before the glyph grid renders. Reads as paper texture
+  // rather than digital flatness in negative-space regions.
+  const GRAIN_GLYPHS = " .,'`";
+  function drawPaperGrain() {
+    const palette = PALETTES[CONFIG.palette];
+    const ink = color(palette.inks[0]);
+    ink.setAlpha(28);
+    fill(ink);
+    noStroke();
+    textAlign(CENTER, CENTER);
+    textFont(CONFIG.font.family);
+    textSize(CONFIG.font.size);
+
+    const stepX = 14, stepY = 14;
+    const w = width, h = height;
+    for (let y = 0; y < h; y += stepY) {
+      for (let x = 0; x < w; x += stepX) {
+        const r = cellHash(x, y, 3);
+        if (r > 0.18) continue;       // ~18% coverage
+        const jx = x + (cellHash(x, y, 4) - 0.5) * stepX;
+        const jy = y + (cellHash(x, y, 5) - 0.5) * stepY;
+        const gi = Math.floor((r / 0.18) * GRAIN_GLYPHS.length);
+        const ch = GRAIN_GLYPHS.charAt(Math.min(GRAIN_GLYPHS.length - 1, gi));
+        if (ch === ' ') continue;
+        text(ch, jx, jy);
+      }
+    }
+  }
+
+  // Layer 3 — directional cross-hatch glyph picker.
+  // Returns null when the cell shouldn't override the ramp pick (low
+  // edge magnitude or weak signal — skin/cheek areas stay smooth).
+  // Otherwise returns a glyph oriented along the *stroke* direction
+  // (perpendicular to the gradient = along iso-luminance contours,
+  // which is how charcoal artists actually shade form).
+  const HATCH_SETS = {
+    horizontal: ['-', '=', '='],
+    vertical:   ['|', 'l', '!'],
+    diagUp:     ['/', '/', '/'],
+    diagDown:   ['\\', '\\', '\\'],
+  };
+  function pickDirectionalGlyph(rampIdx, rampLen, edgeAngle, edgeMag, signal, col, row) {
+    if (edgeMag < 0.12 || signal < 0.35) return null;
+    // Stroke = perpendicular to gradient.
+    let strokeAngle = edgeAngle + Math.PI / 2;
+    // ±10° dither breaks the bucket-staircase artifact on smooth curves.
+    strokeAngle += (cellHash(col, row, 6) - 0.5) * (Math.PI / 18);
+    // Normalize to [0, π) — strokes are 180°-symmetric.
+    let a = ((strokeAngle % Math.PI) + Math.PI) % Math.PI;
+    let orient;
+    if      (a < Math.PI * 0.125 || a >= Math.PI * 0.875) orient = 'horizontal';
+    else if (a < Math.PI * 0.375)                          orient = 'diagUp';
+    else if (a < Math.PI * 0.625)                          orient = 'vertical';
+    else                                                   orient = 'diagDown';
+    const weight = rampLen > 1 ? rampIdx / (rampLen - 1) : 0;
+    const tier = Math.min(2, Math.floor(weight * 3));
+    return HATCH_SETS[orient][tier];
+  }
+
+  function drawGlyphGrid(g, t) {
+    const cols = CONFIG.grid.cols;
+    const rows = CONFIG.grid.rows;
+    const cellW = g.width / cols;
+    const cellH = g.height / rows;
+    const cellPxW = Math.max(1, Math.floor(cellW));
+    const cellPxH = Math.max(1, Math.floor(cellH));
+    const ramp = RAMPS[CONFIG.ramp];
+    const rampLast = ramp.length - 1;
+    const palette = PALETTES[CONFIG.palette];
+    const pixels = g.pixels;
+    const srcW = g.width;
+    const srcH = g.height;
+    const stride = srcW * 4;
+    const gamma = CONFIG.brightnessGamma;
+
+    const bgC = color(palette.bg);
+    const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
+
+    noStroke();
+    textAlign(CENTER, CENTER);
+    textSize(CONFIG.font.size);
+    textFont(CONFIG.font.family);
+
+    // Jitter / buildup constants — exposed here for easy tuning. See the
+    // plan's "Tunable knobs" table for ranges and trade-offs.
+    const ROT_JITTER_RAD = (Math.PI / 180) * 14;   // ±7°
+    const POS_JITTER_FRAC = 0.4;                   // ±20% of cell on each axis
+    const BUILDUP_THRESHOLD = 0.6;
+    const BUILDUP_ALPHA_MULT = 0.42;
+    const BUILDUP_OFFSET_FRAC = 0.6;               // ±30% of cell
+
+    // Animation — sin-based oscillation around the static jitter positions.
+    // Each cell has a unique phase per axis (different cellHash salts), so
+    // neighboring marks don't move in sync — reads as the artist's hand
+    // hovering, never quite letting the marks settle. Amplitudes are
+    // additive on top of the static jitter, so the cell can swing a bit
+    // beyond the static range during the cycle.
+    const TWO_PI = Math.PI * 2;
+    const tw = t * (TWO_PI / CONFIG.animation.duration);
+    const ANIM_ROT_RAD = (Math.PI / 180) * 9;      // ±9° live oscillation
+    const ANIM_POS_FRAC = 0.35;                    // ±17% cell live oscillation
+
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const x0 = Math.floor(col * cellW);
+        const y0 = Math.floor(row * cellH);
+        const cx = x0 + cellW / 2;
+        const cy = y0 + cellH / 2;
+
+        const sample = sampleCell(pixels, stride, x0, y0, cellPxW, cellPxH, srcW, srcH);
+
+        const dr = sample.r - bgR;
+        const dg = sample.g - bgG;
+        const db = sample.b - bgB;
+        let signal = Math.sqrt(dr * dr + dg * dg + db * db) / MAX_RGB_DIST;
+        if (sample.edgeMag !== undefined) {
+          // Additive edge boost — tone+edge gives averaged tone (already
+          // smooth), so we *add* edge magnitude rather than blending it
+          // away. Keeps mid-tone subtlety while still sharpening contours.
+          signal = Math.min(1, signal + sample.edgeMag * 0.4);
+        }
+        if (signal < 0.02) continue;
+
+        const curved = Math.pow(signal, gamma);
+        const idx = Math.min(rampLast, Math.max(0, Math.floor(curved * rampLast + 0.0001)));
+        let ch = ramp.charAt(idx);
+        if (ch === ' ') continue;
+
+        // Layer 3 — directional cross-hatch override on edge-strong cells.
+        if (sample.edgeAngle !== undefined) {
+          const dirCh = pickDirectionalGlyph(
+            idx, ramp.length, sample.edgeAngle, sample.edgeMag, signal, col, row
+          );
+          if (dirCh !== null) ch = dirCh;
+        }
+
+        applyCellFill(sample, palette, curved, bgR, bgG, bgB);
+
+        // Layer 2 — per-cell rotation + position jitter (the keystone),
+        // with sin-driven live oscillation layered on top.
+        const rotJ = (cellHash(col, row, 0) - 0.5) * ROT_JITTER_RAD
+                   + Math.sin(tw + cellHash(col, row, 10) * TWO_PI) * ANIM_ROT_RAD;
+        const dxJ = (cellHash(col, row, 1) - 0.5) * cellW * POS_JITTER_FRAC
+                  + Math.sin(tw + cellHash(col, row, 11) * TWO_PI) * cellW * ANIM_POS_FRAC;
+        const dyJ = (cellHash(col, row, 2) - 0.5) * cellH * POS_JITTER_FRAC
+                  + Math.sin(tw + cellHash(col, row, 12) * TWO_PI) * cellH * ANIM_POS_FRAC;
+        push();
+        translate(cx + dxJ, cy + dyJ);
+        rotate(rotJ);
+        text(ch, 0, 0);
+        pop();
+
+        // Layer 4 — shadow buildup. Lighter ramp glyph at lower alpha,
+        // sub-pixel hash-jittered offset; reads as smudge halo around
+        // heavy strokes, not as offset duplication.
+        if (curved > BUILDUP_THRESHOLD) {
+          const lighterIdx = Math.max(0, idx - 2);
+          const lighterCh = ramp.charAt(lighterIdx);
+          if (lighterCh !== ' ' && lighterCh !== ch) {
+            const c2 = color(palette.inks[0]);
+            c2.setAlpha(255 * curved * BUILDUP_ALPHA_MULT);
+            fill(c2);
+            const oxJ = (cellHash(col, row, 7) - 0.5) * cellW * BUILDUP_OFFSET_FRAC;
+            const oyJ = (cellHash(col, row, 8) - 0.5) * cellH * BUILDUP_OFFSET_FRAC;
+            const rotJ2 = rotJ + (cellHash(col, row, 9) - 0.5) * 0.2;
+            push();
+            translate(cx + dxJ + oxJ, cy + dyJ + oyJ);
+            rotate(rotJ2);
+            text(lighterCh, 0, 0);
+            pop();
+          }
+        }
+      }
+    }
+  }
+
+  // =================================================================
+  // Layer 5 — dust. Microscopic specs that rise from cells on the
+  // silhouette and fade as they drift upward, like the figures are
+  // fragmenting into the universe. Stateless: each particle's
+  // position/alpha is a deterministic function of (col, row, p, t),
+  // so the layer loops seamlessly with the main animation. We
+  // re-sample brightness per cell to gate emission — dust never
+  // rises out of blank paper, only from the figures themselves.
+  // =================================================================
+  function drawDust(g, t) {
+    const cfg = CONFIG.dust;
+    if (!cfg || !cfg.enabled) return;
+
+    const cols = CONFIG.grid.cols;
+    const rows = CONFIG.grid.rows;
+    const cellW = g.width / cols;
+    const cellH = g.height / rows;
+    const cellPxW = Math.max(1, Math.floor(cellW));
+    const cellPxH = Math.max(1, Math.floor(cellH));
+    const palette = PALETTES[CONFIG.palette];
+    const pixels = g.pixels;
+    const srcW = g.width;
+    const srcH = g.height;
+    const stride = srcW * 4;
+
+    const bgC = color(palette.bg);
+    const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
+
+    const TWO_PI = Math.PI * 2;
+    const phaseT = t / CONFIG.animation.duration;       // wraps each loop
+    const riseDist = cellH * cfg.riseDistance;
+    const driftAmp = cellW * cfg.driftAmplitude;
+    const inkHex = palette.inks[0];
+    const glyphs = cfg.glyphs.length > 0 ? cfg.glyphs : '.';
+    const particles = Math.max(1, cfg.particlesPerCell | 0);
+
+    noStroke();
+    textAlign(CENTER, CENTER);
+    textFont(CONFIG.font.family);
+    textSize(CONFIG.font.size * cfg.sizeMult);
+
+    // Per-cell figure mask: same signal as drawGlyphGrid so the gate
+    // matches the silhouette exactly.
+    const inFig = new Uint8Array(cols * rows);
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const x0 = Math.floor(col * cellW);
+        const y0 = Math.floor(row * cellH);
+        const sample = sampleCell(pixels, stride, x0, y0, cellPxW, cellPxH, srcW, srcH);
+        const dr = sample.r - bgR, dg = sample.g - bgG, db = sample.b - bgB;
+        let signal = Math.sqrt(dr * dr + dg * dg + db * db) / MAX_RGB_DIST;
+        if (sample.edgeMag !== undefined) signal = Math.min(1, signal + sample.edgeMag * 0.4);
+        if (signal >= cfg.signalThreshold) inFig[row * cols + col] = 1;
+      }
+    }
+    const edgeMode = cfg.mode === 'edge';
+    if (edgeMode) {
+      // Pale regions inside the figure (a lit face, a highlight) fall under
+      // the threshold and would read as holes with their own "outline".
+      // Flood-fill paper inward from the canvas border; anything the fill
+      // can't reach is enclosed by the figure, so count it as figure. The
+      // only outline left is the true outer silhouette.
+      const outside = new Uint8Array(cols * rows);
+      const stack = [];
+      const seed = (c, r) => {
+        const i = r * cols + c;
+        if (!inFig[i] && !outside[i]) { outside[i] = 1; stack.push(i); }
+      };
+      for (let c = 0; c < cols; c++) { seed(c, 0); seed(c, rows - 1); }
+      for (let r = 0; r < rows; r++) { seed(0, r); seed(cols - 1, r); }
+      while (stack.length) {
+        const i = stack.pop();
+        const c = i % cols, r = (i / cols) | 0;
+        if (c > 0) seed(c - 1, r);
+        if (c < cols - 1) seed(c + 1, r);
+        if (r > 0) seed(c, r - 1);
+        if (r < rows - 1) seed(c, r + 1);
+      }
+      for (let i = 0; i < inFig.length; i++) inFig[i] = outside[i] ? 0 : 1;
+    }
+    const R = Math.max(1, cfg.edgeRadius | 0);
+    // Outline cell = figure cell with paper within R cells (or at canvas edge-free paper).
+    const isEdge = (col, row) => {
+      for (let dy = -R; dy <= R; dy++) {
+        for (let dx = -R; dx <= R; dx++) {
+          const c = col + dx, r = row + dy;
+          if (c < 0 || r < 0 || c >= cols || r >= rows) continue;
+          if (!inFig[r * cols + c]) return true;
+        }
+      }
+      return false;
+    };
+    const overFigure = (x, y) => {
+      const c = Math.floor(x / cellW), r = Math.floor(y / cellH);
+      if (c < 0 || r < 0 || c >= cols || r >= rows) return false;
+      return inFig[r * cols + c] === 1;
+    };
+
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        if (!inFig[row * cols + col]) continue;
+        if (edgeMode && !isEdge(col, row)) continue;
+
+        const x0 = Math.floor(col * cellW);
+        const y0 = Math.floor(row * cellH);
+        const cx = x0 + cellW / 2;
+        const cy = y0 + cellH / 2;
+
+        for (let p = 0; p < particles; p++) {
+          const phase = cellHash(col, row, 20 + p);
+          let prog = phaseT + phase;
+          prog = prog - Math.floor(prog);
+
+          const fadeIn = Math.min(1, prog * 8);
+          const alpha = cfg.alphaMax * (1 - prog) * fadeIn;
+          if (alpha < 1) continue;
+
+          const sx = cx + (cellHash(col, row, 30 + p) - 0.5) * cellW;
+          const sy = cy + (cellHash(col, row, 40 + p) - 0.5) * cellH;
+          const x = sx + Math.sin(prog * TWO_PI + phase * TWO_PI) * driftAmp * prog;
+          const y = sy - prog * riseDist;
+
+          // Edge mode: a speck rising from a shoulder would drift up over
+          // the neck/face — hide it there so dust only shows on paper.
+          if (edgeMode && overFigure(x, y)) continue;
+
+          const ch = glyphs.charAt(Math.floor(phase * 7) % glyphs.length);
+          const c = color(inkHex);
+          c.setAlpha(alpha);
+          fill(c);
+          text(ch, x, y);
+        }
+      }
+    }
+
+    // Restore main glyph size so any later text() calls aren't tiny.
+    textSize(CONFIG.font.size);
+  }
+
+  function sampleCell(pixels, stride, x0, y0, w, h, srcW, srcH) {
+    const strategy = CONFIG.samplingStrategy;
+
+    if (strategy === 'nearest') {
+      const cx = x0 + (w >> 1);
+      const cy = y0 + (h >> 1);
+      const i = cy * stride + cx * 4;
+      return { r: pixels[i], g: pixels[i + 1], b: pixels[i + 2] };
+    }
+
+    if (strategy === 'edge-weighted') {
+      const cxp = x0 + (w >> 1);
+      const cyp = y0 + (h >> 1);
+      const xL = Math.max(0, x0);
+      const xR = Math.min(srcW - 1, x0 + w - 1);
+      const yT = Math.max(0, y0);
+      const yB = Math.min(srcH - 1, y0 + h - 1);
+      const lum = (px, py) => {
+        const i = py * stride + px * 4;
+        return (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+      };
+      const tl = lum(xL, yT), tr = lum(xR, yT);
+      const bl = lum(xL, yB), br = lum(xR, yB);
+      const tc = lum(cxp, yT), bc = lum(cxp, yB);
+      const lc = lum(xL, cyp), rc = lum(xR, cyp);
+      const gx = -tl - 2 * lc - bl + tr + 2 * rc + br;
+      const gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
+      const mag = Math.min(255, Math.sqrt(gx * gx + gy * gy));
+      const i = cyp * stride + cxp * 4;
+      return { r: pixels[i], g: pixels[i + 1], b: pixels[i + 2], edgeMag: mag / 255 };
+    }
+
+    if (strategy === 'tone+edge') {
+      // Average pixels for smooth tonal masses + 9-tap Sobel for edge
+      // magnitude AND angle. Magnitude feeds the same signal-boost path
+      // as 'edge-weighted'; angle is fresh metadata used by the
+      // directional cross-hatch picker downstream.
+      let sumR = 0, sumG = 0, sumB = 0, count = 0;
+      const yEnd = Math.min(srcH, y0 + h);
+      const xEnd = Math.min(srcW, x0 + w);
+      for (let py = y0; py < yEnd; py++) {
+        const rowOff = py * stride;
+        for (let px = x0; px < xEnd; px++) {
+          const i = rowOff + px * 4;
+          sumR += pixels[i];
+          sumG += pixels[i + 1];
+          sumB += pixels[i + 2];
+          count++;
+        }
+      }
+      const cxp = x0 + (w >> 1);
+      const cyp = y0 + (h >> 1);
+      const xL = Math.max(0, x0);
+      const xR = Math.min(srcW - 1, x0 + w - 1);
+      const yT = Math.max(0, y0);
+      const yB = Math.min(srcH - 1, y0 + h - 1);
+      const lum = (px, py) => {
+        const i = py * stride + px * 4;
+        return (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
+      };
+      const tl = lum(xL, yT), tr = lum(xR, yT);
+      const bl = lum(xL, yB), br = lum(xR, yB);
+      const tc = lum(cxp, yT), bc = lum(cxp, yB);
+      const lc = lum(xL, cyp), rc = lum(xR, cyp);
+      const gx = -tl - 2 * lc - bl + tr + 2 * rc + br;
+      const gy = -tl - 2 * tc - tr + bl + 2 * bc + br;
+      const mag = Math.min(255, Math.sqrt(gx * gx + gy * gy));
+      return {
+        r: sumR / count,
+        g: sumG / count,
+        b: sumB / count,
+        edgeMag: mag / 255,
+        edgeAngle: Math.atan2(gy, gx),
+      };
+    }
+
+    let sumR = 0, sumG = 0, sumB = 0, count = 0;
+    const yEnd = Math.min(srcH, y0 + h);
+    const xEnd = Math.min(srcW, x0 + w);
+    for (let py = y0; py < yEnd; py++) {
+      const rowOff = py * stride;
+      for (let px = x0; px < xEnd; px++) {
+        const i = rowOff + px * 4;
+        sumR += pixels[i];
+        sumG += pixels[i + 1];
+        sumB += pixels[i + 2];
+        count++;
+      }
+    }
+    return { r: sumR / count, g: sumG / count, b: sumB / count };
+  }
+
+  function applyCellFill(sample, palette, curved, bgR, bgG, bgB) {
+    const mode = CONFIG.colorMode;
+    if (mode === 'preserve') {
+      const dr = sample.r - bgR;
+      const dg = sample.g - bgG;
+      const db = sample.b - bgB;
+      const m = Math.max(Math.abs(dr), Math.abs(dg), Math.abs(db), 1);
+      const s = 255 / m;
+      const r = Math.max(0, Math.min(255, bgR + dr * s));
+      const g = Math.max(0, Math.min(255, bgG + dg * s));
+      const b = Math.max(0, Math.min(255, bgB + db * s));
+      fill(r, g, b);
+      return;
+    }
+    if (mode === 'monochrome') {
+      const c = color(palette.inks[0]);
+      c.setAlpha(255 * Math.min(1, curved * 1.1));
+      fill(c);
+      return;
+    }
+    if (mode === 'duotone') {
+      const a = color(palette.inks[0]);
+      const b = color(palette.inks[Math.min(1, palette.inks.length - 1)]);
+      const lerped = lerpColor(a, b, Math.min(1, curved));
+      fill(lerped);
+      return;
+    }
+    fill(255);
+  }
+  </script>
+</body>
+</html>
