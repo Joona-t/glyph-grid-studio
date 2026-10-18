@@ -498,7 +498,7 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
     __prefersReducedMotion: () => false, _needsImgDataReadback: () => false, _glOk: true,
     _stableIdx: (s, i, v, idx) => idx, _stableIdxInt: (i, idx) => idx, _ensureStabBuf() {},
     _stabDamped: 0, _stabSwapped: 0, _stabIdx: null, _stabOn: false, _sampleObj: { r: 0, g: 0, b: 0 },
-    __pfAdd() {}, __pfFrame: null, __curCellKey: null, __curCellsFresh: false, __sourceSignalCache: null,
+    __pfAdd() {}, __pfFrame: null, __curCellKey: null, __curCellsFresh: false, __shapeBreath: null, __sourceSignalCache: null,
     performance: { now: () => 0 }, console,
     _ensureRampSprite: () => sprite(Array.from(ramp, (ch) => ch.charCodeAt(0))),
     _rampSpriteSpaceMask: Uint8Array.from(Array.from(ramp, (ch) => ch === ' ' ? 1 : 0)),

@@ -15,6 +15,15 @@
 #      same pixels as the CLI --timeline strings
 #   L5 a malformed --timeline exits 2 before launching; a bad ease is a
 #      schema error at its JSON path
+#   L6 (ITER-085) braille shape selection on the still breathes: preserve +
+#      shape and duotone + shape-edge-aware give more than one distinct frame
+#      (the selection used to ignore breathing — one frame, every frame)
+#   L7 (ITER-086) a brightnessGamma track under colorMode preserve with a
+#      dither renders exactly like a constant gamma, and validate warns; with
+#      dither none the track changes the frames and validate stays quiet
+#   L8 (ITER-088) dispersal with animation.loop false, duration 7, fps 15,
+#      105 frames (fps rounds to 70 ms, so frames 100-104 run past the
+#      duration): the first frame has ink, the last frame is blank paper
 # Prints "timeline: N passed, M failed"; exit 0 only when all pass.
 
 set -u -o pipefail
@@ -29,7 +38,7 @@ TIMEOUT="${TEST_TIMEOUT:-180}"
 
 mkdir -p "$SCRATCH"
 SCRATCH="$(cd "$SCRATCH" && pwd -P)"
-rm -f "$SCRATCH"/*.mp4 "$SCRATCH"/*.json "$SCRATCH"/*.log
+rm -f "$SCRATCH"/*.mp4 "$SCRATCH"/*.gif "$SCRATCH"/*.json "$SCRATCH"/*.log
 
 P=0; F=0
 ok()  { echo "  ✓ $1"; P=$((P+1)); }
@@ -123,6 +132,61 @@ if [[ "$C5" == "2" && "$C5B" == "2" && ! -e "$SCRATCH/l5.mp4" ]] \
   ok "L5 malformed --timeline / bad ease exit 2 before launching"
 else
   bad "L5 timeline errors" "exit=$C5/$C5B | $(echo "$OUT5" | tail -1) | $(echo "$OUT5B" | tail -1)"
+fi
+
+# L6
+distinct() { ffmpeg -v error -i "$1" -f framemd5 - 2>/dev/null | grep -v '^#' | awk -F, '{print $NF}' | sort -u | wc -l | tr -d ' '; }
+L6=""
+for sel in "preserve shape" "duotone shape-edge-aware"; do
+  set -- $sel
+  render --out "$SCRATCH/l6-$1.gif" --palette cream-paper --color-mode "$1" --glyph-set braille \
+    --selection-mode "$2" --dither temporal 2>"$SCRATCH/l6-$1.log"
+  L6="$L6 $1/$2=$(distinct "$SCRATCH/l6-$1.gif")"
+done
+if ! echo "$L6" | grep -qE "=(0|1)( |$)"; then
+  ok "L6 braille shape selection breathes on a still:$L6 distinct frames"
+else
+  bad "L6 shape selection frozen" "$L6 distinct frames | $(tail -1 "$SCRATCH/l6-preserve.log")"
+fi
+
+# L7
+for d in temporal none; do
+  render --out "$SCRATCH/l7-$d-const.gif" --color-mode preserve --dither "$d" --set brightnessGamma=0.4 2>/dev/null
+  render --out "$SCRATCH/l7-$d-track.gif" --color-mode preserve --dither "$d" --set brightnessGamma=0.4 \
+    --timeline "brightnessGamma=0:(0.4),1:(2.5)" 2>/dev/null
+  printf '{"colorMode":"preserve","dither":{"mode":"%s"},"timeline":{"enabled":true,"tracks":{"brightnessGamma":[{"u":0,"v":0.4},{"u":1,"v":2.5}]}}}' "$d" > "$SCRATCH/l7-$d.json"
+  timeout 30 "$BIN" validate "$SCRATCH/l7-$d.json" > "$SCRATCH/l7-$d.validate.log" 2>&1
+done
+M7TC=$(pixmd5 "$SCRATCH/l7-temporal-const.gif"); M7TT=$(pixmd5 "$SCRATCH/l7-temporal-track.gif")
+M7NC=$(pixmd5 "$SCRATCH/l7-none-const.gif"); M7NT=$(pixmd5 "$SCRATCH/l7-none-track.gif")
+if [[ -n "$M7TC" && "$M7TC" == "$M7TT" && -n "$M7NC" && "$M7NC" != "$M7NT" ]] \
+   && grep -q "brightnessGamma: has no effect under colorMode" "$SCRATCH/l7-temporal.validate.log" \
+   && ! grep -q "brightnessGamma" "$SCRATCH/l7-none.validate.log"; then
+  ok "L7 preserve ignores a gamma track under a dither, and validate says so"
+else
+  bad "L7 preserve gamma warning" "temporal ${M7TC:-none}/${M7TT:-none} none ${M7NC:-none}/${M7NT:-none} | $(cat "$SCRATCH/l7-temporal.validate.log" | tail -2)"
+fi
+
+# L8
+timeout "$TIMEOUT" "$BIN" render --in "$STILL" --out "$SCRATCH/l8.gif" --frames 105 --cols 96 --rows 48 \
+  --palette phosphor --color-mode monochrome --ramp blockAscend --dither bayer4 \
+  --set 'animation={"duration":7,"fps":15,"loop":false}' \
+  --set 'dispersal={"enabled":true,"startT":0.76,"endT":0.97,"intensity":0.5,"upwardBias":0.8,"swayAmount":0.6,"rippleAmt":0.25}' \
+  2>"$SCRATCH/l8.log"
+L8WH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$SCRATCH/l8.gif" 2>/dev/null)
+L8=$(ffmpeg -v error -i "$SCRATCH/l8.gif" -f rawvideo -pix_fmt rgb24 - 2>/dev/null | python3 -c '
+import sys
+W, H = (int(x) for x in sys.argv[1].split("x"))
+b = sys.stdin.buffer.read(); fr = len(b) // (W * H * 3)
+def ink(k):
+    o = k * W * H * 3; bg = b[o:o + 3]
+    return sum(1 for i in range(o, o + W * H * 3, 3) if abs(b[i] - bg[0]) + abs(b[i + 1] - bg[1]) + abs(b[i + 2] - bg[2]) > 60)
+print(ink(0), ink(fr - 1))' "${L8WH:-0x0}" 2>/dev/null)
+set -- $L8
+if [[ "${1:-0}" -gt 1000 && "${2:-1}" == "0" ]]; then
+  ok "L8 dispersal holds after endT with loop off (ink first/last frame: $L8)"
+else
+  bad "L8 dispersal hold" "ink first/last frame: ${L8:-none} | $(tail -1 "$SCRATCH/l8.log")"
 fi
 
 echo "timeline: $P passed, $F failed"

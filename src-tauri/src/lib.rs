@@ -608,17 +608,44 @@ fn strip_preset_meta(cfg: &mut serde_json::Value) {
 fn ineffective_config_warnings(cfg: &serde_json::Value) -> Vec<String> {
     let mut out = Vec::new();
     let tl = &cfg["timeline"];
+    let tracked = |k: &str| tl["tracks"].get(k).is_some();
+    // A colorMode track may switch preserve off mid-loop.
+    let preserve = tl["enabled"].as_bool() == Some(true)
+        && !tracked("colorMode")
+        && cfg["colorMode"].as_str() == Some("preserve");
     // ITER-075: a palette track recolours the inks, and colorMode
-    // "preserve" takes the source's own colours — the track is a no-op.
-    if tl["enabled"].as_bool() == Some(true)
-        && tl["tracks"].get("palette").is_some()
-        && tl["tracks"].get("colorMode").is_none()
-        && cfg["colorMode"].as_str() == Some("preserve")
-    {
+    // "preserve" takes the source's own colours.  ITER-086: measured, the
+    // track still moves the background (and the contrast the source colours
+    // are stretched against), so it is not a no-op — the glyphs just keep
+    // the source hues.
+    if preserve && tracked("palette") {
         out.push(
-            "/timeline/tracks/palette: has no effect under colorMode \"preserve\" (the source colours are kept); use monochrome / duotone / gradient"
+            "/timeline/tracks/palette: only changes the background under colorMode \"preserve\" (the glyphs keep the source colours); use monochrome / duotone / gradient"
                 .into(),
         );
+    }
+    // ITER-086: under preserve gamma never colours a glyph, it only picks
+    // one, and only where the ramp index comes from the gamma curve:
+    // selectionMode "brightness" with dither "none", or "flow".  A dither
+    // (absent = the CONFIG default, temporal) picks the index itself, and
+    // shape / edge-directional pick by shape.  Measured (tests/timeline.sh
+    // L7); glyph-timeline.js gammaIgnored is the GUI twin.
+    if preserve
+        && tracked("brightnessGamma")
+        && !tracked("selectionMode")
+        && !tracked("dither.mode")
+    {
+        let sel = cfg["selectionMode"].as_str().unwrap_or("brightness");
+        let dither_off = cfg["compat"].as_str() == Some("v1")
+            || cfg["dither"].as_str() == Some("none")
+            || cfg["dither"]["mode"].as_str() == Some("none");
+        if !(sel == "flow" || (sel == "brightness" && dither_off)) {
+            out.push(format!(
+                "/timeline/tracks/brightnessGamma: has no effect under colorMode \"preserve\" with selectionMode \"{}\"{} — gamma only picks the glyph with selectionMode \"flow\", or \"brightness\" with dither \"none\"",
+                sel,
+                if sel == "brightness" { " and a dither" } else { "" },
+            ));
+        }
     }
     if cfg["video"].get("camera").is_some() {
         out.push("/video/camera: ignored — the camera is runtime-only GUI state and is stripped from presets and configs".into());
@@ -3475,10 +3502,10 @@ impl Drop for ReleaseGifWorkers<'_> {
 ///
 /// `target_max_bytes`: when `Some(N)`, the function encodes at `cap_width`
 /// first; on overshoot it predicts the width that fits from that pass's
-/// size (`twitter_fit_width`, ITER-051), encodes once there, and if that
-/// still overshoots re-predicts from the second pass for one correction
-/// rung — at most three full gifski passes, never below
-/// `TWITTER_FIT_MIN_WIDTH`.  Returns the first buffer ≤ N; if none fits,
+/// size (ITER-051), encodes once there, and while that still overshoots
+/// re-predicts from the last two passes (ITER-087: refitted bytes-vs-width
+/// exponent) down to `TWITTER_FIT_MIN_WIDTH`, at most
+/// `TWITTER_FIT_MAX_PASSES` extra passes (`twitter_fit_ladder`).  Returns the first buffer ≤ N; if none fits,
 /// returns an error rather than silently producing an upload that violates
 /// the requested hard limit.
 /// When `None`, behaves identically to `encode_gif_gifski` (single try).
@@ -3539,7 +3566,7 @@ fn encode_gif_gifski_adaptive(
     )
 }
 
-/// Twitter-fit passes 2-3 after a first pass at `first_width` measured
+/// Twitter-fit shrink passes after a first pass at `first_width` measured
 /// `first_size` bytes > `target`.  Split out of `encode_gif_gifski_adaptive`
 /// so the streaming encoder (ITER-053), whose first pass is already on disk,
 /// can run the same ladder from its retained frames.  Returns the first
@@ -3558,10 +3585,9 @@ fn twitter_fit_shrink(
     // ladder.  GIF bytes scale ~linearly with pixel count at fixed content
     // (ITER-026 log: 18.54 MB × (600/720)² = 12.87 MB predicted vs 12.82 MB
     // measured), and pixels scale with width², so one pass gives the width.
-    // Below ~400 px the linear model over-predicts (LZW + palette do better),
-    // which errs toward fitting.
-    let initial_cap = first_width;
-    let mut best = first_size;
+    // ITER-087: not on temporal-dithered content, where B/px nearly doubles
+    // as the width shrinks (0.28 → 0.53 B/px at 652 → 414 px), so the ladder
+    // refits the exponent from every pass and keeps going to the floor.
     let pixels = |width: u32| -> f64 {
         let height = (u64::from(dimensions.output_height) * u64::from(width))
             .div_ceil(u64::from(dimensions.output_width));
@@ -3569,40 +3595,65 @@ fn twitter_fit_shrink(
     };
     eprintln!(
         "twitter-fit: cap={} size={:.2}MB ({:.3} B/px) > target {:.2}MB — entering shrink ladder",
-        initial_cap,
-        best as f64 / 1024.0 / 1024.0,
-        best as f64 / pixels(initial_cap),
+        first_width,
+        first_size as f64 / 1024.0 / 1024.0,
+        first_size as f64 / pixels(first_width),
         target as f64 / 1024.0 / 1024.0,
     );
-    // Pass 2: predicted width × 0.96 (≈8 % byte headroom).  Measured B/px
-    // drift between 720 px and the fitted width: +6.4 % on worm-move.gif,
-    // +1.9 % on cream-paper, -0.4 % on the ITER-026 sample.  Pass 3
-    // (correction): re-predict from pass 2's own size × 0.97 — B/px measured
-    // that close to the answer moves < 1 %, and there is no fourth pass.
-    let mut width = initial_cap;
-    let mut size = best;
-    for (attempt, margin) in [(2usize, 0.96f64), (3, 0.97)] {
-        control.check_cancelled()?;
-        let Some(next) = twitter_fit_width(width, size, target, margin) else {
-            break;
-        };
+    twitter_fit_ladder(first_width, first_size, target, control, |width, attempt| {
         let phase = format!("encode-gif-attempt-{}", attempt);
-        let encode_width = validated_gif_width(dimensions, Some(next))?;
+        let encode_width = validated_gif_width(dimensions, Some(width))?;
         let buf =
             encode_gif_gifski_frames(frames, delay_ms, border, encode_width, control, &phase)?;
         eprintln!(
             "twitter-fit: predicted cap={} size={:.2}MB ({:.3} B/px)",
-            next,
+            width,
             buf.len() as f64 / 1024.0 / 1024.0,
-            buf.len() as f64 / pixels(next),
+            buf.len() as f64 / pixels(width),
         );
+        Ok(buf)
+    })
+}
+
+/// Most encode passes the Twitter-fit ladder runs after the first one.
+/// Every pass is at least 3 % narrower (margin ≤ 0.97), and a small fitted
+/// exponent jumps straight to the floor, so this only bounds a pathological
+/// run of near misses.
+const TWITTER_FIT_MAX_PASSES: usize = 8;
+
+/// The Twitter-fit ladder after a first pass at `first_width` measured
+/// `first_size` bytes > `target`: predict a width, `encode(width, attempt)`
+/// there, and repeat until a pass fits or there is nothing narrower than
+/// [`TWITTER_FIT_MIN_WIDTH`] left.  Pass 2 assumes bytes ∝ width² (×0.96,
+/// ≈8 % byte headroom); every later pass refits the exponent from the last
+/// two passes (×0.97).  Returns the first buffer ≤ target (also the smallest:
+/// every earlier pass was over), or the "cannot meet target size" error.
+fn twitter_fit_ladder(
+    first_width: u32,
+    first_size: usize,
+    target: u64,
+    control: &ExportControl,
+    mut encode: impl FnMut(u32, usize) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let mut best = first_size;
+    let mut prev: Option<(u32, usize)> = None;
+    let (mut width, mut size) = (first_width, first_size);
+    for pass in 0..TWITTER_FIT_MAX_PASSES {
+        control.check_cancelled()?;
+        let (margin, exponent) = match prev {
+            None => (0.96, 2.0),
+            Some(p) => (0.97, twitter_fit_exponent(p, (width, size))),
+        };
+        let Some(next) = twitter_fit_width_exp(width, size, target, margin, exponent) else {
+            break;
+        };
+        let buf = encode(next, pass + 2)?;
+        prev = Some((width, size));
         width = next;
         size = buf.len();
-        best = best.min(buf.len());
-        // A fitting pass is also the smallest so far: every earlier one
-        // was over the target.
-        if (buf.len() as u64) <= target {
-            eprintln!("twitter-fit: cap={} ✓", next);
+        best = best.min(size);
+        if (size as u64) <= target {
+            eprintln!("twitter-fit: cap={} ✓ (exponent {:.2})", next, exponent);
             return Ok(buf);
         }
     }
@@ -3617,17 +3668,46 @@ fn twitter_fit_shrink(
 /// last rung); below it glyph cells stop being legible.
 const TWITTER_FIT_MIN_WIDTH: u32 = 360;
 
+/// ITER-087: the exponent e in bytes ∝ width^e through two measured passes
+/// `(width, bytes)`.  2 = constant bytes per pixel; temporal-dithered content
+/// measured ≈0.6.  Clamped to [0.25, 3]; 2 when the passes cannot say.
+fn twitter_fit_exponent(prev: (u32, usize), cur: (u32, usize)) -> f64 {
+    let ((w0, b0), (w1, b1)) = (prev, cur);
+    if w0 == w1 || b0 == 0 || b1 == 0 {
+        return 2.0;
+    }
+    let e = (b0 as f64 / b1 as f64).ln() / (f64::from(w0) / f64::from(w1)).ln();
+    if e.is_finite() {
+        e.clamp(0.25, 3.0)
+    } else {
+        2.0
+    }
+}
+
 /// Width predicted to bring a GIF that measured `bytes` at `width` under
 /// `target`, assuming bytes ∝ width² (pixels at a fixed aspect), scaled by
 /// `margin` and rounded down to even.  Clamped to
 /// [`TWITTER_FIT_MIN_WIDTH`, largest even width < `width`]; `None` when that
 /// range is empty, i.e. there is nothing narrower left to try.
+#[cfg(test)]
 fn twitter_fit_width(width: u32, bytes: usize, target: u64, margin: f64) -> Option<u32> {
+    twitter_fit_width_exp(width, bytes, target, margin, 2.0)
+}
+
+/// [`twitter_fit_width`] for bytes ∝ width^`exponent` (ITER-087).
+fn twitter_fit_width_exp(
+    width: u32,
+    bytes: usize,
+    target: u64,
+    margin: f64,
+    exponent: f64,
+) -> Option<u32> {
     let upper = width.saturating_sub(1) & !1;
     if upper < TWITTER_FIT_MIN_WIDTH || bytes == 0 {
         return None;
     }
-    let predicted = f64::from(width) * (target as f64 / bytes as f64).sqrt() * margin;
+    let predicted =
+        f64::from(width) * (target as f64 / bytes as f64).powf(1.0 / exponent) * margin;
     let predicted = (predicted.max(0.0) as u32) & !1;
     Some(predicted.clamp(TWITTER_FIT_MIN_WIDTH, upper))
 }
@@ -3637,8 +3717,8 @@ fn twitter_fit_width(width: u32, bytes: usize, target: u64, margin: f64) -> Opti
 /// `cap_width` (optional) resizes frames before encoding for smaller
 /// output files (Twitter's 15 MB GIF limit, etc.).
 /// `target_max_bytes` (optional, ITER-026): when set, shrinks the width
-/// until output ≤ N — predicted from the first pass, plus at most one
-/// correction (ITER-051).  The GUI's `Export GIF (Twitter-fit)` button
+/// until output ≤ N — predicted from the first pass, then refitted from
+/// each further pass down to the 360 px floor (ITER-051, ITER-087).  The GUI's `Export GIF (Twitter-fit)` button
 /// passes 15 MB.
 #[tauri::command]
 async fn save_gif_real(
@@ -5549,6 +5629,64 @@ mod export_guard_tests {
         assert_eq!(twitter_fit_width(720, 700_001, 700_000, 1.0), Some(718));
     }
 
+    /// ITER-087: the 105-frame phosphor-cycle GIF (652 × 1024 frames,
+    /// 14.5 MB target) measured 0.28 B/px at 652 px and 0.53 B/px at 414 px.
+    /// Bytes as a function of width through those two points.
+    fn phosphor_cycle_bytes(width: u32) -> usize {
+        let e = (0.53f64 / 0.28).ln() / (414f64 / 652.0).ln();
+        let bpx = 0.28 * (f64::from(width) / 652.0).powf(e);
+        let height = (1024 * u64::from(width)).div_ceil(652) as f64;
+        (bpx * 105.0 * f64::from(width) * height) as usize
+    }
+
+    #[test]
+    fn twitter_fit_refits_the_exponent_and_walks_to_the_floor() {
+        let target = 14_500_000u64;
+        let (b652, b414) = (phosphor_cycle_bytes(652), phosphor_cycle_bytes(414));
+        assert!(b652 as u64 > target && b414 as u64 > target, "{b652} {b414}");
+        // bytes ∝ width^0.6, not width²: 0.28 → 0.53 B/px.
+        let e = twitter_fit_exponent((652, b652), (414, b414));
+        assert!((e - 0.60).abs() < 0.01, "exponent {e}");
+        // From 414 the w² model asks for 394 and the old ladder stopped
+        // there (its third and last pass); the refit asks for 378.
+        assert_eq!(twitter_fit_width(414, b414, target, 0.97), Some(394));
+        assert_eq!(twitter_fit_width_exp(414, b414, target, 0.97, e), Some(378));
+        // A tiny exponent jumps to the floor; the floor itself is the end.
+        assert_eq!(twitter_fit_width_exp(414, b414, target, 0.97, 0.25), Some(360));
+        assert_eq!(twitter_fit_width_exp(360, b414, target, 0.97, e), None);
+        assert_eq!(twitter_fit_exponent((652, b652), (652, b414)), 2.0);
+        assert_eq!(twitter_fit_exponent((652, b414), (414, b652)), 0.25);
+
+        // The ladder, with that size model as the encoder: it keeps
+        // refitting until a pass fits, every pass narrower than the last.
+        let control = test_control(JOB_RUNNING);
+        let mut widths = Vec::new();
+        let buf = twitter_fit_ladder(652, b652, target, &control, |w, _| {
+            widths.push(w);
+            Ok(vec![0u8; phosphor_cycle_bytes(w)])
+        })
+        .unwrap();
+        assert!(buf.len() as u64 <= target);
+        assert_eq!(widths, vec![536, 378]);
+        // The ITER-051 ladder's third pass (w² again from 536) misses.
+        let old3 = twitter_fit_width(536, phosphor_cycle_bytes(536), target, 0.97).unwrap();
+        assert!(phosphor_cycle_bytes(old3) as u64 > target, "old pass 3 at {old3} fits");
+        assert!(widths.windows(2).all(|p| p[1] < p[0]), "{widths:?}");
+        assert!(*widths.last().unwrap() >= TWITTER_FIT_MIN_WIDTH, "{widths:?}");
+
+        // A target nothing reaches: the ladder ends at the 360 px floor and
+        // then errors.
+        let mut widths = Vec::new();
+        let err = twitter_fit_ladder(652, b652, 1_000_000, &control, |w, _| {
+            widths.push(w);
+            Ok(vec![0u8; phosphor_cycle_bytes(w)])
+        })
+        .unwrap_err();
+        assert!(err.contains("cannot meet target size"), "{err}");
+        assert_eq!(widths.last(), Some(&TWITTER_FIT_MIN_WIDTH), "{widths:?}");
+        assert!(widths.len() <= TWITTER_FIT_MAX_PASSES);
+    }
+
     #[test]
     fn mp4_timing_is_exact_for_supported_frame_rates() {
         for fps in [24, 25, 30] {
@@ -5802,7 +5940,7 @@ mod preset_schema_tests {
         assert_eq!(cfg["video"]["decode"], "webview");
         assert!(warnings.iter().any(|w| w.starts_with("/video/camera: ignored")), "{:?}", warnings);
         assert!(
-            warnings.iter().any(|w| w.starts_with("/timeline/tracks/palette: has no effect under colorMode")),
+            warnings.iter().any(|w| w.starts_with("/timeline/tracks/palette: only changes the background under colorMode")),
             "{:?}",
             warnings
         );
@@ -5813,6 +5951,44 @@ mod preset_schema_tests {
         strip_preset_meta(&mut batch_cfg);
         assert_eq!(batch_cfg, serde_json::json!({"video": {"mirror": false}}));
         let _ = fs::remove_file(preset);
+    }
+
+    /// ITER-086: the brightnessGamma tracks colorMode preserve ignores, as
+    /// measured (tests/timeline.sh L7): every dither (temporal is the
+    /// default), and shape / edge-directional; brightness + dither none and
+    /// flow keep it, and so does any non-preserve colorMode.
+    #[test]
+    fn gamma_track_under_preserve_warns_where_it_is_a_no_op() {
+        let gamma = |extra: serde_json::Value| -> Vec<String> {
+            let mut cfg = serde_json::json!({"colorMode": "preserve", "timeline": {"enabled": true,
+                "tracks": {"brightnessGamma": [{"u": 0, "v": 0.4}, {"u": 1, "v": 2.5}]}}});
+            for (k, v) in extra.as_object().unwrap() {
+                cfg[k] = v.clone();
+            }
+            validate_config(&cfg)
+                .unwrap()
+                .into_iter()
+                .filter(|w| w.starts_with("/timeline/tracks/brightnessGamma: has no effect"))
+                .collect()
+        };
+        assert_eq!(gamma(serde_json::json!({})).len(), 1, "default dither is temporal");
+        let w = gamma(serde_json::json!({"dither": {"mode": "bayer4"}}));
+        assert!(w[0].contains(r#"selectionMode "brightness" and a dither"#), "{w:?}");
+        let w = gamma(serde_json::json!({"selectionMode": "shape", "dither": {"mode": "none"}}));
+        assert!(w[0].contains(r#"selectionMode "shape" —"#), "{w:?}");
+        assert_eq!(gamma(serde_json::json!({"selectionMode": "edge-directional"})).len(), 1);
+        for fine in [
+            serde_json::json!({"dither": {"mode": "none"}}),
+            serde_json::json!({"selectionMode": "flow"}),
+            serde_json::json!({"compat": "v1"}),
+            serde_json::json!({"colorMode": "monochrome"}),
+            serde_json::json!({"timeline": {"enabled": false,
+                "tracks": {"brightnessGamma": [{"u": 0, "v": 0.4}]}}}),
+            serde_json::json!({"timeline": {"enabled": true, "tracks": {
+                "brightnessGamma": [{"u": 0, "v": 0.4}], "dither.mode": [{"u": 0, "v": "none"}]}}}),
+        ] {
+            assert!(gamma(fine.clone()).is_empty(), "{fine}");
+        }
     }
 
     #[test]
