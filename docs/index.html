@@ -241,16 +241,12 @@
   .show-frame + .show-frame{ margin-top:40px; }
 
   /* ===== v0.2 FEATURES ===== */
-  .features{ display:grid; grid-template-columns:repeat(2,1fr); gap:20px; margin-top:40px; }
-  .features .spec-desc{ margin-bottom:14px; }
   .spec-desc code, .note code{ font-family:var(--mono); font-size:.92em; background:rgba(120,90,40,.12); color:var(--ls-text-strong); padding:1px 5px; border-radius:4px; overflow-wrap:anywhere; }
   :root[data-theme="candy"] .spec-desc code, :root[data-theme="candy"] .note code{ background:rgba(233,30,140,.10); }
   :root[data-theme="basalt"] .spec-desc code, :root[data-theme="basalt"] .note code{ background:rgba(230,214,173,.10); }
   .snip{ margin:0; background:var(--ls-code-bg); color:var(--ls-code-tx); border-radius:var(--ls-radius-sm); padding:11px 14px; font-family:var(--mono); font-size:.74rem; line-height:1.6; overflow-x:auto; white-space:pre; }
   pre.term-body{ margin:0; }
   .term-body .tcom{ color:rgba(243,236,218,.72); }
-  .ascii-demo{ margin-top:30px; }
-  .ascii-demo .term-body{ line-height:1.25; }
 
   /* ===== HEADLESS / MCP ===== */
   .metrics{ list-style:none; padding:0; margin:40px 0 0; display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }
@@ -268,8 +264,27 @@
   .tools code{ font-family:var(--mono); font-size:.84rem; font-weight:700; color:var(--ls-heading); }
   .tools span{ color:var(--ls-text-muted); }
 
+  /* ===== v0.2 REEL: four separate pieces ===== */
+  .reel{ display:grid; grid-template-columns:1fr .74fr; grid-template-areas:"video worm" "type worm" "term term"; gap:30px 24px; margin-top:40px; align-items:start; }
+  .tile{ max-width:none; margin:0; display:flex; flex-direction:column; min-width:0; }   /* grid items default to min-width:auto; the <pre> commands would widen the column past the screen */
+  .tile-video{ grid-area:video; } .tile-type{ grid-area:type; } .tile-term{ grid-area:term; }
+  .tile-worm{ grid-area:worm; align-self:stretch; justify-content:center; }   /* fills both rows; content centred */
+  .tile .plate{ max-width:none; margin-top:14px; }
+  .tile-desc{ font-family:var(--mono); font-size:.78rem; line-height:1.6; color:var(--ls-text-muted); margin:14px 2px 12px; }
+  .tile-desc code{ font-family:var(--mono); font-size:.92em; background:rgba(120,90,40,.12); color:var(--ls-text-strong); padding:1px 5px; border-radius:4px; }
+  :root[data-theme="candy"] .tile-desc code{ background:rgba(233,30,140,.10); }
+  :root[data-theme="basalt"] .tile-desc code{ background:rgba(230,214,173,.10); }
+  video.frame-img{ background:#000; }
+  .term-mat{ padding:12px; }
+  .term-frame{ display:block; width:100%; aspect-ratio:16/9.4; border:0; border-radius:6px; background:#000; }
+  @media (max-width:760px){
+    .reel{ grid-template-columns:1fr; grid-template-areas:"video" "type" "worm" "term"; }
+    .tile-worm .mat{ max-width:420px; margin:0 auto; }
+    :root[data-theme="candy"] .placard{ transform:none; }   /* full-width placards: the -0.5deg tilt poked 2px past the screen */
+    .term-frame{ aspect-ratio:4/3.4; }
+  }
   @media (max-width:900px){ .duo{ grid-template-columns:1fr; } .metrics{ grid-template-columns:repeat(2,1fr); } }
-  @media (max-width:760px){ .specimens, .features{ grid-template-columns:1fr; } nav{ flex-wrap:wrap; } }
+  @media (max-width:760px){ .specimens{ grid-template-columns:1fr; } nav{ flex-wrap:wrap; } }
   @media (max-width:520px){
     .nav-links a:not(.nav-ghost){ display:none; }
     .brand-sub{ display:none; }
@@ -317,21 +332,21 @@
     <span class="kicker" data-kicker>The Glyph Collection · Cream Stock</span>
     <div><span class="alpha-badge">v0.2.0 · video, text & terminal export</span></div>
     <h1 class="headline">Render any image into <em>living</em> glyphs.</h1>
-    <p class="sub">Drop in a photo, a video clip or a line of text, dial in palettes, dithering and CRT-beam effects, and pull a clean character-grid render out in seconds, as a GIF, an MP4 or real terminal text. Or skip the window and drive it all from the shell or an AI agent.</p>
+    <p class="sub">Built for AI agents and headless pipelines first. One CLI and an MCP server turn images, video clips and text into character-grid art: presets are schema-checked in a tenth of a second, the same job renders byte-identical every run, and a batch pays the app&#8217;s start-up once. The studio window is there when you want to tune by eye.</p>
 
     <figure class="placard">
       <div class="mat">
         <img class="frame-img" id="heroImg"
              src="assets/hero-ankh.png"
-             data-cream="assets/hero-ankh.png" data-cream-still="assets/hero-ankh.png"
+             data-cream="assets/hero-ankh.gif" data-cream-still="assets/hero-ankh.png"
              data-candy="assets/hero-candy.gif" data-candy-still="assets/hero-candy-poster.png"
-             data-basalt="assets/hero-ankh.png" data-basalt-still="assets/hero-ankh.png"
+             data-basalt="assets/hero-ankh.gif" data-basalt-still="assets/hero-ankh.png"
              alt="Glyph Grid Studio's ankh brand mark rendered as a grid of typeset Unicode glyphs (cream theme); Sparky the mascot in candy theme.">
       </div>
       <figcaption class="plate">
         <span class="pl-no">PL. I</span>
         <span class="pl-name" data-plate-name>Ankh — Ink on Cream</span>
-        <span class="pl-med">octant glyph grid · blue-noise dither</span>
+        <span class="pl-med">octant glyph grid · breathing loop</span>
       </figcaption>
     </figure>
 
@@ -380,56 +395,61 @@
       <h2 class="sec-title">Four new ways to make glyph art</h2>
       <div class="sec-rule"></div>
     </div>
-    <figure class="placard show-frame" style="margin-top:34px;">
-      <div class="mat">
-        <img class="frame-img anim-img"
-             src="assets/v0.2-showcase-poster.png" data-anim="assets/v0.2-showcase.gif" data-still="assets/v0.2-showcase-poster.png" loading="lazy" width="960" height="600"
-             alt="A four-part reel of v0.2 features: a video clip rendered as glyphs while its palette morphs, the words GLYPH GRID typing themselves out, text composited over an image, and the grid exported as plain terminal text.">
-      </div>
-      <figcaption class="plate">
-        <span class="pl-no">PL. IV</span>
-        <span class="pl-name">The v0.2 reel</span>
-        <span class="pl-med">video · type · timeline · terminal</span>
-      </figcaption>
-    </figure>
 
-    <div class="features">
-      <article class="card"><div class="spec-no">No. 01</div><h3 class="spec-title">Video sources</h3>
-        <p class="spec-desc">Drop in an MP4, MOV, M4V or WebM clip. H.264 is decoded frame-exactly in Rust, so the same clip renders the same bytes every time; HEVC and VP9 play through the built-in video player. Webcam input is in beta.</p>
-        <pre class="snip" tabindex="0" aria-label="Example command: render a video clip"><code>render --in clip.mp4 --out loop.gif --frames 48</code></pre></article>
-      <article class="card"><div class="spec-no">No. 02</div><h3 class="spec-title">Kinetic typography</h3>
-        <p class="spec-desc">Type a title or load a lyric file (<code>.srt</code> or <code>.lrc</code>) and it becomes the source: typewriter, rise, fade or scale, on its own or blended over an image or clip (multiply, screen, mask).</p>
-        <pre class="snip" tabindex="0" aria-label="Example command: lyric cues over an image"><code>render --in cover.png --srt lyrics.lrc \
-  --text-anim typewriter --text-blend multiply \
-  --out lyric.mp4</code></pre></article>
-      <article class="card"><div class="spec-no">No. 03</div><h3 class="spec-title">Keyframe timeline</h3>
-        <p class="spec-desc">Animate any setting over the loop: grid size, gain, dither, and palettes, which morph smoothly through OKLab. Linear, ease-in-out or stepped keys, from the studio or the command line.</p>
-        <pre class="snip" tabindex="0" aria-label="Example command: palette morph"><code>render --in portrait.png --out morph.gif \
-  --timeline 'palette=0:(cream-paper),1:(spice)'</code></pre></article>
-      <article class="card"><div class="spec-no">No. 04</div><h3 class="spec-title">Terminal export</h3>
-        <p class="spec-desc">Get the grid back as real text, not pixels: plain <code>txt</code> to copy and paste, 24-bit <code>ansi</code> to <code>cat</code> in a terminal, an asciinema <code>cast</code>, or one self-contained <code>html</code> page.</p>
-        <pre class="snip" tabindex="0" aria-label="Example command: ANSI export"><code>render --in portrait.png --out portrait.ans --format ansi</code></pre></article>
+    <div class="reel">
+      <figure class="placard tile tile-video">
+        <div class="mat">
+          <video class="frame-img reel-vid" muted loop playsinline preload="none" width="1024" height="558"
+                 poster="assets/showcase-video-poster.jpg"
+                 aria-label="An anime clip of a woman in a neon city, rendered frame by frame as grey glyphs on black; mid-loop the palette warms to amber and back.">
+            <source src="assets/showcase-video.mp4" type="video/mp4">
+          </video>
+        </div>
+        <figcaption class="plate"><span class="pl-no">No. 01</span><span class="pl-name">Video sources</span><span class="pl-med">H.264 decoded in Rust · palette timeline</span></figcaption>
+        <p class="tile-desc">Drop in an MP4, MOV, M4V or WebM clip. H.264 is decoded frame-exactly in Rust, so the same clip renders the same bytes every time. Here the keyframe timeline also morphs the palette from grey to amber and back over the loop.</p>
+        <pre class="snip" tabindex="0" aria-label="Command for this clip"><code>render --in clip.mp4 --out clip.mp4 --color-mode monochrome \
+  --timeline 'palette=0:(monochrome),0.5:(amber-phosphor),1:(monochrome)'</code></pre>
+      </figure>
+
+      <figure class="placard tile tile-worm">
+        <div class="mat">
+          <video class="frame-img reel-vid" muted loop playsinline preload="none" width="714" height="1024"
+                 poster="assets/showcase-text-over-poster.jpg"
+                 aria-label="The words BABY HULUD rise into the night sky above a small sandworm in a desert, all drawn in warm spice-coloured glyphs.">
+            <source src="assets/showcase-text-over.mp4" type="video/mp4">
+          </video>
+        </div>
+        <figcaption class="plate"><span class="pl-no">No. 03</span><span class="pl-name">Text over a source</span><span class="pl-med">screen blend · rise · spice</span></figcaption>
+        <p class="tile-desc">Composite the type onto an image or a clip: screen, multiply or mask, blended in linear light before the grid draws.</p>
+        <pre class="snip" tabindex="0" aria-label="Command for this clip"><code>render --in worm.jpg --text 'BABY\nHULUD' \
+  --text-blend screen --text-anim rise \
+  --palette spice --out worm.mp4</code></pre>
+      </figure>
+
+      <figure class="placard tile tile-type">
+        <div class="mat">
+          <video class="frame-img reel-vid" muted loop playsinline preload="none" width="1024" height="576"
+                 poster="assets/showcase-type-poster.jpg"
+                 aria-label="The words GLYPH GRID, then STUDIO, type themselves out letter by letter in ink-on-cream glyphs, hold, and fade.">
+            <source src="assets/showcase-type.mp4" type="video/mp4">
+          </video>
+        </div>
+        <figcaption class="plate"><span class="pl-no">No. 02</span><span class="pl-name">Kinetic typography</span><span class="pl-med">typewriter · two timed lines</span></figcaption>
+        <p class="tile-desc">A title or a lyric file (<code>.srt</code>, <code>.lrc</code>) becomes the source: typewriter, rise, fade or scale, each line on its own timing.</p>
+        <pre class="snip" tabindex="0" aria-label="Command for a title like this one"><code>render --text 'GLYPH GRID\nSTUDIO' --text-anim typewriter \
+  --palette cream-paper --out title.mp4</code></pre>
+      </figure>
+
+      <figure class="placard tile tile-term">
+        <div class="mat term-mat">
+          <iframe class="term-frame" src="assets/showcase-terminal.html" loading="lazy"
+                  title="The same anime clip exported as an HTML page of real text characters, 120 by 36, playing frame by frame, with Play, Pause and Step controls."></iframe>
+        </div>
+        <figcaption class="plate"><span class="pl-no">No. 04</span><span class="pl-name">Terminal export</span><span class="pl-med">real text · not pixels · playing live</span></figcaption>
+        <p class="tile-desc">The same clip, exported as text instead of pixels. This frame is the app's <code>--format html</code> file itself, playing in your browser: select it, copy it, view source. <code>txt</code> and 24-bit <code>ansi</code> are one still frame for the terminal; <code>cast</code> is an asciinema recording.</p>
+        <pre class="snip" tabindex="0" aria-label="Command for this export"><code>render --in clip.mp4 --format html --cols 120 --rows 36 --out clip.html</code></pre>
+      </figure>
     </div>
-
-    <div class="terminal ascii-demo">
-      <div class="term-bar">
-        <span class="dot d1"></span><span class="dot d2"></span><span class="dot d3"></span>
-        <span class="term-label">zsh — the grid as text</span>
-      </div>
-      <pre class="term-body" tabindex="0" aria-label="A real terminal-text render of the word GLYPH, drawn in ASCII characters"><span class="tprompt">$ </span><span class="tcmd">glyph-grid-studio render --text GLYPH --text-size 300 \
-    --cols 52 --rows 13 --format txt --out glyph.txt
-</span><span class="tprompt">$ </span><span class="tcmd">cat glyph.txt</span>
-                                   .
-
-      ,:;:   .,,     ..:     ,: :,:,,    .,    :.
-    &gt;#%ooM@+ M@*     .M@O  :#%~ %@MoM%8; B@&gt;  o%8
-   O%#       B@o       w@O:@%+ ,%@-  o%B #@*  o@8
-   B@O =&lt;&gt;&lt;~ 8%*        m%@#-  .@@&lt;;+#%&gt; #%BMm%%8
-   o@B ;;B%w B%o         %@&gt;    @%wo&gt;&lt;,  %%*  *@m
-    O##*&gt;8@w B@8*o*o*    #@&lt;    @%~      #@*  *@M
-      :;-::  .,,,;,;,    :,.    ::.      ,:   .;.</pre>
-    </div>
-    <p class="micro">Real output, unedited: a v0.2.0 render of the word GLYPH, 52 × 13 characters.</p>
   </section>
 
   <section class="wrap">
@@ -618,6 +638,27 @@
     if(!reduce.matches){ setHero(root.dataset.theme || 'basalt'); setAnims(); }
   });
   reduce.addEventListener && reduce.addEventListener('change', function(){ setHero(root.dataset.theme || 'basalt'); setAnims(); });
+
+  // reel videos: play muted while on screen; under reduced motion, poster + controls only
+  var vids = document.querySelectorAll('.reel-vid');
+  function setVids(){
+    vids.forEach(function(v){
+      if(reduce.matches){ v.pause(); v.controls = true; } else { v.controls = false; }
+    });
+  }
+  setVids();
+  if('IntersectionObserver' in window){
+    var io = new IntersectionObserver(function(es){
+      es.forEach(function(e){
+        var v = e.target;
+        if(reduce.matches) return;
+        if(e.isIntersecting){ v.preload = 'auto'; var p = v.play(); if(p && p.catch) p.catch(function(){ v.controls = true; }); }
+        else v.pause();
+      });
+    }, { threshold:0.35 });
+    vids.forEach(function(v){ io.observe(v); });
+  }
+  reduce.addEventListener && reduce.addEventListener('change', setVids);
 
   // copy-to-clipboard for the quarantine command
   var copyBtn = document.getElementById('copyBtn'), cmd = document.getElementById('cmd');
