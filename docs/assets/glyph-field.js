@@ -1,7 +1,7 @@
 /* Glyph field — the page background, drawn the way the studio draws.
  *
  * A fixed canvas behind the page holds a character grid of vertical-hatching
- * glyphs. Each cell samples a slowly drifting value-noise field (stretched
+ * glyphs (strokes only, no dots). Each cell samples a slowly drifting value-noise field (stretched
  * vertically so it reads as strands of ink), adds a 4x4 Bayer threshold, and
  * picks a glyph from a density ramp: the same signal → dither → ramp pipeline
  * as the app, at ~12 fps.
@@ -22,7 +22,7 @@
   var ctx = canvas.getContext('2d', { alpha: true });
   if (!ctx) return;
 
-  var RAMP = [' ', '·', ':', '╎', '¦', '│', '┃', '║'];
+  var RAMP = [' ', '╷', '┆', '╎', '¦', '│', '┃', '║'];   // strokes only, faintest first: hatching, never dots
   var CELL_W = 9, CELL_H = 15, FONT_PX = 13;      // CSS px
   var FPS = 12;
   var BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
