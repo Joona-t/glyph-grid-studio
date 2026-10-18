@@ -93,6 +93,10 @@
   :root:not([data-theme="candy"]) body{ font-size:1.06rem; }  /* EB Garamond runs a touch small */
   body::after{ content:""; position:fixed; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:calc(.10 * (var(--ls-grain) + .45)); pointer-events:none; z-index:1; }
   .layer{ position:relative; z-index:2; }
+  /* charcoal titles (assets/charcoal-titles.js): real text stays for readers; the image shows once loaded */
+  .ct-img{ display:none; max-width:100%; height:auto; pointer-events:none; user-select:none; }
+  .ct-on .ct-img{ display:block; }
+  .ct-on .ct-text{ position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap; border:0; }
   /* glyph field: a live hatching grid behind the page (assets/glyph-field.js) */
   :root{ --field-ink:#5e3a24; --field-alpha:.13; }
   :root[data-theme="candy"]{ --field-ink:#b3185c; --field-alpha:.13; }
@@ -331,7 +335,7 @@
     <span class="spark s2 sp2" aria-hidden="true">✦</span>
     <span class="kicker" data-kicker>The Glyph Collection · Cream Stock</span>
     <div><span class="alpha-badge">v0.2.0 · video, text & terminal export</span></div>
-    <h1 class="headline">Render any image into <em>living</em> glyphs.</h1>
+    <h1 class="headline" data-ct="hero"><span class="ct-text">Render any image into <em>living</em> glyphs.</span></h1>
     <p class="sub">Built for AI agents and headless pipelines first. One CLI and an MCP server turn images, video clips and text into character-grid art: presets are schema-checked in a tenth of a second, the same job renders byte-identical every run, and a batch pays the app&#8217;s start-up once. The studio window is there when you want to tune by eye.</p>
 
     <figure class="placard">
@@ -360,7 +364,7 @@
   <section class="wrap showcase">
     <div class="sec-head">
       <div class="sec-eyebrow" data-show-eyebrow>From the studio</div>
-      <h2 class="sec-title">Portraits, rendered in glyphs</h2>
+      <h2 class="sec-title" data-ct="portraits"><span class="ct-text">Portraits, rendered in glyphs</span></h2>
       <div class="sec-rule"></div>
     </div>
     <figure class="placard show-frame">
@@ -392,7 +396,7 @@
   <section class="wrap" id="new">
     <div class="sec-head">
       <div class="sec-eyebrow">New in v0.2.0</div>
-      <h2 class="sec-title">Four new ways to make glyph art</h2>
+      <h2 class="sec-title" data-ct="new"><span class="ct-text">Four new ways to make glyph art</span></h2>
       <div class="sec-rule"></div>
     </div>
 
@@ -455,7 +459,7 @@
   <section class="wrap">
     <div class="sec-head">
       <div class="sec-eyebrow">Catalogue of Capabilities</div>
-      <h2 class="sec-title">Nine specimens from the studio</h2>
+      <h2 class="sec-title" data-ct="specimens"><span class="ct-text">Nine specimens from the studio</span></h2>
       <div class="sec-rule"></div>
     </div>
     <div class="specimens">
@@ -474,7 +478,7 @@
   <section class="wrap" id="cli">
     <div class="sec-head">
       <div class="sec-eyebrow">For scripts &amp; AI agents</div>
-      <h2 class="sec-title">Render from the shell, or let an agent drive</h2>
+      <h2 class="sec-title" data-ct="cli"><span class="ct-text">Render from the shell, or let an agent drive</span></h2>
       <div class="sec-rule"></div>
     </div>
     <ul class="metrics" aria-label="v0.2 headless render measurements">
@@ -541,7 +545,7 @@
   <section class="wrap firstlaunch">
     <div class="sec-head">
       <div class="sec-eyebrow" data-gk-eyebrow>Conservator's Note</div>
-      <h2 class="sec-title">First launch on macOS</h2>
+      <h2 class="sec-title" data-ct="firstlaunch"><span class="ct-text">First launch on macOS</span></h2>
       <div class="sec-rule"></div>
     </div>
     <div class="panel" style="margin-top:34px;">
@@ -673,5 +677,7 @@
 })();
 </script>
 <script src="assets/glyph-field.js" defer></script>
+<script src="assets/titles/titles.js" defer></script>
+<script src="assets/charcoal-titles.js" defer></script>
 </body>
 </html>

@@ -4,6 +4,14 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-089 — 2026-10-18 — site: four separate showcase pieces, a breathing Ankh, charcoal titles
+
+**Problem:** after the v0.2 site update (PR #15) Joona's review: the showcase was one 1.8 s GIF of four 480x278 crops (the type and the Baby Hulud title were cut off, it played too fast), the hero Ankh was static, and the headings were plain type on a site that is about drawing with glyphs.
+
+**What changed:** (1) Each v0.2 feature is its own piece rendered whole by the 0.2.0 app (video source + palette timeline, kinetic type, text over a source, and the real `--format html` export in an iframe); the clips are MP4 `<video>` (play on screen only; posters + controls under reduced motion), because GIF only fit 6 MB by shrinking the video clip to 370 px. (2) The hero Ankh is a 2.3 s ping-pong breathing GIF (435 KB); the source PNG's own vignette read as ink, so the paper is flattened first, and the headless breathing EMA is not periodic, so a cut cycle seamed (2.04) where the ping-pong does not (0.22 vs 0.47 max step). (3) Every large heading is drawn by the charcoal-sketch skill per theme and layout (42 WebP, `scripts/site-titles/`), with a new light-on-dark `basalt` palette in the skill; the real text stays in the DOM (screen readers, search, no-JS and failed loads get plain type). (4) Hero copy leads with agents, claiming only what was measured: `validate` rejects a typo in 0.07-0.1 s; a 3-job batch took 15.8-21.4 s vs 22.7-23.5 s for three renders (loaded M1 Pro). "Headless reduces latency" was not claimed; nothing measures it against the GUI.
+
+**Gotchas:** grid items default to `min-width:auto`, so the `<pre>` commands widened the reel column past a phone screen (fixed with `min-width:0`); the Candy placard tilt poked 2 px past the edge at full width (tilt off under 760 px); `<h2>` rects span the container, so title crops are trimmed to their ink before sizing.
+
 ### ITER-084 — 2026-10-18 — video: no short tails inside containers, crop sides bounded together, chunk offsets bounded
 
 **Problem:** three more crate trust paths in `video.rs`. (29, HIGH) `walk_boxes` let a box list end in fewer than 8 all-zero bytes (QuickTime's udta 32-bit zero), but the mp4 crate's container loops read 8 bytes straddling the container end, get size 0, and `skip_box(0)` seeks back and spins forever, with `open_video` holding the slot lock. Repro: a udta ending in `00 00 00 00`, or 4 zero bytes at the end of stbl, on either fixture; the open never returns. (30, LOW) `sps_parse` bounded each crop side under 16 px but not their sum, so `coded_w - cx*(cl+cr)` underflowed: a 1-MB-wide SPS with crop left = right = 7 gave width 4294967284 in release (a debug panic). (31, LOW) `sample_tables_fit` never bounded stco/co64 entries; the crate adds `chunk_offset + sample_offset` unchecked (debug panic on co64 u64::MAX, release wrap to a garbage seek).

@@ -92,6 +92,10 @@
   :root:not([data-theme="candy"]) body{ font-size:1.06rem; }  /* EB Garamond runs a touch small */
   body::after{ content:""; position:fixed; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:calc(.10 * (var(--ls-grain) + .45)); pointer-events:none; z-index:1; }
   .layer{ position:relative; z-index:2; }
+  /* charcoal titles (assets/charcoal-titles.js): real text stays for readers; the image shows once loaded */
+  .ct-img{ display:none; max-width:100%; height:auto; pointer-events:none; user-select:none; }
+  .ct-on .ct-img{ display:block; }
+  .ct-on .ct-text{ position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap; border:0; }
   /* glyph field: a live hatching grid behind the page (assets/glyph-field.js) */
   :root{ --field-ink:#5e3a24; --field-alpha:.13; }
   :root[data-theme="candy"]{ --field-ink:#b3185c; --field-alpha:.13; }
@@ -290,7 +294,7 @@
   <section class="wrap">
     <div class="sec-head gallery-intro">
       <div class="sec-eyebrow" data-show-eyebrow>From the studio</div>
-      <h1 class="sec-title">Gallery</h1>
+      <h1 class="sec-title" data-ct="gallery"><span class="ct-text">Gallery</span></h1>
       <div class="sec-rule"></div>
       <p class="sub">Some of my favourite pieces.</p>
     </div>
@@ -382,5 +386,7 @@
 })();
 </script>
 <script src="assets/glyph-field.js" defer></script>
+<script src="assets/titles/titles.js" defer></script>
+<script src="assets/charcoal-titles.js" defer></script>
 </body>
 </html>
