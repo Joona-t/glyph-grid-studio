@@ -93,6 +93,12 @@
   :root:not([data-theme="candy"]) body{ font-size:1.06rem; }  /* EB Garamond runs a touch small */
   body::after{ content:""; position:fixed; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:calc(.10 * (var(--ls-grain) + .45)); pointer-events:none; z-index:1; }
   .layer{ position:relative; z-index:2; }
+  /* glyph field: a live hatching grid behind the page (assets/glyph-field.js) */
+  :root{ --field-ink:#5e3a24; --field-alpha:.13; }
+  :root[data-theme="candy"]{ --field-ink:#b3185c; --field-alpha:.13; }
+  :root[data-theme="basalt"]{ --field-ink:#e6d6ad; --field-alpha:.11; }
+  #glyphField{ position:fixed; inset:0; z-index:0; pointer-events:none; opacity:0; transition:opacity 1.2s ease; }
+  #glyphField.on{ opacity:1; }
   a{ color:var(--ls-accent-deep); text-decoration-thickness:1px; text-underline-offset:3px; }
   a:hover{ color:var(--ls-pink-deep); }
   :focus-visible{ outline:2px solid var(--ls-focus); outline-offset:2px; border-radius:4px; }
@@ -280,6 +286,7 @@
 </style>
 </head>
 <body>
+<canvas id="glyphField" aria-hidden="true"></canvas>
 <div class="layer">
 
   <nav>
@@ -624,5 +631,6 @@
   }
 })();
 </script>
+<script src="assets/glyph-field.js" defer></script>
 </body>
 </html>
