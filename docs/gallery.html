@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="cream">
+<html lang="en" data-theme="basalt">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -92,6 +92,12 @@
   :root:not([data-theme="candy"]) body{ font-size:1.06rem; }  /* EB Garamond runs a touch small */
   body::after{ content:""; position:fixed; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:calc(.10 * (var(--ls-grain) + .45)); pointer-events:none; z-index:1; }
   .layer{ position:relative; z-index:2; }
+  /* glyph field: a live hatching grid behind the page (assets/glyph-field.js) */
+  :root{ --field-ink:#5e3a24; --field-alpha:.13; }
+  :root[data-theme="candy"]{ --field-ink:#b3185c; --field-alpha:.13; }
+  :root[data-theme="basalt"]{ --field-ink:#e6d6ad; --field-alpha:.11; }
+  #glyphField{ position:fixed; inset:0; z-index:0; pointer-events:none; opacity:0; transition:opacity 1.2s ease; }
+  #glyphField.on{ opacity:1; }
   a{ color:var(--ls-accent-deep); text-decoration-thickness:1px; text-underline-offset:3px; }
   a:hover{ color:var(--ls-pink-deep); }
   :focus-visible{ outline:2px solid var(--ls-focus); outline-offset:2px; border-radius:4px; }
@@ -255,6 +261,7 @@
 </style>
 </head>
 <body>
+<canvas id="glyphField" aria-hidden="true"></canvas>
 <div class="layer">
 
   <nav>
@@ -267,9 +274,9 @@
     </div>
     <div class="nav-right">
       <div class="theme-toggle" role="group" aria-label="Color theme">
-        <button class="tg" data-set="cream" aria-pressed="true">Cream</button>
+        <button class="tg" data-set="cream" aria-pressed="false">Cream</button>
         <button class="tg" data-set="candy" aria-pressed="false">Candy</button>
-        <button class="tg" data-set="basalt" aria-pressed="false">Basalt</button>
+        <button class="tg" data-set="basalt" aria-pressed="true">Basalt</button>
       </div>
       <div class="nav-links">
         <a href="./">Home</a>
@@ -360,19 +367,20 @@
     });
   }
   function applyTheme(theme, persist){
-    if(theme !== 'candy' && theme !== 'basalt') theme = 'cream';
+    if(theme !== 'candy' && theme !== 'cream') theme = 'basalt';
     root.dataset.theme = theme;
     document.querySelectorAll('.tg').forEach(function(b){ b.setAttribute('aria-pressed', b.dataset.set === theme ? 'true' : 'false'); });
     var s = document.querySelector('[data-show-eyebrow]'); if(s) s.textContent = SHOW[theme];
     if(persist){ try{ localStorage.setItem('ggs-theme', theme); }catch(e){} }
   }
-  var saved = 'cream';
-  try{ saved = localStorage.getItem('ggs-theme') || 'cream'; }catch(e){}
+  var saved = 'basalt';
+  try{ saved = localStorage.getItem('ggs-theme') || 'basalt'; }catch(e){}
   applyTheme(saved, false);
   document.querySelectorAll('.tg').forEach(function(b){ b.addEventListener('click', function(){ applyTheme(b.dataset.set, true); }); });
   window.addEventListener('load', setImgs);
   reduce.addEventListener && reduce.addEventListener('change', setImgs);
 })();
 </script>
+<script src="assets/glyph-field.js" defer></script>
 </body>
 </html>
