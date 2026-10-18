@@ -123,8 +123,10 @@
   .brand .mascot img{ width:100%; height:100%; object-fit:cover; }  /* ankh fills the bubble, no empty ring */
   .brand-name{ font-family:var(--font-display); font-weight:700; font-size:1.15rem; color:var(--ls-heading); letter-spacing:.2px; line-height:1.1; }
   .brand-sub{ font-family:var(--mono); font-size:.62rem; letter-spacing:.22em; text-transform:uppercase; color:var(--ls-text-muted); }
-  .nav-right{ display:flex; align-items:center; gap:12px; }
-  .nav-links{ display:flex; align-items:center; gap:6px; }
+  .nav-right{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  .nav-links{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .nav-fork{ gap:7px; }   /* Fork: same pill as Download, icon + label (octicon repo-forked, MIT) */
+  .nav-fork svg{ flex:none; }
   .nav-links a{ font-family:var(--mono); font-size:.72rem; letter-spacing:.12em; text-transform:uppercase; color:var(--ls-text-muted); text-decoration:none; padding:10px; min-height:44px; display:inline-flex; align-items:center; }
   .nav-links a:hover{ color:var(--ls-heading); }
   .nav-ghost{ border:1.5px solid var(--ls-glass-border); border-radius:999px; background:var(--ls-glass-strong); box-shadow:inset 0 1px 0 rgba(255,255,255,.7); padding:10px 16px !important; color:var(--ls-heading) !important; }
@@ -333,6 +335,7 @@
         <a href="gallery.html">Gallery</a>
         <a href="https://github.com/Joona-t/glyph-grid-studio">GitHub</a>
         <a class="nav-ghost" href="https://github.com/Joona-t/glyph-grid-studio/releases/latest/download/Glyph-Grid-Studio-macOS.dmg">Download</a>
+        <a class="nav-ghost nav-fork" href="https://github.com/Joona-t/glyph-grid-studio/fork" title="Fork it and make it yours. MIT licensed" aria-label="Fork Glyph Grid Studio on GitHub"><svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false"><path fill="currentColor" d="M5 5.372v.878c0 .414.336.75.75.75h4.5a.75.75 0 0 0 .75-.75v-.878a2.25 2.25 0 1 1 1.5 0v.878a2.25 2.25 0 0 1-2.25 2.25h-1.5v2.128a2.251 2.251 0 1 1-1.5 0V8.5h-1.5A2.25 2.25 0 0 1 3.5 6.25v-.878a2.25 2.25 0 1 1 1.5 0ZM5 3.25a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Zm6.75.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5Zm-3 8.75a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0Z"/></svg>Fork</a>
       </div>
     </div>
   </nav>
@@ -584,7 +587,7 @@
 
   <footer class="wrap">
     <div class="foot-grid">
-      <p class="foot-built">Built with p5.js · Tauri 2 · Rust<br>MIT licensed.</p>
+      <p class="foot-built">Built with p5.js · Tauri 2 · Rust<br>MIT licensed: <a href="https://github.com/Joona-t/glyph-grid-studio/fork">fork it</a> and make it yours.</p>
       <div class="foot-links">
         <a href="https://github.com/Joona-t/glyph-grid-studio">GitHub</a>
         <a href="https://github.com/Joona-t/glyph-grid-studio/releases">Releases</a>
