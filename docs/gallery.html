@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="cream">
+<html lang="en" data-theme="basalt">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -274,9 +274,9 @@
     </div>
     <div class="nav-right">
       <div class="theme-toggle" role="group" aria-label="Color theme">
-        <button class="tg" data-set="cream" aria-pressed="true">Cream</button>
+        <button class="tg" data-set="cream" aria-pressed="false">Cream</button>
         <button class="tg" data-set="candy" aria-pressed="false">Candy</button>
-        <button class="tg" data-set="basalt" aria-pressed="false">Basalt</button>
+        <button class="tg" data-set="basalt" aria-pressed="true">Basalt</button>
       </div>
       <div class="nav-links">
         <a href="./">Home</a>
@@ -367,14 +367,14 @@
     });
   }
   function applyTheme(theme, persist){
-    if(theme !== 'candy' && theme !== 'basalt') theme = 'cream';
+    if(theme !== 'candy' && theme !== 'cream') theme = 'basalt';
     root.dataset.theme = theme;
     document.querySelectorAll('.tg').forEach(function(b){ b.setAttribute('aria-pressed', b.dataset.set === theme ? 'true' : 'false'); });
     var s = document.querySelector('[data-show-eyebrow]'); if(s) s.textContent = SHOW[theme];
     if(persist){ try{ localStorage.setItem('ggs-theme', theme); }catch(e){} }
   }
-  var saved = 'cream';
-  try{ saved = localStorage.getItem('ggs-theme') || 'cream'; }catch(e){}
+  var saved = 'basalt';
+  try{ saved = localStorage.getItem('ggs-theme') || 'basalt'; }catch(e){}
   applyTheme(saved, false);
   document.querySelectorAll('.tg').forEach(function(b){ b.addEventListener('click', function(){ applyTheme(b.dataset.set, true); }); });
   window.addEventListener('load', setImgs);
