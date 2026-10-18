@@ -15,6 +15,12 @@
 #      same pixels as the CLI --timeline strings
 #   L5 a malformed --timeline exits 2 before launching; a bad ease is a
 #      schema error at its JSON path
+#   L9 (ITER-089) octant glyphs paint in colorMode preserve: preserve + octant
+#      shape and shape-edge-aware render differently (as tofu boxes every
+#      octant looked the same, so the two were pixel-identical)
+#   L10 (ITER-090) a font.size track reaches preserve + octant shape: the
+#      last frame of a 4 → 24 track is at least half as far from a constant
+#      font.size 4 render as a constant 24 is (it used to stay at the base size)
 # Prints "timeline: N passed, M failed"; exit 0 only when all pass.
 
 set -u -o pipefail
@@ -123,6 +129,39 @@ if [[ "$C5" == "2" && "$C5B" == "2" && ! -e "$SCRATCH/l5.mp4" ]] \
   ok "L5 malformed --timeline / bad ease exit 2 before launching"
 else
   bad "L5 timeline errors" "exit=$C5/$C5B | $(echo "$OUT5" | tail -1) | $(echo "$OUT5B" | tail -1)"
+fi
+
+# mean absolute grey difference between frame $3 of $1 and of $2
+grey() { ffmpeg -v error -i "$1" -vf "select=eq(n\,$2)" -frames:v 1 -f rawvideo -pix_fmt gray - 2>/dev/null; }
+mad() {
+  python3 - <(grey "$1" "$3") <(grey "$2" "$3") <<'EOF'
+import sys
+a = open(sys.argv[1], 'rb').read(); b = open(sys.argv[2], 'rb').read()
+print("%.2f" % (sum(abs(x - y) for x, y in zip(a, b)) / len(a)) if a and len(a) == len(b) else "nan")
+EOF
+}
+OCT=(--color-mode preserve --glyph-set octant)
+
+# L9
+render --out "$SCRATCH/l9-shape.mp4" "${OCT[@]}" --selection-mode shape 2>"$SCRATCH/l9-shape.log"
+render --out "$SCRATCH/l9-edge.mp4" "${OCT[@]}" --selection-mode shape-edge-aware 2>"$SCRATCH/l9-edge.log"
+L9=$(mad "$SCRATCH/l9-shape.mp4" "$SCRATCH/l9-edge.mp4" 0)
+if python3 -c "import sys; sys.exit(0 if float('$L9') > 0.5 else 1)" 2>/dev/null; then
+  ok "L9 preserve + octant: shape and shape-edge-aware differ (mean |Δ| $L9)"
+else
+  bad "L9 preserve + octant draws tofu" "shape vs shape-edge-aware mean |Δ| ${L9:-none} (want > 0.5)"
+fi
+
+# L10
+render --out "$SCRATCH/l10-track.mp4" "${OCT[@]}" --selection-mode shape --timeline "font.size=0:(4),1:(24)" 2>"$SCRATCH/l10-track.log"
+render --out "$SCRATCH/l10-c4.mp4" "${OCT[@]}" --selection-mode shape --set font.size=4 2>"$SCRATCH/l10-c4.log"
+render --out "$SCRATCH/l10-c24.mp4" "${OCT[@]}" --selection-mode shape --set font.size=24 2>"$SCRATCH/l10-c24.log"
+L10T=$(mad "$SCRATCH/l10-track.mp4" "$SCRATCH/l10-c4.mp4" 11)
+L10R=$(mad "$SCRATCH/l10-c24.mp4" "$SCRATCH/l10-c4.mp4" 11)
+if python3 -c "import sys; t, r = float('$L10T'), float('$L10R'); sys.exit(0 if r > 1 and t >= 0.5 * r else 1)" 2>/dev/null; then
+  ok "L10 font.size track reaches preserve + octant shape (last frame vs size 4: $L10T, size 24 vs 4: $L10R)"
+else
+  bad "L10 font.size track under preserve + shape" "last frame vs size 4 ${L10T:-none}, size 24 vs 4 ${L10R:-none} (want ≥ half)"
 fi
 
 echo "timeline: $P passed, $F failed"

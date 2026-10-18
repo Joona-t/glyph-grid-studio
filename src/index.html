@@ -3061,7 +3061,6 @@
     const origCellH = srcH / baseRows;
     noStroke();
     textAlign(CENTER, CENTER);
-    textFont(fontFamilyForActive());
     const prevFontSize = CONFIG.font.size;
     for (const roi of rois) {
       const bump = Math.max(2, Math.min(4, Math.floor(roi.bump || 2)));
@@ -3078,7 +3077,7 @@
       const cellPxH = Math.max(1, Math.floor(roiCellH));
       fill(bgR, bgG, bgB);
       rect(rx0, ry0, rw, rh);
-      textSize(prevFontSize / bump);
+      applyActiveTextFont(prevFontSize / bump);
       for (let r = 0; r < roiRows; r++) {
         for (let c = 0; c < roiCols; c++) {
           const x0 = rx0 + Math.floor(c * roiCellW);
@@ -3101,7 +3100,7 @@
         }
       }
     }
-    textSize(prevFontSize);
+    applyActiveTextFont(prevFontSize);
   }
 
   /* ---- per-pixel linearize + Rec.709 luminance (CR-1). ---- */
@@ -3574,8 +3573,7 @@
     const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
     noStroke();
     textAlign(CENTER, CENTER);
-    textSize(CONFIG.font.size);
-    textFont(fontFamilyForActive());
+    applyActiveTextFont(CONFIG.font.size);
     irBegin(cols, rows, fontFamilyForActive(), 'brightness');
     const ramp = RAMPS[CONFIG.ramp];
     const rampLast = ramp.length - 1;
@@ -3976,8 +3974,7 @@
     const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
     noStroke();
     textAlign(CENTER, CENTER);
-    textSize(CONFIG.font.size);
-    textFont(fontFamilyForActive());
+    applyActiveTextFont(CONFIG.font.size);
     irBegin(cols, rows, fontFamilyForActive(), edgeAware ? 'shape-edge-aware' : 'shape');
     const pixels = g.pixels;
     const srcW = g.width;
@@ -4269,8 +4266,7 @@
     const bgR = red(bgC), bgG = green(bgC), bgB = blue(bgC);
     noStroke();
     textAlign(CENTER, CENTER);
-    textSize(CONFIG.font.size);
-    textFont(fontFamilyForActive());
+    applyActiveTextFont(CONFIG.font.size);
     irBegin(cols, rows, fontFamilyForActive(), cpsOverride ? 'flow' : 'edge-directional');
     const pixels = src.pixels;
     const srcW = src.width;
@@ -4452,6 +4448,22 @@
   function fontFamilyForActive() {
     if (fontDescriptor && CONFIG.glyphSet) return fontDescriptor.cssStack;
     return CONFIG.font.family;
+  }
+
+  /* ITER-089: p5's textFont() wraps any family containing whitespace in
+     double quotes, so the glyph-set stack ('"GlyphGrid", "GlyphGrid-Fallback",
+     monospace') became '12px ""GlyphGrid", ..."' — an invalid canvas font
+     the browser drops without error, leaving the last valid font and size
+     in place.  text() then drew octants in plain monospace (tofu) and a
+     timeline font.size never reached it.  The sprite atlases set ctx.font
+     themselves and were unaffected; do the same for the text() paths. */
+  function applyActiveTextFont(sizePx) {
+    const fam = fontFamilyForActive();
+    textSize(sizePx);
+    textFont(fam);
+    if (fam.indexOf(',') >= 0 || fam.indexOf('"') >= 0) {
+      drawingContext.font = 'normal ' + sizePx + 'px ' + fam;
+    }
   }
 
   /* ---- atlas load.

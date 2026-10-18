@@ -4,6 +4,30 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-090 — 2026-10-18 — a font.size timeline track reaches preserve + shape with a glyph set
+
+**Problem:** found in the ITER-086 sweep: a `font.size` track had no effect under colorMode preserve + selectionMode shape (braille, octant), although a constant `--set font.size` did change those renders. Measured on the cream-paper still, preserve + octant + shape, track `font.size=0:(4),1:(24)`: the last frame (size ≈ 22) was 3.85 grey levels from a constant size-4 render, against 18.9 between constant 4 and constant 24.
+
+**Root cause:** the same invalid canvas font as ITER-089. The shadow config did carry the per-frame size, and `textSize()` passed it on, but the font string it built was the quoted stack, which the browser drops. The canvas kept the last valid font. On the first frame the old order (`textSize` before `textFont(stack)`) still rebuilt the font from the plain family, at frame 0's size, and nothing valid replaced it afterwards. A constant `--set font.size` gives every frame that same size, which is why it worked and a track did not (the stuck last frame measured close to size 4, the track's frame-0 value).
+
+**Fix:** ITER-089's `applyActiveTextFont(size)` sets a valid font with the frame's size on every draw.
+
+**Tests:** tests/timeline.sh L10: the last frame of the 4 → 24 track is at least half as far from a constant size-4 render as a constant 24 is (now 41.6 vs 42.4; before 3.85 vs 18.9, fails).
+
+---
+
+### ITER-089 — 2026-10-18 — octant (and every glyph-set) glyphs paint in the text() paths instead of tofu
+
+**Problem:** in colorMode preserve with selectionMode shape / shape-edge-aware and glyphSet octant, every cell drew the same outlined tofu box, so octant + preserve looked static. Monochrome, duotone and gradient draw the same glyphs fine. Repro: `render -i tests/sources/cream-paper.png --color-mode preserve --glyph-set octant --selection-mode shape`; shape and shape-edge-aware came out pixel-identical.
+
+**Root cause:** not a missing glyph in the font. With a glyph set loaded, `fontFamilyForActive()` returns the CSS stack `"GlyphGrid", "GlyphGrid-Fallback", monospace`. p5 1.11's `textFont()` wraps any family that contains whitespace in double quotes, so the canvas got `normal 8px ""GlyphGrid", …"`, which is not a valid font, and the browser ignores an invalid `ctx.font` assignment without error. `text()` then drew in the last valid font (plain monospace, set in setup()), which has no Unicode 16 octants. The sprite atlases that the monochrome / duotone / gradient fast paths blit set `ctx.font` themselves, unquoted, so they were never affected. The same applied to every `text()` path that used the stack: drawShapeGrid's preserve / depthFog slow path, drawBrightnessGrid's slow path, drawEdgeDirectionalGrid (flow, and every edge colour mode except the monochrome sprite blit) and the salient-ROI overdraw.
+
+**Fix:** `applyActiveTextFont(size)` (src/index.html) calls `textSize` / `textFont` as before, and when the family is a stack (contains a comma or a quote) also sets `drawingContext.font` to `normal <size>px <stack>` directly. The four drawers use it, and the ROI overdraw uses it for its bumped size too. No `textFont(fontFamilyForActive())` call is left. A single unquoted family (the default `monospace`) goes through p5 unchanged, so renders without a glyph set are unaffected.
+
+**Tests:** tests/timeline.sh L9: preserve + octant renders with shape and shape-edge-aware differ (mean grey difference 3.11; 0.00 before the fix, fails).
+
+---
+
 ### ITER-084 — 2026-10-18 — video: no short tails inside containers, crop sides bounded together, chunk offsets bounded
 
 **Problem:** three more crate trust paths in `video.rs`. (29, HIGH) `walk_boxes` let a box list end in fewer than 8 all-zero bytes (QuickTime's udta 32-bit zero), but the mp4 crate's container loops read 8 bytes straddling the container end, get size 0, and `skip_box(0)` seeks back and spins forever, with `open_video` holding the slot lock. Repro: a udta ending in `00 00 00 00`, or 4 zero bytes at the end of stbl, on either fixture; the open never returns. (30, LOW) `sps_parse` bounded each crop side under 16 px but not their sum, so `coded_w - cx*(cl+cr)` underflowed: a 1-MB-wide SPS with crop left = right = 7 gave width 4294967284 in release (a debug panic). (31, LOW) `sample_tables_fit` never bounded stco/co64 entries; the crate adds `chunk_offset + sample_offset` unchecked (debug panic on co64 u64::MAX, release wrap to a garbage seek).
