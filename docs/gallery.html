@@ -90,17 +90,24 @@
   html{ background-image:var(--ls-bg-gradient); background-attachment:fixed; background-color:var(--ls-bg-mid); }
   body{ margin:0; font-family:var(--font-body); color:var(--ls-text); line-height:1.6; -webkit-font-smoothing:antialiased; position:relative; min-height:100vh; }
   :root:not([data-theme="candy"]) body{ font-size:1.06rem; }  /* EB Garamond runs a touch small */
-  body::after{ content:""; position:fixed; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:calc(.10 * (var(--ls-grain) + .45)); pointer-events:none; z-index:1; }
-  .layer{ position:relative; z-index:2; }
+  body::after{ content:""; position:fixed; inset:0; background-image:var(--ls-noise); background-size:160px 160px; mix-blend-mode:soft-light; opacity:calc(.10 * (var(--ls-grain) + .45)); pointer-events:none; z-index:-1; }
+  /* .layer is not a stacking context (z-index:auto) so the charcoal title videos can
+     mix-blend-mode with the real page; the grain and the glyph field sit at z-index:-1,
+     above the page background and below all content, as before */
+  .layer{ position:relative; z-index:auto; }
   /* charcoal titles (assets/charcoal-titles.js): real text stays for readers; the image shows once loaded */
   .ct-img{ display:none; max-width:100%; height:auto; pointer-events:none; user-select:none; }
   .ct-on .ct-img{ display:block; }
+  .ct-vid{ display:none; max-width:100%; height:auto; pointer-events:none; mix-blend-mode:multiply; }   /* dark marks on white: white drops out */
+  :root[data-theme="basalt"] .ct-vid{ mix-blend-mode:screen; }                                         /* light marks on black: black drops out */
+  .ct-anim .ct-img{ display:none; }
+  .ct-anim .ct-vid{ display:block; }
   .ct-on .ct-text{ position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap; border:0; }
   /* glyph field: a live hatching grid behind the page (assets/glyph-field.js) */
   :root{ --field-ink:#5e3a24; --field-alpha:.13; }
   :root[data-theme="candy"]{ --field-ink:#b3185c; --field-alpha:.13; }
   :root[data-theme="basalt"]{ --field-ink:#e6d6ad; --field-alpha:.11; }
-  #glyphField{ position:fixed; inset:0; z-index:0; pointer-events:none; opacity:0; transition:opacity 1.2s ease; }
+  #glyphField{ position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:0; transition:opacity 1.2s ease; }
   #glyphField.on{ opacity:1; }
   a{ color:var(--ls-accent-deep); text-decoration-thickness:1px; text-underline-offset:3px; }
   a:hover{ color:var(--ls-pink-deep); }
