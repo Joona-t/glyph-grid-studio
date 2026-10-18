@@ -230,6 +230,7 @@
   /* showcase (Sparky full-colour render) */
   .showcase{ margin-top:6px; }
   .show-frame{ max-width:680px; }
+  .show-frame + .show-frame{ margin-top:40px; }
 
   @media (max-width:760px){ .specimens{ grid-template-columns:1fr; } nav{ flex-wrap:wrap; } }
   @media (max-width:520px){
@@ -304,7 +305,7 @@
   <section class="wrap showcase">
     <div class="sec-head">
       <div class="sec-eyebrow" data-show-eyebrow>From the studio</div>
-      <h2 class="sec-title">A portrait, rendered in glyphs</h2>
+      <h2 class="sec-title">Portraits, rendered in glyphs</h2>
       <div class="sec-rule"></div>
     </div>
     <figure class="placard show-frame">
@@ -317,6 +318,18 @@
         <span class="pl-no">PL. II</span>
         <span class="pl-name">Portrait — Ink on Cream</span>
         <span class="pl-med">octant grid · inverted signal · breathing loop</span>
+      </figcaption>
+    </figure>
+    <figure class="placard show-frame">
+      <div class="mat">
+        <img class="frame-img" id="paulImg"
+             src="assets/paul-charcoal.gif" loading="lazy" width="600" height="338"
+             alt="Paul Atreides from Dune, backlit, rendered as a shimmering field of warm-black charcoal glyphs on cream paper, his silhouette dissolving into rising dust.">
+      </div>
+      <figcaption class="plate">
+        <span class="pl-no">PL. III</span>
+        <span class="pl-name">Paul — Charcoal on Cream</span>
+        <span class="pl-med">charcoal method · dust grain · breathing loop</span>
       </figcaption>
     </figure>
   </section>
