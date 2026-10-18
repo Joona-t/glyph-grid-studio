@@ -4,6 +4,14 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-090 — 2026-10-18 — site: the charcoal titles breathe
+
+**Problem:** the ITER-089 charcoal titles were stills; Joona: "it is static and needs to be moving".
+
+**What changed:** each title now plays the skill's own seamless 4 s loop at 12 fps (`scripts/site-titles/animate_titles.py`; every mark is a pure sine of time, so frame N is exact). An alpha WebP of the hero loop was 10.7 MB, so the loop ships as H.264 (CRF 32) with the paper baked to white (cream, candy: `mix-blend-mode: multiply`) or black (basalt: `screen`) so the blend drops it out: 0.7 MB for the hero, 10 MB for all 42 clips, about 2.2 MB per full desktop scroll in one theme and 1.2 MB on a phone. The still loads first and stays as the fallback; a video is created only for titles within 300 px of the viewport, paused off screen, and never under prefers-reduced-motion.
+
+**Gotcha:** blend modes only mix inside the element's stacking context, and `.layer { z-index: 2 }` isolated all content, which would have shown the videos as black boxes. `.layer` is now `z-index: auto`, with the grain and the glyph field at `z-index: -1` (still above the page background, below content).
+
 ### ITER-089 — 2026-10-18 — site: four separate showcase pieces, a breathing Ankh, charcoal titles
 
 **Problem:** after the v0.2 site update (PR #15) Joona's review: the showcase was one 1.8 s GIF of four 480x278 crops (the type and the Baby Hulud title were cut off, it played too fast), the hero Ankh was static, and the headings were plain type on a site that is about drawing with glyphs.
