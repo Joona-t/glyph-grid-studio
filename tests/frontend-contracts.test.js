@@ -452,7 +452,7 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   const glBlock = grab(/  let _glInst = null;[^\n]*\n[\s\S]*?\n  function drawGridWebGL\([\s\S]*?\n  \}\n/, 'drawGridWebGL()')
     .replace(/^  let _glInst = null;/, 'var _glInst = null;');
   const snapSrc = grab(/    captureGridSnapshot\(\) \{[\s\S]*?\n    \},\n/, 'captureGridSnapshot()');
-  const code = [irBlock, fn('applyCellFill'), fn('sampleCell'), fn('sampleCellInto'), fn('drawGlyphGrid'),
+  const code = [irBlock, fn('applyCellFill'), fn('applyActiveTextFont'), fn('sampleCell'), fn('sampleCellInto'), fn('drawGlyphGrid'),
     fn('drawBrightnessGrid'), fn('drawShapeGrid'), fn('drawEdgeDirectionalGrid'), flowBlock, glBlock,
     'var __hook = {\n' + snapSrc + '};',
     'this.gf = () => glyphFrame; this.hook = __hook;'].join('\n');
@@ -532,6 +532,18 @@ console.log(`frontend contracts: ok (${inlineScripts.length} inline script, ${co
   ctx.GlyphGrid = ctx.window.GlyphGrid;
   vm.createContext(ctx);
   vm.runInContext(code, ctx);
+
+  /* ITER-089: p5's textFont() quotes a family with whitespace, which turns a
+     glyph-set CSS stack into an invalid canvas font; the stack goes onto the
+     context as-is, and a plain family is left to p5. */
+  ctx.fontFamilyForActive = () => '"GG", "GG-Fallback", monospace';
+  ctx.applyActiveTextFont(12);
+  assert.strictEqual(ctx.drawingContext.font, 'normal 12px "GG", "GG-Fallback", monospace', 'glyph-set stack set on the context unquoted');
+  assert(!/textFont\(fontFamilyForActive\(\)\)/.test(html), 'every text() drawer sets the active font through applyActiveTextFont');
+  delete ctx.drawingContext.font;
+  ctx.fontFamilyForActive = () => 'mono';
+  ctx.applyActiveTextFont(8);
+  assert(!('font' in ctx.drawingContext), 'a plain family goes through p5 only');
 
   const runs = [
     ['v1 mono', 'monochrome', () => ctx.drawGlyphGrid(src), 'brightness'],
