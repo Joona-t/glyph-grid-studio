@@ -22,6 +22,12 @@ A real-time character-grid image renderer for macOS. Drop in any image and conve
 
 Prefer to build it yourself? See [Build from source](#build) below.
 
+## What's new in v0.2
+
+![v0.2 showcase](docs/assets/v0.2-showcase.gif)
+
+Headless renders ~1.8× faster and byte-reproducible, default MP4s 4× smaller, a schema-validated CLI/MCP surface, terminal export (`--format txt|ansi|cast|html`), a keyframe timeline (`--timeline`), kinetic typography (`--text`, `--srt`) and video sources. Full before/after numbers: [docs/V0.2-REPORT.md](docs/V0.2-REPORT.md).
+
 ## What it does
 
 The pipeline samples a source raster image into an `M × N` cell grid. For each cell, the renderer either:
