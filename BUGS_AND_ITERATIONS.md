@@ -453,7 +453,7 @@ Tests: cargo `a_drain_larger_than_ring_keeps_the_requested_frame`, `concurrent_o
 - MCP `glyph_grid_render` gains `config` (any partial CONFIG): written to a temp preset (deleted on return, `TempPreset` drop guard) and passed as `--preset`, so the named params layer on top exactly like CLI flags; validated in-process first.
 
 **Measured:**
-- worm-move 120 frames / `pB.json` vs `golden-p3.mp4`: **PSNR 37.62 dB** (gate ≥ 35 passes; golden left as is). The whole delta is the bloom fix above: the same render with `bloom: {enabled: true, strength: 0}` (inert) is **md5-identical** to the golden (`163e203c…`, PSNR inf). The new output (md5 `96fc9327…`) is saved as `/private/tmp/claude-501/v2/golden-p3-iter057.mp4` for byte-exact comparisons after this commit.
+- worm-move 120 frames / `pB.json` vs `golden-p3.mp4`: **PSNR 37.62 dB** (gate ≥ 35 passes; golden left as is). The whole delta is the bloom fix above: the same render with `bloom: {enabled: true, strength: 0}` (inert) is **md5-identical** to the golden (`163e203c…`, PSNR inf). The new output (md5 `96fc9327…`) is saved as `<scratch>` for byte-exact comparisons after this commit.
 - Byte-identity 7/7 still green, incl. G7 (`render --palette spice --dither stbn` == batch job `{dither:{mode, asSourcePrefilter, levels}}`) — the `{mode}`-only dither patch is pixel-identical.
 - Batch per-job: 3-frame job 1024×682, same job with `border {width: 16}` 1056×714, `frames: "auto"` with duration 0.2 s @ 25 fps → 5 frames (B18).
 - Timing (perf-sample, two runs, **under parallel load**, load avg ~20, `suspect_foreign_xpc:false`): wall 22.14 / 22.64 s, host 2.74 / 3.31 s, WebContent 17.40 / 18.61 s, GPU 8.09 / 7.57 s. WebContent is up vs ITER-056 (13.8 s) because the gate preset now actually runs the bloom stage — real work, not a regression in the merge.
@@ -541,7 +541,7 @@ Tests: cargo `a_drain_larger_than_ring_keeps_the_requested_frame`, `concurrent_o
 **Measured (under parallel load):**
 - Stage split (PERF_JOB, worm pB, 48 frames, avg of 30): preprocess **29.7 ms (JS) → 7.4 ms (GL)**; the following `src.loadPixels()` readback grows 3.7 → 9.7 ms (it now waits on the GPU work), so scene + readback goes 33.5 → 17.4 ms per animated frame.
 - Worm 120 frames, interleaved A/B with the pre-change binary (perf-sample, `suspect_foreign_xpc:true` — other phases' webviews inflate the XPC sums): wall 18.51 / 19.59 s → 17.88 / 16.04 s; WebContent CPU 32.7 / 48.2 s → 14.9 / 26.4 s; GPU 18.3 / 22.7 s → 13.2 / 18.3 s; app CPU 3.26 / 3.49 → 2.80 / 1.89 s. The CLI wall time is still bounded by the off-screen rAF cadence (research F1/F2), so the per-frame win shows mostly as CPU.
-- Output (intentionally moves for animated sources): worm 120 frames vs golden **40.07 dB** avg (per-frame min 38.71, max 54.78), ×2 runs md5-identical (`f24c0b31…`); lossless PERF_JOB PNG anchors GL vs JS 58.4 / 87.3 / 49.7 dB (a few pixels move where a ±1 LSB flips a glyph pick). Animated mode renders vs the pre-change binary: dither none 62.05, edge-directional 51.48, shape octant 51.28, phosphorDecay 52.99, kawaii 49.87, scanlines 50.87 / 51.39, scanlines+bloom 48.93, scanlines+kawaii+letterbox 50.34 dB (≥30 bar). Still sources: all 9 mode renders rgba-identical. `gpuPreprocess:false` worm render = golden md5 `163e203c…` (the JS path is untouched). New reference saved beside the old one as `/private/tmp/claude-501/v2/golden-p4-iter066.mp4`; `golden-p4.mp4` left as is for the other phase-4 groups.
+- Output (intentionally moves for animated sources): worm 120 frames vs golden **40.07 dB** avg (per-frame min 38.71, max 54.78), ×2 runs md5-identical (`f24c0b31…`); lossless PERF_JOB PNG anchors GL vs JS 58.4 / 87.3 / 49.7 dB (a few pixels move where a ±1 LSB flips a glyph pick). Animated mode renders vs the pre-change binary: dither none 62.05, edge-directional 51.48, shape octant 51.28, phosphorDecay 52.99, kawaii 49.87, scanlines 50.87 / 51.39, scanlines+bloom 48.93, scanlines+kawaii+letterbox 50.34 dB (≥30 bar). Still sources: all 9 mode renders rgba-identical. `gpuPreprocess:false` worm render = golden md5 `163e203c…` (the JS path is untouched). New reference saved beside the old one as `<scratch>`; `golden-p4.mp4` left as is for the other phase-4 groups.
 
 **Gate:** cargo build 0 errors · cargo test 18/18 · npm test ok (+ constant parity, 13) · run-all PASS 27 / FAIL 0 (incl. the uncommitted ITER-064 B13 hunk), MCP 10/10, byte-identity 7/7 (animated G3–G5 deterministic on the GL path, incl. headless vs `--show-window`) · output gate 40.07 dB ≥ 35.
 
@@ -1342,7 +1342,7 @@ release-mechanics + repo-hygiene), 1 real new code bug, 4 debunked.
   (`docs/kawaii.md`, the one placeholder comment in `src/index.html`).
   (Historical entries in *this* append-only changelog are left as-written.)
 - Hardened the gate's A1 test: greps `/Users/[^/]+/` (any home path) instead of
-  the literal `/Users/darkfire/`. Updated A5 to assert the real public file set.
+  the literal `~/`. Updated A5 to assert the real public file set.
 
 ### ITER — release mechanics (P0)
 
@@ -1493,7 +1493,7 @@ release-mechanics + repo-hygiene), 1 real new code bug, 4 debunked.
 ### ITER-036 — Animate Still feature completed (was WIP failing gate A1)
 
 - **Problem:** the draft "Animate Still" folder hardcoded
-  `/Users/darkfire/Downloads/hermes2.jpeg` in its load button — a
+  `~/Downloads/hermes2.jpeg` in its load button — a
   personal path that tripped gate A1 and was useless on any other
   machine.
 - **Fix:** button is now generic **"Pick image + animate…"** — native
@@ -1970,7 +1970,7 @@ name — no driver-script rescue needed.
       `targetMaxBytes` from manifest; falls back to 15 MB whenever
       `capWidth == 720` so existing driver scripts get Twitter-fit
       guarantees without changes.
-- **Verification — smoke test on `/Users/darkfire/Downloads/ghost-I.gif`
+- **Verification — smoke test on `~/Downloads/ghost-I.gif`
   (the known-bad source from ITER-025):**
     ```
     twitter-fit: cap=720 size=18.54MB > target 15.00MB — entering shrink ladder
@@ -2753,7 +2753,7 @@ manually as `f655800`. Future loop runs MUST use `--max-cycles`.
 
 **Problem** — Glyph Grid Studio had the raw ingredients for animated glyph art
 (temporal dither, breathing, dispersal, GIF/MP4 export), but no first-class
-workflow for turning a static portrait such as `/Users/darkfire/Downloads/hermes2.jpeg`
+workflow for turning a static portrait such as `~/Downloads/hermes2.jpeg`
 into an animated ASCII/glyph loop.
 
 **Root cause** — The studio UI exposed each animation control separately.
