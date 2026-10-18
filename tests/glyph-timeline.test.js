@@ -119,12 +119,30 @@ assert.strictEqual(TL.active({}), false);
 
 /* ITER-078: a palette track under colorMode preserve is flagged */
 const palTrack = { palette: [{ u: 0, v: 'mono' }, { u: 1, v: 'spice' }] };
-assert(/no effect under colorMode "preserve"/.test(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: true, tracks: palTrack } })));
+assert(/only changes the background under colorMode "preserve"/.test(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: true, tracks: palTrack } })));
 assert.strictEqual(TL.paletteIgnored({ colorMode: 'monochrome', timeline: { enabled: true, tracks: palTrack } }), '');
 assert.strictEqual(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: false, tracks: palTrack } }), '', 'timeline off: nothing runs');
 assert.strictEqual(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: true, tracks: { 'grid.cols': [{ u: 0, v: 80 }] } } }), '');
 assert.strictEqual(TL.paletteIgnored({ colorMode: 'preserve', timeline: { enabled: true,
   tracks: Object.assign({ colorMode: [{ u: 0, v: 'preserve' }, { u: 0.5, v: 'monochrome' }] }, palTrack) } }), '', 'a colorMode track may switch preserve off');
+
+/* ITER-086: a brightnessGamma track under preserve is flagged wherever gamma
+   cannot pick the glyph (any dither — temporal is the default — or shape /
+   edge-directional); brightness + dither none and flow keep it. */
+const gTrack = { brightnessGamma: [{ u: 0, v: 0.4 }, { u: 1, v: 2.5 }] };
+const gam = (extra) => TL.gammaIgnored(Object.assign({ colorMode: 'preserve', timeline: { enabled: true, tracks: gTrack } }, extra));
+assert(/brightnessGamma track has no effect under colorMode "preserve"/.test(gam({})), 'default dither is temporal');
+assert(gam({ dither: { mode: 'bayer4' } }));
+assert(gam({ selectionMode: 'shape', dither: { mode: 'none' } }));
+assert(gam({ selectionMode: 'edge-directional', dither: { mode: 'none' } }));
+assert.strictEqual(gam({ dither: { mode: 'none' } }), '');
+assert.strictEqual(gam({ dither: 'none' }), '');
+assert.strictEqual(gam({ compat: 'v1' }), '', 'v1: no dither stage');
+assert.strictEqual(gam({ selectionMode: 'flow' }), '');
+assert.strictEqual(gam({ colorMode: 'monochrome' }), '');
+assert.strictEqual(TL.gammaIgnored({ colorMode: 'preserve', timeline: { enabled: true,
+  tracks: Object.assign({ 'dither.mode': [{ u: 0, v: 'none' }] }, gTrack) } }), '', 'a dither track may switch it on');
+assert.strictEqual(TL.preserveIgnored({ colorMode: 'preserve', timeline: { enabled: true, tracks: Object.assign({}, palTrack, gTrack) } }).split(' | ').length, 2);
 
 /* the schema's ease enum is this module's (gen-schema reads it) */
 const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'glyph-grid.schema.json'), 'utf8'));

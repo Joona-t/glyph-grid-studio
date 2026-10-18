@@ -4,6 +4,62 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-088 — 2026-10-18 — dispersal holds its end state when animation.loop is false
+
+**Problem:** the 105-frame phosphor-cycle showcase GIF (dispersal startT 0.76 → endT 0.97, `animation: {duration: 7, fps: 15, loop: false}`) went blank at frames 95–99 and then showed the whole figure again at frames 100–104. Repro on the bundled cream-paper still (phosphor, monochrome, bayer4, 105 frames): ink on the last frame 154233 px before, 0 after.
+
+**Root cause:** two things together. The batch rounds fps to whole-centisecond GIF delays (15 fps → 70 ms → 14.29 fps effective), so 105 frames last 7.35 s and frames 100–104 run past `duration`. And the dispersal phase took `t % duration` even with `loop: false`, so those frames wrapped to t ≈ 0, before startT. (The figure was gone "early" for the same reason: frame 97 is t = 6.79 s = endT.)
+
+**Fix:** with `animation.loop === false` the dispersal phase is `min(1, t / duration)`: after endT every frame holds the dispersed state. Looping animations keep the wrap. (The timeline already clamps u the same way for non-looping animations.)
+
+**Tests:** tests/timeline.sh L8 renders that config on cream-paper.png and requires ink on frame 0 and none on the last frame. Fails on the pre-fix binary (154233 px on the last frame), passes now.
+
+**Gate (ITER-085..088 together):** cargo build --release 0 errors (1 pre-existing `Shell::open` deprecation), cargo 75/75, npm test ok, run-all PASS 49 / FAIL 0 (`TEST_TIMEOUT=400`, `TEST_IMG=tests/sources/cream-paper.png`), timeline 8/8 (L6-L8 new; L6, L7 and L8 fail on the pre-fix v0.2.0 build), MCP 34/34, byte-identity 9/9.
+
+**Gotchas:** `--frames auto` would have given 100 frames (duration × effective fps); a hand-picked 105 frames at 15 fps now ends on 5 held blank frames, which gifski merges into one longer frame.
+
+---
+
+### ITER-087 — 2026-10-18 — Twitter-fit refits bytes-vs-width from every pass and walks to the 360 px floor
+
+**Problem:** the 105-frame phosphor-cycle GIF failed `targetMaxBytes` twice with "GIF cannot meet target size" and was finally rendered at 480 px without a target and squeezed with gifsicle by hand, while a width the predictor never tried would have fit.
+
+**Root cause:** ITER-051's predictor assumes constant bytes per pixel (bytes ∝ width²) and runs at most two shrink passes. On temporal-dithered content B/px nearly doubles as the width shrinks (measured 0.28 → 0.53 B/px at 652 → 414 px, i.e. bytes ∝ width^0.6), so each prediction undershoots the shrink it needs, and after the third pass it gave up well above the floor.
+
+**Fix:** `twitter_fit_ladder` (split out of `twitter_fit_shrink` so it can be tested without gifski): pass 2 still predicts with exponent 2 (× 0.96); every later pass refits the exponent e in bytes ∝ width^e from the last two passes (`twitter_fit_exponent`, clamped to [0.25, 3]) and predicts with `twitter_fit_width_exp` (× 0.97). It keeps going while a pass overshoots and there is a narrower even width ≥ 360 px left, at most `TWITTER_FIT_MAX_PASSES` = 8 extra passes (every pass is ≥ 3 % narrower, and a small exponent jumps to the floor, so this only bounds a run of near misses). The error is unchanged when even the floor overshoots.
+
+**Tests (cargo 73 → 75, with ITER-086):** `twitter_fit_refits_the_exponent_and_walks_to_the_floor` models the GIF from the measured numbers (652 × 1024 frames, 105 frames, 14.5 MB target, B/px through 0.28 @ 652 and 0.53 @ 414): the fitted exponent is 0.60; from 414 px the w² model asks for 394 px and the refit for 378 px; the ladder runs 536 → 378 and fits, where ITER-051's third pass from 536 misses; an unreachable target ends at 360 px and errors. ITER-051's `twitter_fit_width_predicts_from_bytes_per_pixel` pins are unchanged.
+
+---
+
+### ITER-086 — 2026-10-18 — validate warns for a brightnessGamma track colorMode preserve ignores; the palette-track warning is corrected
+
+**Problem:** in colorMode preserve a `brightnessGamma` timeline track did nothing in the Pietà showcase, and `validate` said nothing. Its existing ITER-078 warning said a palette track has "no effect" under preserve.
+
+**Root cause (measured):** a sweep over the Pietà source, 8 frames, each track 0 → 1 against the same constant, colorMode preserve vs monochrome, selectionMode brightness (dither none / temporal / bayer4), shape + braille, edge-directional and flow. Under preserve the glyph colour comes from the source, so gamma can only pick the glyph, and it only does where the ramp index comes from the gamma curve: brightness with dither none, or flow. With any dither (the CONFIG default is temporal) the dither picks the index; shape and edge-directional pick by shape. Those renders were pixel-identical with and without the track. The palette track is not a no-op: it moves the background and the contrast the source colours are stretched against (pixels differ).
+
+**Fix:** chosen: warn rather than make gamma feed the dither under preserve. Gamma defaults to 0.55 and dither to temporal, so routing gamma into the dither would restyle every existing preserve render. `ineffective_config_warnings` (validate / --dry-run / render / batch) adds "/timeline/tracks/brightnessGamma: has no effect under colorMode "preserve" with selectionMode …" unless selectionMode is flow, or brightness with dither none (or compat v1). A colorMode / selectionMode / dither.mode track suppresses it, since those can change the answer mid-loop. The palette warning now says the track "only changes the background". The JS twin (`glyph-timeline.js` `gammaIgnored` / `preserveIgnored`) feeds the GUI status bar and the headless cli_log.
+
+**Tests:** cargo `gamma_track_under_preserve_warns_where_it_is_a_no_op` (default dither, bayer4, shape, edge-directional warn; dither none, flow, v1, monochrome, timeline off, a dither.mode track do not); `camera_is_stripped_and_noop_configs_warn` follows the new palette wording. glyph-timeline.test.js covers the JS twin. tests/timeline.sh L7: preserve + temporal with the track is pixel-identical to a constant gamma and validate warns; with dither none the track changes the frames and validate stays quiet.
+
+**Gotchas (not fixed here):** a `font.size` track had no effect under preserve + shape in the same sweep, although a constant font.size does change those renders. Octant glyphs in preserve's `text()` path draw as tofu boxes (the font lacks the Unicode 16 octants), so octant + preserve looks static whatever the selection does.
+
+---
+
+### ITER-085 — 2026-10-18 — studio breathing reaches shape selection, so a still in shape mode animates
+
+**Problem:** the braille Pietà piece (selectionMode shape, dither temporal, studio breathing on) rendered as one frame until a palette timeline was added. Repro on cream-paper.png, 8 frames: braille + shape / shape-edge-aware under preserve, duotone and gradient gave a 1-frame GIF; monochrome was fine.
+
+**Root cause:** not the ITER-042 selection memo itself. Shape selection reads the full-res luminance (`lumBuf`), never the per-cell signal, so the breathing gain swing and jitter (applied to `cellSignal`) never reached it, and dither is brightness-only by design (CR-6). Disabling the memo would have picked the same glyphs again. In monochrome the signal still drove alpha, so frames differed; preserve takes colour from the source and duotone / gradient on a flat tint barely move, so every frame was the same.
+
+**Fix:** the EMA/breathing loop in `drawGlyphGridV2` also records each cell's breathed / unbreathed ratio (`cellBreath`) when the selection mode is shape or shape-edge-aware and the swing or jitter is non-zero. `drawShapeGrid` then passes it to `shapeIndex.selectGrid` as `opts.cellGain`, which scales each cell's 6-D vector before the k-d search, and skips the memo for that frame. Glyph density now breathes as the ramp index does in brightness mode. With swing and jitter 0 (including reduced motion) `__shapeBreath` is null and the memo path is unchanged.
+
+**Tests:** tests/timeline.sh L6: braille on cream-paper.png (12 frames, a full breathing cycle) gives 5 distinct frames under preserve + shape and 4 under duotone + shape-edge-aware; the pre-fix binary gives 1 and 1. frontend-contracts stubs `__shapeBreath`.
+
+**Gotchas:** shape mode with breathing now runs the k-d search every frame on a still (what animated sources always paid). Monochrome shape renders change: the glyphs breathe as well as the alpha.
+
+---
+
 ### ITER-084 — 2026-10-18 — video: no short tails inside containers, crop sides bounded together, chunk offsets bounded
 
 **Problem:** three more crate trust paths in `video.rs`. (29, HIGH) `walk_boxes` let a box list end in fewer than 8 all-zero bytes (QuickTime's udta 32-bit zero), but the mp4 crate's container loops read 8 bytes straddling the container end, get size 0, and `skip_box(0)` seeks back and spins forever, with `open_video` holding the slot lock. Repro: a udta ending in `00 00 00 00`, or 4 zero bytes at the end of stbl, on either fixture; the open never returns. (30, LOW) `sps_parse` bounded each crop side under 16 px but not their sum, so `coded_w - cx*(cl+cr)` underflowed: a 1-MB-wide SPS with crop left = right = 7 gave width 4294967284 in release (a debug panic). (31, LOW) `sample_tables_fit` never bounded stco/co64 entries; the crate adds `chunk_offset + sample_offset` unchecked (debug panic on co64 u64::MAX, release wrap to a garbage seek).

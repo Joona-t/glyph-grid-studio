@@ -125,17 +125,42 @@
   }
 
   /* ITER-078: a palette track recolours the inks; colorMode 'preserve'
-     keeps the source's own colours, so the track silently does nothing.
-     The one-line warning for the GUI status bar and the headless cli_log
-     (Rust's validate_config says the same for validate / --dry-run), or
-     '' when the combination is fine.  A colorMode track may switch the
+     keeps the source's own colours, so the track only moves the background
+     (ITER-086: measured — the frames do change, the glyphs keep the source
+     hues).  The one-line warning for the GUI status bar and the headless
+     cli_log (Rust's validate_config says the same for validate / --dry-run),
+     or '' when the combination is fine.  A colorMode track may switch the
      mode mid-loop, so it suppresses the warning. */
-  const PALETTE_IGNORED = 'timeline: the palette track has no effect under colorMode "preserve" (the source colours are kept); use monochrome / duotone / gradient';
+  const PALETTE_IGNORED = 'timeline: the palette track only changes the background under colorMode "preserve" (the glyphs keep the source colours); use monochrome / duotone / gradient';
   function paletteIgnored(config) {
     if (!active(config)) return '';
     const tr = config.timeline.tracks;
     const has = function (k) { return Object.prototype.hasOwnProperty.call(tr, k); };
     return (has(PALETTE_PATH) && !has('colorMode') && config.colorMode === 'preserve') ? PALETTE_IGNORED : '';
+  }
+
+  /* ITER-086: under colorMode 'preserve' gamma never colours a glyph, it
+     only picks one — and only where the ramp index comes from the gamma
+     curve: selectionMode 'brightness' with dither 'none', or 'flow'.  With
+     a dither (the default is temporal) the dither picks the index; shape /
+     edge-directional pick by shape.  Measured in tests/timeline.sh L7.
+     Mirrors the brightnessGamma check in lib.rs ineffective_config_warnings. */
+  const GAMMA_IGNORED = 'timeline: the brightnessGamma track has no effect under colorMode "preserve" unless selectionMode is "flow", or "brightness" with dither "none"';
+  function gammaIgnored(config) {
+    if (!active(config)) return '';
+    const tr = config.timeline.tracks;
+    const has = function (k) { return Object.prototype.hasOwnProperty.call(tr, k); };
+    if (!has('brightnessGamma') || config.colorMode !== 'preserve') return '';
+    if (has('colorMode') || has('selectionMode') || has('dither.mode')) return '';
+    const sel = config.selectionMode || 'brightness';
+    const d = config.dither;   /* absent = the CONFIG default, temporal */
+    const ditherOff = config.compat === 'v1' || d === 'none' || !!(d && d.mode === 'none');
+    return (sel === 'flow' || (sel === 'brightness' && ditherOff)) ? '' : GAMMA_IGNORED;
+  }
+
+  /* Every preserve no-op note for this config ('' when none). */
+  function preserveIgnored(config) {
+    return [paletteIgnored(config), gammaIgnored(config)].filter(Boolean).join(' | ');
   }
 
   /* Copy-on-write along each tracked path: the shadow shares every
@@ -188,6 +213,8 @@
     frameConfig: frameConfig,
     active: active,
     paletteIgnored: paletteIgnored,
+    gammaIgnored: gammaIgnored,
+    preserveIgnored: preserveIgnored,
   });
 
   root.GlyphGrid = root.GlyphGrid || {};

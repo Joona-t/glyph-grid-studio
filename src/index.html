@@ -1052,6 +1052,8 @@
   let __sourceSignalCache = null;
   let __curCellKey = null;          /* drawGlyphGridV2 -> drawShapeGrid selection cache */
   let __curCellsFresh = false;
+  let cellBreath = null;            /* ITER-085: per-cell breathed/raw signal ratio */
+  let __shapeBreath = null;         /* cellBreath while it should steer shape selection, else null */
   let __srcLayerKey = null;         /* memoized studio source layer (see draw) */
   let __srcLayerProcessed = null;
   let __srcLayerDepth = null;
@@ -2223,9 +2225,9 @@
         `${CONFIG.scene} | ${__tlPaletteName === CONFIG.palette ? 'timeline blend' : CONFIG.palette} | ${CONFIG.samplingStrategy}/${CONFIG.colorMode} | ` +
         `${CONFIG.grid.cols}×${CONFIG.grid.rows} | sample ${(t1 - t0).toFixed(1)}ms${lat}${atlasTag}${animTag}${fpsTag} | ` +
         `t=${t.toFixed(2)}s | compat=${CONFIG.compat}` +
-        /* ITER-078: a palette track under colorMode preserve is a no-op. */
-        ((window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.paletteIgnored(CONFIG_BASE))
-          ? ' | ⚠ palette track ignored (colorMode preserve)' : '');
+        /* ITER-078 / ITER-086: timeline tracks colorMode preserve ignores. */
+        ((window.GlyphGrid && GlyphGrid.timeline && GlyphGrid.timeline.preserveIgnored(CONFIG_BASE))
+          ? ' | ⚠ timeline track ignored (colorMode preserve)' : '');
     }
 
     /* 4. Record capture. */
@@ -2938,11 +2940,24 @@
     const _breatheGain = 1.0 + _gainSwing * Math.sin(_loopPhase * _pulseHz);
     const _seed = (CONFIG.seed | 0) ^ ((_frameIdx + 1) * 2654435761) >>> 0;
     const _jScale = _jitterAmt / 128;
+    /* ITER-085: shape selection reads lumBuf, never cellSignal, so the
+       breathing below did not reach it: a still source in shape /
+       shape-edge-aware picked the same glyphs every frame, and with a
+       colorMode that ignores the signal (preserve; duotone/gradient on a
+       flat tint) every frame was identical.  Hand drawShapeGrid each cell's
+       breathed / unbreathed ratio as a gain on its shape vector. */
+    const _selModeEarly = GlyphGrid.compat.resolveSelectionMode(CONFIG);
+    const _breathSel = (_selModeEarly === 'shape' || _selModeEarly === 'shape-edge-aware')
+      && (_gainSwing !== 0 || _jitterAmt !== 0);
+    if (_breathSel && (!cellBreath || cellBreath.length !== cellSignal.length)) {
+      cellBreath = new Float32Array(cellSignal.length);
+    }
     // F8 (audit): branchless clamp replaces Math.max/Math.min function-call
     // pair per cell. 28,800 iters × 2 fewer calls/iter at default 240×120 grid.
     // Semantics identical for all finite values (NaN → NaN in both paths).
     let _emaMaxD = 0;   /* ITER-062: largest EMA step this frame (idle detector) */
     for (let i = 0; i < cellSignal.length; i++) {
+      const _pre = cellSignal[i];
       const _emaPrev = cellSignalEma[i];
       cellSignalEma[i] = (1 - _emaA) * cellSignalEma[i] + _emaA * cellSignal[i];
       const _emaD = cellSignalEma[i] - _emaPrev;
@@ -2951,8 +2966,10 @@
       const jitter = ((h & 0xff) - 128) * _jScale;
       const _v = cellSignalEma[i] * _breatheGain + jitter;
       cellSignal[i] = _v < 0 ? 0 : _v > 1 ? 1 : _v;
+      if (_breathSel) cellBreath[i] = _pre > 1e-3 ? cellSignal[i] / _pre : 1;
     }
     __emaMaxDelta = _emaMaxD;
+    __shapeBreath = _breathSel ? cellBreath : null;
     if (__pfFrame) __pfFrame.stages._ema = performance.now() - _t_ema0;
     /* ITER-046: priming stops here — the EMA is the only cross-frame state
        the signal stages hold; everything below is per-frame. */
@@ -3673,7 +3690,13 @@
       const _dispT = recState
         ? (recState.frameIdx / CONFIG.animation.fps)
         : ((frameCount - 1) / CONFIG.animation.fps);
-      const _dispNorm = (_dispT % _dispDur) / _dispDur;
+      /* ITER-088: a non-looping animation holds its end state.  The batch
+         rounds fps to whole-cs GIF delays (15 fps → 70 ms → 14.29 fps), so
+         105 frames run past duration 7; the old `% duration` wrapped those
+         frames back to t ≈ 0 and the dispersed figure came back. */
+      const _dispNorm = (CONFIG.animation && CONFIG.animation.loop === false)
+        ? Math.min(1, _dispT / _dispDur)
+        : (_dispT % _dispDur) / _dispDur;
       if (_dispNorm >= _dispCfg.startT) {
         const _dispRange = _dispCfg.endT - _dispCfg.startT;
         _dispBasePhase = (_dispNorm - _dispCfg.startT) / _dispRange;
@@ -3985,7 +4008,8 @@
     const stride = srcW * 4;
     const glyphs = glyphAtlas.glyphs;
     const _t_sel0 = performance.now();
-    /* Selection depends only on lumBuf + grid/cell/reach/atlas, so a still
+    /* Without breathing (__shapeBreath null — swing and jitter 0, e.g.
+       reduced motion), selection depends only on lumBuf + grid/cell/reach/atlas, so a still
        studio source (__curCellKey set) reuses the indices from the frame the
        cell cache was built on.  That frame also ran the prefilter, which
        later cache-hit frames skip; storing only then (or when no prefilter
@@ -3996,7 +4020,13 @@
       && (__curCellKey + '|' + cellPxW + 'x' + cellPxH + '|' + reach);
     const sc = __sourceSignalCache;
     let indices;
-    if (selKey && sc && sc.cellKey === __curCellKey && sc.selKey === selKey
+    if (__shapeBreath) {
+      /* ITER-085: breathing moves the selection every frame — no memo. */
+      indices = GlyphGrid.shapeIndex.selectGrid(
+        glyphAtlas, lumBuf, srcW, srcH, cols, rows, cellPxW, cellPxH,
+        { reach: reach, cellGain: __shapeBreath }
+      );
+    } else if (selKey && sc && sc.cellKey === __curCellKey && sc.selKey === selKey
         && sc.selAtlas === glyphAtlas && sc.selIdx && sc.selIdx.length === selCount) {
       indices = sc.selIdx;
     } else {
@@ -5409,7 +5439,7 @@
         syncTextSource(true);
         textStrokeCheck();
         /* ITER-078: headless twin of the status-bar palette-track note. */
-        const _tlNote = GlyphGrid.timeline && GlyphGrid.timeline.paletteIgnored(CONFIG_BASE);
+        const _tlNote = GlyphGrid.timeline && GlyphGrid.timeline.preserveIgnored(CONFIG_BASE);
         if (_tlNote) tauri('cli_log', { msg: 'warn: ' + _tlNote }).catch(()=>{});
         // Force loop on so draw() advances
         try { loop(); } catch (e) {}

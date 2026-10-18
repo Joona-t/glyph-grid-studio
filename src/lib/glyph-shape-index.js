@@ -336,16 +336,26 @@
   /* Convenience: compute 6D vectors for every cell in the source and
      run NN search.  Uses the atlas's pre-built k-d tree when available
      (every atlas built via buildAtlas has one), falling back to brute
-     force for unusual atlas shapes. */
+     force for unusual atlas shapes.
+     ITER-085: opts.cellGain (Float32Array, one factor per cell) scales each
+     cell's vector before the search, so the per-frame studio breathing
+     (gain swing + jitter) changes which glyph a cell picks, as it changes
+     the ramp index in brightness mode. */
   function selectGrid(atlas, luminance, srcW, srcH, cols, rows, cellW, cellH, opts) {
     const count = cols * rows;
     _ensureBuffers(count);
     const vectors = _selectGridVecs;
     const indices = _selectGridIdx;
+    const gain = opts && opts.cellGain;
     for (let y = 0; y < rows; y++) {
       const rowOff = y * cols * 6;
       for (let x = 0; x < cols; x++) {
-        cellVectorInto(vectors, rowOff + x * 6, luminance, srcW, srcH, x, y, cellW, cellH, opts);
+        const off = rowOff + x * 6;
+        cellVectorInto(vectors, off, luminance, srcW, srcH, x, y, cellW, cellH, opts);
+        if (gain) {
+          const k = gain[y * cols + x];
+          for (let d = 0; d < 6; d++) vectors[off + d] *= k;
+        }
       }
     }
     if (atlas.tree) {
