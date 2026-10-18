@@ -57,6 +57,8 @@ Defaults to keep unless there's a reason:
   256 and roughly halve the file. Need it smaller? `--gif-width 480`.
 - `--palette charcoal` (cream `#EFE3CF`, warm-black `#1F1612`). Pink
   variants for LoveSpark work: `y2k-pink`, `y2k-pastel`, `y2k-neon`.
+  `basalt` is light-on-dark (bone `#E6D6AD` marks on `#16171A` stone): draw
+  the source light-on-dark on that bg, since the signal is distance from bg.
 
 ## Step 3 — check before reporting
 

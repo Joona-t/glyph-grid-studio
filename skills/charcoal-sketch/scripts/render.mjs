@@ -14,7 +14,7 @@
 // Options:
 //   --out DIR           output dir (default ./charcoal-<image name>)
 //   --formats LIST      comma list of still,gif,mp4   (default still,gif)
-//   --palette NAME      charcoal | y2k-pink | y2k-pastel | y2k-neon | …  (default charcoal)
+//   --palette NAME      charcoal | basalt | y2k-pink | y2k-pastel | y2k-neon | …  (default charcoal)
 //   --cell PX           grid cell size, smaller = finer grain        (default 6)
 //   --maxdim PX         render canvas long edge                      (default 1400)
 //   --duration S        loop length in seconds                       (default 6)

@@ -242,6 +242,12 @@
     // heart hero. Slightly more red/saturated than the wordmark fuchsia so
     // the heart reads as a separate visual beat from the wordmark below it.
     'y2k-neon': { bg: '#FFE0EC', inks: ['#FF1493'] },
+    // Basalt — light-on-dark: warm bone marks on dark basalt stone, for the
+    // Glyph Grid Studio site's dark theme. The signal is each pixel's distance
+    // from bg, so draw the source on this bg (light subject on #16171A) and
+    // the marks land where the subject is. Bg matches the site's basalt
+    // --ls-bg-mid; ink is its --ls-heading (12.4:1 on the bg).
+    basalt: { bg: '#16171A', inks: ['#E6D6AD'] },
   };
 
   function inkColor(config, i) {
