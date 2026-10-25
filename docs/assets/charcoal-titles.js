@@ -7,7 +7,7 @@
  *   still  assets/titles/<name>-<theme>-<layout>.webp  → .ct-on
  *   motion assets/titles/<name>-<theme>-<layout>.mp4   → .ct-anim
  *          the skill's seamless 4 s breathing loop. H.264 has no alpha, so the
- *          marks are baked onto white (cream, candy: mix-blend-mode multiply)
+ *          marks are baked onto white (cream, bubblegum: mix-blend-mode multiply)
  *          or black (basalt: screen) and the blend drops the paper out.
  *          Created only for titles near the viewport, paused off screen, never
  *          under prefers-reduced-motion (the still stays).
@@ -22,7 +22,7 @@
   var root = document.documentElement;
   var mq = window.matchMedia('(max-width: 520px)');
   var reduce = window.matchMedia('(prefers-reduced-motion: reduce)');
-  var THEMES = ['cream', 'candy', 'basalt'];
+  var THEMES = ['cream', 'bubblegum', 'basalt'];
   var heads = [].slice.call(document.querySelectorAll('[data-ct]'));
   var near = new WeakMap();   // heading → within ~1 screen of the viewport
 

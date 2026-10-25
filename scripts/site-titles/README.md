@@ -3,7 +3,7 @@
 Rebuilds `docs/assets/titles/*.webp` + `titles.js`: every large heading on the
 site, drawn by the charcoal-sketch skill (`skills/charcoal-sketch`, branch
 `skill/charcoal-sketch`) in each theme's palette (cream → `charcoal`,
-candy → `y2k-pink`, basalt → `basalt`) at a desktop and a phone layout.
+bubblegum → `y2k-pink`, basalt → `basalt`) at a desktop and a phone layout.
 Run after changing a heading's text, font or size, in this order:
 
 ```bash
