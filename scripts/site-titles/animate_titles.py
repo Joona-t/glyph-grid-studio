@@ -9,7 +9,7 @@ stills (rekey.py), crop it to the trimmed still's width, and composite it for
 a CSS blend so H.264 can carry the transparency:
 
   basalt (light marks)  -> premultiplied onto black,  shown mix-blend-mode: screen
-  cream / candy (dark)  -> composited onto white,     shown mix-blend-mode: multiply
+  cream / bubblegum (dark)  -> composited onto white,     shown mix-blend-mode: multiply
 
 Writes <titles dir>/<name>-<theme>-<layout>.mp4 (CRF 32, faststart, yuv420p).
 An alpha WebP of the same loop was 10.7 MB for the hero; this is ~0.7 MB.
@@ -21,7 +21,7 @@ from PIL import Image
 
 WORK, RENDER, TITLES = sys.argv[1], sys.argv[2], sys.argv[3]
 JOBS = int(sys.argv[4]) if len(sys.argv) > 4 else 3
-PAL = {'cream': ('charcoal', '#EFE3CF', '#1F1612'), 'candy': ('y2k-pink', '#FFE6F2', '#8A4259'),
+PAL = {'cream': ('charcoal', '#EFE3CF', '#1F1612'), 'bubblegum': ('y2k-pink', '#FFE6F2', '#8A4259'),
        'basalt': ('basalt', '#16171A', '#E6D6AD')}
 DURATION, FPS = 4, 12
 hexv = lambda h: np.array([int(h[i:i + 2], 16) for i in (1, 3, 5)], float)

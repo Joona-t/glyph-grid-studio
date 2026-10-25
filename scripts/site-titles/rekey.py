@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 
 WORK, OUT = sys.argv[1], sys.argv[2]
-THEMES = {'cream': ('#EFE3CF', '#1F1612'), 'candy': ('#FFE6F2', '#8A4259'), 'basalt': ('#16171A', '#E6D6AD')}
+THEMES = {'cream': ('#EFE3CF', '#1F1612'), 'bubblegum': ('#FFE6F2', '#8A4259'), 'basalt': ('#16171A', '#E6D6AD')}
 hexv = lambda h: np.array([int(h[i:i + 2], 16) for i in (1, 3, 5)], float)
 
 def smooth(e0, e1, x):

@@ -4,6 +4,18 @@ Running log of every defect found, every iteration that landed, and the why behi
 
 ---
 
+### ITER-091 — 2026-10-25 — site: "candy" theme renamed "bubblegum"
+
+**What changed:** Suite-wide rename (Joona). The site's pink theme is now **Bubblegum**:
+- the toggle, `data-theme` selectors, the hero and title `data-*` attributes, and the theme maps in `charcoal-titles.js` and `titles/titles.js`;
+- the `site-titles` scripts (`rekey.py`, `build_titles.py`, `animate_titles.py`);
+- 30 asset files (`git mv` `*-candy-*` → `*-bubblegum-*`).
+
+A saved `ggs-theme` = `candy` is carried over to `bubblegum` on both pages.
+**Verify:** `npm test` passes (frontend contracts + studio export) and the `py_compile` check of the scripts passes. In local Chromium, a stored `candy` loads as bubblegum with storage rewritten and the Bubblegum toggle pressed. The hero `hero-bubblegum.gif` and all six `*-bubblegum-mob.webp` titles return 200. The gallery has no 4xx and no console errors.
+
+---
+
 ### ITER-090 — 2026-10-18 — site: the charcoal titles breathe
 
 **Problem:** the ITER-089 charcoal titles were stills; Joona: "it is static and needs to be moving".

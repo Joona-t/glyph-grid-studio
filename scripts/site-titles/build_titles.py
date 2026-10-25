@@ -31,7 +31,7 @@ TITLES = [  # name, tag/class, html
 ]
 THEMES = {  # site theme -> charcoal palette (bg, ink)
     'cream': ('charcoal', '#EFE3CF', '#1F1612'),
-    'candy': ('y2k-pink', '#FFE6F2', '#8A4259'),
+    'bubblegum': ('y2k-pink', '#FFE6F2', '#8A4259'),
     'basalt': ('basalt', '#16171A', '#E6D6AD'),
 }
 LAYOUTS = {'desk': (1280, None), 'mob': (500, 375)}  # window width, forced body width
